@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+  <title>CODA · Terminal Mesh</title>
+  <style>
+    :root {
+      --bg: #000000;
+      --sidebar: #050507;
+      --surface: #161618;
+      --surface-hover: #222226;
+      --border: #242428;
+      --text: #f4f4f5;
+      --muted: #71717a;
+      --emerald: #22c55e;
+      --sky: #38bdf8;
+      --coral: #e06c50;
+      --rose: #fb7185;
+      --mono: "JetBrains Mono", "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+      --sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", system-ui, sans-serif;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body, #app {
+      height: 100%;
+      width: 100%;
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--sans);
+      overflow: hidden;
+      -webkit-font-smoothing: antialiased;
+    }
+    button, input { font: inherit; color: inherit; }
+    .coda-mono { font-family: var(--mono); font-variant-ligatures: none; }
+    .shell-root {
+      display: flex;
+      height: 100vh;
+      width: 100vw;
+      background: #000;
+    }
+    .left-sidebar {
+      width: 310px;
+      background: var(--sidebar);
+      border-right: 1px solid #18181b;
+      display: flex;
+      flex-direction: column;
+      flex-shrink: 0;
+    }
+    .circle-btn {
+      width: 36px;
+      height: 36px;
+      border-radius: 999px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+    }
+    .circle-btn:hover { background: var(--surface-hover); }
+    .branch-item {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 9px 10px;
+      border-radius: 12px;
+      cursor: pointer;
+      border: 1px solid transparent;
+      margin-bottom: 4px;
+    }
+    .branch-item:hover { background: rgba(255,255,255,0.03); }
+    .branch-item.active {
+      background: #141417;
+      border-color: #27272a;
+    }
+    .main-terminal-col {
+      flex: 1;
+      min-width: 0;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      padding: 12px 14px 10px;
+      background: #000;
+    }
+    .term-viewport {
+      flex: 1;
+      overflow-y: auto;
+      font-family: var(--mono);
+      font-size: 13px;
+      line-height: 1.62;
+      padding: 10px 0;
+      white-space: pre-wrap;
+      word-break: break-word;
+      color: #e4e4e7;
+    }
+    .cursor-box {
+      display: inline-block;
+      border: 1.5px solid #f4f4f5;
+      min-width: 9px;
+      padding: 0 1px;
+      line-height: 1.1;
+    }
+    .keypad-grid {
+      display: grid;
+      grid-template-columns: repeat(12, minmax(0, 1fr));
+      gap: 6px;
+      height: 100px;
+      padding-top: 8px;
+      border-top: 1px solid #141417;
+      font-family: var(--mono);
+      font-size: 13px;
+    }
+    .keypad-left {
+      grid-column: span 10 / span 10;
+      display: grid;
+      grid-template-rows: repeat(2, minmax(0, 1fr));
+      gap: 6px;
+    }
+    .keypad-row {
+      display: grid;
+      grid-template-columns: repeat(10, minmax(0, 1fr));
+      gap: 6px;
+    }
+    .k-btn {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      user-select: none;
+    }
+    .k-btn:hover { background: var(--surface-hover); }
+    .k-btn:active { transform: scale(0.96); }
+    .k-enter {
+      grid-column: span 2 / span 2;
+      background: #f4f4f5;
+      color: #09090b;
+      border: none;
+      border-radius: 16px;
+      font-size: 20px;
+      font-weight: 700;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+    }
+    .k-enter:active { transform: scale(0.96); }
+    .right-rail {
+      width: 58px;
+      background: var(--sidebar);
+      border-left: 1px solid #18181b;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: space-between;
+      padding: 12px 6px;
+      flex-shrink: 0;
+    }
+    .rail-capsule {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      width: 40px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 10px 0;
+      gap: 12px;
+    }
+    .rail-capsule button {
+      background: none;
+      border: none;
+      cursor: pointer;
+      font-size: 15px;
+    }
+    .modal-mask {
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.78);
+      backdrop-filter: blur(8px);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 50;
+    }
+    .modal-card {
+      width: 420px;
+      max-width: 92vw;
+      background: #121215;
+      border: 1px solid #27272a;
+      border-radius: 20px;
+      padding: 22px;
+    }
+    .inp {
+      width: 100%;
+      background: #09090b;
+      border: 1px solid #27272a;
+      border-radius: 10px;
+      padding: 9px 12px;
+      font-size: 13px;
+      margin-top: 6px;
+      margin-bottom: 12px;
+      outline: none;
+    }
+    .inp:focus { border-color: var(--emerald); }
+    @media (max-width: 720px) {
+      .left-sidebar.collapsed-mobile { display: none; }
+    }
+  </style>
+</head>
+<body>
+  <div id="app"></div>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>
