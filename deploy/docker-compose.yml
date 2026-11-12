@@ -1,0 +1,54 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:18-alpine
+    restart: always
+    environment:
+      POSTGRES_USER: coda
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-coda_prod_secret}
+      POSTGRES_DB: coda_prod
+    volumes:
+      - coda_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U coda -d coda_prod"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Mode B: Overseas Coordinator + CDN WSS Tunnel (:8080 behind Cloudflare/CloudFront) + Raw TCP (:24443)
+  coda-coordinator:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    restart: always
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://coda:${POSTGRES_PASSWORD:-coda_prod_secret}@postgres:5432/coda_prod
+      CODA_RELAY_SECRET: ${CODA_RELAY_SECRET:-change-me-shared-hmac-relay-secret-2026}
+      CODA_PUBLIC_URL: ${CODA_PUBLIC_URL:-http://127.0.0.1:8080}
+    ports:
+      - "8080:8080"
+      - "24443:24443"
+
+  # Mode A: Stateless Domestic Cloud (Aliyun / Tencent Cloud) No-ICP Raw TCP Relay Node (:24443 only)
+  coda-relay-cn:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    restart: always
+    command:
+      - "--relay-only"
+      - "--raw-tcp-bind"
+      - "0.0.0.0:24444"
+      - "--region-label"
+      - "CN-Aliyun-NoICP-Edge"
+    environment:
+      CODA_RELAY_SECRET: ${CODA_RELAY_SECRET:-change-me-shared-hmac-relay-secret-2026}
+    ports:
+      - "24444:24444"
+
+volumes:
+  coda_pgdata:
