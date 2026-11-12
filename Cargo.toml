@@ -6,6 +6,7 @@ members = [
     "crates/coda-server",
     "crates/coda-daemon",
     "crates/coda-apple-ffi",
+    "crates/coda-desktop",
 ]
 
 [workspace.package]
@@ -44,3 +45,4 @@ x25519-dalek = { version = "2.0", features = ["static_secrets"] }
 zstd = "0.13"
 argon2 = "0.5"
 libc = "0.2"
+gpui = { version = "0.2.2", features = ["runtime_shaders"] }
