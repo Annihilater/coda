@@ -20,7 +20,7 @@
    - **`crates/coda-desktop` (Rust + GPUI 0.2.2)**：采用 Zed 同款 **Rust + GPUI** 纯 GPU 加速框架（macOS `Metal`、Windows `DirectX 12`、Linux `Vulkan`/`Blade`），**零 FFI 跨语言损耗**直接复用 `coda-protocol`、`coda-herdr` 与 `coda-daemon`（含 Direct P2P 直连引擎），一套 Rust 代码同时覆盖 **macOS、Windows、Linux 桌面端**，实现 120Hz/240Hz 丝滑 OLED 终端工作台。
    - **`apple/` (Swift 6 / SwiftUI Multiplatform)**：专为 **iPhone、iPhone Duo（5.4" 外屏单手终端态 ↔ 7.6" 展开双栏工作台态瞬时字符重排）、iPadOS** 打造，配备双排专属终端键盘（`esc | tab | ⌨/🎙 | ↑ | ⌫` / `^C | ^D | / | ← | ↓ | →` + 右侧跨两排高回车键 `↵`）与右侧垂直拇指轨。
    - **`web/` (TypeScript + `@noble/ciphers` + `fzstd`)**：浏览器端零知识加密终端控制台，1:1 还原纯黑 OLED 终端界面。
-   - **`deploy/`**：提供 `install-daemon.sh`（支持 `curl -fsSL https://<server>/install.sh | sh -s -- --server ... --code ...` 一键安装配置 `launchd` / `systemd`）、`Dockerfile`、`docker-compose.yml` 与国内免备案中继 `coda-relay-cn.service`。
+   - **`deploy/`**：提供 [完整生产环境极简部署指南 (`deploy/DEPLOY.md`)](deploy/DEPLOY.md)、`install-server.sh`、`install-relay-cn.sh`、`install-daemon.sh`（支持 `curl -fsSL https://<server>/install.sh | sh -s -- --server ... --code ...` 一键安装配置 `launchd` / `systemd`）、`Dockerfile`、`docker-compose.yml` 与国内免备案中继 `coda-relay-cn.service`。
 
 ---
 

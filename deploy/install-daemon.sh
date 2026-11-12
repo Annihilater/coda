@@ -5,6 +5,7 @@
 
 set -eu
 
+REPO="Annihilater/coda"
 SERVER_URL="http://127.0.0.1:8080"
 PAIR_CODE=""
 DEVICE_NAME=""
@@ -48,9 +49,36 @@ if ! command -v coda-daemon >/dev/null 2>&1; then
   elif [ -x "./target/debug/coda-daemon" ]; then
     cp "./target/debug/coda-daemon" "${INSTALL_DIR}/coda-daemon"
   else
-    echo "    Building coda-daemon from source via cargo..."
-    cargo build --release -p coda-daemon
-    cp "./target/release/coda-daemon" "${INSTALL_DIR}/coda-daemon"
+    OS_NAME="$(uname -s)"
+    ARCH_NAME="$(uname -m)"
+    PKG_NAME=""
+    DIR_NAME=""
+    if [ "${OS_NAME}" = "Darwin" ]; then
+      PKG_NAME="coda-daemon-macos-aarch64.tar.gz"
+      DIR_NAME="coda-daemon-macos-aarch64"
+    elif [ "${OS_NAME}" = "Linux" ]; then
+      case "${ARCH_NAME}" in
+        x86_64|amd64) PKG_NAME="coda-daemon-linux-x86_64.tar.gz"; DIR_NAME="coda-daemon-linux-x86_64" ;;
+        aarch64|arm64) PKG_NAME="coda-daemon-linux-aarch64.tar.gz"; DIR_NAME="coda-daemon-linux-aarch64" ;;
+      esac
+    fi
+
+    if [ -n "${PKG_NAME}" ]; then
+      echo "    Downloading prebuilt ${PKG_NAME} from GitHub Releases..."
+      TMP_D="$(mktemp -d)"
+      if curl -fsSL "https://github.com/${REPO}/releases/latest/download/${PKG_NAME}" -o "${TMP_D}/${PKG_NAME}"; then
+        tar -C "${TMP_D}" -xzf "${TMP_D}/${PKG_NAME}"
+        cp "${TMP_D}/${DIR_NAME}/coda-daemon" "${INSTALL_DIR}/coda-daemon"
+      else
+        echo "    Release download unavailable; building coda-daemon from source via cargo..."
+        cargo build --release -p coda-daemon
+        cp "./target/release/coda-daemon" "${INSTALL_DIR}/coda-daemon"
+      fi
+      rm -rf "${TMP_D}"
+    else
+      cargo build --release -p coda-daemon
+      cp "./target/release/coda-daemon" "${INSTALL_DIR}/coda-daemon"
+    fi
   fi
   chmod +x "${INSTALL_DIR}/coda-daemon"
 fi
