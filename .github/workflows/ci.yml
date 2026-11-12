@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust-server-and-daemon:
+    name: Rust Core (Protocol, Herdr, Daemon & Server)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: vampire
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_DB: coda_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libzstd-dev
+      - name: Build & test protocol, herdr, daemon, and server
+        env:
+          TEST_DATABASE_URL: postgres://vampire@localhost:5432/coda_test
+        run: |
+          cargo test -p coda-protocol -p coda-herdr -p coda-daemon -p coda-server
+
+  macos-gpui-and-apple:
+    name: macOS (GPUI Desktop + Apple Swift 6 + Web Console)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: oven-sh/setup-bun@v2
+      - uses: Swatinem/rust-cache@v2
+      - name: Build Web Console
+        run: cd web && bun install && bun run build
+      - name: Test GPUI Desktop Client (Metal runtime_shaders)
+        run: |
+          cargo test -p coda-desktop
+          cargo run -p coda-desktop -- --self-test
+      - name: Build & Self-Test Apple Swift 6 Package
+        run: cd apple && swift build && swift run CodaSelfTest
