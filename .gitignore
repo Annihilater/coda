@@ -1,0 +1,10 @@
+/target
+/node_modules
+/web/dist
+/web/node_modules
+/apple/.build
+/.swiftpm
+.DS_Store
+*.swp
+.env
+.coda-dev/
