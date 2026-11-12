@@ -1,0 +1,12 @@
+[package]
+name = "coda-apple-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[dependencies]
+coda-protocol = { path = "../coda-protocol" }
+serde_json.workspace = true
