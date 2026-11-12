@@ -16,8 +16,9 @@
    - **远端文件/截图直传 (`[ 📎 ]` -> `hc terminal.put`)** 与 **语音模型配置持久化 (`[ 🎙 ]` -> `hc doc.set`)**。
 4. **Phase 3 局域网 IPv4 / 大陆原生公网 IPv6 直连打洞引擎 (`DirectP2pClient` & `spawn_direct_p2p_listener`)**
    - 250ms Happy Eyeballs 竞速探测：同局域网（`< 2ms`）或三大运营商原生公网 IPv6（`2408:`/`2409:`/`240e:`，`< 12ms`）自动建立端到端加密点对点直连，**零服务器中继带宽消耗**；不通时毫秒级无感回退至 `:24443` 免备案裸 TCP 或 `:443` CDN WSS。
-5. **纯血 Apple 原生客户端 + 零安装 Web 控制台 + 一键部署套件 (`apple/` & `web/` & `deploy/`)**
-   - **`apple/` (Swift 6 / SwiftUI Multiplatform)**：一套原生工程覆盖 **iPhone、iPhone Duo（5.4" 外屏单手终端态 ↔ 7.6" 展开双栏工作台态瞬时字符重排）、iPadOS、macOS**，配备双排专属终端键盘（`esc | tab | ⌨/🎙 | ↑ | ⌫` / `^C | ^D | / | ← | ↓ | →` + 右侧跨两排高回车键 `↵`）与右侧垂直拇指轨。
+5. **三大客户端矩阵：Rust + GPUI 极速桌面端 + 纯血 Apple 移动端 + 零安装 Web 端 (`crates/coda-desktop` & `apple/` & `web/`)**
+   - **`crates/coda-desktop` (Rust + GPUI 0.2.2)**：采用 Zed 同款 **Rust + GPUI** 纯 GPU 加速框架（macOS `Metal`、Windows `DirectX 12`、Linux `Vulkan`/`Blade`），**零 FFI 跨语言损耗**直接复用 `coda-protocol`、`coda-herdr` 与 `coda-daemon`（含 Direct P2P 直连引擎），一套 Rust 代码同时覆盖 **macOS、Windows、Linux 桌面端**，实现 120Hz/240Hz 丝滑 OLED 终端工作台。
+   - **`apple/` (Swift 6 / SwiftUI Multiplatform)**：专为 **iPhone、iPhone Duo（5.4" 外屏单手终端态 ↔ 7.6" 展开双栏工作台态瞬时字符重排）、iPadOS** 打造，配备双排专属终端键盘（`esc | tab | ⌨/🎙 | ↑ | ⌫` / `^C | ^D | / | ← | ↓ | →` + 右侧跨两排高回车键 `↵`）与右侧垂直拇指轨。
    - **`web/` (TypeScript + `@noble/ciphers` + `fzstd`)**：浏览器端零知识加密终端控制台，1:1 还原纯黑 OLED 终端界面。
    - **`deploy/`**：提供 `install-daemon.sh`（支持 `curl -fsSL https://<server>/install.sh | sh -s -- --server ... --code ...` 一键安装配置 `launchd` / `systemd`）、`Dockerfile`、`docker-compose.yml` 与国内免备案中继 `coda-relay-cn.service`。
 
@@ -25,11 +26,14 @@
 
 ## 本地开发与测试快速启动
 
-### 1. 运行全套单元与端到端集成测试（PostgreSQL 18 + Herdr Core + Swift 原生）
+### 1. 运行全套单元与端到端集成测试（PostgreSQL 18 + Herdr Core + GPUI 桌面端 + Swift 原生）
 
 ```bash
-# Rust 全工作区测试（含多租户隔离、免备案裸 TCP 隧道、CDN WSS 无缝换轨、真实 hc 会话编排）
+# Rust 全工作区测试（含多租户隔离、免备案裸 TCP 隧道、CDN WSS 无缝换轨、Direct P2P 直连、GPUI 桌面端与真实 hc 编排）
 cargo test --workspace
+
+# 启动 Rust + GPUI 120Hz 原生桌面客户端（支持 macOS / Windows / Linux）
+cargo run -p coda-desktop
 
 # Apple Swift 6 原生 CryptoKit 互通与 iPhone Duo 折叠屏动态重排自检
 cd apple && swift run CodaSelfTest
