@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       tag_name:
-        description: "Release tag (e.g. v0.3.4)"
+        description: "Release tag (e.g. v0.3.5)"
         required: true
-        default: "v0.3.4"
+        default: "v0.3.5"
 
 permissions:
   contents: write
@@ -129,6 +129,7 @@ jobs:
           cp target/release/coda-desktop "${APP_DIR}/Contents/MacOS/coda-desktop"
           cp target/release/coda-daemon "${APP_DIR}/Contents/MacOS/coda-daemon"
           chmod +x "${APP_DIR}/Contents/MacOS/coda-desktop" "${APP_DIR}/Contents/MacOS/coda-daemon"
+          swift assets/render_icon.swift --icns "${APP_DIR}/Contents/Resources/AppIcon.icns"
           SHORT_VER="${RELEASE_TAG#v}"
           cat > "${APP_DIR}/Contents/Info.plist" <<EOF
           <?xml version="1.0" encoding="UTF-8"?>
@@ -137,6 +138,7 @@ jobs:
           <dict>
             <key>CFBundleDevelopmentRegion</key><string>en</string>
             <key>CFBundleExecutable</key><string>coda-desktop</string>
+            <key>CFBundleIconFile</key><string>AppIcon</string>
             <key>CFBundleIdentifier</key><string>dev.codahub.desktop</string>
             <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
             <key>CFBundleName</key><string>Coda</string>

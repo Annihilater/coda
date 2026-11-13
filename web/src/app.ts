@@ -93,24 +93,36 @@ interface DeviceAuthPublicInfo {
   expires_at: string;
 }
 
-function mascotSVG(color = "#e06c50") {
-  return `<svg width="18" height="18" viewBox="0 0 16 16" fill="none">
-    <rect x="3" y="4" width="10" height="6" fill="${color}"/>
-    <rect x="2" y="6" width="1" height="3" fill="${color}"/>
-    <rect x="13" y="6" width="1" height="3" fill="${color}"/>
-    <rect x="4" y="5" width="2" height="2" fill="#09090b"/>
-    <rect x="10" y="5" width="2" height="2" fill="#09090b"/>
-    <rect x="3" y="10" width="2" height="3" fill="${color}"/>
-    <rect x="6" y="10" width="1.5" height="2.5" fill="${color}"/>
-    <rect x="8.5" y="10" width="1.5" height="2.5" fill="${color}"/>
-    <rect x="11" y="10" width="2" height="3" fill="${color}"/>
+function codaLogoSVG(size = 24) {
+  return `<svg width="${size}" height="${size}" viewBox="0 0 64 64" fill="none" aria-hidden="true">
+    <defs>
+      <linearGradient id="coda-nav-bg" x1="32" y1="2" x2="32" y2="62" gradientUnits="userSpaceOnUse">
+        <stop offset="0%" stop-color="#171920" />
+        <stop offset="100%" stop-color="#0b0c10" />
+      </linearGradient>
+      <linearGradient id="coda-nav-arc" x1="14" y1="14" x2="48" y2="50" gradientUnits="userSpaceOnUse">
+        <stop offset="0%" stop-color="#f59e0b" />
+        <stop offset="100%" stop-color="#e06c50" />
+      </linearGradient>
+    </defs>
+    <rect x="2" y="2" width="60" height="60" rx="15" fill="url(#coda-nav-bg)" stroke="#2a2d37" stroke-width="1.5" />
+    <path d="M 44.37 44.37 A 17.5 17.5 0 1 1 38.70 15.83" stroke="url(#coda-nav-arc)" stroke-width="5.5" stroke-linecap="round" />
+    <path d="M 25.5 24.5 L 34 32 L 25.5 39.5" stroke="#f4f4f5" stroke-width="4.5" stroke-linecap="round" stroke-linejoin="round" />
+    <circle cx="46" cy="19" r="4.2" fill="#22c55e" />
   </svg>`;
+}
+
+function codaNodeDotSVG(color = "#e06c50") {
+  return `<span style="display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;border-radius:4px;border:1px solid rgba(255,255,255,0.14);background:#161820;flex-shrink:0;">
+    <span style="width:7px;height:7px;border-radius:99px;background:${color};"></span>
+  </span>`;
 }
 
 class CodaTerminalWebApp {
   private token: string | null = localStorage.getItem("coda_token");
   private authMode: "login" | "register" = "login";
-  private portalShowAuthModal = false;
+  private previewTab: "coda" | "server" | "ios" = "coda";
+  private showMobileKeypadOnDesktop = false;
   private siteInfo: SiteInfo | null = null;
   private pendingActivationCode: string = "";
   private pendingDeviceInfo: DeviceAuthPublicInfo | null = null;
@@ -613,206 +625,531 @@ class CodaTerminalWebApp {
     const root = document.getElementById("app")!;
     const baseUrl = this.siteInfo?.public_base_url || window.location.origin;
     const installCmd = this.siteInfo?.install_command || `curl -fsSL ${baseUrl}/install.sh | sh`;
-    const ver = this.siteInfo?.version || "v0.3.4";
+    const ver = this.siteInfo?.version || "v0.3.5";
     const dl = this.siteInfo?.downloads;
     const isActivateView =
       window.location.pathname === "/activate" || !!this.pendingActivationCode;
 
     if (!this.user) {
       const openReg = this.siteInfo?.open_registration ?? true;
-      root.innerHTML = `
-        <div class="portal-root">
-          <div class="portal-container">
-            <nav class="portal-nav">
-              <div style="display:flex;align-items:center;gap:10px;">
-                ${mascotSVG("#e06c50")}
-                <strong class="coda-mono" style="font-size:15px;">CODA MESH</strong>
-                <span class="badge">${this.escapeHtml(ver)}</span>
-                <span class="badge" style="color:var(--emerald);border-color:rgba(34,197,94,0.35);">Zero-Knowledge E2EE</span>
-              </div>
-              <div style="display:flex;gap:8px;flex-wrap:wrap;">
-                <a class="btn-ghost" href="#downloads">免登录下载全端</a>
-                <button id="btn-nav-login" class="btn-ghost">登录控制台</button>
-                <button id="btn-nav-register" class="btn-primary">免费注册账号</button>
-              </div>
-            </nav>
+      const previewContent =
+        this.previewTab === "server"
+          ? {
+              host: "green-jp-02 · Ubuntu 24.04 ARM64",
+              url: `${baseUrl}/nodes/green-jp-02`,
+              title: "coda-server Docker Compose · 127.0.0.1:8080 (Cloudflare Tunnel)",
+              stream: `● [postgres:18] healthy · /var/lib/postgresql\n● [coda-coordinator] 127.0.0.1:8080 -> wss://codahub.dev/v1/tunnel/ws\n● Zero-SNI Raw TCP Relay :24443 · E2EE Blind Forwarding\n\n* Churned for 12s · done 16:40 PM\n✓ Host keys: Ed25519 + X25519 verified`,
+            }
+          : this.previewTab === "ios"
+            ? {
+                host: "iPhone / iPad Safari PWA · LAN Auto-Switch",
+                url: `${baseUrl}/mobile`,
+                title: "移动端单手 E2EE 终端与语音模型输入",
+                stream: `● Detected same Wi-Fi LAN · 250ms Happy Eyeballs probe succeeded\n● Switched route: WSS 443 -> ws://192.168.1.20:24444 (0.8ms RTT)\n● ChaCha20-Poly1305 encrypted PTY attached to MacBook-Pro:t1\n\n* Ready · Touch Keypad + Whisper Voice Config Active`,
+              }
+            : {
+                host: "MacBook-Pro · Rust + GPUI 120Hz Workbench",
+                url: `${baseUrl}/workspaces/coda`,
+                title: "GPUI 桌面工作台与 Herdr PTY 流式同步",
+                stream: `  - 本地 Herdr Core (hc 0.1.20) 在线，工作区 Git Worktree 自动扫描完成\n  - 零知识隧道已绑定账号 @vampire：服务器永远无法解密终端明文\n\n● Background command "cargo test --workspace" completed (exit code 0)\n\n* Baked for 38s · done 16:42 PM\n✓ All tests & E2EE SmartPath P2P verified`,
+              };
 
-            ${
-              isActivateView || this.pendingDeviceInfo
-                ? `
-              <section class="portal-panel" style="margin-bottom:22px;border-color:rgba(56,189,248,0.45);">
+      root.innerHTML = `
+        <div class="hw-page">
+          <nav class="hw-nav">
+            <div class="hw-nav-inner">
+              <a class="hw-brand" href="/">
+                ${codaLogoSVG(26)}
+                <span>Coda</span>
+                <span class="badge coda-mono" style="font-size:11px;">${this.escapeHtml(ver)}</span>
+              </a>
+              <div class="hw-nav-links">
+                <a href="#features">核心特性</a>
+                <a href="#architecture">加密与路由</a>
+                <a href="#compare">能力对比</a>
+                <a href="#downloads">全端下载</a>
+                <a href="#portal-auth-section">接入控制台</a>
+              </div>
+              <div style="display:flex;gap:8px;align-items:center;">
+                <button id="btn-nav-login" class="btn-ghost" style="padding:6px 12px;font-size:12px;">登录</button>
+                <button id="btn-nav-register" class="btn-primary" style="padding:6px 12px;font-size:12px;">免费注册</button>
+              </div>
+            </div>
+          </nav>
+
+          ${
+            isActivateView || this.pendingDeviceInfo
+              ? `
+            <div class="hw-container" style="padding-top:24px;">
+              <section class="portal-panel" style="border-color:rgba(56,189,248,0.45);">
                 <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;">
                   <div>
                     <div style="font-size:16px;font-weight:700;">🔑 浏览器设备码授权 (/activate)</div>
-                    <div style="font-size:12px;color:#a1a1aa;margin-top:4px;">请先在下方登录或注册你的 Coda 账号，即可一键将远端电脑/服务器加入你的私有终端网络。</div>
+                    <div style="font-size:13px;color:var(--muted);margin-top:4px;">请先在下方登录或注册你的 Coda 账号，即可一键将远端电脑/服务器加入你的私有终端网络。</div>
                   </div>
-                  <span class="coda-mono" style="font-size:18px;font-weight:700;color:var(--sky);letter-spacing:2px;">
+                  <span class="coda-mono" style="font-size:20px;font-weight:700;color:var(--sky);letter-spacing:2px;">
                     ${this.escapeHtml(this.pendingActivationCode || "XXXX-XXXX")}
                   </span>
                 </div>
                 ${
                   this.pendingDeviceInfo
-                    ? `<div class="coda-mono" style="margin-top:12px;padding:10px 12px;border-radius:10px;background:#070709;border:1px solid #272730;font-size:12px;color:#d4d4d8;">
+                    ? `<div class="coda-mono" style="margin-top:12px;padding:10px 12px;border-radius:10px;background:#0b0c0e;border:1px solid var(--line-strong);font-size:12px;color:#d4d4d8;">
                         待授权主机：<b>${this.escapeHtml(this.pendingDeviceInfo.device_name)}</b> · 平台：${this.escapeHtml(this.pendingDeviceInfo.platform)} · 角色：${this.escapeHtml(this.pendingDeviceInfo.role)} · 状态：${this.escapeHtml(this.pendingDeviceInfo.status)}
                       </div>`
                     : ""
                 }
               </section>
-            `
-                : ""
-            }
+            </div>
+          `
+              : ""
+          }
 
-            <section class="portal-hero">
-              <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;">
-                <span class="badge" style="color:var(--sky);">Cloudflare Tunnel WSS 即开即用</span>
-                <span class="badge" style="color:var(--emerald);">Wi-Fi 局域网零中继自动直连</span>
-              </div>
-              <h1 style="font-size:28px;line-height:1.25;font-weight:800;margin-bottom:10px;">
-                只登录一次，全端互控写代码
-              </h1>
-              <p style="font-size:14px;color:#a1a1aa;line-height:1.65;max-width:760px;">
-                将你的阿里云/腾讯云 Linux 服务器、家里或公司的 Mac、随身 iPhone/Web 浏览器接入同一账号。
-                同 Wi-Fi 下自动毫秒级局域网直连；跨网自动经 Cloudflare WSS / 免备案节点加密中继。服务器与中继永远无法解密你的终端内容与代码。
-              </p>
+          <section class="hw-hero">
+            <div class="hw-hero-glow"></div>
+            <div class="hw-container">
+              <div class="hw-hero-head">
+                <p class="hw-eyebrow">Zero-Knowledge E2EE · macOS GPUI / Linux Daemon / iOS &amp; Web</p>
+                <h1 class="hw-h1">
+                  十台算力主机常驻在线，<br />登录一次，随处掌控所有 Agent。
+                </h1>
+                <p class="hw-lead">
+                  Coda 将你的海外/国内 Linux 服务器、主力 Mac 桌面与随身手机浏览器编织进同一张零知识加密网。
+                  底层由 <code>herdr-core</code> 持久化守护终端进程，同 Wi-Fi 下自动毫秒级直连，跨网经 Cloudflare Tunnel WSS 加密转发。
+                </p>
 
-              <div class="cmd-box">
-                <div style="min-width:0;flex:1;">
-                  <div style="font-size:11px;color:#71717a;margin-bottom:4px;">⚡ Linux / macOS 服务器一键接入命令（无需提前登录，执行后弹出浏览器授权链接）</div>
-                  <code class="coda-mono" style="font-size:13px;color:var(--emerald);word-break:break-all;">${this.escapeHtml(installCmd)}</code>
-                </div>
-                <button id="btn-copy-install" class="btn-primary">
-                  ${this.copiedToast ? this.escapeHtml(this.copiedToast) : "复制安装命令"}
-                </button>
-              </div>
-            </section>
-
-            <section id="downloads" class="dl-grid">
-              <div class="dl-card">
-                <div>
-                  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
-                    <strong style="font-size:16px;">🖥 Server / Host Daemon</strong>
-                    <span class="badge">Linux & macOS</span>
-                  </div>
-                  <p style="font-size:13px;color:#a1a1aa;line-height:1.6;">
-                    运行在远端写代码机器上，桥接本机 <code>herdr-core (hc)</code> 终端与 <code>git diff</code>，支持浏览器设备码授权 <code>coda-daemon login</code>。
-                  </p>
-                </div>
-                <div style="display:flex;gap:8px;flex-wrap:wrap;">
-                  ${dl ? `<a class="btn-ghost" href="${dl.daemon_linux_x64}" target="_blank">Linux x86_64</a>` : ""}
-                  ${dl ? `<a class="btn-ghost" href="${dl.daemon_linux_arm64}" target="_blank">Linux ARM64</a>` : ""}
-                  ${dl ? `<a class="btn-ghost" href="${dl.daemon_macos_arm64}" target="_blank">macOS Daemon</a>` : ""}
-                </div>
-              </div>
-
-              <div class="dl-card">
-                <div>
-                  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
-                    <strong style="font-size:16px;">💻 macOS 桌面端 (Coda.app)</strong>
-                    <span class="badge" style="color:var(--coral);">Hybrid 双向节点</span>
-                  </div>
-                  <p style="font-size:13px;color:#a1a1aa;line-height:1.6;">
-                    原生 GPUI 极速终端桌面端，既可以控制你的云端 Linux 服务器，也可以把这台 Mac 作为算力主机让 iOS / 浏览器随时遥控。
-                  </p>
-                </div>
-                <div style="display:flex;gap:8px;flex-wrap:wrap;">
-                  ${dl ? `<a class="btn-primary" href="${dl.desktop_macos_dmg}" target="_blank">下载 Mac .dmg 安装包</a>` : ""}
-                  ${dl ? `<a class="btn-ghost" href="${dl.desktop_macos_tar}" target="_blank">全套 .tar.gz</a>` : ""}
-                </div>
-              </div>
-
-              <div class="dl-card">
-                <div>
-                  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
-                    <strong style="font-size:16px;">📱 iOS 移动端 (TestFlight / PWA)</strong>
-                    <span class="badge" style="color:var(--sky);">Beta 先行版</span>
-                  </div>
-                  <p style="font-size:13px;color:#a1a1aa;line-height:1.6;">
-                    在 iPhone Safari 打开当前网址点击「分享 → 添加到主屏幕」即可免上架全屏使用 E2EE 终端键盘与语音输入，同 Wi-Fi 自动走 <code>ws://</code> 局域网直连。
-                  </p>
-                </div>
-                <div style="display:flex;gap:8px;flex-wrap:wrap;">
+                <div class="hw-cta-row">
                   ${
-                    dl?.ios_beta_url
-                      ? `<a class="btn-primary" href="${this.escapeHtml(dl.ios_beta_url)}" target="_blank">打开 TestFlight 安装 iOS Beta</a>`
-                      : `<span class="badge">TestFlight / IPA 构建已就绪（当前推荐直接添加到主屏幕使用）</span>`
+                    dl
+                      ? `<a class="btn-primary" href="${dl.desktop_macos_dmg}" target="_blank"> 下载 macOS 桌面端 (.dmg)</a>`
+                      : `<a class="btn-primary" href="#downloads">下载桌面与服务端</a>`
                   }
+                  <a class="btn-ghost" href="#portal-auth-section">登录 / 注册我的控制面板 →</a>
                 </div>
-              </div>
 
-              <div class="dl-card">
-                <div>
-                  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
-                    <strong style="font-size:16px;">☁ 自建主控端部署套件</strong>
-                    <span class="badge">Docker + CF Tunnel</span>
-                  </div>
-                  <p style="font-size:13px;color:#a1a1aa;line-height:1.6;">
-                    想自己搭一套私有中控？下载精简部署包即可 1 分钟启动 PostgreSQL + Coordinator + Web 官网 + 免备案中继。
-                  </p>
-                </div>
-                <div style="display:flex;gap:8px;flex-wrap:wrap;">
-                  ${dl ? `<a class="btn-ghost" href="${dl.deploy_bundle}" target="_blank">下载 deploy-bundle</a>` : ""}
-                  ${dl ? `<a class="btn-ghost" href="${dl.releases_page}" target="_blank">GitHub Releases (${this.escapeHtml(ver)})</a>` : ""}
-                </div>
-              </div>
-            </section>
-
-            <section id="portal-auth-section" class="portal-auth-grid">
-              <div class="portal-panel">
-                <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;">
-                  <strong style="font-size:16px;">${this.authMode === "login" ? "登录我的 Coda 网络" : "注册新的 Coda 账号"}</strong>
-                  <button id="toggle-auth" style="background:none;border:none;color:var(--sky);font-size:12px;cursor:pointer;">
-                    ${this.authMode === "login" ? "没有账号？免费注册 →" : "已有账号？直接登录 →"}
+                <div class="hw-cmd-pill">
+                  <code>$ ${this.escapeHtml(installCmd)}</code>
+                  <button id="btn-copy-install" class="btn-primary" style="padding:7px 14px;font-size:12px;flex-shrink:0;">
+                    ${this.copiedToast ? this.escapeHtml(this.copiedToast) : "复制安装命令"}
                   </button>
                 </div>
-                ${this.errorMsg ? `<div style="color:var(--rose);font-size:12px;margin-bottom:10px;">${this.escapeHtml(this.errorMsg)}</div>` : ""}
-                <form id="auth-form">
-                  ${
-                    this.authMode === "register"
-                      ? `
-                    <label style="font-size:12px;color:var(--muted);">邮箱</label>
-                    <input name="email" class="inp" required placeholder="dev@example.com" />
-                    <label style="font-size:12px;color:var(--muted);">用户名 (小写英文/数字)</label>
-                    <input name="handle" class="inp" required placeholder="alice" />
-                    <label style="font-size:12px;color:var(--muted);">显示昵称</label>
-                    <input name="display_name" class="inp" required placeholder="Alice" />
-                    <label style="font-size:12px;color:var(--muted);">密码 (>= 6位)</label>
-                    <input type="password" name="password" class="inp" required />
+                <p class="hw-subhint">支持 macOS 14+ (Apple Silicon) 与 Linux x86_64 / ARM64 · 无需提前配置密钥，运行后浏览器一键确认设备码即可入网</p>
+              </div>
+
+              <!-- Interactive Highwind-Style 3-Pane Desktop App Showcase -->
+              <div class="hw-window">
+                <div class="hw-win-top">
+                  <div style="display:flex;align-items:center;gap:12px;">
+                    <div class="hw-traffic">
+                      <span style="background:#ef4444;"></span>
+                      <span style="background:#f59e0b;"></span>
+                      <span style="background:#22c55e;"></span>
+                    </div>
+                    <div class="hw-win-tabs">
+                      <button class="hw-win-tab ${this.previewTab === "coda" ? "active" : ""}" data-preview-tab="coda">■ coda  2/2</button>
+                      <button class="hw-win-tab ${this.previewTab === "server" ? "active" : ""}" data-preview-tab="server">● green-jp-02  1/1</button>
+                      <button class="hw-win-tab ${this.previewTab === "ios" ? "active" : ""}" data-preview-tab="ios">● iPhone / Web  1/1</button>
+                    </div>
+                  </div>
+                  <div class="coda-mono" style="font-size:11px;color:var(--emerald);">● Zero-Knowledge E2EE · codahub.dev</div>
+                </div>
+
+                <div class="hw-win-grid">
+                  <!-- Col 1: PROJECTS Tree -->
+                  <div class="hw-win-col" style="background:#111216;">
+                    <div class="hw-win-label" style="margin-top:0;">PROJECTS</div>
+                    <div class="hw-win-item active"><span>▾ coda</span><span class="coda-mono" style="color:var(--emerald);">2/2</span></div>
+                    <div class="hw-win-label">SERVICES</div>
+                    <div class="hw-win-item"><span><span style="color:var(--emerald);">●</span> herdr-core daemon</span><span class="coda-mono" style="color:var(--faint);">live</span></div>
+                    <div class="hw-win-item"><span><span style="color:var(--emerald);">●</span> codahub.dev tunnel</span><span class="coda-mono" style="color:var(--sky);">WSS</span></div>
+                    <div class="hw-win-label">AGENTS</div>
+                    <div class="hw-win-item active"><span><span style="color:var(--coral);">●</span> Claude Code · main</span><span class="coda-mono" style="color:var(--emerald);">+1233</span></div>
+                    <div class="hw-win-item"><span><span style="color:var(--sky);">●</span> Codex · relay</span><span class="coda-mono" style="color:var(--emerald);">+842</span></div>
+                    <div class="hw-win-label">ACTIONS</div>
+                    <div class="hw-win-item"><span><span style="color:var(--brand-amber);">▸</span> cargo test --workspace</span></div>
+                    <div class="hw-win-item"><span><span style="color:var(--brand-amber);">▸</span> coda-daemon status</span></div>
+                  </div>
+
+                  <!-- Col 2: Center Workspace Preview -->
+                  <div class="hw-win-col" style="background:#0b0c0f;display:flex;flex-direction:column;justify-content:space-between;">
+                    <div>
+                      <div style="display:flex;align-items:center;gap:8px;padding:6px 10px;border-radius:8px;background:#14161b;border:1px solid var(--line);font-family:var(--mono);font-size:11px;margin-bottom:14px;">
+                        <span style="color:var(--emerald);">dev</span>
+                        <span style="color:var(--fg);">${this.escapeHtml(previewContent.url)}</span>
+                      </div>
+                      <div style="padding:18px;border-radius:12px;background:#111317;border:1px solid var(--line);">
+                        <div class="coda-mono" style="font-size:11px;color:var(--brand-amber);margin-bottom:6px;">${this.escapeHtml(previewContent.host)}</div>
+                        <div style="font-size:16px;font-weight:600;margin-bottom:8px;">${this.escapeHtml(previewContent.title)}</div>
+                        <p style="font-size:13px;color:var(--muted);line-height:1.65;">
+                          服务端与主控只转发 <code>ChaCha20-Poly1305</code> 密文信封。无论是 macOS 原生 GPUI 三栏工作台还是 iPhone Safari，均使用本地持久化的 <code>Ed25519 + X25519</code> 密钥直接端到端验证。
+                        </p>
+                      </div>
+                    </div>
+                    <div class="coda-mono" style="display:flex;justify-content:space-between;font-size:11px;color:var(--faint);padding-top:12px;border-top:1px solid var(--line);">
+                      <span>● coda / main · MacBook-Pro</span>
+                      <span style="color:var(--emerald);">+1,233 <span style="color:var(--rose);">-116</span></span>
+                    </div>
+                  </div>
+
+                  <!-- Col 3: Right AI Agent PTY & Composer -->
+                  <div class="hw-win-col" style="background:#0e1014;display:flex;flex-direction:column;justify-content:space-between;">
+                    <div>
+                      <div style="display:flex;justify-content:space-between;align-items:center;padding-bottom:8px;border-bottom:1px solid var(--line);margin-bottom:10px;">
+                        <span style="font-size:12px;font-weight:600;"><span style="color:var(--emerald);">●</span> ${this.escapeHtml(previewContent.title)}</span>
+                        <span class="coda-mono" style="font-size:11px;color:var(--faint);">Opus 4.6</span>
+                      </div>
+                      <pre class="coda-mono" style="font-size:12px;line-height:1.65;color:#d1d5db;white-space:pre-wrap;">${this.escapeHtml(previewContent.stream)}</pre>
+                    </div>
+                    <div style="margin-top:14px;border-radius:8px;background:#16181e;border:1px solid var(--line-strong);padding:8px 10px;">
+                      <div class="coda-mono" style="font-size:12px;color:var(--fg);">
+                        <span style="color:var(--brand-amber);">❯</span> 部署最新 v0.3.5 到日本主控节点并重启服务
+                      </div>
+                      <div class="coda-mono" style="margin-top:6px;display:flex;justify-content:space-between;font-size:11px;color:var(--faint);">
+                        <span>coda · auto-approve on</span>
+                        <span>⌘ Terminal</span>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                <div class="hw-win-status">
+                  <span>▸ 25:00 Focus &nbsp;·&nbsp; <span style="color:var(--brand-amber);">CODA ${this.escapeHtml(ver)}</span> &nbsp;·&nbsp; <span style="color:var(--emerald);">LAN P2P &lt;1ms / CF WSS Ready</span></span>
+                  <span>Metal 120Hz · ChaCha20-Poly1305 + zstd</span>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <section id="features" class="hw-section">
+            <div class="hw-container">
+              <p class="hw-sec-eyebrow">Why Coda</p>
+              <h2 class="hw-h2">你和你的 AI Agent，在所有设备上操控同一套开发现场。</h2>
+              <p class="hw-sec-sub">告别断线重连和繁琐的 SSH 端口转发，把重型服务和 Claude Code / Codex 留在常驻主机上，前端随时接入。</p>
+
+              <div class="hw-splits">
+                <!-- 01 -->
+                <div class="hw-split">
+                  <div>
+                    <p class="hw-sec-eyebrow"><span style="color:var(--brand-amber);">01</span> · Projects &amp; Herdr</p>
+                    <h3 class="hw-h3">合上笔记本、切换手机，远端 Agent 与服务继续运行。</h3>
+                    <div class="hw-split-copy">
+                      <p>每个终端会话都托管在远端本机的 <code>herdr-core (hc)</code> 守护进程上，断网或切端重新打开即秒级恢复上下文、命令输出和 Git Worktree 增量 Diff。</p>
+                      <p>左侧项目树按 <code>SERVICES</code>、<code>AGENTS</code>、<code>ACTIONS</code> 分层组织，macOS 原生桌面端提供与 Highwind 同构的高效率三栏工作流。</p>
+                      <div style="display:flex;flex-wrap:wrap;gap:10px;padding-top:4px;">
+                        <span><span class="hw-kbd">⌘B</span> 切换项目栏</span>
+                        <span><span class="hw-kbd">⌘N</span> 新建终端</span>
+                        <span><span class="hw-kbd">Tab</span> 切换审批模式</span>
+                      </div>
+                    </div>
+                  </div>
+                  <div class="hw-card-frame">
+                    <div class="hw-card-bar"><span>herdr-core · 多厂商 CLI Agent 并行编排</span><span>LIVE</span></div>
+                    <div style="padding:18px;display:flex;flex-direction:column;gap:10px;font-family:var(--mono);font-size:13px;">
+                      <div style="display:flex;justify-content:space-between;padding:10px 12px;border-radius:8px;background:#0b0c0e;border:1px solid var(--line);">
+                        <span><span style="color:var(--coral);">●</span> Claude Code · coda/main</span>
+                        <span style="color:var(--emerald);">running · +1233 -116</span>
+                      </div>
+                      <div style="display:flex;justify-content:space-between;padding:10px 12px;border-radius:8px;background:#0b0c0e;border:1px solid var(--line);">
+                        <span><span style="color:var(--emerald);">●</span> Codex · coda-server/feat/wss</span>
+                        <span style="color:var(--sky);">done · +842 -94</span>
+                      </div>
+                      <div style="display:flex;justify-content:space-between;padding:10px 12px;border-radius:8px;background:#0b0c0e;border:1px solid var(--line);">
+                        <span><span style="color:var(--sky);">●</span> Gemini CLI · codahub-web</span>
+                        <span style="color:var(--muted);">idle · +512 -48</span>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                <!-- 02 -->
+                <div id="architecture" class="hw-split rev">
+                  <div>
+                    <p class="hw-sec-eyebrow"><span style="color:var(--coral);">02</span> · Zero-Knowledge E2EE</p>
+                    <h3 class="hw-h3">零知识端到端加密，主控与中继只看到乱码信封。</h3>
+                    <div class="hw-split-copy">
+                      <p>每台主机与客户端在本地独立生成并保管 <code>Ed25519</code> 身份私钥与 <code>X25519</code> 密钥对。所有终端输入输出均先经 <code>zstd</code> 压缩，再用 <code>ChaCha20-Poly1305</code> 加密后发出。</p>
+                      <p>部署在日本服务器的控制面板只负责成员隔离与路由调度，哪怕服务器与 CDN 被完全攻破也无法窥探你的代码或对话。</p>
+                    </div>
+                  </div>
+                  <div class="hw-card-frame">
+                    <div class="hw-card-bar"><span>coda-protocol · Cryptographic Packet Envelope</span><span>JSON</span></div>
+                    <pre class="coda-mono" style="padding:18px;font-size:12px;line-height:1.7;overflow-x:auto;color:#d1d5db;">{
+  <span style="color:var(--brand-amber);">"frame_type"</span>: <span style="color:var(--emerald);">"route_packet"</span>,
+  <span style="color:var(--brand-amber);">"cipher"</span>: <span style="color:var(--emerald);">"X25519 + HKDF-SHA256 + ChaCha20-Poly1305"</span>,
+  <span style="color:var(--brand-amber);">"compression"</span>: <span style="color:var(--emerald);">"zstd_stream"</span>,
+  <span style="color:var(--brand-amber);">"lan_direct"</span>: <span style="color:var(--sky);">"ws://192.168.x.x:24444 (&lt;1ms)"</span>,
+  <span style="color:var(--brand-amber);">"wan_fallback"</span>: <span style="color:var(--sky);">"wss://codahub.dev/v1/tunnel/ws"</span>
+}</pre>
+                  </div>
+                </div>
+
+                <!-- 03 -->
+                <div class="hw-split">
+                  <div>
+                    <p class="hw-sec-eyebrow"><span style="color:var(--emerald);">03</span> · SmartPath &amp; Device Login</p>
+                    <h3 class="hw-h3">同 Wi-Fi 自动直连，一行命令浏览器确认即入网。</h3>
+                    <div class="hw-split-copy">
+                      <p>在服务器或 Mac 上运行 <code>curl -fsSL ${this.escapeHtml(baseUrl)}/install.sh | sh</code>，终端将弹出一次性设备授权码与 <code>/activate</code> 链接。</p>
+                      <p>你只需用浏览器打开点一次同意，这台机器就实时出现在你名下所有 macOS、Web 和 iOS 设备列表里；身处同一局域网时自动绕过公网直连。</p>
+                    </div>
+                  </div>
+                  <div class="hw-card-frame">
+                    <div class="hw-card-bar"><span>coda-daemon login --server ${this.escapeHtml(baseUrl)}</span><span>RFC 8628</span></div>
+                    <div class="coda-mono" style="padding:18px;font-size:12px;line-height:1.8;color:#d1d5db;">
+                      <div>$ coda-daemon login --server ${this.escapeHtml(baseUrl)}</div>
+                      <div style="color:var(--muted);">✓ 本地密钥已就绪 (Ed25519 + X25519)</div>
+                      <div style="margin-top:8px;padding:10px 12px;border-radius:8px;background:#0b0c0e;border:1px solid var(--line-strong);">
+                        请在浏览器打开链接确认设备码：<br/>
+                        <span style="color:var(--sky);">${this.escapeHtml(baseUrl)}/activate?code=ABCD-2345</span>
+                      </div>
+                      <div style="margin-top:8px;color:var(--emerald);">● 授权成功！已注册为常驻主机节点，LAN P2P :24444 已开启</div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <dl class="hw-principles">
+                <div>
+                  <dt style="font-size:15px;font-weight:600;color:#fff;">原生 Rust + GPUI 桌面端</dt>
+                  <dd style="margin-top:6px;font-size:14px;color:var(--muted);line-height:1.6;">Metal GPU 120Hz 原生渲染 macOS 工作台，告别套壳网页卡顿。</dd>
+                </div>
+                <div>
+                  <dt style="font-size:15px;font-weight:600;color:#fff;">主控零公网端口暴露</dt>
+                  <dd style="margin-top:6px;font-size:14px;color:var(--muted);line-height:1.6;">容器仅监听 127.0.0.1，通过 Cloudflare Tunnel 自动托管 TLS 与 WSS。</dd>
+                </div>
+                <div>
+                  <dt style="font-size:15px;font-weight:600;color:#fff;">未登录开放全端下载</dt>
+                  <dd style="margin-top:6px;font-size:14px;color:var(--muted);line-height:1.6;">官网免登录直接获取 Mac 桌面端、Linux Server/Daemon 与 iOS 测试端。</dd>
+                </div>
+              </dl>
+            </div>
+          </section>
+
+          <section id="compare" class="hw-section">
+            <div class="hw-container">
+              <p class="hw-sec-eyebrow">Compare</p>
+              <h2 class="hw-h2">与其他远程开发工具的能力对比。</h2>
+              <p class="hw-sec-sub">专为高并发 AI Coding 工作流设计，兼顾零知识隐私、多端互通与本地级交互速度。</p>
+
+              <div class="hw-table-wrap">
+                <table class="hw-table">
+                  <thead>
+                    <tr>
+                      <th>方案</th>
+                      <th>常驻 Agent 会话</th>
+                      <th>端到端零知识加密</th>
+                      <th>Wi-Fi 自动 LAN 直连</th>
+                      <th>CF Tunnel 零端口</th>
+                      <th>浏览器设备码绑机</th>
+                      <th>原生 Mac 三栏工作台</th>
+                      <th>iOS 单手触控适配</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr class="is-coda">
+                      <td>Coda</td>
+                      <td><span class="hw-dot" title="支持"></span></td>
+                      <td><span class="hw-dot" title="支持"></span></td>
+                      <td><span class="hw-dot" title="支持"></span></td>
+                      <td><span class="hw-dot" title="支持"></span></td>
+                      <td><span class="hw-dot" title="支持"></span></td>
+                      <td><span class="hw-dot" title="支持"></span></td>
+                      <td><span class="hw-dot" title="支持"></span></td>
+                    </tr>
+                    <tr>
+                      <td>SSH + tmux</td>
+                      <td><span class="hw-dot"></span></td>
+                      <td><span class="hw-dash">—</span></td>
+                      <td><span class="hw-dash">—</span></td>
+                      <td><span class="hw-dash">—</span></td>
+                      <td><span class="hw-dash">—</span></td>
+                      <td><span class="hw-dash">—</span></td>
+                      <td><span class="hw-dash">—</span></td>
+                    </tr>
+                    <tr>
+                      <td>VS Code / Web IDE</td>
+                      <td><span class="hw-dash">—</span></td>
+                      <td><span class="hw-dash">—</span></td>
+                      <td><span class="hw-dash">—</span></td>
+                      <td><span class="hw-dot"></span></td>
+                      <td><span class="hw-dash">—</span></td>
+                      <td><span class="hw-dash">—</span></td>
+                      <td><span class="hw-dash">—</span></td>
+                    </tr>
+                    <tr>
+                      <td>传统远程桌面</td>
+                      <td><span class="hw-dot"></span></td>
+                      <td><span class="hw-dash">—</span></td>
+                      <td><span class="hw-dot"></span></td>
+                      <td><span class="hw-dash">—</span></td>
+                      <td><span class="hw-dash">—</span></td>
+                      <td><span class="hw-dash">—</span></td>
+                      <td><span class="hw-dash">—</span></td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </section>
+
+          <section id="downloads" class="hw-section">
+            <div class="hw-container">
+              <p class="hw-sec-eyebrow">Downloads · ${this.escapeHtml(ver)}</p>
+              <h2 class="hw-h2">免登录下载全端客户端与服务端套件。</h2>
+              <p class="hw-sec-sub">在任意设备安装后，使用同一个 Coda 账号登录或设备码授权即可自动互通。</p>
+
+              <div class="dl-grid">
+                <div class="dl-card">
+                  <div>
+                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+                      <strong style="font-size:16px;">💻 macOS 桌面端 (Coda.app)</strong>
+                      <span class="badge" style="color:var(--coral);">Hybrid 双向节点</span>
+                    </div>
+                    <p style="font-size:13px;color:var(--muted);line-height:1.65;">
+                      原生 Rust + GPUI 三栏开发工作台，既能遥控你的云端 Linux 服务器，也能让手机随时连回这台 Mac。
+                    </p>
+                  </div>
+                  <div style="display:flex;gap:8px;flex-wrap:wrap;">
+                    ${dl ? `<a class="btn-primary" href="${dl.desktop_macos_dmg}" target="_blank">下载 Mac .dmg 安装包</a>` : ""}
+                    ${dl ? `<a class="btn-ghost" href="${dl.desktop_macos_tar}" target="_blank">全套 .tar.gz</a>` : ""}
+                  </div>
+                </div>
+
+                <div class="dl-card">
+                  <div>
+                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+                      <strong style="font-size:16px;">🖥 Server / Host Daemon</strong>
+                      <span class="badge">Linux &amp; macOS</span>
+                    </div>
+                    <p style="font-size:13px;color:var(--muted);line-height:1.65;">
+                      运行在写代码主机上，桥接本机 <code>herdr-core (hc)</code> 与 Git Worktree，支持 <code>coda-daemon login</code> 浏览器授权。
+                    </p>
+                  </div>
+                  <div style="display:flex;gap:8px;flex-wrap:wrap;">
+                    ${dl ? `<a class="btn-ghost" href="${dl.daemon_linux_x64}" target="_blank">Linux x86_64</a>` : ""}
+                    ${dl ? `<a class="btn-ghost" href="${dl.daemon_linux_arm64}" target="_blank">Linux ARM64</a>` : ""}
+                    ${dl ? `<a class="btn-ghost" href="${dl.daemon_macos_arm64}" target="_blank">macOS Daemon</a>` : ""}
+                  </div>
+                </div>
+
+                <div class="dl-card">
+                  <div>
+                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+                      <strong style="font-size:16px;">📱 iOS 测试版 (TestFlight / PWA)</strong>
+                      <span class="badge" style="color:var(--sky);">Beta 先行版</span>
+                    </div>
+                    <p style="font-size:13px;color:var(--muted);line-height:1.65;">
+                      用 iPhone Safari 打开本页面点「分享 → 添加到主屏幕」，免上架直接拥有 E2EE 双排触控键盘与语音输入。
+                    </p>
+                  </div>
+                  <div style="display:flex;gap:8px;flex-wrap:wrap;">
                     ${
-                      openReg
-                        ? `<div style="font-size:11px;color:var(--emerald);margin-bottom:10px;">当前站点已开放自由注册，无需填写邀请码。</div>`
-                        : `<label style="font-size:12px;color:var(--muted);">邀请码 (首位管理员留空)</label><input name="invite_code" class="inp" placeholder="CODA-XXXXXX" />`
+                      dl?.ios_beta_url
+                        ? `<a class="btn-primary" href="${this.escapeHtml(dl.ios_beta_url)}" target="_blank">打开 TestFlight 安装 iOS Beta</a>`
+                        : `<span class="badge">TestFlight / IPA 构建已就绪（当前推荐直接添加到主屏幕使用）</span>`
                     }
-                  `
-                      : `
-                    <label style="font-size:12px;color:var(--muted);">邮箱或用户名</label>
-                    <input name="email_or_handle" class="inp" required placeholder="alice" />
-                    <label style="font-size:12px;color:var(--muted);">密码</label>
-                    <input type="password" name="password" class="inp" required />
-                  `
-                  }
-                  <button type="submit" class="btn-primary" style="width:100%;margin-top:4px;padding:11px;">
-                    ${this.authMode === "login" ? "登录并进入控制台" : "立即注册并开启 E2EE 组网"}
-                  </button>
-                </form>
+                  </div>
+                </div>
+
+                <div class="dl-card">
+                  <div>
+                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+                      <strong style="font-size:16px;">☁ 自建主控端部署套件</strong>
+                      <span class="badge">Docker + CF Tunnel</span>
+                    </div>
+                    <p style="font-size:13px;color:var(--muted);line-height:1.65;">
+                      1 分钟启动 PostgreSQL 18 + Coordinator + Web 官网 + 免备案裸 TCP 中继，仅绑定 <code>127.0.0.1</code> 供隧道接入。
+                    </p>
+                  </div>
+                  <div style="display:flex;gap:8px;flex-wrap:wrap;">
+                    ${dl ? `<a class="btn-ghost" href="${dl.deploy_bundle}" target="_blank">下载 deploy-bundle</a>` : ""}
+                    ${dl ? `<a class="btn-ghost" href="${dl.releases_page}" target="_blank">GitHub Releases (${this.escapeHtml(ver)})</a>` : ""}
+                  </div>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <section id="portal-auth-section" class="hw-section">
+            <div class="hw-container">
+              <p class="hw-sec-eyebrow">Console Access</p>
+              <h2 class="hw-h2">注册并进入我的私有终端网络。</h2>
+
+              <div class="portal-auth-grid">
+                <div class="portal-panel">
+                  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;">
+                    <strong style="font-size:16px;">${this.authMode === "login" ? "登录我的 Coda 网络" : "注册新的 Coda 账号"}</strong>
+                    <button id="toggle-auth" style="background:none;border:none;color:var(--sky);font-size:12px;cursor:pointer;">
+                      ${this.authMode === "login" ? "没有账号？免费注册 →" : "已有账号？直接登录 →"}
+                    </button>
+                  </div>
+                  ${this.errorMsg ? `<div style="color:var(--rose);font-size:12px;margin-bottom:10px;">${this.escapeHtml(this.errorMsg)}</div>` : ""}
+                  <form id="auth-form">
+                    ${
+                      this.authMode === "register"
+                        ? `
+                      <label style="font-size:12px;color:var(--muted);">邮箱</label>
+                      <input name="email" class="inp" required placeholder="dev@example.com" />
+                      <label style="font-size:12px;color:var(--muted);">用户名 (小写英文/数字)</label>
+                      <input name="handle" class="inp" required placeholder="alice" />
+                      <label style="font-size:12px;color:var(--muted);">显示昵称</label>
+                      <input name="display_name" class="inp" required placeholder="Alice" />
+                      <label style="font-size:12px;color:var(--muted);">密码 (>= 6位)</label>
+                      <input type="password" name="password" class="inp" required />
+                      ${
+                        openReg
+                          ? `<div style="font-size:11px;color:var(--emerald);margin-bottom:10px;">当前站点已开放自由注册，无需填写邀请码。</div>`
+                          : `<label style="font-size:12px;color:var(--muted);">邀请码 (首位管理员留空)</label><input name="invite_code" class="inp" placeholder="CODA-XXXXXX" />`
+                      }
+                    `
+                        : `
+                      <label style="font-size:12px;color:var(--muted);">邮箱或用户名</label>
+                      <input name="email_or_handle" class="inp" required placeholder="alice" />
+                      <label style="font-size:12px;color:var(--muted);">密码</label>
+                      <input type="password" name="password" class="inp" required />
+                    `
+                    }
+                    <button type="submit" class="btn-primary" style="width:100%;margin-top:4px;padding:11px;">
+                      ${this.authMode === "login" ? "登录并进入控制台" : "立即注册并开启 E2EE 组网"}
+                    </button>
+                  </form>
+                </div>
+
+                <div class="portal-panel" style="display:flex;flex-direction:column;justify-content:space-between;">
+                  <div>
+                    <strong style="font-size:16px;">3 步接入任何写代码设备</strong>
+                    <ol style="margin-top:12px;padding-left:18px;font-size:13px;color:var(--muted);line-height:1.9;">
+                      <li>在官网直接注册并登录（或先在服务器上装好再登录）。</li>
+                      <li>在任何服务器/Mac 上执行上方 <code>curl | sh</code> 或运行 <code>coda-daemon login --server ${this.escapeHtml(baseUrl)}</code>。</li>
+                      <li>打开终端输出的 <code>/activate?code=XXXX-XXXX</code> 授权链接点击批准，这台机器立刻出现在你的控制面板与 Mac 客户端中。</li>
+                    </ol>
+                  </div>
+                  <div style="margin-top:16px;padding:12px;border-radius:10px;background:#0b0c0e;border:1px solid var(--line);font-size:12px;color:var(--muted);">
+                    端到端密钥始终保存在设备本地（<code>Ed25519 + X25519</code> + <code>ChaCha20-Poly1305</code>），主控节点仅做加密包盲转发。
+                  </div>
+                </div>
               </div>
 
-              <div class="portal-panel" style="display:flex;flex-direction:column;justify-content:space-between;">
-                <div>
-                  <strong style="font-size:16px;">3 步接入任何写代码设备</strong>
-                  <ol style="margin-top:12px;padding-left:18px;font-size:13px;color:#a1a1aa;line-height:1.85;">
-                    <li>在官网直接注册并登录（或先在服务器上装好再登录）。</li>
-                    <li>在任何服务器/Mac 上执行上方 <code>curl | sh</code> 或运行 <code>coda-daemon login --server ${this.escapeHtml(baseUrl)}</code>。</li>
-                    <li>打开终端输出的 <code>/activate?code=XXXX-XXXX</code> 授权链接点击批准，这台机器立刻出现在左侧所有设备列表中。</li>
-                  </ol>
+              <footer class="hw-footer">
+                <div style="display:flex;align-items:center;gap:8px;">
+                  ${codaLogoSVG(18)}
+                  <span>Coda Mesh · codahub.dev</span>
                 </div>
-                <div style="margin-top:16px;padding:12px;border-radius:12px;background:#070709;border:1px solid #222229;font-size:12px;color:#a1a1aa;">
-                  端到端密钥始终保存在设备本地（<code>Ed25519 + X25519</code> + <code>ChaCha20-Poly1305</code>），主控节点仅做加密包转发。
+                <div style="display:flex;gap:18px;flex-wrap:wrap;">
+                  <a href="#downloads" style="text-decoration:none;">下载中心</a>
+                  ${dl ? `<a href="${dl.releases_page}" target="_blank" style="text-decoration:none;">GitHub Releases</a>` : ""}
                 </div>
-              </div>
-            </section>
-          </div>
+              </footer>
+            </div>
+          </section>
         </div>
       `;
+
+      document.querySelectorAll("[data-preview-tab]").forEach((el) => {
+        el.addEventListener("click", () => {
+          this.previewTab = (el as HTMLElement).dataset.previewTab as "coda" | "server" | "ios";
+          this.render();
+        });
+      });
 
       document.getElementById("btn-copy-install")?.addEventListener("click", async () => {
         try {
@@ -871,6 +1208,8 @@ class CodaTerminalWebApp {
 
     const activeTerm = this.terminals.find((t) => t.address === this.activeTerminalAddr) || this.terminals[0];
     const nowTime = new Date().toTimeString().slice(0, 5);
+    const isNarrowViewport = window.innerWidth < 900;
+    const renderTouchKeypad = isNarrowViewport || this.showMobileKeypadOnDesktop;
 
     root.innerHTML = `
       <div class="shell-root">
@@ -879,14 +1218,17 @@ class CodaTerminalWebApp {
             ? `
           <!-- LEFT SIDEBAR: Account + Machine/Repo/Branch List -->
           <aside class="left-sidebar">
-            <div style="padding:14px 16px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid #141417;">
-              <div>
-                <div style="font-size:14px;font-weight:500;">${this.user.email}</div>
-                <div style="font-size:12px;color:var(--emerald);margin-top:2px;">已连接 · ${
-                  this.activeTransportMode === "lan_ws" ? "⚡ 局域网直连" : "🌐 智能中继"
-                }${this.rttMs !== null ? ` (${this.rttMs}ms)` : ""}</div>
+            <div style="padding:14px 16px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--line);">
+              <div style="display:flex;align-items:center;gap:10px;min-width:0;">
+                ${codaLogoSVG(24)}
+                <div style="min-width:0;">
+                  <div style="font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${this.user.email}</div>
+                  <div style="font-size:11px;color:var(--emerald);margin-top:2px;">已连接 · ${
+                    this.activeTransportMode === "lan_ws" ? "⚡ 局域网直连" : "🌐 智能中继"
+                  }${this.rttMs !== null ? ` (${this.rttMs}ms)` : ""}</div>
+                </div>
               </div>
-              <div style="display:flex;gap:8px;">
+              <div style="display:flex;gap:6px;">
                 <button id="btn-open-settings" class="circle-btn" title="配对机器与好友邀请码">⚙</button>
                 <button id="btn-collapse-sidebar" class="circle-btn" title="收起侧边栏">◧</button>
               </div>
@@ -917,17 +1259,17 @@ class CodaTerminalWebApp {
                               (t) => `
                           <div class="branch-item ${this.activeTerminalAddr === t.address ? "active" : ""}" data-term="${t.address}">
                             <div style="display:flex;align-items:center;gap:10px;min-width:0;">
-                              ${mascotSVG("#e06c50")}
+                              ${codaNodeDotSVG("#e06c50")}
                               <div style="min-width:0;">
                                 <div class="coda-mono" style="font-size:13px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
                                   ${t.name || t.address}
                                 </div>
-                                <div style="font-size:12px;color:var(--emerald);margin-top:2px;">
+                                <div style="font-size:11px;color:var(--emerald);margin-top:2px;">
                                   ${t.status?.state || "终端运行中"}
                                 </div>
                               </div>
                             </div>
-                            <div class="coda-mono" style="font-size:12px;color:var(--emerald);">+184 <span style="color:var(--rose);">-19</span></div>
+                            <div class="coda-mono" style="font-size:11px;color:var(--emerald);">+184 <span style="color:var(--rose);">-19</span></div>
                           </div>
                         `
                             )
@@ -935,10 +1277,10 @@ class CodaTerminalWebApp {
                         : `
                         <div class="branch-item ${this.selectedDaemon?.id === d.id ? "active" : ""}" data-dev="${d.id}">
                           <div style="display:flex;align-items:center;gap:10px;">
-                            ${mascotSVG(d.is_online ? "#e06c50" : "#52525b")}
+                            ${codaNodeDotSVG(d.is_online ? "#e06c50" : "#52525b")}
                             <div>
                               <div class="coda-mono" style="font-size:13px;">main</div>
-                              <div style="font-size:12px;color:${d.is_online ? "var(--emerald)" : "var(--muted)"};">
+                              <div style="font-size:11px;color:${d.is_online ? "var(--emerald)" : "var(--muted)"};">
                                 ${d.is_online ? "点击加载 Herdr 终端" : "主机离线"}
                               </div>
                             </div>
@@ -960,23 +1302,23 @@ class CodaTerminalWebApp {
         <!-- CENTER TERMINAL PANE -->
         <main class="main-terminal-col">
           <!-- Top Session Header + Overlapping Agent Avatars -->
-          <div style="display:flex;align-items:flex-start;justify-content:space-between;padding-bottom:8px;border-bottom:1px solid #141417;">
+          <div style="display:flex;align-items:flex-start;justify-content:space-between;padding-bottom:8px;border-bottom:1px solid var(--line);">
             <div style="min-width:0;">
               <div style="font-size:15px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
                 ${activeTerm?.status?.title || activeTerm?.name || "Coda 交互式 AI 终端会话"}
               </div>
               <div class="coda-mono" style="font-size:12px;color:var(--muted);margin-top:2px;">
-                ${activeTerm?.cwd || "~/personal/github/coda"} · main · ${this.selectedDaemon?.name || "Home"}
+                ${activeTerm?.cwd || "~/personal/github/coda"} · main · ${this.selectedDaemon?.name || "MacBook-Pro"}
               </div>
             </div>
-            <div style="display:flex;align-items:center;">
+            <div style="display:flex;align-items:center;gap:8px;">
               ${(this.terminals.length > 0 ? this.terminals : [{ address: "t1" } as any])
                 .map(
                   (t, i) => `
-                <button data-term="${t.address}" style="margin-left:${i === 0 ? "0" : "-8px"};width:36px;height:36px;border-radius:999px;background:#141417;border:${
+                <button data-term="${t.address}" style="margin-left:${i === 0 ? "0" : "-8px"};width:34px;height:34px;border-radius:999px;background:#14161b;border:${
                     t.address === this.activeTerminalAddr ? "2px solid #f4f4f5" : "1px solid #3f3f46"
                   };display:flex;align-items:center;justify-content:center;cursor:pointer;z-index:${10 - i};">
-                  ${mascotSVG(i % 2 === 0 ? "#e06c50" : "#38bdf8")}
+                  ${codaNodeDotSVG(i % 2 === 0 ? "#e06c50" : "#38bdf8")}
                 </button>
               `
                 )
@@ -989,15 +1331,15 @@ class CodaTerminalWebApp {
             this.terminalScreen
               ? this.escapeHtml(this.terminalScreen)
               : `  - 已连接 PostgreSQL 18 多租户控制面与端到端加密隧道 (X25519 + ChaCha20-Poly1305)
-  - 本机 Herdr Core (hc 0.1.20) 在线，随时可通过右侧「+」拉起 Claude Code / Grok Build / Codex
+  - 本机 Herdr Core (hc 0.1.20) 在线，随时可通过右侧「+」拉起 Claude Code / Codex / Gemini CLI
 
-* Ready · ${this.rttMs !== null ? `RTT ${this.rttMs}ms` : "Zero-SNI Raw TCP :24443 & WSS Dual-Lane Ready"}`
+* Ready · ${this.rttMs !== null ? `RTT ${this.rttMs}ms` : "CF Tunnel WSS :443 & Direct LAN P2P Ready"}`
           }
 
-<div style="margin-top:14px;border-top:1px solid #27272a;padding-top:6px;border-bottom:1px solid #27272a;padding-bottom:6px;">&gt; ${this.formatCursorDraft(
+<div style="margin-top:14px;border-top:1px solid var(--line);padding-top:6px;border-bottom:1px solid var(--line);padding-bottom:6px;">&gt; ${this.formatCursorDraft(
             this.draftInput
           )}</div>
-<div style="font-size:12px;color:#71717a;margin-top:4px;">Opus 5.5 | 5h <span style="color:var(--rose);">100%</span> | 7d 总 <span style="color:#d4d4d8;">77%</span> | <span style="color:#f59e0b;">⚠ E2EE zstd</span></div>
+<div style="font-size:12px;color:#71717a;margin-top:4px;">Opus 4.6 | 5h <span style="color:var(--rose);">100%</span> | 7d 总 <span style="color:#d4d4d8;">77%</span> | <span style="color:#f59e0b;">⚠ E2EE zstd</span></div>
 <div style="font-size:12px;color:var(--coral);">▶▶ bypass permissions on (shift+tab to cycle) <span style="color:#71717a;">· ← ${
             this.terminals.length || 1
           } agents · PR</span></div></div>
@@ -1015,7 +1357,10 @@ class CodaTerminalWebApp {
               : ""
           }
 
-          <!-- Bottom 2-Row Tactile Keypad + Tall White Enter -->
+          ${
+            renderTouchKeypad
+              ? `
+          <!-- Mobile 2-Row Tactile Keypad + Tall White Enter -->
           <div class="keypad-grid">
             <div class="keypad-left">
               <div class="keypad-row">
@@ -1039,7 +1384,21 @@ class CodaTerminalWebApp {
               </div>
             </div>
             <button data-k="enter" class="k-enter">↵</button>
-          </div>
+          </div>`
+              : `
+          <!-- Desktop Prompt Composer Bar -->
+          <form id="desktop-prompt-form" class="desktop-composer">
+            <div class="desktop-composer-row">
+              <span class="coda-mono" style="color:var(--brand-amber);font-weight:700;">❯</span>
+              <input id="desktop-prompt-input" class="desktop-composer-inp" value="${this.escapeHtml(
+                this.draftInput
+              )}" placeholder="向当前 Herdr / Agent 终端发送指令或 Prompt... (Enter 发送)" autocomplete="off" />
+              <button type="button" data-k="ctrl+c" class="btn-ghost" style="padding:5px 9px;font-size:11px;color:var(--coral);">^C</button>
+              <button type="button" id="btn-toggle-touch-pad" class="btn-ghost" style="padding:5px 9px;font-size:11px;" title="切换触控虚拟键盘">⌨</button>
+              <button type="submit" class="btn-primary" style="padding:6px 12px;font-size:12px;">↑ 发送</button>
+            </div>
+          </form>`
+          }
         </main>
 
         <!-- RIGHT VERTICAL THUMB RAIL -->
@@ -1055,7 +1414,7 @@ class CodaTerminalWebApp {
               ${
                 this.activeTransportMode === "lan_ws"
                   ? `<span style="color:var(--emerald);">LAN</span>`
-                  : `<span style="color:var(--muted);">5G</span>`
+                  : `<span style="color:var(--muted);">WSS</span>`
               }
             </div>
           </div>
@@ -1273,6 +1632,31 @@ class CodaTerminalWebApp {
       const inp = document.getElementById("kb-input") as HTMLInputElement;
       this.draftInput = inp.value;
       this.showKeyboardInputBar = false;
+      this.render();
+    });
+
+    document.getElementById("desktop-prompt-input")?.addEventListener("input", (e) => {
+      this.draftInput = (e.target as HTMLInputElement).value;
+    });
+
+    document.getElementById("btn-toggle-touch-pad")?.addEventListener("click", () => {
+      this.showMobileKeypadOnDesktop = !this.showMobileKeypadOnDesktop;
+      this.render();
+    });
+
+    document.getElementById("desktop-prompt-form")?.addEventListener("submit", (e) => {
+      e.preventDefault();
+      const inp = document.getElementById("desktop-prompt-input") as HTMLInputElement | null;
+      const text = (inp ? inp.value : this.draftInput).trim();
+      if (this.selectedDaemon && this.activeTerminalAddr && text) {
+        this.sendEncrypted(this.selectedDaemon, {
+          op: "send_terminal_text",
+          req_id: `tx-${Date.now()}`,
+          terminal: this.activeTerminalAddr,
+          text,
+        });
+      }
+      this.draftInput = "";
       this.render();
     });
 

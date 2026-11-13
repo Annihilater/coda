@@ -1,4 +1,4 @@
-import { mkdirSync, copyFileSync } from "node:fs";
+import { mkdirSync, copyFileSync, existsSync } from "node:fs";
 
 mkdirSync("./dist", { recursive: true });
 
@@ -15,4 +15,10 @@ if (!res.success) {
 }
 
 copyFileSync("./index.html", "./dist/index.html");
+if (existsSync("../assets/logo.svg")) {
+  copyFileSync("../assets/logo.svg", "./dist/logo.svg");
+}
+if (existsSync("../assets/icon-512.png")) {
+  copyFileSync("../assets/icon-512.png", "./dist/apple-touch-icon.png");
+}
 console.log("Built Coda Web Console -> web/dist/");

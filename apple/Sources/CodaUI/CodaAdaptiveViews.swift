@@ -149,9 +149,9 @@ public struct CodaAdaptiveRootView: View {
         CodaAgentSession(
             id: "coda/main",
             address: "t1",
-            machineName: "Home",
+            machineName: "MacBook-Pro",
             machinePlatform: "macos",
-            agentApp: "Opus 5.5",
+            agentApp: "Opus 4.6",
             title: "语音模型 provider + baseurl + key 配置",
             statusMessage: "4 个终端运行中",
             cwd: "coda · main",
@@ -159,58 +159,93 @@ public struct CodaAdaptiveRootView: View {
             progress: 100,
             diffSummary: "+1,233 -116",
             screenPreview: """
-                里，一个是我这次用来合 #135 的临时目录。
-              - 本地分支删了 8 个：2.25 和 2.26
-                发版留下的、内容已在 main 里的分支，加上
-                #113 的分支。
+              - 本地 Worktree 已整理：移除已合入 main 的临时分支并保持活跃工作区在线。
+              - Herdr Core (`hc 0.1.20`) 全双工 PTY 流与 `hc doc.set` 语音配置已就绪。
 
-              还剩
-              - .coda/worktrees/a46dbd6c... : #135
-                的工作区，分支已经合并了。它是 Herdr
-                管理的工作区，你在 Coda 里把这个工作区删掉就行。
+            * Crunched for 4m 18s · done 12:37 PM
 
-            * Crunched for 8m 41s · done 12:37 PM
-
-            ● Background command "Wait for main CI at the integrated tip" completed (exit code 0)
+            ● Background command "cargo test -p coda-protocol -p coda-herdr" completed (exit code 0)
 
               Read 1 file
 
-            ● main 上的 CI 也通过了：最新提交 974dce2e，合入了 #135 和 5 个依赖升级，CI 结果为 success。整合到此全部完成。
+            ● main 分支测试与 CI 验证通过：X25519 + ChaCha20-Poly1305 零知识隧道与 GPUI 桌面端均已就绪。
 
             * Churned for 22s · done 12:43 PM
-              new task? /clear... · ✓ Update installed
+              new task? /clear... · ✓ E2EE Mesh Connected
             """
         ),
         CodaAgentSession(
-            id: "coda/pixel",
+            id: "coda/relay",
             address: "t2",
-            machineName: "Home",
-            machinePlatform: "macos",
-            agentApp: "Fable 5",
-            title: "Pixel app 项目进展",
+            machineName: "green-jp-02",
+            machinePlatform: "linux",
+            agentApp: "Sonnet 4.5",
+            title: "Cloudflare Tunnel WSS 与内网 P2P 自动切换",
             statusMessage: "本轮完成",
-            cwd: "cc-host · main",
+            cwd: "coda-server · main",
             state: .done,
             progress: 100,
-            diffSummary: "+2,687 -306",
+            diffSummary: "+842 -94",
             screenPreview: """
-              - 管理员门生效：/accounts/new 自托管确认步的「设备」分叉和 /pixel-setup 页都只对 isAdmin 渲染；
-              - assetlinks.json 返回 404 —— 预期状态（等 keystore 生成后回填）。
+              - 主控面板绑定 127.0.0.1:8080，由 Cloudflare Tunnel 零公网端口反代至 https://codahub.dev。
+              - SmartPeerClient 同 Wi-Fi 下自动协商 :24444 LAN P2P 直连（< 1ms），跨网无缝切回 WSS 443。
 
-            * Baked for 54s · done 4:33 PM
+            * Baked for 38s · done 4:33 PM
+
+            ● recap: 端到端加密通道与 RFC 8628 浏览器设备码授权全链验证完成。
             """
         ),
     ]
 }
 
-// MARK: - 1. Left Repo & Branch/Worktree Sidebar (Image 2 Left Column)
+struct CodaBrandMarkView: View {
+    var size: CGFloat = 26
+
+    var body: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: size * 0.24, style: .continuous)
+                .fill(Color(red: 0.08, green: 0.09, blue: 0.12))
+                .overlay(
+                    RoundedRectangle(cornerRadius: size * 0.24, style: .continuous)
+                        .stroke(Color.white.opacity(0.14), lineWidth: 1)
+                )
+
+            Circle()
+                .trim(from: 0.12, to: 0.88)
+                .stroke(
+                    LinearGradient(
+                        colors: [Color(red: 0.96, green: 0.62, blue: 0.04), CodaPalette.coralAgent],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    ),
+                    style: StrokeStyle(lineWidth: size * 0.1, lineCap: .round)
+                )
+                .rotationEffect(.degrees(18))
+                .padding(size * 0.22)
+
+            Image(systemName: "chevron.right")
+                .font(.system(size: size * 0.28, weight: .bold, design: .monospaced))
+                .foregroundStyle(.white)
+                .offset(x: -size * 0.02)
+
+            Circle()
+                .fill(CodaPalette.workingEmerald)
+                .frame(width: size * 0.16, height: size * 0.16)
+                .offset(x: size * 0.21, y: -size * 0.18)
+        }
+        .frame(width: size, height: size)
+    }
+}
+
+// MARK: - 1. Left Repo & Branch/Worktree Sidebar
 
 struct CodaRepoBranchSidebar: View {
     @ObservedObject var store: CodaWorkspaceStore
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack {
+            HStack(spacing: 10) {
+                CodaBrandMarkView(size: 28)
                 VStack(alignment: .leading, spacing: 2) {
                     Text(store.accountLabel)
                         .font(.system(size: 14, weight: .medium))
@@ -584,7 +619,8 @@ struct CodaAccountMeshSheet: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            HStack {
+            HStack(spacing: 10) {
+                CodaBrandMarkView(size: 24)
                 Text("连接 Coda 云端主控网络")
                     .font(.headline)
                 Spacer()

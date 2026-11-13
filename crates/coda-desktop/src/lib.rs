@@ -2,15 +2,16 @@
 //! - Zero WebView / Electron overhead: renders directly onto Metal (macOS), DirectX 12 (Windows),
 //!   and Vulkan/Blade (Linux) at 120Hz/240Hz.
 //! - Zero FFI boundary: directly shares `coda-protocol`, `coda-herdr`, and `coda-daemon` in pure Rust!
-//! - Implements the exact OLED Pitch-Black (`#000000`) Terminal Workspace aesthetic:
-//!   1. Collapsible Left Repo / Branch / Worktree Sidebar (`● <repo> · <machine>`, status badges, `+add -del` diff stats).
-//!   2. Full-Bleed Center Terminal Viewport + Overlapping Circular Agent Switcher + 2-Row Tactile Keypad + Tall White Enter (`↵`).
-//!   3. Right Vertical Thumb Rail (Red Live Dot Capsule, Telemetry Ring `68 / 5G`, `[ ‹ ]`, `[ + / ••• ]`, `[ 📎 / 📋 ]`).
+//! - Implements the Highwind-style macOS 3-Column Agentic Workbench:
+//!   1. Top Workspace Group Bar & Secondary Numbered View / Split Toggle Bar.
+//!   2. Left `PROJECTS` Explorer (`SERVICES`, `AGENTS`, `ACTIONS`) with collapsible repositories.
+//!   3. Center Workspace Preview / Worktree Diff Inspector / Mesh & Voice Hub.
+//!   4. Right AI Agent & Live PTY Stream Pane with Desktop Prompt Composer (no mobile soft keypad).
+//!   5. Bottom Global Focus & Route Telemetry Status Bar (`v0.3.5`).
 
 use std::sync::{Arc, Mutex};
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-use chrono::Local;
 use coda_daemon::{
     list_account_hosts, mint_peer_relay_config, poll_device_login_until_approved,
     start_device_login_flow, start_embedded_host_if_configured, DaemonConfig, DirectP2pClient,
@@ -22,7 +23,7 @@ use coda_protocol::{
     RepoWorkspaceSummary, StoredDeviceIdentity, TrafficLane, VoiceModelConfig,
 };
 use gpui::{
-    actions, black, div, prelude::*, px, rgb, rgba, size, white, App, Application, Bounds,
+    actions, div, prelude::*, px, rgb, rgba, size, white, App, Application, Bounds,
     ClipboardItem, Context, FocusHandle, Focusable, KeyBinding, MouseButton, MouseUpEvent,
     SharedString, Window, WindowBounds, WindowOptions,
 };
@@ -40,16 +41,20 @@ actions!(
     ]
 );
 
-/// Pure OLED & Zinc Dark Palette matching the Coda Mobile/Web Terminal aesthetic 1:1.
+/// Layered Dark Workbench Palette matching the macOS Desktop Workbench design.
 pub mod palette {
-    pub const OLED_BLACK: u32 = 0x000000;
-    pub const SIDEBAR_BG: u32 = 0x050507;
-    pub const KEY_SURFACE: u32 = 0x17171a;
-    pub const KEY_HOVER: u32 = 0x222227;
-    pub const KEY_BORDER: u32 = 0x27272c;
-    pub const DIVIDER: u32 = 0x16161a;
-    pub const TEXT_PRIMARY: u32 = 0xf4f4f5;
-    pub const TEXT_MUTED: u32 = 0x71717a;
+    pub const CHROME_BG: u32 = 0x141519;
+    pub const SIDEBAR_BG: u32 = 0x111216;
+    pub const CENTER_BG: u32 = 0x0b0c0f;
+    pub const AGENT_BG: u32 = 0x0e1014;
+    pub const OLED_BLACK: u32 = 0x0b0c0f;
+    pub const KEY_SURFACE: u32 = 0x181a20;
+    pub const KEY_HOVER: u32 = 0x22252e;
+    pub const KEY_BORDER: u32 = 0x262932;
+    pub const DIVIDER: u32 = 0x20232b;
+    pub const TEXT_PRIMARY: u32 = 0xededf0;
+    pub const TEXT_MUTED: u32 = 0x8e929f;
+    pub const TEXT_FAINT: u32 = 0x5c606d;
     pub const EMERALD_WORKING: u32 = 0x22c55e;
     pub const SKY_DONE: u32 = 0x38bdf8;
     pub const CORAL_AGENT: u32 = 0xe06c50;
@@ -79,6 +84,11 @@ pub struct CodaDesktopState {
     pub is_logged_in: bool,
     pub connected_route: String,
     pub show_sidebar: bool,
+    pub show_center_pane: bool,
+    pub show_agent_pane: bool,
+    pub center_tab: String,
+    pub expanded_repo: String,
+    pub focus_timer_running: bool,
     pub show_voice_modal: bool,
     pub bypass_permissions: bool,
     pub draft_input: String,
@@ -98,55 +108,45 @@ impl Default for CodaDesktopState {
         let sessions = vec![
             DesktopTerminalSession {
                 address: "t1".into(),
-                title: "语音模型 provider + baseurl + key 配置".into(),
+                title: "GPUI 桌面工作台与 Herdr PTY 流式同步".into(),
                 repo_name: "coda".into(),
                 branch_name: "main".into(),
-                machine_name: "Home".into(),
-                model_badge: "Opus 5.5".into(),
+                machine_name: "MacBook-Pro".into(),
+                model_badge: "Opus 4.6".into(),
                 status_label: "4 个终端运行中".into(),
                 is_done: false,
                 diff_added: 1233,
                 diff_deleted: 116,
                 screen_text: concat!(
-                    "    里，一个是我这次用来合 #135 的临时目录。\n",
-                    "  - 本地分支删了 8 个：2.25 和 2.26\n",
-                    "    发版留下的、内容已在 main 里的分支，加上\n",
-                    "    #113 的分支。\n\n",
-                    "  还剩\n",
-                    "  - .coda/worktrees/a46dbd6c... : #135\n",
-                    "    的工作区，分支已经合并了。它是 Herdr\n",
-                    "    管理的工作区，worktree 守卫不允许我删，你在\n",
-                    "    Coda 里把这个工作区删掉就行。\n",
-                    "  - preview/workbench-a/b : 桌面 GPUI 预览自己的\n",
-                    "    worktree，不动。\n\n",
-                    "* Crunched for 8m 41s · done 12:37 PM\n\n",
-                    "● Background command \"Wait for main CI at the integrated tip\" completed (exit code 0)\n\n",
-                    "  Read 1 file\n\n",
-                    "● main 上的 CI 也通过了：最新提交 796c64b，合入了 #135 和 GPUI 原生桌面客户端，CI 结果为 success。整合到此全部完成。\n\n",
+                    "  - 已连接本地 Herdr Core (`hc 0.1.20`) 守护进程，自动扫描活跃 Git Worktree 与终端。\n",
+                    "  - 本地预览工作区：`coda` (`main`) 与 `codahub-web` (`feat/highwind-landing`)。\n",
+                    "  - 零知识端到端加密引擎就绪：Ed25519 签名 + X25519 密钥协商 + ChaCha20-Poly1305。\n\n",
+                    "* Crunched for 4m 18s · done 12:37 PM\n\n",
+                    "● Background command \"cargo test -p coda-protocol -p coda-herdr\" completed (exit code 0)\n\n",
+                    "  Read 2 files\n\n",
+                    "● 测试与路由自检全部通过：LAN Direct P2P (:24444) 与 Cloudflare WSS (/v1/tunnel/ws) 双通道就绪。\n\n",
                     "* Churned for 22s · done 12:43 PM\n",
-                    "  new task? /clear... · ✓ Update installed · Rust + GPUI 120Hz Metal Ready"
+                    "  new task? /clear... · ✓ Rust + GPUI 120Hz Metal Ready"
                 )
                 .into(),
             },
             DesktopTerminalSession {
                 address: "t2".into(),
-                title: "Pixel app 项目进展".into(),
-                repo_name: "cc-host".into(),
-                branch_name: "rel/2.27.0".into(),
-                machine_name: "Home".into(),
-                model_badge: "Fable 5".into(),
+                title: "Cloudflare Tunnel 与零知识 E2EE 路由巡检".into(),
+                repo_name: "coda-server".into(),
+                branch_name: "feat/cf-tunnel-wss".into(),
+                machine_name: "green-jp-02".into(),
+                model_badge: "Sonnet 4.5".into(),
                 status_label: "本轮完成".into(),
                 is_done: true,
-                diff_added: 2687,
-                diff_deleted: 306,
+                diff_added: 842,
+                diff_deleted: 94,
                 screen_text: concat!(
-                    "  - 管理员门生效：/accounts/new 自托管确认步的「设备」分叉和\n",
-                    "    /pixel-setup 页都只对 isAdmin 渲染（两处都留了注释，开放时\n",
-                    "    一起去掉）；普通用户看到的自托管流程与之前逐字节一致。\n",
-                    "  - assetlinks.json 返回 404 —— 预期状态（ANDROID_APP_* vars\n",
-                    "    要等 keystore 生成后回填，在那之前 App 无法登录）。\n\n",
-                    "* Baked for 54s · done 4:33 PM\n\n",
-                    "● recap: Pixel 手机自托管已全链开发完成并合入上线，console 入口目前仅管理员可见。"
+                    "  - 控制面板默认仅监听 127.0.0.1:8080，由 Cloudflare Tunnel 零公网端口反代至 https://codahub.dev。\n",
+                    "  - SmartPeerClient 同 Wi-Fi 下 250ms 探测局域网 P2P 直连（< 1ms），跨网自动切换至 WSS 443。\n",
+                    "  - RFC 8628 浏览器设备码授权 (/activate) 已与 Postgres 18 多租户控制面联调完成。\n\n",
+                    "* Baked for 38s · done 4:33 PM\n\n",
+                    "● recap: green-jp-02 节点健康检查通过，所有端到端通道加密在线。"
                 )
                 .into(),
             },
@@ -156,10 +156,10 @@ impl Default for CodaDesktopState {
             RepoWorkspaceSummary {
                 repo_name: "coda".into(),
                 root_path: "/Users/vampire/personal/github/coda".into(),
-                machine_name: "Home".into(),
+                machine_name: "MacBook-Pro".into(),
                 branches: vec![
                     BranchWorktreeItem {
-                        branch: "dev/20261113-gpui-desktop-client".into(),
+                        branch: "main".into(),
                         worktree_path: "/Users/vampire/personal/github/coda".into(),
                         diff_added: 1233,
                         diff_deleted: 116,
@@ -167,31 +167,31 @@ impl Default for CodaDesktopState {
                         status_summary: "4 个终端运行中".into(),
                     },
                     BranchWorktreeItem {
-                        branch: "rel/2.27.0".into(),
+                        branch: "feat/cf-tunnel-wss".into(),
                         worktree_path: "/Users/vampire/personal/github/coda".into(),
-                        diff_added: 642,
-                        diff_deleted: 48,
+                        diff_added: 842,
+                        diff_deleted: 94,
                         active_terminals: vec![],
                         status_summary: "本轮完成".into(),
                     },
                 ],
             },
             RepoWorkspaceSummary {
-                repo_name: "myWsq/youran-mono".into(),
-                root_path: "/Users/vampire/personal/github/youran-mono".into(),
-                machine_name: "Home".into(),
+                repo_name: "codahub-web".into(),
+                root_path: "/Users/vampire/personal/github/coda/web".into(),
+                machine_name: "MacBook-Pro".into(),
                 branches: vec![
                     BranchWorktreeItem {
                         branch: "main".into(),
-                        worktree_path: "/Users/vampire/personal/github/youran-mono".into(),
-                        diff_added: 2687,
-                        diff_deleted: 306,
+                        worktree_path: "/Users/vampire/personal/github/coda/web".into(),
+                        diff_added: 512,
+                        diff_deleted: 48,
                         active_terminals: vec![],
                         status_summary: "1 个终端运行中".into(),
                     },
                     BranchWorktreeItem {
-                        branch: "feat/web-agent".into(),
-                        worktree_path: "/Users/vampire/personal/github/youran-mono".into(),
+                        branch: "feat/highwind-landing".into(),
+                        worktree_path: "/Users/vampire/personal/github/coda/web".into(),
                         diff_added: 0,
                         diff_deleted: 0,
                         active_terminals: vec![],
@@ -210,9 +210,14 @@ impl Default for CodaDesktopState {
             is_logged_in: false,
             connected_route: "已连接 · L0 GPUI Metal 120Hz".into(),
             show_sidebar: true,
+            show_center_pane: true,
+            show_agent_pane: true,
+            center_tab: "preview".into(),
+            expanded_repo: "coda".into(),
+            focus_timer_running: true,
             show_voice_modal: false,
             bypass_permissions: true,
-            draft_input: "发个 iOS 版".into(),
+            draft_input: String::new(),
             active_terminal_addr: "t1".into(),
             selected_host_id: None,
             remote_hosts: Vec::new(),
@@ -538,6 +543,70 @@ impl CodaDesktopState {
             }
         });
     }
+
+    pub fn spawn_new_session(&mut self) {
+        let next_idx = self.sessions.len() + 1;
+        let addr = format!("t{next_idx}");
+        let machine = self
+            .selected_host_id
+            .and_then(|id| {
+                self.remote_hosts
+                    .iter()
+                    .find(|h| h.id == id)
+                    .map(|h| h.name.clone())
+            })
+            .unwrap_or_else(|| "MacBook-Pro".into());
+        self.sessions.insert(
+            0,
+            DesktopTerminalSession {
+                address: addr.clone(),
+                title: format!("Claude Code 终端会话 #{next_idx}"),
+                repo_name: self.expanded_repo.clone(),
+                branch_name: "main".into(),
+                machine_name: machine,
+                model_badge: "Opus 4.6".into(),
+                status_label: "1 个终端运行中".into(),
+                is_done: false,
+                diff_added: 0,
+                diff_deleted: 0,
+                screen_text: format!(
+                    "● Spawned herdr-core agent terminal `{addr}` via Coda GPUI Workbench"
+                ),
+            },
+        );
+        self.active_terminal_addr = addr;
+    }
+
+    pub fn run_quick_action(&mut self, command: &str) {
+        self.draft_input = command.to_string();
+        self.handle_tactile_key("enter");
+    }
+}
+
+fn spawn_background_herdr_sync(state_bg: Arc<Mutex<CodaDesktopState>>) {
+    std::thread::spawn(move || {
+        if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            rt.block_on(async move {
+                let mut tmp = CodaDesktopState::default();
+                tmp.sync_from_local_herdr().await;
+                if let Ok(mut g) = state_bg.lock() {
+                    if !tmp.repos.is_empty() {
+                        g.repos = tmp.repos;
+                    }
+                    g.voice_config = tmp.voice_config;
+                    for s in tmp.sessions {
+                        if !g.sessions.iter().any(|existing| existing.address == s.address) {
+                            g.sessions.push(s);
+                        }
+                    }
+                    g.status_banner = Some("✓ 已同步本地 Herdr 终端与 Git Worktree 列表".into());
+                }
+            });
+        }
+    });
 }
 
 fn spawn_background_herdr_send(terminal_addr: String, text: String) {
@@ -883,822 +952,392 @@ impl CodaGpuWorkspaceView {
         }
     }
 
-    fn render_left_sidebar(&self, st: &CodaDesktopState, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .w(px(310.0))
-            .h_full()
-            .bg(rgb(palette::SIDEBAR_BG))
-            .border_r_1()
-            .border_color(rgb(palette::DIVIDER))
-            .flex()
-            .flex_col()
-            // 1. Account Header (`vampire@coda.dev` + `已连接` + `[⚙]` + `[◧]`)
-            .child(
-                div()
-                    .px_4()
-                    .py_3()
-                    .border_b_1()
-                    .border_color(rgb(palette::DIVIDER))
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(rgb(palette::TEXT_PRIMARY))
-                                    .child(SharedString::from(st.account_email.clone())),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(palette::EMERALD_WORKING))
-                                    .child(SharedString::from(st.connected_route.clone())),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .size(px(34.0))
-                                    .rounded_full()
-                                    .bg(rgb(palette::KEY_SURFACE))
-                                    .border_1()
-                                    .border_color(rgb(palette::KEY_BORDER))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .text_sm()
-                                    .text_color(rgb(palette::TEXT_PRIMARY))
-                                    .child("⚙")
-                                    .hover(|s| s.bg(rgb(palette::KEY_HOVER)).cursor_pointer())
-                                    .on_mouse_up(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _: &MouseUpEvent, _, cx| {
-                                            if let Ok(mut g) = this.state.lock() {
-                                                g.show_voice_modal = !g.show_voice_modal;
-                                            }
-                                            cx.notify();
-                                        }),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .size(px(34.0))
-                                    .rounded_full()
-                                    .bg(rgb(palette::KEY_SURFACE))
-                                    .border_1()
-                                    .border_color(rgb(palette::KEY_BORDER))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .text_sm()
-                                    .text_color(rgb(palette::TEXT_PRIMARY))
-                                    .child("◧")
-                                    .hover(|s| s.bg(rgb(palette::KEY_HOVER)).cursor_pointer())
-                                    .on_mouse_up(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _: &MouseUpEvent, _, cx| {
-                                            if let Ok(mut g) = this.state.lock() {
-                                                g.show_sidebar = !g.show_sidebar;
-                                            }
-                                            cx.notify();
-                                        }),
-                                    ),
-                            ),
-                    ),
-            )
-            // 2. Account / Remote Host Switcher + Repo/Branch List
-            .child(
-                div()
-                    .px_3()
-                    .py_2()
-                    .border_b_1()
-                    .border_color(rgb(palette::DIVIDER))
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .when(!st.is_logged_in, |el| {
-                        let srv = st.server_url.clone();
-                        el.child(
-                            div()
-                                .px_3()
-                                .py_2()
-                                .rounded_lg()
-                                .bg(rgb(palette::KEY_SURFACE))
-                                .border_1()
-                                .border_color(rgb(palette::EMERALD_WORKING))
-                                .text_xs()
-                                .text_color(rgb(palette::EMERALD_WORKING))
-                                .child(SharedString::from(format!(
-                                    "🔑 浏览器登录 ({srv})"
-                                )))
-                                .hover(|s| s.bg(rgb(palette::KEY_HOVER)).cursor_pointer())
-                                .on_mouse_up(
-                                    MouseButton::Left,
-                                    cx.listener(|this, _: &MouseUpEvent, _, cx| {
-                                        let url = this.state.lock().map(|g| g.server_url.clone()).unwrap_or_default();
-                                        spawn_desktop_browser_login(Arc::clone(&this.state), url);
-                                        cx.notify();
-                                    }),
-                                ),
-                        )
-                    })
-                    .child(
-                        div()
-                            .flex()
-                            .flex_wrap()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .px_2()
-                                    .py_1()
-                                    .rounded_md()
-                                    .text_xs()
-                                    .bg(if st.selected_host_id.is_none() {
-                                        rgb(palette::KEY_HOVER)
-                                    } else {
-                                        rgb(palette::KEY_SURFACE)
-                                    })
-                                    .border_1()
-                                    .border_color(rgb(palette::KEY_BORDER))
-                                    .text_color(rgb(palette::TEXT_PRIMARY))
-                                    .child("💻 本机")
-                                    .hover(|s| s.cursor_pointer())
-                                    .on_mouse_up(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _: &MouseUpEvent, _, cx| {
-                                            if let Ok(mut g) = this.state.lock() {
-                                                g.selected_host_id = None;
-                                                g.connected_route = "已连接 · L0 本机 Herdr 直连".into();
-                                            }
-                                            cx.notify();
-                                        }),
-                                    ),
-                            )
-                            .children(st.remote_hosts.iter().map(|host| {
-                                let h_clone = host.clone();
-                                let is_cur = st.selected_host_id == Some(host.id);
-                                let dot = if host.is_online { "●" } else { "○" };
-                                div()
-                                    .px_2()
-                                    .py_1()
-                                    .rounded_md()
-                                    .text_xs()
-                                    .bg(if is_cur {
-                                        rgb(palette::KEY_HOVER)
-                                    } else {
-                                        rgb(palette::KEY_SURFACE)
-                                    })
-                                    .border_1()
-                                    .border_color(if is_cur {
-                                        rgb(palette::SKY_DONE)
-                                    } else {
-                                        rgb(palette::KEY_BORDER)
-                                    })
-                                    .text_color(if host.is_online {
-                                        rgb(palette::TEXT_PRIMARY)
-                                    } else {
-                                        rgb(palette::TEXT_MUTED)
-                                    })
-                                    .child(SharedString::from(format!("{dot} {}", host.name)))
-                                    .hover(|s| s.cursor_pointer())
-                                    .on_mouse_up(
-                                        MouseButton::Left,
-                                        cx.listener(move |this, _: &MouseUpEvent, _, cx| {
-                                            if let Ok(mut g) = this.state.lock() {
-                                                g.selected_host_id = Some(h_clone.id);
-                                                g.status_banner = Some(format!("正在经智能路由连接 {}...", h_clone.name));
-                                            }
-                                            spawn_load_remote_host(Arc::clone(&this.state), h_clone.clone());
-                                            cx.notify();
-                                        }),
-                                    )
-                            })),
-                    ),
-            )
-            // 3. Grouped Repo & Branch/Worktree List
-            .child(
-                div()
-                    .id("sidebar-scroll")
-                    .flex_1()
-                    .overflow_scroll()
-                    .p_3()
-                    .flex()
-                    .flex_col()
-                    .gap_3()
-                    .children(st.sessions.iter().map(|sess| {
-                        let is_selected = sess.address == st.active_terminal_addr;
-                        let addr = sess.address.clone();
-                        let status_color = if sess.is_done {
-                            palette::SKY_DONE
-                        } else {
-                            palette::EMERALD_WORKING
-                        };
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .px_2()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .text_xs()
-                                    .text_color(rgb(palette::TEXT_MUTED))
-                                    .child(
-                                        div()
-                                            .size(px(7.0))
-                                            .rounded_full()
-                                            .bg(rgb(palette::EMERALD_WORKING)),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_color(rgb(palette::TEXT_PRIMARY))
-                                            .child(SharedString::from(sess.repo_name.clone())),
-                                    )
-                                    .child(SharedString::from(format!("· {}", sess.machine_name))),
-                            )
-                            .child(
-                                div()
-                                    .px_3()
-                                    .py_2()
-                                    .rounded_lg()
-                                    .bg(if is_selected {
-                                        rgba(0xffffff14)
-                                    } else {
-                                        rgba(0x00000000)
-                                    })
-                                    .hover(|s| s.bg(rgba(0xffffff10)).cursor_pointer())
-                                    .flex()
-                                    .items_center()
-                                    .justify_between()
-                                    .on_mouse_up(
-                                        MouseButton::Left,
-                                        cx.listener(move |this, _: &MouseUpEvent, _, cx| {
-                                            if let Ok(mut g) = this.state.lock() {
-                                                g.active_terminal_addr = addr.clone();
-                                            }
-                                            cx.notify();
-                                        }),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .items_center()
-                                            .gap_2()
-                                            .child(
-                                                div()
-                                                    .size(px(16.0))
-                                                    .rounded_sm()
-                                                    .bg(rgb(palette::CORAL_AGENT)),
-                                            )
-                                            .child(
-                                                div()
-                                                    .flex()
-                                                    .flex_col()
-                                                    .child(
-                                                        div()
-                                                            .text_sm()
-                                                            .text_color(rgb(palette::TEXT_PRIMARY))
-                                                            .child(SharedString::from(
-                                                                sess.branch_name.clone(),
-                                                            )),
-                                                    )
-                                                    .child(
-                                                        div()
-                                                            .text_xs()
-                                                            .text_color(rgb(status_color))
-                                                            .child(SharedString::from(
-                                                                sess.status_label.clone(),
-                                                            )),
-                                                    ),
-                                            ),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .gap_1()
-                                            .text_xs()
-                                            .child(
-                                                div()
-                                                    .text_color(rgb(palette::EMERALD_WORKING))
-                                                    .child(SharedString::from(format!(
-                                                        "+{}",
-                                                        sess.diff_added
-                                                    ))),
-                                            )
-                                            .child(
-                                                div()
-                                                    .text_color(rgb(palette::ROSE_DIFF_DEL))
-                                                    .child(SharedString::from(format!(
-                                                        "-{}",
-                                                        sess.diff_deleted
-                                                    ))),
-                                            ),
-                                    ),
-                            )
-                    })),
-            )
-    }
-
-    fn render_center_terminal_pane(
+    fn render_top_workspace_bar(
         &self,
         st: &CodaDesktopState,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let active = st.active_session().clone();
-        let prompt_line = if st.draft_input.is_empty() {
-            "> ▯".to_string()
-        } else {
-            let mut chars = st.draft_input.chars();
-            let first = chars.next().unwrap_or(' ');
-            let rest: String = chars.collect();
-            format!("> [{first}]{rest}")
-        };
-
-        let mode_footer = if st.bypass_permissions {
-            format!(
-                "▶▶ bypass permissions on (shift+tab to cycle) · ← {} agents · PR",
-                st.sessions.len()
-            )
-        } else {
-            format!(
-                "▶▶ plan mode on (shift+tab to cycle) · ← {} agents · PR",
-                st.sessions.len()
-            )
-        };
+        let srv = st.server_url.clone();
+        let active_local = st.selected_host_id.is_none();
 
         div()
-            .flex_1()
-            .h_full()
-            .bg(rgb(palette::OLED_BLACK))
-            .px_4()
-            .py_3()
-            .flex()
-            .flex_col()
-            .justify_between()
-            // 1. Top Session Header + Overlapping Circular Agent Switcher
-            .child(
-                div()
-                    .pb_2()
-                    .border_b_1()
-                    .border_color(rgb(palette::DIVIDER))
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .child(
-                                div()
-                                    .text_base()
-                                    .text_color(rgb(palette::TEXT_PRIMARY))
-                                    .child(SharedString::from(active.title.clone())),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(palette::TEXT_MUTED))
-                                    .child(SharedString::from(format!(
-                                        "{} · {} · {}",
-                                        active.repo_name, active.branch_name, active.machine_name
-                                    ))),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .gap_1()
-                            .children(st.sessions.iter().map(|s| {
-                                let addr = s.address.clone();
-                                let is_sel = addr == st.active_terminal_addr;
-                                div()
-                                    .size(px(34.0))
-                                    .rounded_full()
-                                    .bg(rgb(palette::KEY_SURFACE))
-                                    .border_2()
-                                    .border_color(if is_sel {
-                                        white()
-                                    } else {
-                                        rgb(palette::KEY_BORDER).into()
-                                    })
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .text_xs()
-                                    .text_color(rgb(palette::CORAL_AGENT))
-                                    .child(SharedString::from(addr.clone()))
-                                    .hover(|style| style.bg(rgb(palette::KEY_HOVER)).cursor_pointer())
-                                    .on_mouse_up(
-                                        MouseButton::Left,
-                                        cx.listener(move |this, _: &MouseUpEvent, _, cx| {
-                                            if let Ok(mut g) = this.state.lock() {
-                                                g.active_terminal_addr = addr.clone();
-                                            }
-                                            cx.notify();
-                                        }),
-                                    )
-                            })),
-                    ),
-            )
-            // 2. Full-Bleed Live GPU Terminal Viewport + Prompt `> [cursor]` + Telemetry Footer
-            .child(
-                div()
-                    .id("terminal-viewport")
-                    .flex_1()
-                    .overflow_scroll()
-                    .py_3()
-                    .flex()
-                    .flex_col()
-                    .justify_between()
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .when_some(st.status_banner.clone(), |el, banner| {
-                                el.child(
-                                    div()
-                                        .px_3()
-                                        .py_1()
-                                        .mb_2()
-                                        .rounded_md()
-                                        .bg(rgb(palette::KEY_SURFACE))
-                                        .border_1()
-                                        .border_color(rgb(palette::EMERALD_WORKING))
-                                        .text_xs()
-                                        .text_color(rgb(palette::EMERALD_WORKING))
-                                        .child(SharedString::from(banner)),
-                                )
-                            })
-                            .when(st.show_voice_modal, |el| {
-                                el.child(
-                                    div()
-                                        .p_3()
-                                        .mb_3()
-                                        .rounded_xl()
-                                        .bg(rgb(palette::KEY_SURFACE))
-                                        .border_1()
-                                        .border_color(rgb(palette::KEY_BORDER))
-                                        .flex()
-                                        .flex_col()
-                                        .gap_2()
-                                        .child(
-                                            div()
-                                                .text_sm()
-                                                .text_color(rgb(palette::TEXT_PRIMARY))
-                                                .child(SharedString::from(format!(
-                                                    "🎙 语音模型配置: {} · {} ({})",
-                                                    st.voice_config.provider,
-                                                    st.voice_config.model,
-                                                    st.voice_config.base_url
-                                                ))),
-                                        )
-                                        .child(
-                                            div()
-                                                .flex()
-                                                .gap_2()
-                                                .child(
-                                                    div()
-                                                        .px_3()
-                                                        .py_1()
-                                                        .rounded_md()
-                                                        .bg(rgb(palette::SIDEBAR_BG))
-                                                        .border_1()
-                                                        .border_color(rgb(palette::KEY_BORDER))
-                                                        .text_xs()
-                                                        .text_color(rgb(palette::TEXT_PRIMARY))
-                                                        .child("OpenAI Transcribe")
-                                                        .hover(|s| s.bg(rgb(palette::KEY_HOVER)).cursor_pointer())
-                                                        .on_mouse_up(
-                                                            MouseButton::Left,
-                                                            cx.listener(|this, _: &MouseUpEvent, _, cx| {
-                                                                if let Ok(mut g) = this.state.lock() {
-                                                                    g.apply_voice_preset("openai");
-                                                                }
-                                                                cx.notify();
-                                                            }),
-                                                        ),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .px_3()
-                                                        .py_1()
-                                                        .rounded_md()
-                                                        .bg(rgb(palette::SIDEBAR_BG))
-                                                        .border_1()
-                                                        .border_color(rgb(palette::KEY_BORDER))
-                                                        .text_xs()
-                                                        .text_color(rgb(palette::SKY_DONE))
-                                                        .child("Groq Whisper-v3-Turbo")
-                                                        .hover(|s| s.bg(rgb(palette::KEY_HOVER)).cursor_pointer())
-                                                        .on_mouse_up(
-                                                            MouseButton::Left,
-                                                            cx.listener(|this, _: &MouseUpEvent, _, cx| {
-                                                                if let Ok(mut g) = this.state.lock() {
-                                                                    g.apply_voice_preset("groq");
-                                                                }
-                                                                cx.notify();
-                                                            }),
-                                                        ),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .px_3()
-                                                        .py_1()
-                                                        .rounded_md()
-                                                        .bg(rgb(palette::SIDEBAR_BG))
-                                                        .border_1()
-                                                        .border_color(rgb(palette::KEY_BORDER))
-                                                        .text_xs()
-                                                        .text_color(rgb(palette::CORAL_AGENT))
-                                                        .child("DeepSeek Voice")
-                                                        .hover(|s| s.bg(rgb(palette::KEY_HOVER)).cursor_pointer())
-                                                        .on_mouse_up(
-                                                            MouseButton::Left,
-                                                            cx.listener(|this, _: &MouseUpEvent, _, cx| {
-                                                                if let Ok(mut g) = this.state.lock() {
-                                                                    g.apply_voice_preset("deepseek");
-                                                                }
-                                                                cx.notify();
-                                                            }),
-                                                        ),
-                                                ),
-                                        ),
-                                )
-                            })
-                            .children(active.screen_text.lines().map(|line| {
-                                let trimmed = line.trim_start();
-                                let line_color = if trimmed.starts_with("●") {
-                                    palette::EMERALD_WORKING
-                                } else if trimmed.starts_with('*') {
-                                    palette::AMBER_WARN
-                                } else if trimmed.starts_with('+') {
-                                    palette::EMERALD_WORKING
-                                } else if trimmed.starts_with("- ") {
-                                    palette::TEXT_PRIMARY
-                                } else {
-                                    palette::TEXT_PRIMARY
-                                };
-                                div()
-                                    .text_sm()
-                                    .text_color(rgb(line_color))
-                                    .child(SharedString::from(line.to_string()))
-                            })),
-                    )
-                    .child(
-                        div()
-                            .mt_4()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .py_1()
-                                    .border_t_1()
-                                    .border_b_1()
-                                    .border_color(rgb(palette::KEY_BORDER))
-                                    .text_sm()
-                                    .text_color(rgb(palette::TEXT_PRIMARY))
-                                    .child(SharedString::from(prompt_line)),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(palette::TEXT_MUTED))
-                                    .child(SharedString::from(format!(
-                                        "{} | 5h 100% | 7d 总 77% | ⚠ GPUI Metal 120Hz · Zero-FFI Rust",
-                                        active.model_badge
-                                    ))),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(palette::CORAL_AGENT))
-                                    .child(SharedString::from(mode_footer)),
-                            ),
-                    ),
-            )
-            // 3. Dedicated 2-Row Tactile Terminal Keypad + Tall White Enter (`↵`)
-            .child(self.render_two_row_keypad(cx))
-    }
-
-    fn render_two_row_keypad(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .h(px(94.0))
-            .pt_1()
-            .flex()
-            .gap_2()
-            .child(
-                div()
-                    .flex_1()
-                    .h_full()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    // Row 1: esc | tab | [⌨ | 🎙] | ↑ | ⌫
-                    .child(
-                        div()
-                            .flex_1()
-                            .flex()
-                            .gap_2()
-                            .child(self.keypad_key("esc", "esc", palette::TEXT_PRIMARY, cx))
-                            .child(self.keypad_key("tab", "tab", palette::TEXT_PRIMARY, cx))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .h_full()
-                                    .rounded_xl()
-                                    .bg(rgb(palette::KEY_SURFACE))
-                                    .border_1()
-                                    .border_color(rgb(palette::KEY_BORDER))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .text_sm()
-                                    .text_color(rgb(palette::TEXT_PRIMARY))
-                                    .child("⌨  |  🎙")
-                                    .hover(|s| s.bg(rgb(palette::KEY_HOVER)).cursor_pointer())
-                                    .on_mouse_up(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _: &MouseUpEvent, _, cx| {
-                                            if let Ok(mut g) = this.state.lock() {
-                                                g.show_voice_modal = !g.show_voice_modal;
-                                            }
-                                            cx.notify();
-                                        }),
-                                    ),
-                            )
-                            .child(self.keypad_key("↑", "up", palette::TEXT_PRIMARY, cx))
-                            .child(self.keypad_key("⌫", "backspace", palette::TEXT_PRIMARY, cx)),
-                    )
-                    // Row 2: ^C | ^D | / | ← | ↓ | →
-                    .child(
-                        div()
-                            .flex_1()
-                            .flex()
-                            .gap_2()
-                            .child(self.keypad_key("^C", "ctrl_c", palette::CORAL_AGENT, cx))
-                            .child(self.keypad_key("^D", "ctrl_d", palette::TEXT_PRIMARY, cx))
-                            .child(self.keypad_key("/", "slash", palette::TEXT_PRIMARY, cx))
-                            .child(self.keypad_key("←", "left", palette::TEXT_PRIMARY, cx))
-                            .child(self.keypad_key("↓", "down", palette::TEXT_PRIMARY, cx))
-                            .child(self.keypad_key("→", "right", palette::TEXT_PRIMARY, cx)),
-                    ),
-            )
-            // Tall White Enter Key (`↵`) spanning both rows
-            .child(
-                div()
-                    .w(px(64.0))
-                    .h_full()
-                    .rounded_2xl()
-                    .bg(rgb(palette::TEXT_PRIMARY))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_xl()
-                    .text_color(black())
-                    .child("↵")
-                    .hover(|s| s.bg(white()).cursor_pointer())
-                    .on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(|this, _: &MouseUpEvent, _, cx| {
-                            if let Ok(mut g) = this.state.lock() {
-                                g.handle_tactile_key("enter");
-                            }
-                            cx.notify();
-                        }),
-                    ),
-            )
-    }
-
-    fn keypad_key(
-        &self,
-        label: &'static str,
-        action_code: &'static str,
-        fg_hex: u32,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        div()
-            .flex_1()
-            .h_full()
-            .rounded_xl()
-            .bg(rgb(palette::KEY_SURFACE))
-            .border_1()
-            .border_color(rgb(palette::KEY_BORDER))
-            .flex()
-            .items_center()
-            .justify_center()
-            .text_sm()
-            .text_color(rgb(fg_hex))
-            .child(label)
-            .hover(|s| s.bg(rgb(palette::KEY_HOVER)).cursor_pointer())
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(move |this, _: &MouseUpEvent, _, cx| {
-                    if let Ok(mut g) = this.state.lock() {
-                        g.handle_tactile_key(action_code);
-                    }
-                    cx.notify();
-                }),
-            )
-    }
-
-    fn render_right_rail(&self, st: &CodaDesktopState, cx: &mut Context<Self>) -> impl IntoElement {
-        let now_str = Local::now().format("%H:%M").to_string();
-        div()
-            .w(px(58.0))
-            .h_full()
-            .bg(rgb(palette::SIDEBAR_BG))
-            .border_l_1()
+            .h(px(38.0))
+            .w_full()
+            .bg(rgb(palette::CHROME_BG))
+            .border_b_1()
             .border_color(rgb(palette::DIVIDER))
-            .py_3()
+            .px_3()
             .flex()
-            .flex_col()
             .items_center()
             .justify_between()
-            // Top Red Live Indicator Capsule
-            .child(
-                div()
-                    .w(px(32.0))
-                    .h(px(54.0))
-                    .rounded_full()
-                    .border_1()
-                    .border_color(rgb(0x4c1d24))
-                    .bg(rgb(0x0c0a0b))
-                    .pb_2()
-                    .flex()
-                    .items_end()
-                    .justify_center()
-                    .child(div().size(px(10.0)).rounded_full().bg(rgb(0xef4444))),
-            )
-            // Clock + 68 / 5G Telemetry Ring
+            // Left: Brand + Focus + Workspace/Host Group Tabs
             .child(
                 div()
                     .flex()
-                    .flex_col()
                     .items_center()
-                    .gap_1()
+                    .gap_2()
+                    // Coda Brand Mark
                     .child(
                         div()
-                            .text_xs()
-                            .text_color(rgb(palette::TEXT_PRIMARY))
-                            .child(SharedString::from(now_str)),
-                    )
-                    .child(
-                        div()
-                            .size(px(40.0))
-                            .rounded_full()
-                            .border_2()
-                            .border_color(rgb(palette::KEY_BORDER))
-                            .flex()
-                            .flex_col()
-                            .items_center()
-                            .justify_center()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(palette::TEXT_PRIMARY))
-                                    .child("68"),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(palette::TEXT_MUTED))
-                                    .child("5G"),
-                            ),
-                    ),
-            )
-            // Sidebar Toggle + `[ + / ••• ]` Capsule
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .gap_3()
-                    .child(
-                        div()
-                            .size(px(36.0))
-                            .rounded_full()
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
                             .bg(rgb(palette::KEY_SURFACE))
                             .border_1()
                             .border_color(rgb(palette::KEY_BORDER))
                             .flex()
                             .items_center()
-                            .justify_center()
-                            .text_sm()
-                            .text_color(rgb(palette::TEXT_PRIMARY))
-                            .child(if st.show_sidebar { "‹" } else { "›" })
+                            .gap_2()
+                            .child(div().size(px(8.0)).rounded_full().bg(rgb(palette::EMERALD_WORKING)))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(palette::TEXT_PRIMARY))
+                                    .child("CODA"),
+                            ),
+                    )
+                    // Focus Workspace Pill
+                    .child(
+                        div()
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .bg(rgb(palette::KEY_SURFACE))
+                            .border_1()
+                            .border_color(rgb(palette::KEY_BORDER))
+                            .text_xs()
+                            .text_color(rgb(palette::TEXT_MUTED))
+                            .child(SharedString::from(format!("■ Focus  {}", st.sessions.len())))
                             .hover(|s| s.bg(rgb(palette::KEY_HOVER)).cursor_pointer())
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                                    if let Ok(mut g) = this.state.lock() {
+                                        g.center_tab = "preview".into();
+                                        g.show_center_pane = true;
+                                        g.show_agent_pane = true;
+                                    }
+                                    cx.notify();
+                                }),
+                            ),
+                    )
+                    // Local Mac Host Tab
+                    .child(
+                        div()
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .bg(if active_local {
+                                rgb(palette::KEY_HOVER)
+                            } else {
+                                rgb(palette::SIDEBAR_BG)
+                            })
+                            .border_1()
+                            .border_color(if active_local {
+                                rgb(palette::CORAL_AGENT)
+                            } else {
+                                rgb(palette::KEY_BORDER)
+                            })
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .text_xs()
+                            .text_color(rgb(palette::TEXT_PRIMARY))
+                            .child(div().size(px(6.0)).rounded_full().bg(rgb(palette::CORAL_AGENT)))
+                            .child(SharedString::from(format!(
+                                "Local Mac  {}/{}",
+                                st.repos.len(),
+                                st.repos.len()
+                            )))
+                            .hover(|s| s.cursor_pointer())
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                                    if let Ok(mut g) = this.state.lock() {
+                                        g.selected_host_id = None;
+                                        g.connected_route = "已连接 · L0 本机 Herdr 直连".into();
+                                    }
+                                    cx.notify();
+                                }),
+                            ),
+                    )
+                    // Remote Host Tabs
+                    .children(st.remote_hosts.iter().map(|host| {
+                        let h_clone = host.clone();
+                        let is_cur = st.selected_host_id == Some(host.id);
+                        let dot_color = if host.is_online {
+                            palette::EMERALD_WORKING
+                        } else {
+                            palette::TEXT_FAINT
+                        };
+                        div()
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .bg(if is_cur {
+                                rgb(palette::KEY_HOVER)
+                            } else {
+                                rgb(palette::SIDEBAR_BG)
+                            })
+                            .border_1()
+                            .border_color(if is_cur {
+                                rgb(palette::SKY_DONE)
+                            } else {
+                                rgb(palette::KEY_BORDER)
+                            })
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .text_xs()
+                            .text_color(if host.is_online {
+                                rgb(palette::TEXT_PRIMARY)
+                            } else {
+                                rgb(palette::TEXT_MUTED)
+                            })
+                            .child(div().size(px(6.0)).rounded_full().bg(rgb(dot_color)))
+                            .child(SharedString::from(host.name.clone()))
+                            .hover(|s| s.bg(rgb(palette::KEY_HOVER)).cursor_pointer())
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(move |this, _: &MouseUpEvent, _, cx| {
+                                    if let Ok(mut g) = this.state.lock() {
+                                        g.selected_host_id = Some(h_clone.id);
+                                        g.status_banner = Some(format!(
+                                            "正在经智能路由连接 {}...",
+                                            h_clone.name
+                                        ));
+                                    }
+                                    spawn_load_remote_host(Arc::clone(&this.state), h_clone.clone());
+                                    cx.notify();
+                                }),
+                            )
+                    }))
+                    // + Enroll / Sync Host Tab
+                    .child(
+                        div()
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .bg(rgb(palette::SIDEBAR_BG))
+                            .border_1()
+                            .border_color(rgb(palette::KEY_BORDER))
+                            .text_xs()
+                            .text_color(rgb(palette::TEXT_MUTED))
+                            .child("+")
+                            .hover(|s| {
+                                s.bg(rgb(palette::KEY_HOVER))
+                                    .text_color(rgb(palette::TEXT_PRIMARY))
+                                    .cursor_pointer()
+                            })
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                                    let url = this
+                                        .state
+                                        .lock()
+                                        .map(|g| g.server_url.clone())
+                                        .unwrap_or_default();
+                                    spawn_desktop_browser_login(Arc::clone(&this.state), url);
+                                    cx.notify();
+                                }),
+                            ),
+                    ),
+            )
+            // Right: Voice Config + Browser Login / Account Status
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .bg(rgb(palette::KEY_SURFACE))
+                            .border_1()
+                            .border_color(rgb(palette::KEY_BORDER))
+                            .text_xs()
+                            .text_color(rgb(palette::TEXT_MUTED))
+                            .child("⚙ 语音/模型")
+                            .hover(|s| {
+                                s.bg(rgb(palette::KEY_HOVER))
+                                    .text_color(rgb(palette::TEXT_PRIMARY))
+                                    .cursor_pointer()
+                            })
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                                    if let Ok(mut g) = this.state.lock() {
+                                        g.show_voice_modal = !g.show_voice_modal;
+                                        g.show_agent_pane = true;
+                                    }
+                                    cx.notify();
+                                }),
+                            ),
+                    )
+                    .child(if st.is_logged_in {
+                        div()
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .bg(rgb(palette::KEY_SURFACE))
+                            .border_1()
+                            .border_color(rgb(palette::EMERALD_WORKING))
+                            .text_xs()
+                            .text_color(rgb(palette::EMERALD_WORKING))
+                            .child(SharedString::from(format!("● {}", st.account_email)))
+                            .hover(|s| s.bg(rgb(palette::KEY_HOVER)).cursor_pointer())
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                                    if let Ok(mut g) = this.state.lock() {
+                                        g.center_tab = "mesh".into();
+                                        g.show_center_pane = true;
+                                    }
+                                    cx.notify();
+                                }),
+                            )
+                    } else {
+                        div()
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .bg(rgb(palette::KEY_SURFACE))
+                            .border_1()
+                            .border_color(rgb(palette::AMBER_WARN))
+                            .text_xs()
+                            .text_color(rgb(palette::AMBER_WARN))
+                            .child(SharedString::from(format!("🔑 浏览器登录 ({srv})")))
+                            .hover(|s| s.bg(rgb(palette::KEY_HOVER)).cursor_pointer())
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                                    let url = this
+                                        .state
+                                        .lock()
+                                        .map(|g| g.server_url.clone())
+                                        .unwrap_or_default();
+                                    spawn_desktop_browser_login(Arc::clone(&this.state), url);
+                                    cx.notify();
+                                }),
+                            )
+                    }),
+            )
+    }
+
+    fn render_secondary_view_bar(
+        &self,
+        st: &CodaDesktopState,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .h(px(32.0))
+            .w_full()
+            .bg(rgb(palette::SIDEBAR_BG))
+            .border_b_1()
+            .border_color(rgb(palette::DIVIDER))
+            .px_3()
+            .flex()
+            .items_center()
+            .justify_between()
+            // Left: Numbered View / Session Switcher
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .children(st.sessions.iter().enumerate().map(|(idx, sess)| {
+                        let addr = sess.address.clone();
+                        let is_active = addr == st.active_terminal_addr;
+                        let label = format!("{}  {}", idx + 1, sess.repo_name);
+                        div()
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .bg(if is_active {
+                                rgb(palette::KEY_HOVER)
+                            } else {
+                                rgb(palette::SIDEBAR_BG)
+                            })
+                            .border_1()
+                            .border_color(if is_active {
+                                rgb(palette::KEY_BORDER)
+                            } else {
+                                rgb(palette::SIDEBAR_BG)
+                            })
+                            .text_xs()
+                            .text_color(if is_active {
+                                rgb(palette::TEXT_PRIMARY)
+                            } else {
+                                rgb(palette::TEXT_MUTED)
+                            })
+                            .child(SharedString::from(label))
+                            .hover(|s| {
+                                s.bg(rgb(palette::KEY_SURFACE))
+                                    .text_color(rgb(palette::TEXT_PRIMARY))
+                                    .cursor_pointer()
+                            })
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(move |this, _: &MouseUpEvent, _, cx| {
+                                    if let Ok(mut g) = this.state.lock() {
+                                        g.active_terminal_addr = addr.clone();
+                                    }
+                                    cx.notify();
+                                }),
+                            )
+                    }))
+                    .child(
+                        div()
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .text_xs()
+                            .text_color(rgb(palette::TEXT_MUTED))
+                            .child("+ 新建终端")
+                            .hover(|s| {
+                                s.bg(rgb(palette::KEY_SURFACE))
+                                    .text_color(rgb(palette::TEXT_PRIMARY))
+                                    .cursor_pointer()
+                            })
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                                    if let Ok(mut g) = this.state.lock() {
+                                        g.spawn_new_session();
+                                    }
+                                    cx.notify();
+                                }),
+                            ),
+                    ),
+            )
+            // Right: Split Layout Toggles (`Projects` | `Preview` | `Agent`)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        div()
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .bg(if st.show_sidebar {
+                                rgb(palette::KEY_HOVER)
+                            } else {
+                                rgb(palette::SIDEBAR_BG)
+                            })
+                            .border_1()
+                            .border_color(rgb(palette::KEY_BORDER))
+                            .text_xs()
+                            .text_color(if st.show_sidebar {
+                                rgb(palette::TEXT_PRIMARY)
+                            } else {
+                                rgb(palette::TEXT_FAINT)
+                            })
+                            .child("◧ Projects")
+                            .hover(|s| s.cursor_pointer())
                             .on_mouse_up(
                                 MouseButton::Left,
                                 cx.listener(|this, _: &MouseUpEvent, _, cx| {
@@ -1711,94 +1350,29 @@ impl CodaGpuWorkspaceView {
                     )
                     .child(
                         div()
-                            .w(px(38.0))
-                            .py_2()
-                            .rounded_full()
-                            .bg(rgb(palette::KEY_SURFACE))
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .bg(if st.show_center_pane {
+                                rgb(palette::KEY_HOVER)
+                            } else {
+                                rgb(palette::SIDEBAR_BG)
+                            })
                             .border_1()
                             .border_color(rgb(palette::KEY_BORDER))
-                            .flex()
-                            .flex_col()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(rgb(palette::TEXT_PRIMARY))
-                                    .child("+")
-                                    .hover(|s| s.cursor_pointer())
-                                    .on_mouse_up(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _: &MouseUpEvent, _, cx| {
-                                            if let Ok(mut g) = this.state.lock() {
-                                                let next_idx = g.sessions.len() + 1;
-                                                let addr = format!("t{next_idx}");
-                                                g.sessions.insert(
-                                                    0,
-                                                    DesktopTerminalSession {
-                                                        address: addr.clone(),
-                                                        title: format!("Claude Code 终端会话 #{next_idx}"),
-                                                        repo_name: "coda".into(),
-                                                        branch_name: "main".into(),
-                                                        machine_name: "Home".into(),
-                                                        model_badge: "Opus 5.5".into(),
-                                                        status_label: "1 个终端运行中".into(),
-                                                        is_done: false,
-                                                        diff_added: 42,
-                                                        diff_deleted: 4,
-                                                        screen_text: format!(
-                                                            "● Spawned herdr-core agent terminal `{addr}` via Coda GPUI Desktop"
-                                                        ),
-                                                    },
-                                                );
-                                                g.active_terminal_addr = addr;
-                                            }
-                                            cx.notify();
-                                        }),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(palette::TEXT_MUTED))
-                                    .child("•••")
-                                    .hover(|s| s.cursor_pointer())
-                                    .on_mouse_up(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _: &MouseUpEvent, _, cx| {
-                                            if let Ok(mut g) = this.state.lock() {
-                                                g.show_voice_modal = !g.show_voice_modal;
-                                            }
-                                            cx.notify();
-                                        }),
-                                    ),
-                            ),
-                    ),
-            )
-            // Bottom `[ 📎 / 📋 ]` Capsule (`hc terminal.put` upload + Clipboard paste)
-            .child(
-                div()
-                    .w(px(38.0))
-                    .py_2()
-                    .rounded_full()
-                    .bg(rgb(palette::KEY_SURFACE))
-                    .border_1()
-                    .border_color(rgb(palette::KEY_BORDER))
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(rgb(palette::TEXT_PRIMARY))
-                            .child("📎")
+                            .text_xs()
+                            .text_color(if st.show_center_pane {
+                                rgb(palette::TEXT_PRIMARY)
+                            } else {
+                                rgb(palette::TEXT_FAINT)
+                            })
+                            .child("▣ Preview")
                             .hover(|s| s.cursor_pointer())
                             .on_mouse_up(
                                 MouseButton::Left,
                                 cx.listener(|this, _: &MouseUpEvent, _, cx| {
                                     if let Ok(mut g) = this.state.lock() {
-                                        g.trigger_attachment_upload();
+                                        g.show_center_pane = !g.show_center_pane;
                                     }
                                     cx.notify();
                                 }),
@@ -1806,49 +1380,1550 @@ impl CodaGpuWorkspaceView {
                     )
                     .child(
                         div()
-                            .text_sm()
-                            .text_color(rgb(palette::TEXT_PRIMARY))
-                            .child("📋")
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .bg(if st.show_agent_pane {
+                                rgb(palette::KEY_HOVER)
+                            } else {
+                                rgb(palette::SIDEBAR_BG)
+                            })
+                            .border_1()
+                            .border_color(rgb(palette::KEY_BORDER))
+                            .text_xs()
+                            .text_color(if st.show_agent_pane {
+                                rgb(palette::TEXT_PRIMARY)
+                            } else {
+                                rgb(palette::TEXT_FAINT)
+                            })
+                            .child("◨ Agent")
                             .hover(|s| s.cursor_pointer())
                             .on_mouse_up(
                                 MouseButton::Left,
                                 cx.listener(|this, _: &MouseUpEvent, _, cx| {
-                                    if let Some(item) = cx.read_from_clipboard() {
-                                        if let Some(txt) = item.text() {
-                                            let trimmed = txt.trim();
-                                            if let Ok(mut g) = this.state.lock() {
-                                                if !g.is_logged_in
-                                                    && (trimmed.starts_with("http://")
-                                                        || trimmed.starts_with("https://"))
-                                                {
-                                                    g.server_url =
-                                                        trimmed.trim_end_matches('/').to_string();
-                                                    g.status_banner = Some(format!(
-                                                        "✓ 已更新服务器地址为 {}",
-                                                        g.server_url
-                                                    ));
-                                                } else {
-                                                    g.draft_input.push_str(&txt);
-                                                }
-                                            }
-                                            cx.notify();
-                                        }
-                                    } else {
-                                        let cmd = this
-                                            .state
-                                            .lock()
-                                            .map(|g| {
-                                                format!("coda-daemon login --server {}", g.server_url)
-                                            })
-                                            .unwrap_or_else(|_| {
-                                                "coda-daemon login --server https://codahub.dev"
-                                                    .into()
-                                            });
-                                        cx.write_to_clipboard(ClipboardItem::new_string(cmd));
+                                    if let Ok(mut g) = this.state.lock() {
+                                        g.show_agent_pane = !g.show_agent_pane;
                                     }
+                                    cx.notify();
                                 }),
                             ),
                     ),
+            )
+    }
+
+    fn render_left_projects_sidebar(
+        &self,
+        st: &CodaDesktopState,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let total_branches: usize = st.repos.iter().map(|r| r.branches.len()).sum();
+
+        div()
+            .w(px(264.0))
+            .h_full()
+            .bg(rgb(palette::SIDEBAR_BG))
+            .border_r_1()
+            .border_color(rgb(palette::DIVIDER))
+            .flex()
+            .flex_col()
+            // Sidebar Header: `PROJECTS <count>` + `[↻ Sync]` + `[+]`
+            .child(
+                div()
+                    .h(px(36.0))
+                    .px_3()
+                    .border_b_1()
+                    .border_color(rgb(palette::DIVIDER))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(palette::TEXT_MUTED))
+                                    .child("PROJECTS"),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(palette::TEXT_FAINT))
+                                    .child(SharedString::from(format!("{total_branches}"))),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_md()
+                                    .text_xs()
+                                    .text_color(rgb(palette::TEXT_MUTED))
+                                    .child("↻")
+                                    .hover(|s| {
+                                        s.bg(rgb(palette::KEY_HOVER))
+                                            .text_color(rgb(palette::TEXT_PRIMARY))
+                                            .cursor_pointer()
+                                    })
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                                            spawn_background_herdr_sync(Arc::clone(&this.state));
+                                            cx.notify();
+                                        }),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_md()
+                                    .bg(rgb(palette::CORAL_AGENT))
+                                    .text_xs()
+                                    .text_color(white())
+                                    .child("+")
+                                    .hover(|s| s.cursor_pointer())
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                                            if let Ok(mut g) = this.state.lock() {
+                                                g.spawn_new_session();
+                                            }
+                                            cx.notify();
+                                        }),
+                                    ),
+                            ),
+                    ),
+            )
+            // Scrollable Project Tree (`SERVICES`, `AGENTS`, `ACTIONS`)
+            .child(
+                div()
+                    .id("sidebar-scroll")
+                    .flex_1()
+                    .overflow_scroll()
+                    .p_2()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .children(st.repos.iter().map(|repo| {
+                        let repo_name = repo.repo_name.clone();
+                        let is_expanded = st.expanded_repo == repo_name;
+                        let chevron = if is_expanded { "▾" } else { "▸" };
+                        let branch_count = repo.branches.len();
+                        let short_path = repo
+                            .root_path
+                            .rsplit('/')
+                            .take(2)
+                            .collect::<Vec<_>>()
+                            .into_iter()
+                            .rev()
+                            .collect::<Vec<_>>()
+                            .join("/");
+
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            // Project Row
+                            .child(
+                                div()
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_md()
+                                    .bg(if is_expanded {
+                                        rgba(0xffffff0a)
+                                    } else {
+                                        rgba(0x00000000)
+                                    })
+                                    .hover(|s| s.bg(rgba(0xffffff10)).cursor_pointer())
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _: &MouseUpEvent, _, cx| {
+                                            if let Ok(mut g) = this.state.lock() {
+                                                if g.expanded_repo == repo_name {
+                                                    g.expanded_repo.clear();
+                                                } else {
+                                                    g.expanded_repo = repo_name.clone();
+                                                }
+                                            }
+                                            cx.notify();
+                                        }),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap_1()
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(rgb(palette::TEXT_FAINT))
+                                                    .child(chevron),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_sm()
+                                                    .text_color(rgb(palette::TEXT_PRIMARY))
+                                                    .child(SharedString::from(repo.repo_name.clone())),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(rgb(palette::TEXT_FAINT))
+                                                    .child(SharedString::from(format!(" {short_path}"))),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(rgb(palette::EMERALD_WORKING))
+                                            .child(SharedString::from(format!("{branch_count}/{branch_count}"))),
+                                    ),
+                            )
+                            // Expanded Sections: SERVICES, AGENTS, ACTIONS
+                            .when(is_expanded, |el| {
+                                el.child(
+                                    div()
+                                        .pl_3()
+                                        .flex()
+                                        .flex_col()
+                                        .gap_2()
+                                        // SERVICES
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .flex_col()
+                                                .gap_1()
+                                                .child(
+                                                    div()
+                                                        .px_2()
+                                                        .text_xs()
+                                                        .text_color(rgb(palette::TEXT_FAINT))
+                                                        .child("SERVICES"),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .px_2()
+                                                        .py_1()
+                                                        .rounded_md()
+                                                        .flex()
+                                                        .items_center()
+                                                        .justify_between()
+                                                        .hover(|s| s.bg(rgba(0xffffff0a)).cursor_pointer())
+                                                        .child(
+                                                            div()
+                                                                .flex()
+                                                                .items_center()
+                                                                .gap_2()
+                                                                .child(
+                                                                    div()
+                                                                        .size(px(7.0))
+                                                                        .rounded_full()
+                                                                        .bg(rgb(palette::EMERALD_WORKING)),
+                                                                )
+                                                                .child(
+                                                                    div()
+                                                                        .text_xs()
+                                                                        .text_color(rgb(palette::TEXT_PRIMARY))
+                                                                        .child("herdr-core daemon"),
+                                                                ),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .text_xs()
+                                                                .text_color(rgb(palette::TEXT_FAINT))
+                                                                .child("live"),
+                                                        ),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .px_2()
+                                                        .py_1()
+                                                        .rounded_md()
+                                                        .flex()
+                                                        .items_center()
+                                                        .justify_between()
+                                                        .hover(|s| s.bg(rgba(0xffffff0a)).cursor_pointer())
+                                                        .on_mouse_up(
+                                                            MouseButton::Left,
+                                                            cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                                                                if let Ok(mut g) = this.state.lock() {
+                                                                    g.center_tab = "mesh".into();
+                                                                    g.show_center_pane = true;
+                                                                }
+                                                                cx.notify();
+                                                            }),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .flex()
+                                                                .items_center()
+                                                                .gap_2()
+                                                                .child(
+                                                                    div()
+                                                                        .size(px(7.0))
+                                                                        .rounded_full()
+                                                                        .bg(rgb(palette::EMERALD_WORKING)),
+                                                                )
+                                                                .child(
+                                                                    div()
+                                                                        .text_xs()
+                                                                        .text_color(rgb(palette::TEXT_PRIMARY))
+                                                                        .child("codahub.dev tunnel"),
+                                                                ),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .text_xs()
+                                                                .text_color(rgb(palette::SKY_DONE))
+                                                                .child("E2EE"),
+                                                        ),
+                                                ),
+                                        )
+                                        // AGENTS
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .flex_col()
+                                                .gap_1()
+                                                .child(
+                                                    div()
+                                                        .px_2()
+                                                        .text_xs()
+                                                        .text_color(rgb(palette::TEXT_FAINT))
+                                                        .child("AGENTS"),
+                                                )
+                                                .children(st.sessions.iter().map(|sess| {
+                                                    let addr = sess.address.clone();
+                                                    let is_sel = addr == st.active_terminal_addr;
+                                                    let dot_color = if sess.is_done {
+                                                        palette::SKY_DONE
+                                                    } else {
+                                                        palette::EMERALD_WORKING
+                                                    };
+                                                    div()
+                                                        .px_2()
+                                                        .py_1()
+                                                        .rounded_md()
+                                                        .bg(if is_sel {
+                                                            rgb(palette::KEY_HOVER)
+                                                        } else {
+                                                            rgb(palette::SIDEBAR_BG)
+                                                        })
+                                                        .border_1()
+                                                        .border_color(if is_sel {
+                                                            rgb(palette::KEY_BORDER)
+                                                        } else {
+                                                            rgb(palette::SIDEBAR_BG)
+                                                        })
+                                                        .hover(|s| s.bg(rgb(palette::KEY_SURFACE)).cursor_pointer())
+                                                        .on_mouse_up(
+                                                            MouseButton::Left,
+                                                            cx.listener(move |this, _: &MouseUpEvent, _, cx| {
+                                                                if let Ok(mut g) = this.state.lock() {
+                                                                    g.active_terminal_addr = addr.clone();
+                                                                    g.show_agent_pane = true;
+                                                                }
+                                                                cx.notify();
+                                                            }),
+                                                        )
+                                                        .flex()
+                                                        .items_center()
+                                                        .justify_between()
+                                                        .child(
+                                                            div()
+                                                                .flex()
+                                                                .items_center()
+                                                                .gap_2()
+                                                                .child(
+                                                                    div()
+                                                                        .size(px(7.0))
+                                                                        .rounded_full()
+                                                                        .bg(rgb(dot_color)),
+                                                                )
+                                                                .child(
+                                                                    div()
+                                                                        .flex()
+                                                                        .flex_col()
+                                                                        .child(
+                                                                            div()
+                                                                                .text_xs()
+                                                                                .text_color(rgb(palette::TEXT_PRIMARY))
+                                                                                .child(SharedString::from(sess.title.clone())),
+                                                                        )
+                                                                        .child(
+                                                                            div()
+                                                                                .text_xs()
+                                                                                .text_color(rgb(palette::TEXT_FAINT))
+                                                                                .child(SharedString::from(format!(
+                                                                                    "{} · {}",
+                                                                                    sess.branch_name, sess.machine_name
+                                                                                ))),
+                                                                        ),
+                                                                ),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .text_xs()
+                                                                .text_color(rgb(palette::EMERALD_WORKING))
+                                                                .child(SharedString::from(format!(
+                                                                    "+{}",
+                                                                    sess.diff_added
+                                                                ))),
+                                                        )
+                                                })),
+                                        )
+                                        // ACTIONS
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .flex_col()
+                                                .gap_1()
+                                                .child(
+                                                    div()
+                                                        .px_2()
+                                                        .text_xs()
+                                                        .text_color(rgb(palette::TEXT_FAINT))
+                                                        .child("ACTIONS"),
+                                                )
+                                                .children(
+                                                    [
+                                                        ("cargo test --workspace", "cargo test --workspace"),
+                                                        ("git status -sb", "git status -sb"),
+                                                        ("coda-daemon status", "coda-daemon status"),
+                                                        ("/clear", "/clear"),
+                                                    ]
+                                                    .into_iter()
+                                                    .map(|(label, cmd)| {
+                                                        div()
+                                                            .px_2()
+                                                            .py_1()
+                                                            .rounded_md()
+                                                            .flex()
+                                                            .items_center()
+                                                            .gap_2()
+                                                            .text_xs()
+                                                            .text_color(rgb(palette::TEXT_MUTED))
+                                                            .hover(|s| {
+                                                                s.bg(rgb(palette::KEY_SURFACE))
+                                                                    .text_color(rgb(palette::TEXT_PRIMARY))
+                                                                    .cursor_pointer()
+                                                            })
+                                                            .child(
+                                                                div()
+                                                                    .text_color(rgb(palette::AMBER_WARN))
+                                                                    .child("▸"),
+                                                            )
+                                                            .child(label)
+                                                            .on_mouse_up(
+                                                                MouseButton::Left,
+                                                                cx.listener(move |this, _: &MouseUpEvent, _, cx| {
+                                                                    if let Ok(mut g) = this.state.lock() {
+                                                                        g.run_quick_action(cmd);
+                                                                    }
+                                                                    cx.notify();
+                                                                }),
+                                                            )
+                                                    }),
+                                                ),
+                                        ),
+                                )
+                            })
+                    })),
+            )
+    }
+
+    fn render_center_inspector_pane(
+        &self,
+        st: &CodaDesktopState,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let active = st.active_session().clone();
+        let tab = st.center_tab.as_str();
+        let url_open = st.server_url.clone();
+
+        div()
+            .flex_1()
+            .h_full()
+            .bg(rgb(palette::CENTER_BG))
+            .border_r_1()
+            .border_color(rgb(palette::DIVIDER))
+            .flex()
+            .flex_col()
+            // Top Address / Inspector Mode Toolbar
+            .child(
+                div()
+                    .h(px(36.0))
+                    .px_3()
+                    .bg(rgb(palette::SIDEBAR_BG))
+                    .border_b_1()
+                    .border_color(rgb(palette::DIVIDER))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_md()
+                                    .bg(rgb(palette::KEY_SURFACE))
+                                    .border_1()
+                                    .border_color(rgb(palette::EMERALD_WORKING))
+                                    .text_xs()
+                                    .text_color(rgb(palette::EMERALD_WORKING))
+                                    .child("dev"),
+                            )
+                            .child(
+                                div()
+                                    .px_3()
+                                    .py_1()
+                                    .rounded_md()
+                                    .bg(rgb(palette::CENTER_BG))
+                                    .border_1()
+                                    .border_color(rgb(palette::KEY_BORDER))
+                                    .text_xs()
+                                    .text_color(rgb(palette::TEXT_PRIMARY))
+                                    .child(SharedString::from(format!(
+                                        "{}/{}",
+                                        st.server_url, active.repo_name
+                                    ))),
+                            )
+                            .child(
+                                div()
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_md()
+                                    .text_xs()
+                                    .text_color(rgb(palette::TEXT_MUTED))
+                                    .child("↗ 浏览器")
+                                    .hover(|s| {
+                                        s.bg(rgb(palette::KEY_HOVER))
+                                            .text_color(rgb(palette::TEXT_PRIMARY))
+                                            .cursor_pointer()
+                                    })
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(move |_, _: &MouseUpEvent, _, _| {
+                                            open_browser_url(&url_open);
+                                        }),
+                                    ),
+                            ),
+                    )
+                    // Mode Tabs: Preview | Worktrees & Diff | Mesh & Voice
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .children(
+                                [
+                                    ("preview", "Preview"),
+                                    ("worktrees", "Worktrees & Diff"),
+                                    ("mesh", "Mesh & Voice"),
+                                ]
+                                .into_iter()
+                                .map(|(key, label)| {
+                                    let is_cur = tab == key;
+                                    div()
+                                        .px_2()
+                                        .py_1()
+                                        .rounded_md()
+                                        .bg(if is_cur {
+                                            rgb(palette::KEY_HOVER)
+                                        } else {
+                                            rgb(palette::SIDEBAR_BG)
+                                        })
+                                        .border_1()
+                                        .border_color(if is_cur {
+                                            rgb(palette::KEY_BORDER)
+                                        } else {
+                                            rgb(palette::SIDEBAR_BG)
+                                        })
+                                        .text_xs()
+                                        .text_color(if is_cur {
+                                            rgb(palette::TEXT_PRIMARY)
+                                        } else {
+                                            rgb(palette::TEXT_MUTED)
+                                        })
+                                        .child(label)
+                                        .hover(|s| s.cursor_pointer())
+                                        .on_mouse_up(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _: &MouseUpEvent, _, cx| {
+                                                if let Ok(mut g) = this.state.lock() {
+                                                    g.center_tab = key.to_string();
+                                                }
+                                                cx.notify();
+                                            }),
+                                        )
+                                }),
+                            ),
+                    ),
+            )
+            // Center Body Viewport
+            .child(
+                div()
+                    .id("center-scroll")
+                    .flex_1()
+                    .overflow_scroll()
+                    .p_5()
+                    .flex()
+                    .flex_col()
+                    .gap_4()
+                    .when_some(st.pending_login_code.clone(), |el, code| {
+                        let auth_url = st.pending_login_url.clone().unwrap_or_default();
+                        let auth_url_click = auth_url.clone();
+                        el.child(
+                            div()
+                                .p_4()
+                                .rounded_xl()
+                                .bg(rgb(palette::KEY_SURFACE))
+                                .border_1()
+                                .border_color(rgb(palette::SKY_DONE))
+                                .flex()
+                                .flex_col()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(rgb(palette::SKY_DONE))
+                                        .child("🔑 RFC 8628 浏览器设备授权等待确认中"),
+                                )
+                                .child(
+                                    div()
+                                        .text_base()
+                                        .text_color(rgb(palette::TEXT_PRIMARY))
+                                        .child(SharedString::from(format!("授权码：{code}"))),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(palette::TEXT_MUTED))
+                                        .child(SharedString::from(auth_url)),
+                                )
+                                .child(
+                                    div()
+                                        .px_3()
+                                        .py_1()
+                                        .rounded_md()
+                                        .bg(rgb(palette::SKY_DONE))
+                                        .text_xs()
+                                        .text_color(rgb(palette::OLED_BLACK))
+                                        .child("重新打开浏览器授权页面 →")
+                                        .hover(|s| s.cursor_pointer())
+                                        .on_mouse_up(
+                                            MouseButton::Left,
+                                            cx.listener(move |_, _: &MouseUpEvent, _, _| {
+                                                if !auth_url_click.is_empty() {
+                                                    open_browser_url(&auth_url_click);
+                                                }
+                                            }),
+                                        ),
+                                ),
+                        )
+                    })
+                    .when(tab == "preview", |el| {
+                        el.child(
+                            div()
+                                .p_5()
+                                .rounded_xl()
+                                .bg(rgb(palette::SIDEBAR_BG))
+                                .border_1()
+                                .border_color(rgb(palette::KEY_BORDER))
+                                .flex()
+                                .flex_col()
+                                .gap_3()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(palette::AMBER_WARN))
+                                        .child("ZERO-KNOWLEDGE WORKSPACE INSPECTOR"),
+                                )
+                                .child(
+                                    div()
+                                        .text_base()
+                                        .text_color(rgb(palette::TEXT_PRIMARY))
+                                        .child("同一账号下，控制远端 Linux / Mac / iOS 全端写入与调试"),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(palette::TEXT_MUTED))
+                                        .child(SharedString::from(format!(
+                                            "当前选中工作区：{} ({}) · 主机：{}\n端到端通道：{} · 控制面：{}",
+                                            active.repo_name,
+                                            active.branch_name,
+                                            active.machine_name,
+                                            st.connected_route,
+                                            st.server_url
+                                        ))),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .gap_3()
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .p_4()
+                                        .rounded_xl()
+                                        .bg(rgb(palette::SIDEBAR_BG))
+                                        .border_1()
+                                        .border_color(rgb(palette::KEY_BORDER))
+                                        .flex()
+                                        .flex_col()
+                                        .gap_1()
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(rgb(palette::EMERALD_WORKING))
+                                                .child("● Herdr Core PTY"),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_sm()
+                                                .text_color(rgb(palette::TEXT_PRIMARY))
+                                                .child(SharedString::from(format!(
+                                                    "{} 个活跃 Agent 会话",
+                                                    st.sessions.len()
+                                                ))),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(rgb(palette::TEXT_FAINT))
+                                                .child("关闭窗口或切换分支也不会丢失远端终端进度"),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .p_4()
+                                        .rounded_xl()
+                                        .bg(rgb(palette::SIDEBAR_BG))
+                                        .border_1()
+                                        .border_color(rgb(palette::KEY_BORDER))
+                                        .flex()
+                                        .flex_col()
+                                        .gap_1()
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(rgb(palette::SKY_DONE))
+                                                .child("⚡ SmartPath Mesh"),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_sm()
+                                                .text_color(rgb(palette::TEXT_PRIMARY))
+                                                .child(SharedString::from(format!(
+                                                    "{} 台在线/已配对节点",
+                                                    st.remote_hosts.len() + 1
+                                                ))),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(rgb(palette::TEXT_FAINT))
+                                                .child("同 Wi-Fi 自动走 LAN P2P (<1ms)，跨网走 CF WSS"),
+                                        ),
+                                ),
+                        )
+                    })
+                    .when(tab == "worktrees" || tab == "preview", |el| {
+                        el.child(
+                            div()
+                                .p_4()
+                                .rounded_xl()
+                                .bg(rgb(palette::SIDEBAR_BG))
+                                .border_1()
+                                .border_color(rgb(palette::KEY_BORDER))
+                                .flex()
+                                .flex_col()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .justify_between()
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(rgb(palette::TEXT_MUTED))
+                                                .child("GIT WORKTREES & DIFF STATS"),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(rgb(palette::TEXT_FAINT))
+                                                .child(SharedString::from(format!(
+                                                    "{} repositories",
+                                                    st.repos.len()
+                                                ))),
+                                        ),
+                                )
+                                .children(st.repos.iter().map(|repo| {
+                                    div()
+                                        .p_3()
+                                        .rounded_lg()
+                                        .bg(rgb(palette::CENTER_BG))
+                                        .border_1()
+                                        .border_color(rgb(palette::DIVIDER))
+                                        .flex()
+                                        .flex_col()
+                                        .gap_2()
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .items_center()
+                                                .justify_between()
+                                                .child(
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(rgb(palette::TEXT_PRIMARY))
+                                                        .child(SharedString::from(format!(
+                                                            "{}  ({})",
+                                                            repo.repo_name, repo.root_path
+                                                        ))),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(rgb(palette::TEXT_FAINT))
+                                                        .child(SharedString::from(
+                                                            repo.machine_name.clone(),
+                                                        )),
+                                                ),
+                                        )
+                                        .children(repo.branches.iter().map(|br| {
+                                            div()
+                                                .flex()
+                                                .items_center()
+                                                .justify_between()
+                                                .text_xs()
+                                                .child(
+                                                    div()
+                                                        .text_color(rgb(palette::SKY_DONE))
+                                                        .child(SharedString::from(format!(
+                                                            "  ⎇ {} · {}",
+                                                            br.branch, br.status_summary
+                                                        ))),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .flex()
+                                                        .gap_2()
+                                                        .child(
+                                                            div()
+                                                                .text_color(rgb(
+                                                                    palette::EMERALD_WORKING,
+                                                                ))
+                                                                .child(SharedString::from(format!(
+                                                                    "+{}",
+                                                                    br.diff_added
+                                                                ))),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .text_color(rgb(
+                                                                    palette::ROSE_DIFF_DEL,
+                                                                ))
+                                                                .child(SharedString::from(format!(
+                                                                    "-{}",
+                                                                    br.diff_deleted
+                                                                ))),
+                                                        ),
+                                                )
+                                        }))
+                                })),
+                        )
+                    })
+                    .when(tab == "mesh", |el| {
+                        el.child(
+                            div()
+                                .p_4()
+                                .rounded_xl()
+                                .bg(rgb(palette::SIDEBAR_BG))
+                                .border_1()
+                                .border_color(rgb(palette::KEY_BORDER))
+                                .flex()
+                                .flex_col()
+                                .gap_3()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(palette::TEXT_MUTED))
+                                        .child("🎙 VOICE MODEL & CRYPTOGRAPHIC TUNNEL"),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(palette::TEXT_PRIMARY))
+                                        .child(SharedString::from(format!(
+                                            "Provider: {} · Model: {} · Endpoint: {}",
+                                            st.voice_config.provider,
+                                            st.voice_config.model,
+                                            st.voice_config.base_url
+                                        ))),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .gap_2()
+                                        .child(
+                                            div()
+                                                .px_3()
+                                                .py_1()
+                                                .rounded_md()
+                                                .bg(rgb(palette::KEY_SURFACE))
+                                                .border_1()
+                                                .border_color(rgb(palette::KEY_BORDER))
+                                                .text_xs()
+                                                .text_color(rgb(palette::TEXT_PRIMARY))
+                                                .child("OpenAI Transcribe")
+                                                .hover(|s| s.bg(rgb(palette::KEY_HOVER)).cursor_pointer())
+                                                .on_mouse_up(
+                                                    MouseButton::Left,
+                                                    cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                                                        if let Ok(mut g) = this.state.lock() {
+                                                            g.apply_voice_preset("openai");
+                                                        }
+                                                        cx.notify();
+                                                    }),
+                                                ),
+                                        )
+                                        .child(
+                                            div()
+                                                .px_3()
+                                                .py_1()
+                                                .rounded_md()
+                                                .bg(rgb(palette::KEY_SURFACE))
+                                                .border_1()
+                                                .border_color(rgb(palette::KEY_BORDER))
+                                                .text_xs()
+                                                .text_color(rgb(palette::SKY_DONE))
+                                                .child("Groq Whisper-v3-Turbo")
+                                                .hover(|s| s.bg(rgb(palette::KEY_HOVER)).cursor_pointer())
+                                                .on_mouse_up(
+                                                    MouseButton::Left,
+                                                    cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                                                        if let Ok(mut g) = this.state.lock() {
+                                                            g.apply_voice_preset("groq");
+                                                        }
+                                                        cx.notify();
+                                                    }),
+                                                ),
+                                        )
+                                        .child(
+                                            div()
+                                                .px_3()
+                                                .py_1()
+                                                .rounded_md()
+                                                .bg(rgb(palette::KEY_SURFACE))
+                                                .border_1()
+                                                .border_color(rgb(palette::KEY_BORDER))
+                                                .text_xs()
+                                                .text_color(rgb(palette::CORAL_AGENT))
+                                                .child("DeepSeek Voice")
+                                                .hover(|s| s.bg(rgb(palette::KEY_HOVER)).cursor_pointer())
+                                                .on_mouse_up(
+                                                    MouseButton::Left,
+                                                    cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                                                        if let Ok(mut g) = this.state.lock() {
+                                                            g.apply_voice_preset("deepseek");
+                                                        }
+                                                        cx.notify();
+                                                    }),
+                                                ),
+                                        ),
+                                ),
+                        )
+                    }),
+            )
+            // Bottom Breadcrumb
+            .child(
+                div()
+                    .h(px(26.0))
+                    .px_3()
+                    .bg(rgb(palette::SIDEBAR_BG))
+                    .border_t_1()
+                    .border_color(rgb(palette::DIVIDER))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .text_xs()
+                            .text_color(rgb(palette::TEXT_MUTED))
+                            .child(div().size(px(6.0)).rounded_full().bg(rgb(palette::EMERALD_WORKING)))
+                            .child(SharedString::from(format!(
+                                "{} / {} · {}",
+                                active.repo_name, active.branch_name, active.machine_name
+                            ))),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .text_xs()
+                            .child(
+                                div()
+                                    .text_color(rgb(palette::EMERALD_WORKING))
+                                    .child(SharedString::from(format!("+{}", active.diff_added))),
+                            )
+                            .child(
+                                div()
+                                    .text_color(rgb(palette::ROSE_DIFF_DEL))
+                                    .child(SharedString::from(format!("-{}", active.diff_deleted))),
+                            ),
+                    ),
+            )
+    }
+
+    fn render_right_agent_pane(
+        &self,
+        st: &CodaDesktopState,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let active = st.active_session().clone();
+        let draft_display = if st.draft_input.is_empty() {
+            "输入指令或 Prompt 发送给远端 Agent... (Enter 发送)".to_string()
+        } else {
+            format!("{}▏", st.draft_input)
+        };
+        let draft_color = if st.draft_input.is_empty() {
+            palette::TEXT_FAINT
+        } else {
+            palette::TEXT_PRIMARY
+        };
+        let mode_label = if st.bypass_permissions {
+            "⇄ bypass permissions on"
+        } else {
+            "⇄ plan mode (review)"
+        };
+
+        let pane = if st.show_center_pane {
+            div().w(px(470.0))
+        } else {
+            div().flex_1()
+        };
+
+        pane.h_full()
+            .bg(rgb(palette::AGENT_BG))
+            .flex()
+            .flex_col()
+            // 1. Agent Pane Header
+            .child(
+                div()
+                    .h(px(36.0))
+                    .px_3()
+                    .border_b_1()
+                    .border_color(rgb(palette::DIVIDER))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .size(px(7.0))
+                                    .rounded_full()
+                                    .bg(rgb(if active.is_done {
+                                        palette::SKY_DONE
+                                    } else {
+                                        palette::EMERALD_WORKING
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(rgb(palette::TEXT_PRIMARY))
+                                    .child(SharedString::from(active.title.clone())),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_md()
+                                    .bg(rgb(palette::KEY_SURFACE))
+                                    .text_xs()
+                                    .text_color(rgb(palette::TEXT_MUTED))
+                                    .child(SharedString::from(active.model_badge.clone())),
+                            )
+                            .child(
+                                div()
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_md()
+                                    .bg(rgb(palette::KEY_SURFACE))
+                                    .border_1()
+                                    .border_color(rgb(palette::KEY_BORDER))
+                                    .text_xs()
+                                    .text_color(rgb(palette::CORAL_AGENT))
+                                    .child("^C")
+                                    .hover(|s| s.bg(rgb(palette::KEY_HOVER)).cursor_pointer())
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                                            if let Ok(mut g) = this.state.lock() {
+                                                g.handle_tactile_key("ctrl_c");
+                                            }
+                                            cx.notify();
+                                        }),
+                                    ),
+                            ),
+                    ),
+            )
+            // 2. Scrollable Dense Monospace Stream
+            .child(
+                div()
+                    .id("terminal-viewport")
+                    .flex_1()
+                    .overflow_scroll()
+                    .px_4()
+                    .py_3()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .when_some(st.status_banner.clone(), |el, banner| {
+                        el.child(
+                            div()
+                                .px_3()
+                                .py_1()
+                                .mb_2()
+                                .rounded_md()
+                                .bg(rgb(palette::KEY_SURFACE))
+                                .border_1()
+                                .border_color(rgb(palette::EMERALD_WORKING))
+                                .text_xs()
+                                .text_color(rgb(palette::EMERALD_WORKING))
+                                .child(SharedString::from(banner)),
+                        )
+                    })
+                    .when(st.show_voice_modal, |el| {
+                        el.child(
+                            div()
+                                .p_3()
+                                .mb_2()
+                                .rounded_lg()
+                                .bg(rgb(palette::KEY_SURFACE))
+                                .border_1()
+                                .border_color(rgb(palette::KEY_BORDER))
+                                .flex()
+                                .flex_col()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(palette::TEXT_PRIMARY))
+                                        .child(SharedString::from(format!(
+                                            "🎙 语音模型: {} · {} ({})",
+                                            st.voice_config.provider,
+                                            st.voice_config.model,
+                                            st.voice_config.base_url
+                                        ))),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .gap_2()
+                                        .child(
+                                            div()
+                                                .px_2()
+                                                .py_1()
+                                                .rounded_md()
+                                                .bg(rgb(palette::SIDEBAR_BG))
+                                                .border_1()
+                                                .border_color(rgb(palette::KEY_BORDER))
+                                                .text_xs()
+                                                .text_color(rgb(palette::TEXT_PRIMARY))
+                                                .child("OpenAI")
+                                                .hover(|s| s.bg(rgb(palette::KEY_HOVER)).cursor_pointer())
+                                                .on_mouse_up(
+                                                    MouseButton::Left,
+                                                    cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                                                        if let Ok(mut g) = this.state.lock() {
+                                                            g.apply_voice_preset("openai");
+                                                        }
+                                                        cx.notify();
+                                                    }),
+                                                ),
+                                        )
+                                        .child(
+                                            div()
+                                                .px_2()
+                                                .py_1()
+                                                .rounded_md()
+                                                .bg(rgb(palette::SIDEBAR_BG))
+                                                .border_1()
+                                                .border_color(rgb(palette::KEY_BORDER))
+                                                .text_xs()
+                                                .text_color(rgb(palette::SKY_DONE))
+                                                .child("Groq Whisper")
+                                                .hover(|s| s.bg(rgb(palette::KEY_HOVER)).cursor_pointer())
+                                                .on_mouse_up(
+                                                    MouseButton::Left,
+                                                    cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                                                        if let Ok(mut g) = this.state.lock() {
+                                                            g.apply_voice_preset("groq");
+                                                        }
+                                                        cx.notify();
+                                                    }),
+                                                ),
+                                        )
+                                        .child(
+                                            div()
+                                                .px_2()
+                                                .py_1()
+                                                .rounded_md()
+                                                .bg(rgb(palette::SIDEBAR_BG))
+                                                .border_1()
+                                                .border_color(rgb(palette::KEY_BORDER))
+                                                .text_xs()
+                                                .text_color(rgb(palette::CORAL_AGENT))
+                                                .child("DeepSeek")
+                                                .hover(|s| s.bg(rgb(palette::KEY_HOVER)).cursor_pointer())
+                                                .on_mouse_up(
+                                                    MouseButton::Left,
+                                                    cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                                                        if let Ok(mut g) = this.state.lock() {
+                                                            g.apply_voice_preset("deepseek");
+                                                        }
+                                                        cx.notify();
+                                                    }),
+                                                ),
+                                        ),
+                                ),
+                        )
+                    })
+                    .children(active.screen_text.lines().map(|line| {
+                        let trimmed = line.trim_start();
+                        let line_color = if trimmed.starts_with("●") {
+                            palette::EMERALD_WORKING
+                        } else if trimmed.starts_with('*') {
+                            palette::AMBER_WARN
+                        } else if trimmed.starts_with('+') {
+                            palette::EMERALD_WORKING
+                        } else {
+                            palette::TEXT_PRIMARY
+                        };
+                        div()
+                            .text_xs()
+                            .text_color(rgb(line_color))
+                            .child(SharedString::from(line.to_string()))
+                    })),
+            )
+            // 3. Desktop Prompt Composer Box (Matches Highwind Bottom-Right Prompt Bar)
+            .child(
+                div()
+                    .bg(rgb(palette::KEY_SURFACE))
+                    .border_t_1()
+                    .border_color(rgb(palette::KEY_BORDER))
+                    .flex()
+                    .flex_col()
+                    // Row 1: `❯ [input]` + `[📎]` + `[📋]` + `[↑]`
+                    .child(
+                        div()
+                            .px_3()
+                            .py_2()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .text_color(rgb(palette::AMBER_WARN))
+                                            .child("❯"),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .text_color(rgb(draft_color))
+                                            .child(SharedString::from(draft_display)),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .child(
+                                        div()
+                                            .px_2()
+                                            .py_1()
+                                            .rounded_md()
+                                            .text_xs()
+                                            .text_color(rgb(palette::TEXT_MUTED))
+                                            .child("📎")
+                                            .hover(|s| s.bg(rgb(palette::KEY_HOVER)).cursor_pointer())
+                                            .on_mouse_up(
+                                                MouseButton::Left,
+                                                cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                                                    if let Ok(mut g) = this.state.lock() {
+                                                        g.trigger_attachment_upload();
+                                                    }
+                                                    cx.notify();
+                                                }),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .px_2()
+                                            .py_1()
+                                            .rounded_md()
+                                            .text_xs()
+                                            .text_color(rgb(palette::TEXT_MUTED))
+                                            .child("📋")
+                                            .hover(|s| s.bg(rgb(palette::KEY_HOVER)).cursor_pointer())
+                                            .on_mouse_up(
+                                                MouseButton::Left,
+                                                cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                                                    if let Some(item) = cx.read_from_clipboard() {
+                                                        if let Some(txt) = item.text() {
+                                                            let trimmed = txt.trim();
+                                                            if let Ok(mut g) = this.state.lock() {
+                                                                if !g.is_logged_in
+                                                                    && (trimmed.starts_with("http://")
+                                                                        || trimmed.starts_with("https://"))
+                                                                {
+                                                                    g.server_url =
+                                                                        trimmed.trim_end_matches('/').to_string();
+                                                                    g.status_banner = Some(format!(
+                                                                        "✓ 已更新服务器地址为 {}",
+                                                                        g.server_url
+                                                                    ));
+                                                                } else {
+                                                                    g.draft_input.push_str(&txt);
+                                                                }
+                                                            }
+                                                            cx.notify();
+                                                        }
+                                                    } else {
+                                                        let cmd = this
+                                                            .state
+                                                            .lock()
+                                                            .map(|g| {
+                                                                format!(
+                                                                    "coda-daemon login --server {}",
+                                                                    g.server_url
+                                                                )
+                                                            })
+                                                            .unwrap_or_else(|_| {
+                                                                "coda-daemon login --server https://codahub.dev".into()
+                                                            });
+                                                        cx.write_to_clipboard(ClipboardItem::new_string(cmd));
+                                                    }
+                                                }),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .px_2()
+                                            .py_1()
+                                            .rounded_md()
+                                            .bg(rgb(palette::TEXT_PRIMARY))
+                                            .text_xs()
+                                            .text_color(rgb(palette::OLED_BLACK))
+                                            .child("↑ 发送")
+                                            .hover(|s| s.bg(white()).cursor_pointer())
+                                            .on_mouse_up(
+                                                MouseButton::Left,
+                                                cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                                                    if let Ok(mut g) = this.state.lock() {
+                                                        g.handle_tactile_key("enter");
+                                                    }
+                                                    cx.notify();
+                                                }),
+                                            ),
+                                    ),
+                            ),
+                    )
+                    // Row 2: repo badge | model | clickable mode | agent count
+                    .child(
+                        div()
+                            .px_3()
+                            .py_1()
+                            .border_t_1()
+                            .border_color(rgb(palette::DIVIDER))
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .text_xs()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .px_2()
+                                            .rounded_sm()
+                                            .bg(rgb(palette::SIDEBAR_BG))
+                                            .text_color(rgb(palette::TEXT_PRIMARY))
+                                            .child(SharedString::from(active.repo_name.clone())),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_color(rgb(palette::TEXT_MUTED))
+                                            .child(SharedString::from(format!(
+                                                "{} · {}",
+                                                active.model_badge, active.address
+                                            ))),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .text_color(rgb(palette::CORAL_AGENT))
+                                            .child(mode_label)
+                                            .hover(|s| s.cursor_pointer())
+                                            .on_mouse_up(
+                                                MouseButton::Left,
+                                                cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                                                    if let Ok(mut g) = this.state.lock() {
+                                                        g.handle_tactile_key("tab");
+                                                    }
+                                                    cx.notify();
+                                                }),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_color(rgb(palette::TEXT_FAINT))
+                                            .child(SharedString::from(format!(
+                                                "· {} agents",
+                                                st.sessions.len()
+                                            ))),
+                                    ),
+                            ),
+                    )
+                    // Row 3: Bottom Terminal Strip
+                    .child(
+                        div()
+                            .h(px(26.0))
+                            .px_3()
+                            .bg(rgb(palette::SIDEBAR_BG))
+                            .border_t_1()
+                            .border_color(rgb(palette::DIVIDER))
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .text_xs()
+                            .text_color(rgb(palette::TEXT_MUTED))
+                            .child(SharedString::from(format!(
+                                "▣ Terminal · hc attach {}",
+                                active.address
+                            )))
+                            .child(
+                                div()
+                                    .text_color(rgb(palette::TEXT_FAINT))
+                                    .child("⌘B Sidebar · ⌘N New · Tab Mode"),
+                            ),
+                    ),
+            )
+    }
+
+    fn render_bottom_status_bar(
+        &self,
+        st: &CodaDesktopState,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let focus_text = if st.focus_timer_running {
+            "▸ 25:00 Focus"
+        } else {
+            "⏸ 25:00 Paused"
+        };
+
+        div()
+            .h(px(24.0))
+            .w_full()
+            .bg(rgb(palette::CHROME_BG))
+            .border_t_1()
+            .border_color(rgb(palette::DIVIDER))
+            .px_3()
+            .flex()
+            .items_center()
+            .justify_between()
+            .text_xs()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .child(
+                        div()
+                            .text_color(rgb(palette::TEXT_MUTED))
+                            .child(focus_text)
+                            .hover(|s| s.text_color(rgb(palette::TEXT_PRIMARY)).cursor_pointer())
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                                    if let Ok(mut g) = this.state.lock() {
+                                        g.focus_timer_running = !g.focus_timer_running;
+                                    }
+                                    cx.notify();
+                                }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_color(rgb(palette::AMBER_WARN))
+                            .child(SharedString::from(format!("CODA v{}", env!("CARGO_PKG_VERSION")))),
+                    )
+                    .child(
+                        div()
+                            .text_color(rgb(palette::EMERALD_WORKING))
+                            .child(SharedString::from(st.connected_route.clone())),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .text_color(rgb(palette::TEXT_FAINT))
+                    .child("E2EE ChaCha20-Poly1305")
+                    .child("Metal 120Hz")
+                    .child(SharedString::from(format!("Sessions: {}", st.sessions.len()))),
             )
     }
 }
@@ -1860,23 +2935,59 @@ impl Render for CodaGpuWorkspaceView {
             .size_full()
             .bg(rgb(palette::OLED_BLACK))
             .track_focus(&self.focus_handle(cx))
+            .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {
+                if let Ok(mut g) = this.state.lock() {
+                    g.show_sidebar = !g.show_sidebar;
+                }
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &SpawnNewTerminal, _, cx| {
+                if let Ok(mut g) = this.state.lock() {
+                    g.spawn_new_session();
+                }
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &CycleBypassPermissions, _, cx| {
+                if let Ok(mut g) = this.state.lock() {
+                    g.handle_tactile_key("tab");
+                }
+                cx.notify();
+            }))
             .flex()
-            .flex_row()
-            .when(st.show_sidebar, |el| {
-                el.child(self.render_left_sidebar(&st, cx))
-            })
-            .child(self.render_center_terminal_pane(&st, cx))
-            .child(self.render_right_rail(&st, cx))
+            .flex_col()
+            .child(self.render_top_workspace_bar(&st, cx))
+            .child(self.render_secondary_view_bar(&st, cx))
+            .child(
+                div()
+                    .flex_1()
+                    .w_full()
+                    .flex()
+                    .flex_row()
+                    .when(st.show_sidebar, |el| {
+                        el.child(self.render_left_projects_sidebar(&st, cx))
+                    })
+                    .when(st.show_center_pane, |el| {
+                        el.child(self.render_center_inspector_pane(&st, cx))
+                    })
+                    .when(st.show_agent_pane, |el| {
+                        el.child(self.render_right_agent_pane(&st, cx))
+                    }),
+            )
+            .child(self.render_bottom_status_bar(&st, cx))
     }
 }
 
 /// Launches the native 120Hz GPU-accelerated Coda Desktop window (`macOS`, `Windows`, `Linux`).
 pub fn launch_gpui_desktop_app() {
     Application::new().run(|cx: &mut App| {
-        cx.bind_keys([KeyBinding::new("cmd-q", QuitApp, None)]);
+        cx.bind_keys([
+            KeyBinding::new("cmd-q", QuitApp, None),
+            KeyBinding::new("cmd-b", ToggleSidebar, None),
+            KeyBinding::new("cmd-n", SpawnNewTerminal, None),
+        ]);
         cx.on_action(|_: &QuitApp, cx| cx.quit());
 
-        let bounds = Bounds::centered(None, size(px(1180.0), px(760.0)), cx);
+        let bounds = Bounds::centered(None, size(px(1380.0), px(840.0)), cx);
         let window = cx
             .open_window(
                 WindowOptions {
@@ -1889,9 +3000,22 @@ pub fn launch_gpui_desktop_app() {
 
         let view = window.update(cx, |_, _, cx| cx.entity()).unwrap();
         cx.observe_keystrokes(move |ev, _, cx| {
+            let key = ev.keystroke.key.as_str();
+            if ev.keystroke.modifiers.platform && key == "v" {
+                if let Some(item) = cx.read_from_clipboard() {
+                    if let Some(txt) = item.text() {
+                        view.update(cx, |this, cx| {
+                            if let Ok(mut g) = this.state.lock() {
+                                g.draft_input.push_str(&txt);
+                            }
+                            cx.notify();
+                        });
+                    }
+                }
+                return;
+            }
             view.update(cx, |this, cx| {
                 if let Ok(mut g) = this.state.lock() {
-                    let key = ev.keystroke.key.as_str();
                     match key {
                         "enter" => g.handle_tactile_key("enter"),
                         "backspace" => g.handle_tactile_key("backspace"),
@@ -1924,8 +3048,11 @@ mod tests {
         let mut state = CodaDesktopState::default();
         assert_eq!(state.active_session().address, "t1");
         assert!(state.bypass_permissions);
+        assert!(state.show_sidebar);
+        assert!(state.show_center_pane);
+        assert!(state.show_agent_pane);
 
-        // Verify tactile keypad actions (`tab`, `slash`, `backspace`, `attachment`, `enter`)
+        // Verify prompt & shortcut actions (`tab`, `slash`, `backspace`, `attachment`, `spawn`)
         state.handle_tactile_key("tab");
         assert!(!state.bypass_permissions);
 
@@ -1937,6 +3064,10 @@ mod tests {
 
         state.trigger_attachment_upload();
         assert!(state.draft_input.contains("coda_gpui_capture.txt"));
+
+        let initial_sessions = state.sessions.len();
+        state.spawn_new_session();
+        assert_eq!(state.sessions.len(), initial_sessions + 1);
 
         // Verify live herdr-core workspace & terminal synchronization
         state.sync_from_local_herdr().await;
