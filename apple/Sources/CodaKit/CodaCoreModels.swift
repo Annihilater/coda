@@ -312,3 +312,62 @@ public struct CodaVoiceModelConfig: Codable, Sendable, Equatable {
         self.model = model
     }
 }
+
+public struct CodaEndpointCandidate: Codable, Sendable, Equatable {
+    public let kind: String
+    public let addr: String
+
+    public init(kind: String, addr: String) {
+        self.kind = kind
+        self.addr = addr
+    }
+}
+
+public struct CodaRemoteDevice: Identifiable, Codable, Sendable, Equatable {
+    public let id: UUID
+    public let name: String
+    public let role: String
+    public let platform: String
+    public let x25519Pubkey: String
+    public let endpoints: [CodaEndpointCandidate]
+    public let isOnline: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case name
+        case role
+        case platform
+        case x25519Pubkey = "x25519_pubkey"
+        case endpoints = "endpoints_json"
+        case isOnline = "is_online"
+    }
+
+    public init(
+        id: UUID,
+        name: String,
+        role: String,
+        platform: String,
+        x25519Pubkey: String,
+        endpoints: [CodaEndpointCandidate],
+        isOnline: Bool
+    ) {
+        self.id = id
+        self.name = name
+        self.role = role
+        self.platform = platform
+        self.x25519Pubkey = x25519Pubkey
+        self.endpoints = endpoints
+        self.isOnline = isOnline
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(UUID.self, forKey: .id)
+        name = try c.decode(String.self, forKey: .name)
+        role = try c.decode(String.self, forKey: .role)
+        platform = try c.decode(String.self, forKey: .platform)
+        x25519Pubkey = try c.decode(String.self, forKey: .x25519Pubkey)
+        endpoints = (try? c.decodeIfPresent([CodaEndpointCandidate].self, forKey: .endpoints)) ?? []
+        isOnline = try c.decode(Bool.self, forKey: .isOnline)
+    }
+}

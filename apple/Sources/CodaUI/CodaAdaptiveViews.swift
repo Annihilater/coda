@@ -24,7 +24,7 @@ public final class CodaWorkspaceStore: ObservableObject {
     @Published public var bypassPermissions: Bool = true
     @Published public var voiceConfig: CodaVoiceModelConfig = CodaVoiceModelConfig()
     @Published public var showVoiceConfigSheet: Bool = false
-    @Published public var routeMode: SmartPathRouteMode = .cnIPv6P2P
+    @Published public var routeMode: SmartPathRouteMode = .lanDirect
 
     public init(initialSessions: [CodaAgentSession] = CodaAdaptiveRootView.sampleSessions) {
         self.sessions = initialSessions
@@ -147,7 +147,7 @@ struct CodaRepoBranchSidebar: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("vampire@coda.dev")
                         .font(.system(size: 14, weight: .medium))
-                    Text("已连接")
+                    Text(store.routeMode == .lanDirect ? "已连接 · ⚡ 局域网直连" : "已连接 · \(store.routeMode.rawValue)")
                         .font(.system(size: 12, weight: .medium))
                         .foregroundStyle(CodaPalette.workingEmerald)
                 }
@@ -411,9 +411,9 @@ struct CodaRightVerticalThumbRail: View {
                     VStack(spacing: 0) {
                         Text("68")
                             .font(.system(size: 10, weight: .bold, design: .monospaced))
-                        Text("5G")
+                        Text(store.routeMode == .lanDirect ? "LAN" : "5G")
                             .font(.system(size: 9, design: .monospaced))
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(store.routeMode == .lanDirect ? CodaPalette.workingEmerald : .secondary)
                     }
                 }
             }
