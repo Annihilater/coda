@@ -21,21 +21,25 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
   RELEASE_TAG: ${{ github.event.inputs.tag_name || github.ref_name }}
 
 jobs:
   build-linux-x86_64:
-    name: Build Linux x86_64 (Server + Daemon + Web + Deploy Kit)
+    name: Build Linux x86_64 (Server + Daemon + Web)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: oven-sh/setup-bun@v2
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "release-linux-x86_64"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y pkg-config libzstd-dev
+        run: dpkg -s pkg-config libzstd-dev >/dev/null 2>&1 || (sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libzstd-dev)
       - name: Build Web Console
-        run: cd web && bun install && bun run build
+        run: cd web && bun install --frozen-lockfile && bun run build
       - name: Build coda-server & coda-daemon (release)
         run: cargo build --release -p coda-server -p coda-daemon
       - name: Package Linux x86_64 Artifacts
@@ -50,11 +54,17 @@ jobs:
           cp target/release/coda-daemon dist/coda-daemon-linux-x86_64/
           cp deploy/install-daemon.sh dist/coda-daemon-linux-x86_64/
 
-          tar --owner=0 --group=0 -C dist -czf "dist/coda-server-linux-x86_64-${RELEASE_TAG}.tar.gz" coda-server-linux-x86_64
-          tar --owner=0 --group=0 -C dist -czf "dist/coda-daemon-linux-x86_64-${RELEASE_TAG}.tar.gz" coda-daemon-linux-x86_64
+          COMPRESS="gzip -1"
+          if command -v pigz >/dev/null 2>&1; then
+            COMPRESS="pigz -1"
+          fi
+          tar --owner=0 --group=0 -C dist -I "${COMPRESS}" -cf "dist/coda-server-linux-x86_64-${RELEASE_TAG}.tar.gz" coda-server-linux-x86_64
+          tar --owner=0 --group=0 -C dist -I "${COMPRESS}" -cf "dist/coda-daemon-linux-x86_64-${RELEASE_TAG}.tar.gz" coda-daemon-linux-x86_64
       - uses: actions/upload-artifact@v4
         with:
           name: linux-x86_64-artifacts
+          compression-level: 0
+          retention-days: 1
           path: |
             dist/*.tar.gz
 
@@ -66,10 +76,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: oven-sh/setup-bun@v2
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "release-linux-aarch64"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y pkg-config libzstd-dev
+        run: dpkg -s pkg-config libzstd-dev >/dev/null 2>&1 || (sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libzstd-dev)
       - name: Build Web Console
-        run: cd web && bun install && bun run build
+        run: cd web && bun install --frozen-lockfile && bun run build
       - name: Build coda-server & coda-daemon (release)
         run: cargo build --release -p coda-server -p coda-daemon
       - name: Package Linux aarch64
@@ -84,11 +97,17 @@ jobs:
           cp target/release/coda-daemon dist/coda-daemon-linux-aarch64/
           cp deploy/install-daemon.sh dist/coda-daemon-linux-aarch64/
 
-          tar --owner=0 --group=0 -C dist -czf "dist/coda-server-linux-aarch64-${RELEASE_TAG}.tar.gz" coda-server-linux-aarch64
-          tar --owner=0 --group=0 -C dist -czf "dist/coda-daemon-linux-aarch64-${RELEASE_TAG}.tar.gz" coda-daemon-linux-aarch64
+          COMPRESS="gzip -1"
+          if command -v pigz >/dev/null 2>&1; then
+            COMPRESS="pigz -1"
+          fi
+          tar --owner=0 --group=0 -C dist -I "${COMPRESS}" -cf "dist/coda-server-linux-aarch64-${RELEASE_TAG}.tar.gz" coda-server-linux-aarch64
+          tar --owner=0 --group=0 -C dist -I "${COMPRESS}" -cf "dist/coda-daemon-linux-aarch64-${RELEASE_TAG}.tar.gz" coda-daemon-linux-aarch64
       - uses: actions/upload-artifact@v4
         with:
           name: linux-aarch64-artifacts
+          compression-level: 0
+          retention-days: 1
           path: |
             dist/*.tar.gz
 
@@ -100,12 +119,22 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: oven-sh/setup-bun@v2
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "release-macos-aarch64"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Restore Swift Release Build Cache
+        uses: actions/cache/restore@v4
+        with:
+          path: apple/.build
+          key: swift-release-macos-aarch64-${{ hashFiles('apple/Package.swift', 'apple/Sources/**', 'apple/Tests/**') }}
+          restore-keys: |
+            swift-release-macos-aarch64-
       - name: Build Web Console
-        run: cd web && bun install && bun run build
+        run: cd web && bun install --frozen-lockfile && bun run build
       - name: Build Rust Release Binaries (coda-desktop GPUI + coda-daemon + coda-server)
         run: cargo build --release -p coda-server -p coda-daemon -p coda-desktop
-      - name: Build Apple Swift 6 Native Binaries
-        run: cd apple && swift build -c release
+      - name: Build Apple Swift 6 Desktop Companion
+        run: cd apple && swift build -c release --product CodaMacApp
       - name: Package macOS Apple Silicon Suite
         run: |
           mkdir -p dist/coda-macos-aarch64 dist/coda-daemon-macos-aarch64
@@ -157,19 +186,22 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: macos-aarch64-artifacts
+          compression-level: 0
+          retention-days: 1
           path: |
             dist/*.tar.gz
             dist/*.dmg
 
-  publish-github-release:
-    name: Publish Multi-Arch GHCR Image & GitHub Release
-    needs: [build-linux-x86_64, build-linux-aarch64, build-macos-aarch64]
+  build-and-push-docker:
+    name: Build & Push Multi-Arch GHCR + Offline Docker Tarballs
+    needs: [build-linux-x86_64, build-linux-aarch64]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
-          path: release-assets
+          pattern: linux-*-artifacts
+          path: linux-assets
           merge-multiple: true
 
       - name: Set up QEMU & Docker Buildx
@@ -184,11 +216,11 @@ jobs:
 
       - name: Prepare Multi-Arch Docker Build Context
         run: |
-          mkdir -p docker-ctx/bin/linux-amd64 docker-ctx/bin/linux-arm64 docker-ctx/web docker-ctx/deploy dist-unpack
-          tar -C dist-unpack -xzf "release-assets/coda-server-linux-x86_64-${RELEASE_TAG}.tar.gz"
-          tar -C dist-unpack -xzf "release-assets/coda-daemon-linux-x86_64-${RELEASE_TAG}.tar.gz"
-          tar -C dist-unpack -xzf "release-assets/coda-server-linux-aarch64-${RELEASE_TAG}.tar.gz"
-          tar -C dist-unpack -xzf "release-assets/coda-daemon-linux-aarch64-${RELEASE_TAG}.tar.gz"
+          mkdir -p docker-ctx/bin/linux-amd64 docker-ctx/bin/linux-arm64 docker-ctx/web docker-ctx/deploy dist-unpack dist-images
+          tar -C dist-unpack -xzf "linux-assets/coda-server-linux-x86_64-${RELEASE_TAG}.tar.gz"
+          tar -C dist-unpack -xzf "linux-assets/coda-daemon-linux-x86_64-${RELEASE_TAG}.tar.gz"
+          tar -C dist-unpack -xzf "linux-assets/coda-server-linux-aarch64-${RELEASE_TAG}.tar.gz"
+          tar -C dist-unpack -xzf "linux-assets/coda-daemon-linux-aarch64-${RELEASE_TAG}.tar.gz"
 
           cp dist-unpack/coda-server-linux-x86_64/coda-server docker-ctx/bin/linux-amd64/coda-server
           cp dist-unpack/coda-daemon-linux-x86_64/coda-daemon docker-ctx/bin/linux-amd64/coda-daemon
@@ -203,7 +235,7 @@ jobs:
           LABEL org.opencontainers.image.source="https://github.com/Annihilater/coda"
           LABEL org.opencontainers.image.description="Coda Zero-Knowledge AI Agent Mesh Coordinator & Stateless Relay"
           LABEL org.opencontainers.image.licenses="MIT"
-          RUN apt-get update && apt-get install -y ca-certificates curl git libzstd1 && rm -rf /var/lib/apt/lists/*
+          RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git libzstd1 && rm -rf /var/lib/apt/lists/*
           WORKDIR /opt/coda
           COPY bin/linux-${TARGETARCH}/coda-server /usr/local/bin/coda-server
           COPY bin/linux-${TARGETARCH}/coda-daemon /usr/local/bin/coda-daemon
@@ -221,20 +253,52 @@ jobs:
           file: docker-ctx/Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
+          cache-from: type=registry,ref=ghcr.io/annihilater/coda:buildcache
+          cache-to: type=registry,ref=ghcr.io/annihilater/coda:buildcache,mode=max,image-manifest=true,oci-mediatypes=true
           tags: |
             ghcr.io/annihilater/coda:${{ env.RELEASE_TAG }}
             ghcr.io/annihilater/coda:latest
 
-      - name: Export Offline Container Image Tarballs for GitHub Releases Fallback
+      - name: Export Offline Container Image Tarballs in Parallel
         run: |
+          GZIP_BIN="gzip"
+          if command -v pigz >/dev/null 2>&1; then
+            GZIP_BIN="pigz"
+          fi
           docker buildx build --platform linux/amd64 \
+            --cache-from type=registry,ref=ghcr.io/annihilater/coda:buildcache \
             -t "ghcr.io/annihilater/coda:${RELEASE_TAG}" \
             --output type=docker,dest=- docker-ctx \
-            | gzip -1 > "release-assets/coda-image-linux-amd64-${RELEASE_TAG}.tar.gz"
+            | "${GZIP_BIN}" -1 > "dist-images/coda-image-linux-amd64-${RELEASE_TAG}.tar.gz" &
+          PID_AMD64=$!
+
           docker buildx build --platform linux/arm64 \
+            --cache-from type=registry,ref=ghcr.io/annihilater/coda:buildcache \
             -t "ghcr.io/annihilater/coda:${RELEASE_TAG}" \
             --output type=docker,dest=- docker-ctx \
-            | gzip -1 > "release-assets/coda-image-linux-arm64-${RELEASE_TAG}.tar.gz"
+            | "${GZIP_BIN}" -1 > "dist-images/coda-image-linux-arm64-${RELEASE_TAG}.tar.gz" &
+          PID_ARM64=$!
+
+          wait "${PID_AMD64}"
+          wait "${PID_ARM64}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: docker-offline-images
+          compression-level: 0
+          retention-days: 1
+          path: dist-images/*.tar.gz
+
+  publish-github-release:
+    name: Assemble Deploy Bundle & Publish GitHub Release
+    needs: [build-linux-x86_64, build-linux-aarch64, build-macos-aarch64, build-and-push-docker]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
 
       - name: Assemble Clean coda-deploy-bundle (No Dockerfile, Prebuilt Image + Lifecycle Scripts)
         run: |
