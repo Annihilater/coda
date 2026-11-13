@@ -1192,6 +1192,7 @@ dependencies = [
  "coda-herdr",
  "coda-protocol",
  "gpui",
+ "libc",
  "serde",
  "serde_json",
  "tokio",
