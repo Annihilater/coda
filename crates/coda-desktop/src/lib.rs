@@ -7,7 +7,7 @@
 //!   2. Left `PROJECTS` Explorer (`SERVICES`, `AGENTS`, `ACTIONS`) with collapsible repositories.
 //!   3. Center Workspace Preview / Worktree Diff Inspector / Mesh & Voice Hub.
 //!   4. Right AI Agent & Live PTY Stream Pane with Desktop Prompt Composer (no mobile soft keypad).
-//!   5. Bottom Global Focus & Route Telemetry Status Bar (`v0.3.5`).
+//!   5. Bottom Global Focus & Route Telemetry Status Bar (`v0.3.6`).
 
 use std::sync::{Arc, Mutex};
 
@@ -135,7 +135,7 @@ impl Default for CodaDesktopState {
                 title: "Cloudflare Tunnel 与零知识 E2EE 路由巡检".into(),
                 repo_name: "coda-server".into(),
                 branch_name: "feat/cf-tunnel-wss".into(),
-                machine_name: "green-jp-02".into(),
+                machine_name: "atlas-core-01".into(),
                 model_badge: "Sonnet 4.5".into(),
                 status_label: "本轮完成".into(),
                 is_done: true,
@@ -146,7 +146,7 @@ impl Default for CodaDesktopState {
                     "  - SmartPeerClient 同 Wi-Fi 下 250ms 探测局域网 P2P 直连（< 1ms），跨网自动切换至 WSS 443。\n",
                     "  - RFC 8628 浏览器设备码授权 (/activate) 已与 Postgres 18 多租户控制面联调完成。\n\n",
                     "* Baked for 38s · done 4:33 PM\n\n",
-                    "● recap: green-jp-02 节点健康检查通过，所有端到端通道加密在线。"
+                    "● recap: atlas-core-01 节点健康检查通过，所有端到端通道加密在线。"
                 )
                 .into(),
             },

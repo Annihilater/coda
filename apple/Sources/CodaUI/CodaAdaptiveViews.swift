@@ -177,7 +177,7 @@ public struct CodaAdaptiveRootView: View {
         CodaAgentSession(
             id: "coda/relay",
             address: "t2",
-            machineName: "green-jp-02",
+            machineName: "atlas-core-01",
             machinePlatform: "linux",
             agentApp: "Sonnet 4.5",
             title: "Cloudflare Tunnel WSS 与内网 P2P 自动切换",
