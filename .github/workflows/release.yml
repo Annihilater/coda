@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       tag_name:
-        description: "Release tag (e.g. v0.2.3)"
+        description: "Release tag (e.g. v0.3.0)"
         required: true
-        default: "v0.2.3"
+        default: "v0.3.0"
 
 permissions:
   contents: write
@@ -122,11 +122,42 @@ jobs:
 
           tar -C dist -czf "dist/coda-macos-aarch64-${RELEASE_TAG}.tar.gz" coda-macos-aarch64
           tar -C dist -czf "dist/coda-daemon-macos-aarch64-${RELEASE_TAG}.tar.gz" coda-daemon-macos-aarch64
+
+          DMG_STAGE="dist-dmg"
+          APP_DIR="${DMG_STAGE}/Coda.app"
+          mkdir -p "${APP_DIR}/Contents/MacOS" "${APP_DIR}/Contents/Resources"
+          cp target/release/coda-desktop "${APP_DIR}/Contents/MacOS/coda-desktop"
+          cp target/release/coda-daemon "${APP_DIR}/Contents/MacOS/coda-daemon"
+          chmod +x "${APP_DIR}/Contents/MacOS/coda-desktop" "${APP_DIR}/Contents/MacOS/coda-daemon"
+          SHORT_VER="${RELEASE_TAG#v}"
+          cat > "${APP_DIR}/Contents/Info.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleDevelopmentRegion</key><string>en</string>
+            <key>CFBundleExecutable</key><string>coda-desktop</string>
+            <key>CFBundleIdentifier</key><string>dev.coda.desktop</string>
+            <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+            <key>CFBundleName</key><string>Coda</string>
+            <key>CFBundleDisplayName</key><string>Coda</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>${SHORT_VER}</string>
+            <key>CFBundleVersion</key><string>${SHORT_VER}</string>
+            <key>LSMinimumSystemVersion</key><string>14.0</string>
+            <key>NSHighResolutionCapable</key><true/>
+          </dict>
+          </plist>
+          EOF
+          ln -s /Applications "${DMG_STAGE}/Applications"
+          codesign --force --deep --sign - "${APP_DIR}"
+          hdiutil create -volname "Coda Desktop ${RELEASE_TAG}" -srcfolder "${DMG_STAGE}" -ov -format UDZO "dist/Coda-Desktop-macos-aarch64-${RELEASE_TAG}.dmg"
       - uses: actions/upload-artifact@v4
         with:
           name: macos-aarch64-artifacts
           path: |
             dist/*.tar.gz
+            dist/*.dmg
 
   publish-github-release:
     name: Publish Multi-Arch GHCR Image & GitHub Release
@@ -231,7 +262,7 @@ jobs:
       - name: Generate SHA256SUMS
         run: |
           cd release-assets
-          sha256sum *.tar.gz > "SHA256SUMS-${RELEASE_TAG}.txt"
+          sha256sum *.tar.gz *.dmg > "SHA256SUMS-${RELEASE_TAG}.txt"
           cat "SHA256SUMS-${RELEASE_TAG}.txt"
 
       - name: Publish Release to GitHub
@@ -244,4 +275,5 @@ jobs:
           prerelease: false
           files: |
             release-assets/*.tar.gz
+            release-assets/*.dmg
             release-assets/SHA256SUMS-*.txt

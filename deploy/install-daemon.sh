@@ -1,15 +1,22 @@
 #!/usr/bin/env sh
-# Coda Host Daemon One-Click Installer & Pairing Script (macOS & Linux)
-# Usage:
-#   curl -fsSL https://<coda-server>/install.sh | sh -s -- --server https://<coda-server> --code 839-204 [--name "Mac Studio"]
+# Coda Host Daemon One-Click Installer & Browser Authorization Script (macOS & Linux)
+# Default (Browser Device Flow - recommended):
+#   curl -fsSL https://<coda-server>/install.sh | sh
+# Legacy 6-digit code pairing:
+#   curl -fsSL https://<coda-server>/install.sh | sh -s -- --server https://<coda-server> --code 839-204 [--name "My Server"]
 
 set -eu
 
 REPO="Annihilater/coda"
 VERSION="${CODA_VERSION:-latest}"
-SERVER_URL="http://127.0.0.1:8080"
+DEFAULT_SERVER_URL="__CODA_DEFAULT_SERVER_URL__"
+case "${DEFAULT_SERVER_URL}" in
+  __*__) DEFAULT_SERVER_URL="http://127.0.0.1:8080" ;;
+esac
+SERVER_URL="${CODA_SERVER_URL:-${DEFAULT_SERVER_URL}}"
 PAIR_CODE=""
 DEVICE_NAME=""
+DEVICE_ROLE="${CODA_DEVICE_ROLE:-daemon}"
 INSTALL_DIR="${HOME}/.local/bin"
 
 while [ $# -gt 0 ]; do
@@ -28,6 +35,10 @@ while [ $# -gt 0 ]; do
       ;;
     --name)
       DEVICE_NAME="$2"
+      shift 2
+      ;;
+    --role)
+      DEVICE_ROLE="$2"
       shift 2
       ;;
     *)
@@ -101,11 +112,18 @@ if [ -n "${PAIR_CODE}" ]; then
   else
     coda-daemon pair --server "${SERVER_URL}" --code "${PAIR_CODE}"
   fi
+elif [ ! -f "${HOME}/.config/coda/daemon.json" ]; then
+  echo "==> [3/4] Authorizing host with Coda Coordinator (${SERVER_URL}) via browser device login..."
+  if [ -n "${DEVICE_NAME}" ]; then
+    coda-daemon login --server "${SERVER_URL}" --role "${DEVICE_ROLE}" --name "${DEVICE_NAME}"
+  else
+    coda-daemon login --server "${SERVER_URL}" --role "${DEVICE_ROLE}"
+  fi
 else
-  echo "==> [3/4] No --code supplied; skipping pairing step (run: coda-daemon pair --server ${SERVER_URL} --code XXX-XXX)"
+  echo "==> [3/4] Existing daemon config detected at ${HOME}/.config/coda/daemon.json (re-run \`coda-daemon login --server ${SERVER_URL}\` to re-authorize)."
 fi
 
-echo "==> [4/4] Configuring background service supervision..."
+echo "==> [4/4] Configuring & starting background service supervision..."
 OS_NAME="$(uname -s)"
 if [ "${OS_NAME}" = "Darwin" ]; then
   PLIST_DIR="${HOME}/Library/LaunchAgents"
@@ -135,8 +153,9 @@ if [ "${OS_NAME}" = "Darwin" ]; then
 </dict>
 </plist>
 EOF
-  echo "    Created macOS LaunchAgent at ${PLIST_PATH}"
-  echo "    Load with: launchctl load -w ${PLIST_PATH}"
+  launchctl unload "${PLIST_PATH}" 2>/dev/null || true
+  launchctl load -w "${PLIST_PATH}" 2>/dev/null || true
+  echo "    macOS LaunchAgent active: ${PLIST_PATH}"
 elif [ "${OS_NAME}" = "Linux" ]; then
   UNIT_DIR="${HOME}/.config/systemd/user"
   UNIT_PATH="${UNIT_DIR}/coda-daemon.service"
@@ -156,8 +175,12 @@ RestartSec=2
 [Install]
 WantedBy=default.target
 EOF
-  echo "    Created systemd user unit at ${UNIT_PATH}"
-  echo "    Enable with: systemctl --user daemon-reload && systemctl --user enable --now coda-daemon"
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl --user daemon-reload 2>/dev/null || true
+    systemctl --user enable --now coda-daemon 2>/dev/null || true
+  fi
+  echo "    systemd user unit installed: ${UNIT_PATH}"
+  echo "    Check status with: coda-daemon status"
 fi
 
 echo "==> Coda Host Daemon setup complete!"

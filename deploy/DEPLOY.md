@@ -15,7 +15,24 @@ Coda 每次发布 Tag (`v*`) 时，GitHub Actions 流水线会自动构建并发
 | **`coda-server-linux-{x86_64,aarch64}-<version>.tar.gz`** | `coda-server-linux-*/` | Linux 服务端裸机包（含 `coda-server` + `web-dist` + `migrations` + `deploy`） |
 | **`coda-daemon-linux-{x86_64,aarch64}-<version>.tar.gz`** | `coda-daemon-linux-*/` | Linux 受控开发机守护进程 (`coda-daemon`) |
 | **`coda-macos-aarch64-<version>.tar.gz`** | `coda-macos-aarch64/` | macOS Apple Silicon 全家桶（含 **`coda-desktop` [Rust+GPUI 120Hz 桌面端]**、`CodaMacApp` [SwiftUI]、`coda-daemon`、`coda-server`） |
+| **`Coda-Desktop-macos-aarch64-<version>.dmg`** | macOS App 安装镜像 | 拖入 `Applications` 即可运行的 `Coda.app`（内置 `coda-desktop` + `coda-daemon`） |
 | **`coda-daemon-macos-aarch64-<version>.tar.gz`** | `coda-daemon-macos-aarch64/` | macOS Apple Silicon 受控开发机守护进程 (`coda-daemon`) |
+
+---
+
+## Cloudflare Tunnel 域名接入（日本 / 海外主控服务器零端口暴露推荐）
+
+如果你把主控端部署在日本 / 海外 VPS，并通过 **Cloudflare Tunnel (`cloudflared`)** 映射到自己的域名（如 `https://coda.yourdomain.com`）：
+
+1. 在 `cloudflared` 中将公网域名指向本机 **`http://127.0.0.1:8080`**（Cloudflare Tunnel 原生支持 `/v1/tunnel/ws` 的 WebSocket 隧道转发）。
+2. 修改 `.env`：
+   ```dotenv
+   CODA_PUBLIC_URL=https://coda.yourdomain.com
+   CODA_OPEN_REGISTRATION=true
+   ```
+   > 只要 `CODA_PUBLIC_URL` 是 `https://` 域名且未配置 `CODA_RAW_TCP_PUBLIC_ENDPOINT`，控制面会自动将 `global-cdn-wss`（`wss://coda.yourdomain.com/v1/tunnel/ws`）设为首选，并屏蔽不可达的内网 `127.0.0.1:24443` 地址。
+3. 执行 **`./restart.sh`** 让 `.env` 生效。
+4. 访问 `https://coda.yourdomain.com` 即可打开 **Coda 官网与免登录全端下载中心**，访客无需登录即可注册或下载 Linux Server / macOS 桌面端 / deploy-bundle；后期如加自选 CDN，直接把 CDN 回源指向该域名即可。
 
 ---
 
@@ -87,43 +104,39 @@ curl -fsSL https://raw.githubusercontent.com/Annihilater/coda/main/deploy/instal
 
 ---
 
-## 三、注册管理员账号 & 一键接入开发机 (Mac / Linux Server)
+## 三、只登录一次，全端浏览器授权接入开发机 (Server / Mac / iOS)
 
-1. **注册管理员**：打开浏览器访问 `http://你的服务器IP:8080`，点击 **「注册新账号」**。**第一个注册的用户会自动成为管理员（无需邀请码）**。
-2. **生成配对码 & 邀请朋友**：
-   - 点击左上角 **`[ ⚙ ]`** 按钮：
-     - 点击 **「+ 签发好友邀请码」**，把生成的 `CODA-XXXXXX` 发给朋友即可让他们注册各自独立的账号。
-     - 点击 **「+ 生成 6 位机器配对码」**，复制弹出的一键配对命令。
-3. **在你的 Mac 或 Linux 开发机上运行一键配对命令**：
+1. **注册账号**：打开浏览器访问 **`https://你的域名`**（或 `http://你的服务器IP:8080`）：
+   - 当 `.env` 设置了 `CODA_OPEN_REGISTRATION=true` 时，任何人都可**免邀请码自由注册**并直接进入控制台（第一个注册的用户同时拥有管理员权限）；
+   - 如需封闭内测，设 `CODA_OPEN_REGISTRATION=false`，则除首位管理员外需使用管理员签发的 `CODA-XXXXXX` 邀请码。
+2. **Linux / macOS 服务器一键接入（推荐浏览器设备码授权）**：
+   直接在目标开发机或云服务器上执行官网首页的一键命令（脚本会自动读取你主控域名，无需提前复制配对码）：
 
 ```bash
-curl -fsSL http://你的服务器IP:8080/install.sh | sh -s -- \
-  --server http://你的服务器IP:8080 \
-  --code 839-204 \
-  --name "Home-Mac-Studio"
+curl -fsSL https://你的域名/install.sh | sh
 ```
 
-该脚本会自动安装 `herdr-core` (`hc`)、下载对应系统的 `coda-daemon`、完成零知识密钥配对，并启动守护进程：
+执行后终端会打印激活链接与 8 位设备码（例如 **`https://你的域名/activate?code=ABCD-2345`**）。在任意浏览器打开并登录确认批准，服务器即自动绑定到你的账号并后台启动 `coda-daemon`。（同时兼容传统 6 位 `--code 839-204` 配对方式。）
 
 ```bash
-# 立即在前台或后台启动隧道守护进程（同时开启 :24444 局域网/IPv6 P2P 直连引擎）
-~/.local/bin/coda-daemon run
+# 查看当前绑定的设备状态与中继链路
+~/.local/bin/coda-daemon status
 ```
 
 ---
 
-## 四、使用各端客户端连接开发
+## 四、使用各端客户端连接开发（Windows/Mac/iOS 互控）
 
-1. **Web 终端控制台（零安装）**：直接用手机或电脑浏览器访问 `http://你的服务器IP:8080`。
-2. **macOS 原生 120Hz GPUI 桌面客户端**：
-   下载并解压带版本号的 `coda-macos-aarch64-<version>.tar.gz`（解压后目录固定为 `coda-macos-aarch64/`），直接运行：
+1. **Web 终端 & iOS Safari PWA（零上架零安装）**：
+   用电脑浏览器或 iPhone Safari 访问 `https://你的域名`；在 iPhone Safari 点击「分享 → 添加到主屏幕」即可全屏当原生 App 使用；如有苹果开发者账号测试分发的 **TestFlight** 链接，可在 `.env` 中配置 `CODA_IOS_BETA_URL`，官网下载卡片会自动显示按钮。
+2. **macOS 桌面端（`.dmg` 双击安装，`Hybrid` 双重角色）**：
+   在官网下载中心直接点击下载 **`Coda-Desktop-macos-aarch64-<version>.dmg`** 并拖入 `Applications`；首次打开若提示未公证开发者，在终端执行一次：
    ```bash
-   VER="$(curl -fsSLI -o /dev/null -w '%{url_effective}' https://github.com/Annihilater/coda/releases/latest | awk -F/ '{print $NF}')"
-   curl -fsSL "https://github.com/Annihilater/coda/releases/download/${VER}/coda-macos-aarch64-${VER}.tar.gz" | tar -xz
-   ./coda-macos-aarch64/coda-desktop
+   xattr -cr /Applications/Coda.app
    ```
-3. **iPhone / iPhone Duo / iPad 原生客户端 (`apple/`)**：
-   使用 Xcode 打开 `apple/Package.swift` 选择你的真机编译运行。
+   打开 `Coda.app` 点击左侧「🔑 浏览器登录」即可绑定同一账号——它既可作为控制端遥控你所有远端 Linux Server，也可同时作为被控主机让手机或网页端遥控。
+3. **iPhone / iPhone Duo / iPad 原生 SwiftUI 客户端 (`apple/`)**：
+   使用 Xcode 打开 `apple/Package.swift` 编译到真机运行测试版，点左上角钥匙图标使用浏览器设备码授权登录。
 
 ---
 

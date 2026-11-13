@@ -15,6 +15,7 @@ ARG_RELAY_SECRET=""
 ARG_DB_URL=""
 ARG_HTTP_BIND=""
 ARG_RAW_TCP_BIND=""
+ARG_OPEN_REG=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -25,6 +26,7 @@ while [ $# -gt 0 ]; do
     --database-url) ARG_DB_URL="$2"; shift 2 ;;
     --http-bind) ARG_HTTP_BIND="$2"; shift 2 ;;
     --raw-tcp-bind) ARG_RAW_TCP_BIND="$2"; shift 2 ;;
+    --open-registration) ARG_OPEN_REG="$2"; shift 2 ;;
     *) shift 1 ;;
   esac
 done
@@ -49,6 +51,10 @@ DB_URL="${ARG_DB_URL:-${DATABASE_URL:-postgres://coda:coda_prod_pass@127.0.0.1:5
 HTTP_BIND="${ARG_HTTP_BIND:-${CODA_HTTP_BIND:-0.0.0.0:${CODA_HTTP_PORT:-8080}}}"
 RAW_TCP_BIND="${ARG_RAW_TCP_BIND:-${CODA_RAW_TCP_BIND:-0.0.0.0:${CODA_RAW_TCP_PORT:-24443}}}"
 REGION_LABEL="${CODA_REGION_LABEL:-CN-BGP-NoICP}"
+OPEN_REGISTRATION="${ARG_OPEN_REG:-${CODA_OPEN_REGISTRATION:-true}}"
+GITHUB_REPO="${CODA_GITHUB_REPO:-Annihilater/coda}"
+IOS_BETA_URL="${CODA_IOS_BETA_URL:-}"
+RAW_TCP_PUBLIC_ENDPOINT="${CODA_RAW_TCP_PUBLIC_ENDPOINT:-}"
 
 if [ "${VERSION}" = "latest" ]; then
   EFFECTIVE_URL="$(curl -fsSLI -o /dev/null -w '%{url_effective}' "https://github.com/${REPO}/releases/latest")"
@@ -82,6 +88,10 @@ CODA_PUBLIC_URL=${PUBLIC_URL}
 CODA_HTTP_BIND=${HTTP_BIND}
 CODA_RAW_TCP_BIND=${RAW_TCP_BIND}
 CODA_REGION_LABEL=${REGION_LABEL}
+CODA_OPEN_REGISTRATION=${OPEN_REGISTRATION}
+CODA_GITHUB_REPO=${GITHUB_REPO}
+CODA_IOS_BETA_URL=${IOS_BETA_URL}
+CODA_RAW_TCP_PUBLIC_ENDPOINT=${RAW_TCP_PUBLIC_ENDPOINT}
 DATABASE_URL=${DB_URL}
 EOF
 chmod 600 /etc/coda/.env
