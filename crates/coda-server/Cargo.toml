@@ -24,6 +24,7 @@ coda-protocol = { path = "../coda-protocol" }
 futures-util.workspace = true
 hex.workspace = true
 rand.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -37,5 +38,4 @@ uuid.workspace = true
 [dev-dependencies]
 coda-daemon = { path = "../coda-daemon" }
 coda-herdr = { path = "../coda-herdr" }
-reqwest.workspace = true
 tokio-tungstenite.workspace = true

@@ -937,17 +937,26 @@ async fn test_open_portal_device_code_rfc8628_and_cloudflare_wss_mesh() {
     .await
     .unwrap();
 
+    let temp_web_dist = std::env::temp_dir().join(format!("coda-e2e-web-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&temp_web_dist).unwrap();
+    std::fs::write(
+        temp_web_dist.join("index.html"),
+        "<!doctype html><div id=\"app\"></div>",
+    )
+    .unwrap();
+    std::fs::write(temp_web_dist.join("app.abcdef1234.js"), "console.log(\"ok\");").unwrap();
+
     let server = start_full_server_with_options(
         &db_url,
         "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
         "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
         b"cf-wss-device-flow-secret-2026".to_vec(),
         None,
-        None,
+        Some(temp_web_dist.clone()),
         ServerOptions {
             open_registration: true,
             raw_tcp_public_endpoint: None,
-            release_version: "v0.3.5".into(),
+            release_version: "v0.3.6".into(),
             github_repo: "Annihilater/coda".into(),
             ios_beta_url: Some("https://testflight.apple.com/join/CodaBeta".into()),
         },
@@ -958,8 +967,8 @@ async fn test_open_portal_device_code_rfc8628_and_cloudflare_wss_mesh() {
     let base = format!("http://{}", server.http_addr);
     let http = reqwest::Client::new();
 
-    // 1. Public unauthenticated portal metadata + Cloudflare forwarded header detection
-    let site: serde_json::Value = http
+    // 1. Public unauthenticated portal metadata + Cloudflare cache/forwarded header detection
+    let site_resp = http
         .get(format!("{base}/api/v1/public/site-info"))
         .header("x-forwarded-host", "codahub.dev")
         .header("cf-visitor", r#"{"scheme":"https"}"#)
@@ -967,19 +976,137 @@ async fn test_open_portal_device_code_rfc8628_and_cloudflare_wss_mesh() {
         .await
         .unwrap()
         .error_for_status()
-        .unwrap()
-        .json()
-        .await
         .unwrap();
+    assert_eq!(
+        site_resp
+            .headers()
+            .get("cache-control")
+            .and_then(|v| v.to_str().ok()),
+        Some("no-cache, no-store, must-revalidate")
+    );
+    assert_eq!(
+        site_resp
+            .headers()
+            .get("cdn-cache-control")
+            .and_then(|v| v.to_str().ok()),
+        Some("no-store")
+    );
+    let site: serde_json::Value = site_resp.json().await.unwrap();
     assert_eq!(site["open_registration"], true);
     assert_eq!(
         site["install_command"],
         "curl -fsSL https://codahub.dev/install.sh | sh"
     );
-    assert!(site["downloads"]["desktop_macos_dmg"]
-        .as_str()
-        .unwrap()
-        .ends_with("Coda-Desktop-macos-aarch64-v0.3.5.dmg"));
+    assert_eq!(
+        site["downloads"]["desktop_macos_dmg"],
+        "https://codahub.dev/download/desktop-macos.dmg"
+    );
+    assert_eq!(
+        site["downloads"]["releases_page"],
+        "https://github.com/Annihilater/coda/releases/latest"
+    );
+    for (key, val) in site["downloads"].as_object().unwrap() {
+        if let Some(url) = val.as_str() {
+            assert!(
+                !url.contains("v0.3.6"),
+                "download URL `{key}` must not be pinned to a hardcoded release tag: {url}"
+            );
+        }
+    }
+
+    // Verify /download/{artifact} issues an uncached 302 redirect to GitHub latest release, and 404 on unknown artifacts
+    let no_redirect_http = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let dl_resp = no_redirect_http
+        .get(format!("{base}/download/desktop-macos.dmg"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(dl_resp.status(), reqwest::StatusCode::FOUND);
+    assert_eq!(
+        dl_resp
+            .headers()
+            .get("cache-control")
+            .and_then(|v| v.to_str().ok()),
+        Some("no-cache, no-store, must-revalidate")
+    );
+    assert_eq!(
+        dl_resp
+            .headers()
+            .get("cdn-cache-control")
+            .and_then(|v| v.to_str().ok()),
+        Some("no-store")
+    );
+    let redirect_location = dl_resp
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .unwrap();
+    assert!(
+        redirect_location.starts_with("https://github.com/Annihilater/coda/releases/"),
+        "unexpected redirect location: {redirect_location}"
+    );
+    assert!(!redirect_location.contains("v0.3.6"));
+
+    let unknown_dl_resp = no_redirect_http
+        .get(format!("{base}/download/unknown.bin"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unknown_dl_resp.status(), reqwest::StatusCode::NOT_FOUND);
+
+    // Verify SPA routes return 200 OK with strict CDN no-store headers
+    for spa_path in ["/", "/login", "/register", "/activate?code=ABCD-1234", "/console"] {
+        let resp = http.get(format!("{base}{spa_path}")).send().await.unwrap();
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::OK,
+            "SPA route {spa_path} must return 200 OK"
+        );
+        assert_eq!(
+            resp.headers()
+                .get("cache-control")
+                .and_then(|v| v.to_str().ok()),
+            Some("no-cache, no-store, must-revalidate")
+        );
+        assert_eq!(
+            resp.headers()
+                .get("cdn-cache-control")
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store")
+        );
+    }
+
+    // Verify immutable CDN caching for existing hashed bundles (/app.<hash>.js) vs no-store on 404
+    let hashed_resp = http
+        .get(format!("{base}/app.abcdef1234.js"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(hashed_resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        hashed_resp
+            .headers()
+            .get("cache-control")
+            .and_then(|v| v.to_str().ok()),
+        Some("public, max-age=31536000, immutable")
+    );
+    let missing_hashed_resp = http
+        .get(format!("{base}/app.missing9999.js"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing_hashed_resp.status(), reqwest::StatusCode::NOT_FOUND);
+    assert_eq!(
+        missing_hashed_resp
+            .headers()
+            .get("cdn-cache-control")
+            .and_then(|v| v.to_str().ok()),
+        Some("no-store")
+    );
+    let _ = std::fs::remove_dir_all(&temp_web_dist);
     let relays = site["relays"].as_array().unwrap();
     assert!(!relays.iter().any(|r| r["mode"] == "raw_tcp_no_sni"));
     assert!(relays

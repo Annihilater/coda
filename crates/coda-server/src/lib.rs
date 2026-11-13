@@ -1,13 +1,22 @@
 pub mod db;
 pub mod relay;
 
-use std::{net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{
+    net::SocketAddr,
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use anyhow::Result;
 use axum::{
-    extract::{Query, State, WebSocketUpgrade},
-    http::{HeaderMap, StatusCode},
-    response::IntoResponse,
+    extract::{Path, Query, Request, State, WebSocketUpgrade},
+    http::{
+        header::{self, HeaderName, HeaderValue},
+        HeaderMap, StatusCode,
+    },
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
@@ -15,6 +24,7 @@ use chrono::Utc;
 use coda_protocol::{RelayTicketClaims, StoredDeviceIdentity};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use tokio::sync::RwLock;
 use tower_http::{
     cors::{Any, CorsLayer},
     services::{ServeDir, ServeFile},
@@ -64,6 +74,8 @@ pub struct AppState {
     pub release_version: String,
     pub github_repo: String,
     pub ios_beta_url: Option<String>,
+    pub http_no_redirect: reqwest::Client,
+    pub latest_release_cache: Arc<RwLock<Option<(String, Instant)>>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -242,6 +254,33 @@ pub struct EnrollHostDeviceRequest {
     pub herdr_version: Option<String>,
 }
 
+async fn cache_control_middleware(req: Request, next: Next) -> Response {
+    let path = req.uri().path().to_string();
+    let is_hashed_bundle = path.starts_with("/app.") && path.ends_with(".js") && path.len() > 8;
+    let mut resp = next.run(req).await;
+    if resp.status() == StatusCode::SWITCHING_PROTOCOLS {
+        return resp;
+    }
+    let is_ok_hashed = is_hashed_bundle && resp.status() == StatusCode::OK;
+    let headers = resp.headers_mut();
+    if is_ok_hashed {
+        headers.insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("public, max-age=31536000, immutable"),
+        );
+    } else {
+        headers.insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("no-cache, no-store, must-revalidate"),
+        );
+        headers.insert(
+            HeaderName::from_static("cdn-cache-control"),
+            HeaderValue::from_static("no-store"),
+        );
+    }
+    resp
+}
+
 pub fn build_router(state: AppState, web_dist_dir: Option<PathBuf>) -> Router {
     let cors = CorsLayer::new()
         .allow_origin(Any)
@@ -277,18 +316,24 @@ pub fn build_router(state: AppState, web_dist_dir: Option<PathBuf>) -> Router {
             post(enroll_host_device_handler),
         )
         .route("/api/v1/relay/ticket", post(mint_relay_ticket_handler))
+        .route("/download/{artifact}", get(download_latest_artifact_handler))
         .route("/install.sh", get(install_script_handler))
         .route("/v1/tunnel/ws", get(ws_tunnel_upgrade_handler))
         .with_state(state);
 
     let app = if let Some(dir) = web_dist_dir.filter(|p| p.exists()) {
         let index = dir.join("index.html");
-        api.fallback_service(ServeDir::new(dir).not_found_service(ServeFile::new(index)))
+        api.route_service("/login", ServeFile::new(&index))
+            .route_service("/register", ServeFile::new(&index))
+            .route_service("/activate", ServeFile::new(&index))
+            .route_service("/console", ServeFile::new(&index))
+            .fallback_service(ServeDir::new(dir).not_found_service(ServeFile::new(index)))
     } else {
         api
     };
 
     app.layer(cors)
+        .layer(middleware::from_fn(cache_control_middleware))
 }
 
 pub struct RunningServer {
@@ -367,6 +412,12 @@ pub async fn start_full_server_with_options(
     )
     .await?;
 
+    let http_no_redirect = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(4))
+        .user_agent("coda-server")
+        .build()?;
+
     let state = AppState {
         db,
         relay_hub,
@@ -380,6 +431,8 @@ pub async fn start_full_server_with_options(
         release_version: options.release_version,
         github_repo: options.github_repo,
         ios_beta_url: options.ios_beta_url.filter(|s| !s.trim().is_empty()),
+        http_no_redirect,
+        latest_release_cache: Arc::new(RwLock::new(None)),
     };
 
     let router = build_router(state.clone(), web_dist_dir);
@@ -508,6 +561,114 @@ async fn health_handler(State(st): State<AppState>) -> Json<Value> {
     }))
 }
 
+const LATEST_RELEASE_CACHE_TTL: Duration = Duration::from_secs(300);
+
+fn extract_release_tag_from_location(location: &str) -> Option<String> {
+    let (_, after) = location.split_once("/releases/tag/")?;
+    let raw_tag = after
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(after)
+        .trim_end_matches('/');
+    if raw_tag.is_empty()
+        || !raw_tag
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '+'))
+    {
+        return None;
+    }
+    Some(raw_tag.to_string())
+}
+
+fn release_asset_filename(artifact: &str, tag: &str) -> Option<String> {
+    let filename = match artifact {
+        "desktop-macos.dmg" => format!("Coda-Desktop-macos-aarch64-{tag}.dmg"),
+        "desktop-macos.tar.gz" => format!("coda-macos-aarch64-{tag}.tar.gz"),
+        "daemon-linux-x86_64.tar.gz" => format!("coda-daemon-linux-x86_64-{tag}.tar.gz"),
+        "daemon-linux-aarch64.tar.gz" => format!("coda-daemon-linux-aarch64-{tag}.tar.gz"),
+        "daemon-macos-aarch64.tar.gz" => format!("coda-daemon-macos-aarch64-{tag}.tar.gz"),
+        "server-linux-x86_64.tar.gz" => format!("coda-server-linux-x86_64-{tag}.tar.gz"),
+        "server-linux-aarch64.tar.gz" => format!("coda-server-linux-aarch64-{tag}.tar.gz"),
+        "server-macos-aarch64.tar.gz" => format!("coda-macos-aarch64-{tag}.tar.gz"),
+        "deploy-bundle.tar.gz" => format!("coda-deploy-bundle-{tag}.tar.gz"),
+        "checksums.txt" => format!("SHA256SUMS-{tag}.txt"),
+        _ => return None,
+    };
+    Some(filename)
+}
+
+async fn resolve_latest_github_tag(st: &AppState) -> Option<String> {
+    {
+        let cached = st.latest_release_cache.read().await;
+        if let Some((tag, fetched_at)) = cached.as_ref() {
+            if fetched_at.elapsed() < LATEST_RELEASE_CACHE_TTL {
+                return Some(tag.clone());
+            }
+        }
+    }
+
+    let latest_url = format!("https://github.com/{}/releases/latest", st.github_repo);
+    let mut resolved = None;
+
+    if let Ok(resp) = st.http_no_redirect.head(&latest_url).send().await {
+        if let Some(loc) = resp
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+        {
+            resolved = extract_release_tag_from_location(loc);
+        }
+    }
+
+    if resolved.is_none() {
+        if let Ok(resp) = st.http_no_redirect.get(&latest_url).send().await {
+            if let Some(loc) = resp
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+            {
+                resolved = extract_release_tag_from_location(loc);
+            }
+        }
+    }
+
+    if let Some(tag) = resolved {
+        let mut cached = st.latest_release_cache.write().await;
+        *cached = Some((tag.clone(), Instant::now()));
+        return Some(tag);
+    }
+
+    let cached = st.latest_release_cache.read().await;
+    cached.as_ref().map(|(tag, _)| tag.clone())
+}
+
+async fn download_latest_artifact_handler(
+    State(st): State<AppState>,
+    Path(artifact): Path<String>,
+) -> Response {
+    if release_asset_filename(&artifact, "v0.0.0").is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "unknown download artifact" })),
+        )
+            .into_response();
+    }
+
+    let target_url = match resolve_latest_github_tag(&st).await {
+        Some(latest_tag) => {
+            let filename = release_asset_filename(&artifact, &latest_tag)
+                .expect("validated artifact key");
+            format!(
+                "https://github.com/{}/releases/download/{latest_tag}/{filename}",
+                st.github_repo
+            )
+        }
+        None => format!("https://github.com/{}/releases/latest", st.github_repo),
+    };
+
+    (StatusCode::FOUND, [(header::LOCATION, target_url)]).into_response()
+}
+
 async fn public_site_info_handler(
     State(st): State<AppState>,
     headers: HeaderMap,
@@ -520,8 +681,8 @@ async fn public_site_info_handler(
     } else {
         format!("v{}", st.release_version)
     };
-    let dl_base = format!("https://github.com/{}/releases/download/{tag}", st.github_repo);
-    let releases_page = format!("https://github.com/{}/releases/tag/{tag}", st.github_repo);
+    let dl_root = format!("{base_url}/download");
+    let releases_page = format!("https://github.com/{}/releases/latest", st.github_repo);
 
     Ok(Json(json!({
         "service": "coda-server",
@@ -533,15 +694,15 @@ async fn public_site_info_handler(
         "install_command": format!("curl -fsSL {base_url}/install.sh | sh"),
         "relays": relays,
         "downloads": {
-            "daemon_linux_x64": format!("{dl_base}/coda-daemon-linux-x86_64-{tag}.tar.gz"),
-            "daemon_linux_arm64": format!("{dl_base}/coda-daemon-linux-aarch64-{tag}.tar.gz"),
-            "daemon_macos_arm64": format!("{dl_base}/coda-daemon-macos-aarch64-{tag}.tar.gz"),
-            "server_linux_x64": format!("{dl_base}/coda-server-linux-x86_64-{tag}.tar.gz"),
-            "server_linux_arm64": format!("{dl_base}/coda-server-linux-aarch64-{tag}.tar.gz"),
-            "server_macos_arm64": format!("{dl_base}/coda-macos-aarch64-{tag}.tar.gz"),
-            "desktop_macos_dmg": format!("{dl_base}/Coda-Desktop-macos-aarch64-{tag}.dmg"),
-            "desktop_macos_tar": format!("{dl_base}/coda-macos-aarch64-{tag}.tar.gz"),
-            "deploy_bundle": format!("{dl_base}/coda-deploy-bundle-{tag}.tar.gz"),
+            "daemon_linux_x64": format!("{dl_root}/daemon-linux-x86_64.tar.gz"),
+            "daemon_linux_arm64": format!("{dl_root}/daemon-linux-aarch64.tar.gz"),
+            "daemon_macos_arm64": format!("{dl_root}/daemon-macos-aarch64.tar.gz"),
+            "server_linux_x64": format!("{dl_root}/server-linux-x86_64.tar.gz"),
+            "server_linux_arm64": format!("{dl_root}/server-linux-aarch64.tar.gz"),
+            "server_macos_arm64": format!("{dl_root}/server-macos-aarch64.tar.gz"),
+            "desktop_macos_dmg": format!("{dl_root}/desktop-macos.dmg"),
+            "desktop_macos_tar": format!("{dl_root}/desktop-macos.tar.gz"),
+            "deploy_bundle": format!("{dl_root}/deploy-bundle.tar.gz"),
             "ios_beta_url": st.ios_beta_url,
             "releases_page": releases_page,
         }
@@ -1066,5 +1227,47 @@ impl IntoResponse for ApiError {
             })),
         )
             .into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_release_tag_handles_valid_and_invalid_locations() {
+        assert_eq!(
+            extract_release_tag_from_location("https://github.com/Annihilater/coda/releases/tag/v0.3.5"),
+            Some("v0.3.5".to_string())
+        );
+        assert_eq!(
+            extract_release_tag_from_location("/Annihilater/coda/releases/tag/v0.3.6-rc.1/?foo=bar#top"),
+            Some("v0.3.6-rc.1".to_string())
+        );
+        assert_eq!(
+            extract_release_tag_from_location("https://github.com/Annihilater/coda/releases/tag/"),
+            None
+        );
+        assert_eq!(
+            extract_release_tag_from_location("https://github.com/Annihilater/coda/releases/tag/bad/path"),
+            None
+        );
+    }
+
+    #[test]
+    fn release_asset_filename_maps_known_artifacts() {
+        assert_eq!(
+            release_asset_filename("desktop-macos.dmg", "v0.3.5").as_deref(),
+            Some("Coda-Desktop-macos-aarch64-v0.3.5.dmg")
+        );
+        assert_eq!(
+            release_asset_filename("daemon-linux-x86_64.tar.gz", "v0.3.5").as_deref(),
+            Some("coda-daemon-linux-x86_64-v0.3.5.tar.gz")
+        );
+        assert_eq!(
+            release_asset_filename("deploy-bundle.tar.gz", "v0.3.5").as_deref(),
+            Some("coda-deploy-bundle-v0.3.5.tar.gz")
+        );
+        assert_eq!(release_asset_filename("unknown.bin", "v0.3.5"), None);
     }
 }
