@@ -1,0 +1,41 @@
+name: CodaMobile
+options:
+  bundleIdPrefix: dev.codahub
+  deploymentTarget:
+    iOS: "17.0"
+  xcodeVersion: "16.0"
+
+packages:
+  CodaApple:
+    path: .
+
+targets:
+  CodaMobile:
+    type: application
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources:
+      - path: iOSApp
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.codahub.mobile
+        PRODUCT_NAME: Coda
+        MARKETING_VERSION: "0.3.7"
+        CURRENT_PROJECT_VERSION: "1"
+        SWIFT_VERSION: "6.0"
+        TARGETED_DEVICE_FAMILY: "1,2"
+        SUPPORTS_MACCATALYST: false
+        GENERATE_INFOPLIST_FILE: true
+        INFOPLIST_KEY_CFBundleDisplayName: "Coda"
+        INFOPLIST_KEY_UIRequiresFullScreen: false
+        INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone: "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"
+        INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad: "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"
+        INFOPLIST_KEY_NSLocalNetworkUsageDescription: "Discover and connect directly to paired Coda hosts on your local Wi-Fi network with zero-knowledge E2EE."
+        INFOPLIST_KEY_UILaunchScreen_Generation: true
+    dependencies:
+      - package: CodaApple
+        product: CodaKit
+      - package: CodaApple
+        product: CodaGhosttyKit
+      - package: CodaApple
+        product: CodaUI

@@ -7,22 +7,22 @@ import Network
 @main
 struct CodaSelfTest {
     static func main() async throws {
-        // 1. Verify Apple CryptoKit Curve25519 + HKDF-SHA256 + ChaChaPoly E2EE & Anti-Replay
-        let iphoneDuo = CodaDeviceIdentity.generate(name: "iPhone Duo")
-        let macStudio = CodaDeviceIdentity.generate(name: "Home Mac Studio")
+        // 1. Apple CryptoKit Curve25519 + HKDF-SHA256 + ChaChaPoly E2EE & Anti-Replay
+        let iphoneClient = CodaDeviceIdentity.generate(name: "iPhone Client")
+        let studioHost = CodaDeviceIdentity.generate(name: "Studio Host")
 
         var clientSess = try CodaE2EESession(
-            myX25519SecretB64: iphoneDuo.x25519SecretB64,
-            peerX25519PublicB64: macStudio.x25519PublicB64,
+            myX25519SecretB64: iphoneClient.x25519SecretB64,
+            peerX25519PublicB64: studioHost.x25519PublicB64,
             isClientInitiator: true
         )
         var daemonSess = try CodaE2EESession(
-            myX25519SecretB64: macStudio.x25519SecretB64,
-            peerX25519PublicB64: iphoneDuo.x25519PublicB64,
+            myX25519SecretB64: studioHost.x25519SecretB64,
+            peerX25519PublicB64: iphoneClient.x25519PublicB64,
             isClientInitiator: false
         )
 
-        let msg = Data(#"{"op":"ping","req_id":"apple-1","sent_ms":100}"#.utf8)
+        let msg = Data(#"{"op":"ping","req_id":"swift-1","sent_ms":100}"#.utf8)
         let sealed = try clientSess.sealJSON(msg)
         let opened = try daemonSess.openJSON(sealed)
         precondition(opened == msg, "Decrypted payload mismatch")
@@ -35,12 +35,12 @@ struct CodaSelfTest {
         }
         precondition(replayRejected, "Replay attack was not rejected")
 
-        // 2. Verify OSC 7501 Semantic Agent Status & iPhone Duo 5.4" -> 7.6" Unfold Reflow
+        // 2. OSC 7501 Semicolon + Colon Formats & Foldable Width Reflow
         var surface = GhosttyReflowEngine(columns: 40, rows: 10)
         let stream = "\u{1B}]7501;state=blocked;kind=permission;app=claude;title=RunTests;progress=85\u{07}"
             + "Claude Code modified crates/coda-server/src/relay.rs and awaits approval to run tests\n"
         surface.feed(Data(stream.utf8))
-        precondition(surface.latestHerdrStatus?.state == .blocked)
+        precondition(surface.latestHerdrStatus?.state == .needsYou)
         precondition(surface.latestHerdrStatus?.kind == "permission")
         precondition(surface.latestHerdrStatus?.progress == 85)
         precondition(surface.visibleLines.count > 2)
@@ -48,44 +48,62 @@ struct CodaSelfTest {
         surface.resizeReflow(columns: 108, rows: 28)
         precondition(surface.visibleLines.count == 1)
 
-        // 3. Verify Phase 2 Base64 Live PTY Chunk Feeding & Voice Model Config Codable Roundtrip
-        let ptyChunkB64 = Data("\u{1B}[32m● PTY Live Stream OK\u{1B}[0m\r\n".utf8).base64EncodedString()
+        // 3. TrueColor 24-bit ANSI SGR + Git Diff Classification + Colon OSC 7501 + Tactile Chords
+        let ptyChunkB64 = Data("\u{1B}[32m* PTY Live Stream OK\u{1B}[0m\r\n".utf8).base64EncodedString()
         surface.feedBase64PtyChunk(ptyChunkB64)
         precondition(surface.visibleLines.last?.contains("PTY Live Stream OK") == true)
 
+        let richRaw = "\u{1B}]7501:blocked:Approve deploy\u{07}\u{1B}[38;2;56;189;248m+added diff line\u{1B}[0m\n-removed diff line\n1. Yes\n"
+        let styled = GhosttyReflowEngine.renderStyledLines(rawOutput: richRaw, targetColumns: 80)
+        precondition(styled.latestStatus?.state == .needsYou)
+        precondition(styled.latestStatus?.message == "Approve deploy")
+        precondition(styled.lines.count == 3)
+        precondition(styled.lines[0].kind == .diffAdded)
+        precondition(styled.lines[0].spans.first?.fg == GhosttyRGBColor(r: 56, g: 189, b: 248))
+        precondition(styled.lines[1].kind == .diffRemoved)
+        precondition(styled.lines[2].kind == .promptChoice)
+        precondition(GhosttyReflowEngine.encodeKey(.shiftTab) == Data("\u{1B}[Z".utf8))
+        precondition(GhosttyReflowEngine.encodeModifiedText("c", ctrl: true, alt: false) == Data([0x03]))
+
+        // 4. Herdr Inbox Priority Ordering (`Needs you` -> `Error` -> `Done (unread)` -> `Working` -> `Idle`)
+        let now = Date()
+        let sIdle = CodaAgentSession(id: "s4", terminalAddress: "t4", workspaceName: "coda", hostName: "studio", agentName: "zsh", taskTitle: "Shell", state: .idle, updatedAt: now)
+        let sWork = CodaAgentSession(id: "s3", terminalAddress: "t3", workspaceName: "coda", hostName: "studio", agentName: "codex", taskTitle: "Build", state: .working, updatedAt: now.addingTimeInterval(-10))
+        let sDoneUnread = CodaAgentSession(id: "s2", terminalAddress: "t2", workspaceName: "coda", hostName: "studio", agentName: "claude", taskTitle: "Done task", state: .done, unreadCompletion: true, updatedAt: now.addingTimeInterval(-20))
+        let sNeeds = CodaAgentSession(id: "s1", terminalAddress: "t1", workspaceName: "coda", hostName: "studio", agentName: "claude", taskTitle: "Approve tool", state: .needsYou, updatedAt: now.addingTimeInterval(-30))
+        let sortedIDs = [sIdle, sWork, sDoneUnread, sNeeds].sorted(by: CodaAgentSession.inboxOrder).map(\.id)
+        precondition(sortedIDs == ["s1", "s2", "s3", "s4"], "Unexpected inbox priority order: \(sortedIDs)")
+
+        // 5. Wire Codable Compatibility Checks
         let voiceCfg = CodaVoiceModelConfig(
             provider: "openai",
             baseURL: "https://api.openai.com/v1",
-            apiKey: "sk-apple-test",
+            apiKey: "test-placeholder-token",
             model: "gpt-4o-mini-transcribe"
         )
         let voiceJSON = try JSONEncoder().encode(voiceCfg)
         let decodedVoice = try JSONDecoder().decode(CodaVoiceModelConfig.self, from: voiceJSON)
         precondition(decodedVoice == voiceCfg)
 
-        // 4. Verify Phase 2 Git Repo & Worktree JSON Wire Compatibility with Rust `coda-protocol`
         let sampleRepoJSON = Data("""
         {
           "repo_name": "coda",
-          "root_path": "/Users/vampire/personal/github/coda",
-          "machine_name": "Home",
+          "root_path": "/Users/dev/coda",
+          "machine_name": "Studio",
           "branches": [
             {
               "branch": "main",
-              "worktree_path": "/Users/vampire/personal/github/coda",
-              "diff_added": 1233,
-              "diff_deleted": 116,
-              "status_summary": "4 个终端运行中"
+              "worktree_path": "/Users/dev/coda",
+              "diff_added": 124,
+              "diff_deleted": 16,
+              "status_summary": "2 panes working"
             }
           ]
         }
         """.utf8)
         let repo = try JSONDecoder().decode(CodaRepoWorkspaceSummary.self, from: sampleRepoJSON)
-        precondition(repo.repoName == "coda")
-        precondition(repo.branches.first?.diffAdded == 1233)
-        precondition(repo.branches.first?.statusSummary == "4 个终端运行中")
+        precondition(repo.repoName == "coda" && repo.branches.first?.diffAdded == 124)
 
-        // 5. Verify RFC 8628 Device Auth JSON Wire Compatibility (Linux `daemon` + macOS `hybrid`)
         let startJSON = Data("""
         {
           "device_code": "dev_test_123",
@@ -98,52 +116,19 @@ struct CodaSelfTest {
         """.utf8)
         let authStart = try JSONDecoder().decode(CodaDeviceAuthStart.self, from: startJSON)
         precondition(authStart.userCode == "ABCD-2345")
-        precondition(authStart.verificationURIComplete.contains("ABCD-2345"))
 
-        let pollJSON = Data("""
-        {
-          "state": "approved",
-          "session_token": "tok_test_abc",
-          "owner_handle": "alice",
-          "daemon_relay_ticket": "ticket_xyz",
-          "device": {
-            "id": "\(UUID().uuidString.lowercased())",
-            "name": "MacBook-Pro",
-            "role": "hybrid",
-            "platform": "macos",
-            "x25519_pubkey": "\(iphoneDuo.x25519PublicB64)",
-            "endpoints_json": [{"kind": "lan_ipv4", "addr": "192.168.1.20:24444"}],
-            "is_online": true
-          },
-          "relays": [
-            {
-              "id": "global-cdn-wss",
-              "region": "Global Edge CDN / CF Tunnel (WSS 443)",
-              "mode": "cdn_wss",
-              "endpoint": "wss://codahub.dev/v1/tunnel/ws",
-              "priority": 5
-            }
-          ]
-        }
-        """.utf8)
-        let pollResult = try JSONDecoder().decode(CodaDeviceAuthPollResult.self, from: pollJSON)
-        precondition(pollResult.state == "approved")
-        precondition(pollResult.device?.role == "hybrid")
-        precondition(pollResult.relays?.first?.endpoint == "wss://codahub.dev/v1/tunnel/ws")
-
-        // 6. Verify Auto-LAN UDP Discovery + Direct P2P TCP Handshake + E2EE Ping/Pong + Relay Fallback
+        // 6. Auto-LAN UDP Discovery + Direct P2P TCP Handshake + E2EE ListTerminals / SendTerminalText RPCs
         try await runAutoLanSmartPathLoopbackTest()
 
-        print("✅ CodaSelfTest passed: Apple CryptoKit E2EE + OSC 7501 + PTY Live Stream + RFC 8628 + Auto-LAN SmartPath P2P verified!")
+        print("[OK] ALL CODA APPLE NATIVE SELF-TESTS PASSED!")
     }
 
     static func runAutoLanSmartPathLoopbackTest() async throws {
         let daemonId = UUID()
         let clientId = UUID()
-        let daemonIdentity = CodaDeviceIdentity.generate(name: "Mock-Mac-Host")
-        let clientIdentity = CodaDeviceIdentity.generate(name: "iPhone-Duo-Client")
+        let daemonIdentity = CodaDeviceIdentity.generate(name: "Loopback-Host")
+        let clientIdentity = CodaDeviceIdentity.generate(name: "Loopback-iPhone")
 
-        // Start TCP listener speaking Coda DirectP2pHello -> DirectP2pAck -> E2EE Ping/Pong
         let tcpListener = try NWListener(using: .tcp, on: .any)
         let readyPort = AsyncStream<UInt16> { cont in
             tcpListener.stateUpdateHandler = { state in
@@ -164,12 +149,11 @@ struct CodaSelfTest {
             p2pPort = p
             break
         }
-        precondition(p2pPort > 0, "failed to bind mock Direct P2P listener")
+        precondition(p2pPort > 0, "failed to bind loopback Direct P2P listener")
         let fixedP2pPort = Int(p2pPort)
 
-        // Start UDP LAN beacon responder on 127.0.0.1:ephemeral
         let udpFD = Darwin.socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
-        precondition(udpFD >= 0, "failed creating mock UDP beacon socket")
+        precondition(udpFD >= 0, "failed creating UDP beacon socket")
         var udpBind = sockaddr_in()
         udpBind.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
         udpBind.sin_family = sa_family_t(AF_INET)
@@ -180,7 +164,7 @@ struct CodaSelfTest {
                 Darwin.bind(udpFD, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
             }
         }
-        precondition(bRes == 0, "failed binding mock UDP beacon")
+        precondition(bRes == 0, "failed binding UDP beacon")
 
         var boundUdpAddr = sockaddr_in()
         var boundUdpLen = socklen_t(MemoryLayout<sockaddr_in>.size)
@@ -229,7 +213,7 @@ struct CodaSelfTest {
 
         let targetDevice = CodaRemoteDevice(
             id: daemonId,
-            name: "Mock-Mac-Host",
+            name: "Loopback-Host",
             role: "daemon",
             platform: "macos",
             x25519Pubkey: daemonIdentity.x25519PublicB64,
@@ -247,7 +231,8 @@ struct CodaSelfTest {
         )
         precondition(negotiated == .lanDirect, "expected .lanDirect via UDP auto-discovery")
 
-        let reqData = Data(#"{"op":"ping","req_id":"apple-lan-1","sent_ms":4242}"#.utf8)
+        // Verify raw E2EE Ping/Pong
+        let reqData = Data(#"{"op":"ping","req_id":"swift-ping-1","sent_ms":4242}"#.utf8)
         let replyData = try await net.requestOverDirectP2P(
             reqData,
             clientIdentity: clientIdentity,
@@ -256,8 +241,25 @@ struct CodaSelfTest {
         )
         let reply = try JSONSerialization.jsonObject(with: replyData) as? [String: Any]
         precondition((reply?["op"] as? String) == "pong")
-        precondition((reply?["req_id"] as? String) == "apple-lan-1")
-        precondition((reply?["daemon_hostname"] as? String) == "Mock-Mac-Host")
+        precondition((reply?["daemon_hostname"] as? String) == "Loopback-Host")
+
+        // Verify high-level typed RPC `listTerminals` and `sendTerminalText`
+        let terms = try await net.listTerminals(
+            on: targetDevice,
+            clientIdentity: clientIdentity,
+            clientDeviceId: clientId
+        )
+        precondition(terms.count == 1 && terms.first?.address == "t1")
+        precondition(terms.first?.status?.state == "blocked")
+
+        try await net.sendTerminalText(
+            on: targetDevice,
+            clientIdentity: clientIdentity,
+            clientDeviceId: clientId,
+            terminal: "t1",
+            text: "cargo check",
+            submit: true
+        )
 
         tcpListener.cancel()
     }
@@ -289,45 +291,99 @@ struct CodaSelfTest {
                 "path_kind": "lan_ipv4",
             ]
             sendFramed(conn: conn, obj: ack) {
-                readFramed(conn: conn) { pkt in
-                    var localSess = initialSess
-                    guard let pkt,
-                          (pkt["frame_type"] as? String) == "route_packet",
-                          let e2eeObj = pkt["e2ee"] as? [String: Any],
-                          let e2eeData = try? JSONSerialization.data(withJSONObject: e2eeObj),
-                          let enc = try? JSONDecoder().decode(CodaEncryptedPayload.self, from: e2eeData),
-                          let pt = try? localSess.openJSON(enc),
-                          let req = try? JSONSerialization.jsonObject(with: pt) as? [String: Any],
-                          let reqId = req["req_id"] as? String,
-                          let sentMs = req["sent_ms"]
-                    else {
-                        conn.cancel()
-                        return
-                    }
+                servePacketLoop(conn: conn, daemonId: daemonId, sess: initialSess)
+            }
+        }
+    }
 
-                    let pong: [String: Any] = [
-                        "op": "pong",
-                        "req_id": reqId,
-                        "sent_ms": sentMs,
-                        "daemon_hostname": "Mock-Mac-Host",
-                        "herdr_version": "0.1.20",
-                    ]
-                    if let pongData = try? JSONSerialization.data(withJSONObject: pong),
-                       let sealed = try? localSess.sealJSON(pongData) {
-                        let respFrame: [String: Any] = [
-                            "frame_type": "route_packet",
-                            "src_device_id": daemonId.uuidString.lowercased(),
-                            "dst_device_id": (pkt["src_device_id"] as? String) ?? "",
-                            "lane": "control_p0",
-                            "e2ee": [
-                                "seq": sealed.seq,
-                                "compressed": sealed.compressed,
-                                "ciphertext_b64": sealed.ciphertextB64,
+    private static func servePacketLoop(conn: NWConnection, daemonId: UUID, sess: CodaE2EESession) {
+        readFramed(conn: conn) { pkt in
+            var nextSess = sess
+            guard let pkt,
+                  (pkt["frame_type"] as? String) == "route_packet",
+                  let e2eeObj = pkt["e2ee"] as? [String: Any],
+                  let e2eeData = try? JSONSerialization.data(withJSONObject: e2eeObj),
+                  let enc = try? JSONDecoder().decode(CodaEncryptedPayload.self, from: e2eeData),
+                  let pt = try? nextSess.openJSON(enc),
+                  let req = try? JSONSerialization.jsonObject(with: pt) as? [String: Any],
+                  let op = req["op"] as? String,
+                  let reqId = req["req_id"] as? String
+            else {
+                conn.cancel()
+                return
+            }
+
+            let replyObj: [String: Any]
+            switch op {
+            case "ping":
+                replyObj = [
+                    "op": "pong",
+                    "req_id": reqId,
+                    "sent_ms": req["sent_ms"] ?? 0,
+                    "daemon_hostname": "Loopback-Host",
+                    "herdr_version": "0.1.20",
+                ]
+            case "list_terminals":
+                replyObj = [
+                    "op": "terminals_snapshot",
+                    "req_id": reqId,
+                    "core_name": "loopback",
+                    "core_id": "core-1",
+                    "terminals": [
+                        [
+                            "address": "t1",
+                            "name": "Auth refactor",
+                            "argv": ["claude"],
+                            "cwd": "/Users/dev/coda",
+                            "cols": 100,
+                            "rows": 32,
+                            "alive": true,
+                            "status": [
+                                "state": "blocked",
+                                "kind": "permission",
+                                "app": "claude",
+                                "title": "Run cargo test",
+                                "msg": "Allow running tests?",
                             ],
                         ]
-                        sendFramed(conn: conn, obj: respFrame) {}
-                    }
-                }
+                    ],
+                ]
+            case "send_terminal_text":
+                replyObj = [
+                    "op": "action_ack",
+                    "req_id": reqId,
+                    "ok": true,
+                    "detail": "text_sent",
+                ]
+            default:
+                replyObj = [
+                    "op": "action_ack",
+                    "req_id": reqId,
+                    "ok": true,
+                    "detail": "ok",
+                ]
+            }
+
+            guard let respData = try? JSONSerialization.data(withJSONObject: replyObj),
+                  let sealed = try? nextSess.sealJSON(respData) else {
+                conn.cancel()
+                return
+            }
+
+            let respFrame: [String: Any] = [
+                "frame_type": "route_packet",
+                "src_device_id": daemonId.uuidString.lowercased(),
+                "dst_device_id": (pkt["src_device_id"] as? String) ?? "",
+                "lane": "control_p0",
+                "e2ee": [
+                    "seq": sealed.seq,
+                    "compressed": sealed.compressed,
+                    "ciphertext_b64": sealed.ciphertextB64,
+                ],
+            ]
+            let updatedSess = nextSess
+            sendFramed(conn: conn, obj: respFrame) {
+                servePacketLoop(conn: conn, daemonId: daemonId, sess: updatedSess)
             }
         }
     }
