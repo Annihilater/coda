@@ -7,7 +7,7 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-coda_prod_secret}
       POSTGRES_DB: coda_prod
     volumes:
-      - coda_pgdata:/var/lib/postgresql/data
+      - coda_pgdata:/var/lib/postgresql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U coda -d coda_prod"]
       interval: 5s
@@ -27,7 +27,7 @@ services:
     environment:
       DATABASE_URL: ${DOCKER_DATABASE_URL:-postgres://coda:${POSTGRES_PASSWORD:-coda_prod_secret}@postgres:5432/coda_prod}
       CODA_RELAY_SECRET: ${CODA_RELAY_SECRET:-change-me-shared-hmac-relay-secret-2026}
-      CODA_PUBLIC_URL: ${CODA_PUBLIC_URL:-http://127.0.0.1:8080}
+      CODA_PUBLIC_URL: ${CODA_PUBLIC_URL:-}
       CODA_REGION_LABEL: ${CODA_REGION_LABEL:-CN-BGP-NoICP}
       CODA_OPEN_REGISTRATION: ${CODA_OPEN_REGISTRATION:-true}
       CODA_RAW_TCP_PUBLIC_ENDPOINT: ${CODA_RAW_TCP_PUBLIC_ENDPOINT:-}

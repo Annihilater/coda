@@ -10,7 +10,7 @@ Coda 每次发布 Tag (`v*`) 时，GitHub Actions 流水线会自动构建并发
 | 制品 / 镜像名称 | 解压后目录 / 平台 | 说明 |
 | :--- | :--- | :--- |
 | **`ghcr.io/annihilater/coda:<version>`** | `linux/amd64` / `linux/arm64` | **预构建多架构服务端容器镜像**（内置 `coda-server`、`coda-daemon` 与前端资源） |
-| **`coda-deploy-bundle-<version>.tar.gz`** | `coda-deploy-bundle/` | **极简部署运维包**（含 `start.sh`/`stop.sh`/`restart.sh`/`status.sh`/`logs.sh`/`update.sh`、`docker-compose.yml`、`.env.example`、`*.service`、安装脚本与本指南，**无 `Dockerfile`**） |
+| **`coda-deploy-bundle-<version>.tar.gz`** | `coda-deploy-bundle/` | **极简部署运维包**（含 `pull.sh`/`start.sh`/`stop.sh`/`restart.sh`/`status.sh`/`logs.sh`/`update.sh`、`docker-compose.yml`、`.env.example`、`*.service`、安装脚本与本指南，**无 `Dockerfile`**） |
 | **`coda-image-linux-{amd64,arm64}-<version>.tar.gz`** | 离线容器镜像包 | 供内网或 GHCR 不可达环境执行 `docker load` 离线导入使用 |
 | **`coda-server-linux-{x86_64,aarch64}-<version>.tar.gz`** | `coda-server-linux-*/` | Linux 服务端裸机包（含 `coda-server` + `web-dist` + `migrations` + `deploy`） |
 | **`coda-daemon-linux-{x86_64,aarch64}-<version>.tar.gz`** | `coda-daemon-linux-*/` | Linux 受控开发机守护进程 (`coda-daemon`) |
@@ -51,11 +51,12 @@ VER="$(curl -fsSLI -o /dev/null -w '%{url_effective}' https://github.com/Annihil
 curl -fsSL "https://github.com/Annihilater/coda/releases/download/${VER}/coda-deploy-bundle-${VER}.tar.gz" | tar -xz
 cd coda-deploy-bundle
 
-# 2. 复制配置文件并修改关键环境变量（DEPLOY_MODE / CODA_PUBLIC_URL / CODA_RELAY_SECRET / POSTGRES_PASSWORD）
+# 2. 查看隐藏模板文件（ls -la）并复制修改关键环境变量（DEPLOY_MODE / CODA_PUBLIC_URL / CODA_RELAY_SECRET / POSTGRES_PASSWORD）
 cp .env.example .env
 vim .env
 
-# 3. 一键启动（自动拉取预构建镜像 + 启动容器 + 健康检查）
+# 3. 预拉取镜像并一键启动（自动拉取预构建镜像 + 启动容器 + 健康检查）
+./pull.sh
 ./start.sh
 ```
 
@@ -63,6 +64,7 @@ vim .env
 
 | 脚本 | 作用说明 |
 | :--- | :--- |
+| **`./pull.sh`** | 预拉取所需容器镜像（`postgres:18-alpine` 与 `coda` 镜像；GHCR 不可达时自动回落 GitHub Releases 离线镜像包） |
 | **`./start.sh`** | 首次检查 `.env`，拉取/加载预构建镜像并启动服务（根据 `.env` 中的 `DEPLOY_MODE` 启动主控或国内中继） |
 | **`./stop.sh`** | 停止运行中的容器（传 `--down` 可移除容器但保留 `coda_pgdata` 数据卷） |
 | **`./restart.sh`** | **修改 `.env` 后推荐执行**：重新加载 `.env` 并重建 Coda 容器使新配置立即生效 |

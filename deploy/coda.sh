@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 # Coda Production Lifecycle Manager
 # Supports Docker Compose (default) and Systemd (--systemd / DEPLOY_RUNTIME=systemd).
-# Commands: start | stop | restart | status | logs | update
+# Commands: pull | start | stop | restart | status | logs | update
 
 set -eu
 
@@ -18,9 +18,10 @@ Coda 运维管理脚本
 
 用法:
   ./coda.sh <命令> [选项]
-  或直接运行快捷脚本: ./start.sh | ./stop.sh | ./restart.sh | ./status.sh | ./logs.sh | ./update.sh
+  或直接运行快捷脚本: ./pull.sh | ./start.sh | ./stop.sh | ./restart.sh | ./status.sh | ./logs.sh | ./update.sh
 
 命令:
+  pull               预拉取所需容器镜像（postgres:18-alpine 与 coda 镜像；GHCR 不可达时自动回落离线包）
   start              首次检查 .env、拉取/加载预编译镜像并启动服务（按 .env 中的 DEPLOY_MODE）
   stop [--down]      停止服务（加 --down 时同时移除容器，保留数据库卷 coda_pgdata）
   restart            重新读取 .env 并重建 Coda 容器以使新配置生效
@@ -244,6 +245,9 @@ if [ "${RUNTIME}" = "systemd" ] || [ "${SYSTEMD_FLAG}" = "1" ]; then
   load_env 0
   UNIT="$(systemd_unit_for_mode)"
   case "${CMD}" in
+    pull)
+      echo "[INFO] 当前为 systemd 裸机模式，无需拉取 Docker 镜像（如需安装/更新二进制请使用 install-server.sh / install-relay-cn.sh）。"
+      ;;
     start)
       systemctl start "${UNIT}"
       systemctl --no-pager -l status "${UNIT}" || true
@@ -271,6 +275,15 @@ fi
 
 # Docker Compose mode
 case "${CMD}" in
+  pull)
+    load_env 0
+    ensure_image 1
+    if [ "${DEPLOY_MODE}" != "relay-cn" ]; then
+      echo "==> [镜像] 正在拉取数据库镜像 postgres:18-alpine ..."
+      run_compose pull postgres
+    fi
+    echo "==> 镜像拉取完成！可执行 ls -la 查看 .env.example（或直接运行 ./start.sh 自动生成 .env）。"
+    ;;
   start)
     load_env 1
     ensure_image 0
@@ -289,7 +302,7 @@ case "${CMD}" in
       echo "    Web 控制台与 API : ${PUBLIC_URL} (本地端口 :${HTTP_PORT})"
       echo "    免备案裸 TCP 隧道 : :${RAW_TCP_PORT}"
     fi
-    echo "    常用命令: ./status.sh | ./logs.sh | ./restart.sh | ./stop.sh"
+    echo "    常用命令: ./pull.sh | ./status.sh | ./logs.sh | ./restart.sh | ./stop.sh"
     ;;
   stop)
     load_env 0

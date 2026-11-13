@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       tag_name:
-        description: "Release tag (e.g. v0.3.1)"
+        description: "Release tag (e.g. v0.3.2)"
         required: true
-        default: "v0.3.1"
+        default: "v0.3.2"
 
 permissions:
   contents: write
@@ -251,10 +251,13 @@ jobs:
           sed "s|ghcr.io/annihilater/coda:latest|ghcr.io/annihilater/coda:${RELEASE_TAG}|g" \
             deploy/docker-compose.yml > "${BUNDLE_DIR}/docker-compose.yml"
 
-          for s in coda.sh start.sh stop.sh restart.sh status.sh logs.sh update.sh install-server.sh install-relay-cn.sh install-daemon.sh; do
+          for s in pull.sh start.sh stop.sh restart.sh status.sh logs.sh update.sh install-server.sh install-relay-cn.sh install-daemon.sh; do
             cp "deploy/${s}" "${BUNDLE_DIR}/${s}"
             chmod 0755 "${BUNDLE_DIR}/${s}"
           done
+          sed "s|ghcr.io/annihilater/coda:latest|ghcr.io/annihilater/coda:${RELEASE_TAG}|g" \
+            deploy/coda.sh > "${BUNDLE_DIR}/coda.sh"
+          chmod 0755 "${BUNDLE_DIR}/coda.sh"
           chmod 0644 "${BUNDLE_DIR}/.env.example" "${BUNDLE_DIR}/docker-compose.yml" "${BUNDLE_DIR}/coda-server.service" "${BUNDLE_DIR}/coda-relay-cn.service"
 
           tar --owner=0 --group=0 -C dist-bundle -czf "release-assets/coda-deploy-bundle-${RELEASE_TAG}.tar.gz" coda-deploy-bundle
