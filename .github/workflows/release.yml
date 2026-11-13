@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       tag_name:
-        description: "Release tag (e.g. v0.3.2)"
+        description: "Release tag (e.g. v0.3.3)"
         required: true
-        default: "v0.3.2"
+        default: "v0.3.3"
 
 permissions:
   contents: write
@@ -120,8 +120,8 @@ jobs:
           cp target/release/coda-daemon dist/coda-daemon-macos-aarch64/
           cp deploy/install-daemon.sh dist/coda-daemon-macos-aarch64/
 
-          tar -C dist -czf "dist/coda-macos-aarch64-${RELEASE_TAG}.tar.gz" coda-macos-aarch64
-          tar -C dist -czf "dist/coda-daemon-macos-aarch64-${RELEASE_TAG}.tar.gz" coda-daemon-macos-aarch64
+          COPYFILE_DISABLE=1 tar -C dist -czf "dist/coda-macos-aarch64-${RELEASE_TAG}.tar.gz" coda-macos-aarch64
+          COPYFILE_DISABLE=1 tar -C dist -czf "dist/coda-daemon-macos-aarch64-${RELEASE_TAG}.tar.gz" coda-daemon-macos-aarch64
 
           DMG_STAGE="dist-dmg"
           APP_DIR="${DMG_STAGE}/Coda.app"
@@ -195,9 +195,9 @@ jobs:
           cp -r dist-unpack/coda-server-linux-x86_64/web-dist docker-ctx/web/dist
           cp deploy/install-daemon.sh docker-ctx/deploy/install-daemon.sh
 
-          cat > docker-ctx/Dockerfile <<'DOCKERFILE_EOF'
+          sed 's/^          //' > docker-ctx/Dockerfile <<'DOCKERFILE_EOF'
           FROM debian:bookworm-slim
-          ARG TARGETARCH=amd64
+          ARG TARGETARCH
           LABEL org.opencontainers.image.source="https://github.com/Annihilater/coda"
           LABEL org.opencontainers.image.description="Coda Zero-Knowledge AI Agent Mesh Coordinator & Stateless Relay"
           LABEL org.opencontainers.image.licenses="MIT"
@@ -248,6 +248,7 @@ jobs:
 
           sed "s|ghcr.io/annihilater/coda:latest|ghcr.io/annihilater/coda:${RELEASE_TAG}|g" \
             deploy/.env.example > "${BUNDLE_DIR}/.env.example"
+          cp "${BUNDLE_DIR}/.env.example" "${BUNDLE_DIR}/env.example"
           sed "s|ghcr.io/annihilater/coda:latest|ghcr.io/annihilater/coda:${RELEASE_TAG}|g" \
             deploy/docker-compose.yml > "${BUNDLE_DIR}/docker-compose.yml"
 
@@ -258,7 +259,7 @@ jobs:
           sed "s|ghcr.io/annihilater/coda:latest|ghcr.io/annihilater/coda:${RELEASE_TAG}|g" \
             deploy/coda.sh > "${BUNDLE_DIR}/coda.sh"
           chmod 0755 "${BUNDLE_DIR}/coda.sh"
-          chmod 0644 "${BUNDLE_DIR}/.env.example" "${BUNDLE_DIR}/docker-compose.yml" "${BUNDLE_DIR}/coda-server.service" "${BUNDLE_DIR}/coda-relay-cn.service"
+          chmod 0644 "${BUNDLE_DIR}/.env.example" "${BUNDLE_DIR}/env.example" "${BUNDLE_DIR}/docker-compose.yml" "${BUNDLE_DIR}/coda-server.service" "${BUNDLE_DIR}/coda-relay-cn.service"
 
           tar --owner=0 --group=0 -C dist-bundle -czf "release-assets/coda-deploy-bundle-${RELEASE_TAG}.tar.gz" coda-deploy-bundle
 

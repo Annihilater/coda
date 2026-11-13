@@ -613,7 +613,7 @@ class CodaTerminalWebApp {
     const root = document.getElementById("app")!;
     const baseUrl = this.siteInfo?.public_base_url || window.location.origin;
     const installCmd = this.siteInfo?.install_command || `curl -fsSL ${baseUrl}/install.sh | sh`;
-    const ver = this.siteInfo?.version || "v0.3.2";
+    const ver = this.siteInfo?.version || "v0.3.3";
     const dl = this.siteInfo?.downloads;
     const isActivateView =
       window.location.pathname === "/activate" || !!this.pendingActivationCode;

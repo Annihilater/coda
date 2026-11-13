@@ -23,7 +23,7 @@ Coda 运维管理脚本
 命令:
   pull               预拉取所需容器镜像（postgres:18-alpine 与 coda 镜像；GHCR 不可达时自动回落离线包）
   start              首次检查 .env、拉取/加载预编译镜像并启动服务（按 .env 中的 DEPLOY_MODE）
-  stop [--down]      停止服务（加 --down 时同时移除容器，保留数据库卷 coda_pgdata）
+  stop [--down] [-v] 停止服务（加 --down 移除容器；加 --down -v 同时清理数据库卷 coda_pgdata）
   restart            重新读取 .env 并重建 Coda 容器以使新配置生效
   status             查看运行状态、端口监听情况与健康检查结果
   logs [service...]  实时跟踪查看日志（可用 Ctrl+C 退出；可传服务名如 coda-coordinator）
@@ -46,6 +46,7 @@ shift 1
 OVERRIDE_MODE=""
 PASSTHROUGH_ARGS=""
 DOWN_FLAG=0
+DOWN_VOLUMES_FLAG=0
 
 for arg in "$@"; do
   case "${arg}" in
@@ -58,6 +59,10 @@ for arg in "$@"; do
       ;;
     --down)
       DOWN_FLAG=1
+      ;;
+    -v|--volumes)
+      DOWN_FLAG=1
+      DOWN_VOLUMES_FLAG=1
       ;;
     -h|--help)
       usage
@@ -108,25 +113,34 @@ resolve_runtime() {
   exit 1
 }
 
+gen_secret_hex() {
+  if command -v openssl >/dev/null 2>&1; then
+    openssl rand -hex 24
+  else
+    od -An -N24 -tx1 /dev/urandom | tr -d ' \n'
+  fi
+}
+
 load_env() {
   require_configured="${1:-0}"
 
   if [ ! -f "${SCRIPT_DIR}/.env" ]; then
-    if [ "${require_configured}" = "1" ] && [ -f "${SCRIPT_DIR}/.env.example" ]; then
-      cp "${SCRIPT_DIR}/.env.example" "${SCRIPT_DIR}/.env"
+    template_env=""
+    if [ -f "${SCRIPT_DIR}/.env.example" ]; then
+      template_env="${SCRIPT_DIR}/.env.example"
+    elif [ -f "${SCRIPT_DIR}/env.example" ]; then
+      template_env="${SCRIPT_DIR}/env.example"
+    fi
+
+    if [ "${RUNTIME}" != "systemd" ] && [ -n "${template_env}" ] && { [ "${require_configured}" = "1" ] || [ "${CMD}" = "pull" ]; }; then
+      rand_relay_secret="$(gen_secret_hex)"
+      rand_pg_pass="$(gen_secret_hex)"
+      sed \
+        -e "s|coda_shared_hmac_relay_secret_change_me_2026|${rand_relay_secret}|g" \
+        -e "s|coda_prod_change_me_2026|${rand_pg_pass}|g" \
+        "${template_env}" > "${SCRIPT_DIR}/.env"
       chmod 600 "${SCRIPT_DIR}/.env" 2>/dev/null || true
-      if [ "${CODA_AUTO_START:-0}" != "1" ]; then
-        cat <<EOF
-[INFO] 首次运行，已自动生成默认配置文件: ${SCRIPT_DIR}/.env
-       请先修改其中的关键配置后再重新执行 ./start.sh ：
-         1) DEPLOY_MODE       : coordinator (主控制面) 或 relay-cn (国内免备案裸TCP中继)
-         2) CODA_PUBLIC_URL   : 例如 https://codahub.dev 或 http://你的公网IP:8080
-         3) CODA_RELAY_SECRET : 主控制面与所有中继必须一致（可用 openssl rand -hex 32 生成）
-         4) POSTGRES_PASSWORD : 数据库密码（仅 coordinator 模式需要）
-       （如确定仅用默认值直接启动，可执行: CODA_AUTO_START=1 ./start.sh）
-EOF
-        exit 1
-      fi
+      echo "[INFO] 已根据模板自动生成配置文件 ${SCRIPT_DIR}/.env（默认域名 https://codahub.dev，已自动生成随机数据库密码与中继密钥；如需自定义可编辑 .env 后执行 ./restart.sh）。"
     elif [ -f "/etc/coda/.env" ]; then
       set -a
       # shellcheck disable=SC1091
@@ -276,13 +290,13 @@ fi
 # Docker Compose mode
 case "${CMD}" in
   pull)
-    load_env 0
+    load_env 1
     ensure_image 1
     if [ "${DEPLOY_MODE}" != "relay-cn" ]; then
       echo "==> [镜像] 正在拉取数据库镜像 postgres:18-alpine ..."
       run_compose pull postgres
     fi
-    echo "==> 镜像拉取完成！可执行 ls -la 查看 .env.example（或直接运行 ./start.sh 自动生成 .env）。"
+    echo "==> 镜像拉取完成！如需微调域名或密钥可编辑 .env，然后直接运行 ./start.sh 启动。"
     ;;
   start)
     load_env 1
@@ -306,7 +320,10 @@ case "${CMD}" in
     ;;
   stop)
     load_env 0
-    if [ "${DOWN_FLAG}" = "1" ]; then
+    if [ "${DOWN_VOLUMES_FLAG}" = "1" ]; then
+      echo "==> 正在停止并移除 Coda 容器及数据卷 (coda_pgdata)..."
+      run_compose --profile relay-cn down -v
+    elif [ "${DOWN_FLAG}" = "1" ]; then
       echo "==> 正在停止并移除 Coda 容器（保留数据卷 coda_pgdata）..."
       run_compose --profile relay-cn down
     else
