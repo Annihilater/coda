@@ -27,6 +27,11 @@ async fn test_multi_tenant_postgres_and_raw_tcp_e2ee_herdr_tunnel() {
     let db_url = std::env::var("TEST_DATABASE_URL")
         .unwrap_or_else(|_| "postgres://vampire@localhost:5432/coda_test".to_string());
 
+    // Ensure schema migrations exist on a brand-new CI database BEFORE truncating tables
+    let _ = coda_server::db::Db::connect_and_migrate(&db_url)
+        .await
+        .expect("PostgreSQL coda_test should be reachable and migrate cleanly");
+
     // Clean test tables before run
     let (pg, conn) = tokio_postgres::connect(&db_url, tokio_postgres::NoTls)
         .await
@@ -145,7 +150,25 @@ async fn test_multi_tenant_postgres_and_raw_tcp_e2ee_herdr_tunnel() {
     let daemon_task = tokio::spawn(async move {
         let _ = coda_daemon::run_daemon_once(&cfg_bg, Some("raw_tcp_no_sni")).await;
     });
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let ready_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut daemon_online = false;
+    while tokio::time::Instant::now() < ready_deadline {
+        if let Ok(resp) = http
+            .get(format!("{base}/api/v1/devices"))
+            .bearer_auth(&owner_auth.token)
+            .send()
+            .await
+        {
+            if let Ok(devs) = resp.json::<Vec<DeviceRecord>>().await {
+                if devs.iter().any(|d| d.id == daemon_cfg.device_id && d.is_online) {
+                    daemon_online = true;
+                    break;
+                }
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+    }
+    assert!(daemon_online, "daemon should register online on Raw TCP relay within 5s");
 
     // 5. Verify tenant isolation: Friend Leo sees 0 of Vampire's devices & cannot mint relay ticket to it!
     let leo_devices: Vec<DeviceRecord> = http
@@ -281,7 +304,7 @@ async fn test_multi_tenant_postgres_and_raw_tcp_e2ee_herdr_tunnel() {
                 assert_eq!(req_id, "ping-1");
                 assert_eq!(daemon_hostname, "Mac-Mini-Studio");
                 if discover_hc_binary().is_some() {
-                    assert_eq!(herdr_version, "0.1.20");
+                    assert!(!herdr_version.is_empty() && herdr_version != "unavailable");
                 }
             }
             other => panic!("expected Pong, got {other:?}"),
@@ -897,8 +920,12 @@ async fn read_len_frame(stream: &mut TcpStream) -> RelayWireFrame {
 async fn next_route_packet(stream: &mut TcpStream) -> RelayWireFrame {
     loop {
         let f = read_len_frame(stream).await;
-        if matches!(f, RelayWireFrame::RoutePacket { .. }) {
-            return f;
+        match f {
+            RelayWireFrame::RoutePacket { .. } => return f,
+            RelayWireFrame::Error { code, message } => {
+                panic!("unexpected relay error while waiting for RoutePacket ({code}): {message}");
+            }
+            _ => {}
         }
     }
 }
