@@ -7,12 +7,13 @@ on:
   workflow_dispatch:
     inputs:
       tag_name:
-        description: "Release tag (e.g. v0.2.2)"
+        description: "Release tag (e.g. v0.2.3)"
         required: true
-        default: "v0.2.2"
+        default: "v0.2.3"
 
 permissions:
   contents: write
+  packages: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -45,8 +46,8 @@ jobs:
           cp target/release/coda-daemon dist/coda-daemon-linux-x86_64/
           cp deploy/install-daemon.sh dist/coda-daemon-linux-x86_64/
 
-          tar -C dist -czf "dist/coda-server-linux-x86_64-${RELEASE_TAG}.tar.gz" coda-server-linux-x86_64
-          tar -C dist -czf "dist/coda-daemon-linux-x86_64-${RELEASE_TAG}.tar.gz" coda-daemon-linux-x86_64
+          tar --owner=0 --group=0 -C dist -czf "dist/coda-server-linux-x86_64-${RELEASE_TAG}.tar.gz" coda-server-linux-x86_64
+          tar --owner=0 --group=0 -C dist -czf "dist/coda-daemon-linux-x86_64-${RELEASE_TAG}.tar.gz" coda-daemon-linux-x86_64
       - uses: actions/upload-artifact@v4
         with:
           name: linux-x86_64-artifacts
@@ -79,8 +80,8 @@ jobs:
           cp target/release/coda-daemon dist/coda-daemon-linux-aarch64/
           cp deploy/install-daemon.sh dist/coda-daemon-linux-aarch64/
 
-          tar -C dist -czf "dist/coda-server-linux-aarch64-${RELEASE_TAG}.tar.gz" coda-server-linux-aarch64
-          tar -C dist -czf "dist/coda-daemon-linux-aarch64-${RELEASE_TAG}.tar.gz" coda-daemon-linux-aarch64
+          tar --owner=0 --group=0 -C dist -czf "dist/coda-server-linux-aarch64-${RELEASE_TAG}.tar.gz" coda-server-linux-aarch64
+          tar --owner=0 --group=0 -C dist -czf "dist/coda-daemon-linux-aarch64-${RELEASE_TAG}.tar.gz" coda-daemon-linux-aarch64
       - uses: actions/upload-artifact@v4
         with:
           name: linux-aarch64-artifacts
@@ -124,7 +125,7 @@ jobs:
             dist/*.tar.gz
 
   publish-github-release:
-    name: Publish GitHub Release
+    name: Publish Multi-Arch GHCR Image & GitHub Release
     needs: [build-linux-x86_64, build-linux-aarch64, build-macos-aarch64]
     runs-on: ubuntu-latest
     steps:
@@ -133,35 +134,38 @@ jobs:
         with:
           path: release-assets
           merge-multiple: true
-      - name: Assemble self-contained coda-deploy-bundle
+
+      - name: Set up QEMU & Docker Buildx
+        uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - name: Log in to GitHub Container Registry (GHCR)
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Prepare Multi-Arch Docker Build Context
         run: |
-          BUNDLE_DIR="dist-bundle/coda-deploy-bundle"
-          mkdir -p "${BUNDLE_DIR}/bin/linux-amd64" "${BUNDLE_DIR}/bin/linux-arm64" "${BUNDLE_DIR}/web" "${BUNDLE_DIR}/deploy"
-          tar -C dist-bundle -xzf "release-assets/coda-server-linux-x86_64-${RELEASE_TAG}.tar.gz"
-          tar -C dist-bundle -xzf "release-assets/coda-daemon-linux-x86_64-${RELEASE_TAG}.tar.gz"
-          tar -C dist-bundle -xzf "release-assets/coda-server-linux-aarch64-${RELEASE_TAG}.tar.gz"
-          tar -C dist-bundle -xzf "release-assets/coda-daemon-linux-aarch64-${RELEASE_TAG}.tar.gz"
+          mkdir -p docker-ctx/bin/linux-amd64 docker-ctx/bin/linux-arm64 docker-ctx/web docker-ctx/deploy dist-unpack
+          tar -C dist-unpack -xzf "release-assets/coda-server-linux-x86_64-${RELEASE_TAG}.tar.gz"
+          tar -C dist-unpack -xzf "release-assets/coda-daemon-linux-x86_64-${RELEASE_TAG}.tar.gz"
+          tar -C dist-unpack -xzf "release-assets/coda-server-linux-aarch64-${RELEASE_TAG}.tar.gz"
+          tar -C dist-unpack -xzf "release-assets/coda-daemon-linux-aarch64-${RELEASE_TAG}.tar.gz"
 
-          cp dist-bundle/coda-server-linux-x86_64/coda-server "${BUNDLE_DIR}/bin/linux-amd64/coda-server"
-          cp dist-bundle/coda-daemon-linux-x86_64/coda-daemon "${BUNDLE_DIR}/bin/linux-amd64/coda-daemon"
-          cp dist-bundle/coda-server-linux-aarch64/coda-server "${BUNDLE_DIR}/bin/linux-arm64/coda-server"
-          cp dist-bundle/coda-daemon-linux-aarch64/coda-daemon "${BUNDLE_DIR}/bin/linux-arm64/coda-daemon"
-          cp -r dist-bundle/coda-server-linux-x86_64/web-dist "${BUNDLE_DIR}/web/dist"
+          cp dist-unpack/coda-server-linux-x86_64/coda-server docker-ctx/bin/linux-amd64/coda-server
+          cp dist-unpack/coda-daemon-linux-x86_64/coda-daemon docker-ctx/bin/linux-amd64/coda-daemon
+          cp dist-unpack/coda-server-linux-aarch64/coda-server docker-ctx/bin/linux-arm64/coda-server
+          cp dist-unpack/coda-daemon-linux-aarch64/coda-daemon docker-ctx/bin/linux-arm64/coda-daemon
+          cp -r dist-unpack/coda-server-linux-x86_64/web-dist docker-ctx/web/dist
+          cp deploy/install-daemon.sh docker-ctx/deploy/install-daemon.sh
 
-          cp deploy/DEPLOY.md "${BUNDLE_DIR}/DEPLOY.md"
-          cp deploy/.env.example "${BUNDLE_DIR}/.env.example"
-          cp deploy/coda-server.service "${BUNDLE_DIR}/coda-server.service"
-          cp deploy/coda-relay-cn.service "${BUNDLE_DIR}/coda-relay-cn.service"
-          cp deploy/install-server.sh "${BUNDLE_DIR}/install-server.sh"
-          cp deploy/install-relay-cn.sh "${BUNDLE_DIR}/install-relay-cn.sh"
-          cp deploy/install-daemon.sh "${BUNDLE_DIR}/install-daemon.sh"
-          cp deploy/install-daemon.sh "${BUNDLE_DIR}/deploy/install-daemon.sh"
-          cp -r migrations "${BUNDLE_DIR}/migrations"
-          cp README.md "${BUNDLE_DIR}/README.md"
-
-          cat > "${BUNDLE_DIR}/Dockerfile" <<'DOCKERFILE_EOF'
+          cat > docker-ctx/Dockerfile <<'DOCKERFILE_EOF'
           FROM debian:bookworm-slim
           ARG TARGETARCH=amd64
+          LABEL org.opencontainers.image.source="https://github.com/Annihilater/coda"
+          LABEL org.opencontainers.image.description="Coda Zero-Knowledge AI Agent Mesh Coordinator & Stateless Relay"
+          LABEL org.opencontainers.image.licenses="MIT"
           RUN apt-get update && apt-get install -y ca-certificates curl git libzstd1 && rm -rf /var/lib/apt/lists/*
           WORKDIR /opt/coda
           COPY bin/linux-${TARGETARCH}/coda-server /usr/local/bin/coda-server
@@ -170,76 +174,62 @@ jobs:
           COPY deploy/install-daemon.sh /opt/coda/deploy/install-daemon.sh
           EXPOSE 8080 24443
           ENTRYPOINT ["coda-server"]
-          CMD ["--http-bind", "0.0.0.0:8080", "--raw-tcp-bind", "0.0.0.0:24443", "--web-dist", "/opt/coda/web/dist"]
+          CMD ["--web-dist", "/opt/coda/web/dist"]
           DOCKERFILE_EOF
 
-          cat > "${BUNDLE_DIR}/docker-compose.yml" <<'COMPOSE_EOF'
-          services:
-            postgres:
-              image: postgres:18-alpine
-              restart: always
-              environment:
-                POSTGRES_USER: coda
-                POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-coda_prod_secret}
-                POSTGRES_DB: coda_prod
-              volumes:
-                - coda_pgdata:/var/lib/postgresql/data
-              healthcheck:
-                test: ["CMD-SHELL", "pg_isready -U coda -d coda_prod"]
-                interval: 5s
-                timeout: 3s
-                retries: 10
+      - name: Push Multi-Arch Image to ghcr.io/annihilater/coda
+        uses: docker/build-push-action@v6
+        with:
+          context: docker-ctx
+          file: docker-ctx/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/annihilater/coda:${{ env.RELEASE_TAG }}
+            ghcr.io/annihilater/coda:latest
 
-            coda-coordinator:
-              build:
-                context: .
-                dockerfile: Dockerfile
-              restart: always
-              depends_on:
-                postgres:
-                  condition: service_healthy
-              env_file:
-                - path: .env
-                  required: false
-              environment:
-                DATABASE_URL: postgres://coda:${POSTGRES_PASSWORD:-coda_prod_secret}@postgres:5432/coda_prod
-                CODA_RELAY_SECRET: ${CODA_RELAY_SECRET:-change-me-shared-hmac-relay-secret-2026}
-                CODA_PUBLIC_URL: ${CODA_PUBLIC_URL:-http://127.0.0.1:8080}
-                CODA_HTTP_BIND: ${CODA_HTTP_BIND:-0.0.0.0:8080}
-                CODA_RAW_TCP_BIND: ${CODA_RAW_TCP_BIND:-0.0.0.0:24443}
-              ports:
-                - "8080:8080"
-                - "24443:24443"
+      - name: Export Offline Container Image Tarballs for GitHub Releases Fallback
+        run: |
+          docker buildx build --platform linux/amd64 \
+            -t "ghcr.io/annihilater/coda:${RELEASE_TAG}" \
+            --output type=docker,dest=- docker-ctx \
+            | gzip -1 > "release-assets/coda-image-linux-amd64-${RELEASE_TAG}.tar.gz"
+          docker buildx build --platform linux/arm64 \
+            -t "ghcr.io/annihilater/coda:${RELEASE_TAG}" \
+            --output type=docker,dest=- docker-ctx \
+            | gzip -1 > "release-assets/coda-image-linux-arm64-${RELEASE_TAG}.tar.gz"
 
-            coda-relay-cn:
-              profiles: ["relay-cn"]
-              build:
-                context: .
-                dockerfile: Dockerfile
-              restart: always
-              command:
-                - "--relay-only"
-                - "--raw-tcp-bind"
-                - "0.0.0.0:24444"
-              env_file:
-                - path: .env
-                  required: false
-              environment:
-                CODA_RELAY_SECRET: ${CODA_RELAY_SECRET:-change-me-shared-hmac-relay-secret-2026}
-                CODA_REGION_LABEL: ${CODA_REGION_LABEL:-CN-Aliyun-NoICP-Edge}
-              ports:
-                - "24444:24444"
+      - name: Assemble Clean coda-deploy-bundle (No Dockerfile, Prebuilt Image + Lifecycle Scripts)
+        run: |
+          BUNDLE_DIR="dist-bundle/coda-deploy-bundle"
+          mkdir -p "${BUNDLE_DIR}"
 
-          volumes:
-            coda_pgdata:
-          COMPOSE_EOF
+          cp deploy/DEPLOY.md "${BUNDLE_DIR}/DEPLOY.md"
+          cp README.md "${BUNDLE_DIR}/README.md"
+          cp -r migrations "${BUNDLE_DIR}/migrations"
 
-          tar -C dist-bundle -czf "release-assets/coda-deploy-bundle-${RELEASE_TAG}.tar.gz" coda-deploy-bundle
+          cp deploy/coda-server.service "${BUNDLE_DIR}/coda-server.service"
+          cp deploy/coda-relay-cn.service "${BUNDLE_DIR}/coda-relay-cn.service"
+
+          sed "s|ghcr.io/annihilater/coda:latest|ghcr.io/annihilater/coda:${RELEASE_TAG}|g" \
+            deploy/.env.example > "${BUNDLE_DIR}/.env.example"
+          sed "s|ghcr.io/annihilater/coda:latest|ghcr.io/annihilater/coda:${RELEASE_TAG}|g" \
+            deploy/docker-compose.yml > "${BUNDLE_DIR}/docker-compose.yml"
+
+          for s in coda.sh start.sh stop.sh restart.sh status.sh logs.sh update.sh install-server.sh install-relay-cn.sh install-daemon.sh; do
+            cp "deploy/${s}" "${BUNDLE_DIR}/${s}"
+            chmod 0755 "${BUNDLE_DIR}/${s}"
+          done
+          chmod 0644 "${BUNDLE_DIR}/.env.example" "${BUNDLE_DIR}/docker-compose.yml" "${BUNDLE_DIR}/coda-server.service" "${BUNDLE_DIR}/coda-relay-cn.service"
+
+          tar --owner=0 --group=0 -C dist-bundle -czf "release-assets/coda-deploy-bundle-${RELEASE_TAG}.tar.gz" coda-deploy-bundle
+
       - name: Generate SHA256SUMS
         run: |
           cd release-assets
           sha256sum *.tar.gz > "SHA256SUMS-${RELEASE_TAG}.txt"
           cat "SHA256SUMS-${RELEASE_TAG}.txt"
+
       - name: Publish Release to GitHub
         uses: softprops/action-gh-release@v2
         with:
