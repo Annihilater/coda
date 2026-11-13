@@ -108,3 +108,16 @@ pub unsafe extern "C" fn coda_ffi_session_open(
     };
     to_c_string(serde_json::to_string(&msg).unwrap_or_default())
 }
+
+/// Decodes base64-encoded `zstd` compressed payload bytes into a UTF-8 JSON C string.
+#[no_mangle]
+pub unsafe extern "C" fn coda_ffi_zstd_decompress_b64(compressed_b64: *const c_char) -> *mut c_char {
+    if compressed_b64.is_null() {
+        return std::ptr::null_mut();
+    }
+    let raw = CStr::from_ptr(compressed_b64).to_string_lossy();
+    let Ok(utf8) = coda_protocol::zstd_decompress_b64_to_utf8(&raw) else {
+        return std::ptr::null_mut();
+    };
+    to_c_string(utf8)
+}

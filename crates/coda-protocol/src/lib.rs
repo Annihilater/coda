@@ -111,6 +111,7 @@ pub struct E2eeSession {
     rx_dir_tag: u8,
     next_tx_seq: u64,
     highest_rx_seq: Option<u64>,
+    peer_lacks_zstd: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -156,6 +157,7 @@ impl E2eeSession {
             rx_dir_tag,
             next_tx_seq: 1,
             highest_rx_seq: None,
+            peer_lacks_zstd: false,
         })
     }
 
@@ -168,7 +170,7 @@ impl E2eeSession {
 
     pub fn seal_message(&mut self, msg: &PeerMessage) -> Result<EncryptedPayload> {
         let raw_json = serde_json::to_vec(msg)?;
-        let (body, compressed) = if raw_json.len() >= ZSTD_COMPRESS_THRESHOLD {
+        let (body, compressed) = if !self.peer_lacks_zstd && raw_json.len() >= ZSTD_COMPRESS_THRESHOLD {
             let encoded = zstd::stream::encode_all(Cursor::new(&raw_json), 3)?;
             if encoded.len() + 16 < raw_json.len() {
                 (encoded, true)
@@ -215,8 +217,19 @@ impl E2eeSession {
             pt
         };
         self.highest_rx_seq = Some(payload.seq);
-        Ok(serde_json::from_slice(&json_bytes)?)
+        let msg: PeerMessage = serde_json::from_slice(&json_bytes)?;
+        if msg.request_id().is_some_and(|id| id.starts_with("swift-")) {
+            self.peer_lacks_zstd = true;
+        }
+        Ok(msg)
     }
+}
+
+/// Decodes base64-encoded `zstd` payload and returns UTF-8 JSON string (used by Apple FFI).
+pub fn zstd_decompress_b64_to_utf8(compressed_b64: &str) -> Result<String> {
+    let raw = B64.decode(compressed_b64)?;
+    let decompressed = zstd::stream::decode_all(Cursor::new(&raw))?;
+    Ok(String::from_utf8(decompressed)?)
 }
 
 // ============================================================================
@@ -586,6 +599,29 @@ pub enum PeerMessage {
     },
 }
 
+impl PeerMessage {
+    /// Returns the correlation `req_id` when this variant represents a client request.
+    pub fn request_id(&self) -> Option<&str> {
+        match self {
+            Self::Ping { req_id, .. }
+            | Self::ListTerminals { req_id, .. }
+            | Self::ListWorkspaces { req_id, .. }
+            | Self::LaunchAgent { req_id, .. }
+            | Self::PtyAttach { req_id, .. }
+            | Self::PtyDetach { req_id, .. }
+            | Self::UploadTerminalFile { req_id, .. }
+            | Self::SetVoiceConfig { req_id, .. }
+            | Self::SendTerminalText { req_id, .. }
+            | Self::SendTerminalKeys { req_id, .. }
+            | Self::InterruptTerminal { req_id, .. }
+            | Self::ReadTerminalScreen { req_id, .. }
+            | Self::GitDiffRequest { req_id, .. }
+            | Self::HttpLocalPreviewRequest { req_id, .. } => Some(req_id.as_str()),
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -657,5 +693,51 @@ mod tests {
         assert_eq!(verified.user_id, claims.user_id);
         assert!(RelayTicketClaims::verify(&token, b"wrong-key", 1_900_000_000).is_err());
         assert!(RelayTicketClaims::verify(&token, secret, 2_100_000_000).is_err());
+    }
+
+    #[test]
+    fn test_swift_req_id_negotiates_uncompressed_reply() {
+        let client_id = StoredDeviceIdentity::generate("iPhone App");
+        let daemon_id = StoredDeviceIdentity::generate("Studio Host");
+
+        let mut client_sess = E2eeSession::derive(
+            &client_id.x25519_secret().unwrap(),
+            &daemon_id.x25519_public_b64,
+            true,
+        )
+        .unwrap();
+        let mut daemon_sess = E2eeSession::derive(
+            &daemon_id.x25519_secret().unwrap(),
+            &client_id.x25519_public_b64,
+            false,
+        )
+        .unwrap();
+
+        let req = PeerMessage::ReadTerminalScreen {
+            req_id: "swift-1".into(),
+            terminal: "t1".into(),
+            history_lines: 180,
+        };
+        let sealed_req = client_sess.seal_message(&req).unwrap();
+        let opened_req = daemon_sess.open_message(&sealed_req).unwrap();
+        assert_eq!(opened_req.request_id(), Some("swift-1"));
+
+        let big_screen = "Large terminal line for Swift fallback check\n".repeat(80);
+        let reply = PeerMessage::TerminalScreenSnapshot {
+            req_id: "swift-1".into(),
+            terminal: "t1".into(),
+            text: big_screen.clone(),
+            status: None,
+        };
+        let sealed_reply = daemon_sess.seal_message(&reply).unwrap();
+        assert!(
+            !sealed_reply.compressed,
+            "daemon should skip zstd compression once peer sends swift-* req_id"
+        );
+        let opened_reply = client_sess.open_message(&sealed_reply).unwrap();
+        match opened_reply {
+            PeerMessage::TerminalScreenSnapshot { text, .. } => assert_eq!(text, big_screen),
+            _ => panic!("unexpected variant"),
+        }
     }
 }
