@@ -23,10 +23,10 @@ jobs:
         ports:
           - 5432:5432
         options: >-
-          --health-cmd pg_isready
+          --health-cmd "pg_isready -U vampire -d coda_test"
           --health-interval 5s
           --health-timeout 3s
-          --health-retries 5
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -37,7 +37,7 @@ jobs:
         env:
           TEST_DATABASE_URL: postgres://vampire@localhost:5432/coda_test
         run: |
-          cargo test -p coda-protocol -p coda-herdr -p coda-daemon -p coda-server
+          cargo test -p coda-protocol -p coda-herdr -p coda-daemon -p coda-server -- --nocapture
 
   macos-gpui-and-apple:
     name: macOS (GPUI Desktop + Apple Swift 6 + Web Console)
