@@ -62,8 +62,7 @@ jobs:
           tar --owner=0 --group=0 -C dist -I "${COMPRESS}" -cf "dist/coda-daemon-linux-x86_64-${RELEASE_TAG}.tar.gz" coda-daemon-linux-x86_64
       - uses: actions/upload-artifact@v4
         with:
-          name: linux-x86_64-artifacts
-          compression-level: 0
+          name: coda-rel-linux-x86_64
           retention-days: 1
           path: |
             dist/*.tar.gz
@@ -105,8 +104,7 @@ jobs:
           tar --owner=0 --group=0 -C dist -I "${COMPRESS}" -cf "dist/coda-daemon-linux-aarch64-${RELEASE_TAG}.tar.gz" coda-daemon-linux-aarch64
       - uses: actions/upload-artifact@v4
         with:
-          name: linux-aarch64-artifacts
-          compression-level: 0
+          name: coda-rel-linux-aarch64
           retention-days: 1
           path: |
             dist/*.tar.gz
@@ -149,8 +147,10 @@ jobs:
           cp target/release/coda-daemon dist/coda-daemon-macos-aarch64/
           cp deploy/install-daemon.sh dist/coda-daemon-macos-aarch64/
 
-          COPYFILE_DISABLE=1 tar -C dist -czf "dist/coda-macos-aarch64-${RELEASE_TAG}.tar.gz" coda-macos-aarch64
-          COPYFILE_DISABLE=1 tar -C dist -czf "dist/coda-daemon-macos-aarch64-${RELEASE_TAG}.tar.gz" coda-daemon-macos-aarch64
+          COPYFILE_DISABLE=1 tar -C dist -czf "dist/coda-macos-aarch64-${RELEASE_TAG}.tar.gz" coda-macos-aarch64 &
+          PID_TAR1=$!
+          COPYFILE_DISABLE=1 tar -C dist -czf "dist/coda-daemon-macos-aarch64-${RELEASE_TAG}.tar.gz" coda-daemon-macos-aarch64 &
+          PID_TAR2=$!
 
           DMG_STAGE="dist-dmg"
           APP_DIR="${DMG_STAGE}/Coda.app"
@@ -182,11 +182,12 @@ jobs:
           EOF
           ln -s /Applications "${DMG_STAGE}/Applications"
           codesign --force --deep --sign - "${APP_DIR}"
-          hdiutil create -volname "Coda Desktop ${RELEASE_TAG}" -srcfolder "${DMG_STAGE}" -ov -format UDZO "dist/Coda-Desktop-macos-aarch64-${RELEASE_TAG}.dmg"
+          hdiutil create -volname "Coda Desktop ${RELEASE_TAG}" -srcfolder "${DMG_STAGE}" -ov -format UDZO -imagekey zlib-level=1 "dist/Coda-Desktop-macos-aarch64-${RELEASE_TAG}.dmg"
+          wait "${PID_TAR1}"
+          wait "${PID_TAR2}"
       - uses: actions/upload-artifact@v4
         with:
-          name: macos-aarch64-artifacts
-          compression-level: 0
+          name: coda-rel-macos-aarch64
           retention-days: 1
           path: |
             dist/*.tar.gz
@@ -196,11 +197,14 @@ jobs:
     name: Build & Push Multi-Arch GHCR + Offline Docker Tarballs
     needs: [build-linux-x86_64, build-linux-aarch64]
     runs-on: ubuntu-latest
+    env:
+      DOCKER_BUILD_SUMMARY: "false"
+      DOCKER_BUILD_RECORD_UPLOAD: "false"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
-          pattern: linux-*-artifacts
+          pattern: coda-rel-linux-*
           path: linux-assets
           merge-multiple: true
 
@@ -284,8 +288,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: docker-offline-images
-          compression-level: 0
+          name: coda-rel-docker-images
           retention-days: 1
           path: dist-images/*.tar.gz
 
@@ -295,10 +298,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - id: dl
+        uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
+          pattern: coda-rel-*
           path: release-assets
           merge-multiple: true
+      - name: Fallback Artifact Download via gh CLI
+        if: steps.dl.outcome != 'success'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          rm -rf release-assets release-assets-raw
+          mkdir -p release-assets-raw release-assets
+          gh run download "${GITHUB_RUN_ID}" --pattern "coda-rel-*" --dir release-assets-raw
+          find release-assets-raw -type f \( -name "*.tar.gz" -o -name "*.dmg" \) -exec mv {} release-assets/ \;
 
       - name: Assemble Clean coda-deploy-bundle (No Dockerfile, Prebuilt Image + Lifecycle Scripts)
         run: |
