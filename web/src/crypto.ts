@@ -51,6 +51,11 @@ export function loadOrCreateWebIdentity(): WebDeviceIdentity {
   return id;
 }
 
+export function signWebMessage(identity: WebDeviceIdentity, message: string): string {
+  const sig = ed25519.sign(enc.encode(message), fromB64(identity.ed25519SecretB64));
+  return toB64(sig);
+}
+
 /**
  * Browser-side Zero-Knowledge E2EE Session matching `crates/coda-protocol` & Swift `CryptoKit` byte-for-byte.
  */

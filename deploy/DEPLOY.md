@@ -100,3 +100,14 @@ curl -fsSL http://你的服务器IP:8080/install.sh | sh -s -- \
    ```
 3. **iPhone / iPhone Duo / iPad 原生客户端 (`apple/`)**：
    使用 Xcode 打开 `apple/Package.swift` 选择你的真机编译运行。
+
+---
+
+## 五、内网 Wi-Fi / IPv6 自动直连协商机制（免配置）
+
+只要控制端与 Mac / Linux 主机处于同一局域网 Wi-Fi（或均具备电信/联通/移动原生公网 IPv6），系统会自动跳过云端中继完成点对点加密直连：
+
+- **自动发现与协议自适应**：主机（`coda-daemon` 或打开即生效的 Mac `coda-desktop`）在 `:24444` 同时监听 **Raw TCP（iOS / GPUI 客户端）**、**局域网 WebSocket（Web 浏览器）** 与 **UDP Wi-Fi 广播信标**；每次连网或切换 Wi-Fi 时自动上报最新内网地址。
+- **零感知热切换与容灾回落**：
+  - 同处 Wi-Fi 下自动竞速切换至 **⚡ 局域网直连（通常 < 1–3ms，不消耗服务器中继流量）**；
+  - 当手机离开 Wi-Fi 切换至 **5G 蜂窝网络** 时，独立 E2EE 密钥会话会零中断回落至 **`:24443` 免备案裸 TCP** 或 **`/v1/tunnel/ws` CDN WSS**，确保远程终端与 AI Agent 会话不断线。

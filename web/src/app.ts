@@ -1,4 +1,4 @@
-import { BrowserE2EESession, loadOrCreateWebIdentity } from "./crypto";
+import { BrowserE2EESession, loadOrCreateWebIdentity, signWebMessage } from "./crypto";
 
 interface User {
   id: string;
@@ -9,12 +9,18 @@ interface User {
   bandwidth_quota_mbps: number;
 }
 
+interface EndpointCandidate {
+  kind: string;
+  addr: string;
+}
+
 interface Device {
   id: string;
   name: string;
   role: string;
   platform: string;
   x25519_pubkey: string;
+  endpoints_json?: EndpointCandidate[];
   herdr_version?: string | null;
   is_online: boolean;
 }
@@ -96,11 +102,21 @@ class CodaTerminalWebApp {
   private latestInviteCode: string | null = null;
   private rttMs: number | null = null;
   private ws: WebSocket | null = null;
+  private directWs: WebSocket | null = null;
+  private directWsPeerId: string | null = null;
+  private activeTransportMode: "lan_ws" | "relay_ws" = "relay_ws";
+  private negotiatingPeerId: string | null = null;
   private e2eeSessions = new Map<string, BrowserE2EESession>();
+  private directE2eeSessions = new Map<string, BrowserE2EESession>();
   private webIdentity = loadOrCreateWebIdentity();
   private errorMsg = "";
 
   async init() {
+    window.addEventListener("online", () => {
+      if (this.selectedDaemon?.is_online) {
+        void this.tryNegotiateDirectLanWs(this.selectedDaemon);
+      }
+    });
     window.addEventListener("resize", () => {
       if (this.selectedDaemon && this.activeTerminalAddr) {
         const cols = Math.max(48, Math.floor((window.innerWidth - (this.showSidebar ? 390 : 80)) / 8.2));
@@ -185,24 +201,23 @@ class CodaTerminalWebApp {
       const frame = JSON.parse(ev.data);
       if (frame.frame_type === "auth_ack" && frame.ok) {
         if (this.selectedDaemon?.is_online) {
-          this.sendEncrypted(this.selectedDaemon, {
-            op: "ping",
-            req_id: `p-${Date.now()}`,
-            sent_ms: Date.now(),
-          });
-          this.sendEncrypted(this.selectedDaemon, {
-            op: "list_terminals",
-            req_id: `ls-${Date.now()}`,
-            include_finished: false,
-          });
-          this.sendEncrypted(this.selectedDaemon, {
-            op: "list_workspaces",
-            req_id: `ws-${Date.now()}`,
-            root_dirs: [],
-          });
+          this.queryDaemonOverview(this.selectedDaemon);
+          void this.tryNegotiateDirectLanWs(this.selectedDaemon);
         }
       } else if (frame.frame_type === "peer_presence") {
+        if (Array.isArray(frame.endpoints)) {
+          const idx = this.devices.findIndex((d) => d.id === frame.device_id);
+          if (idx >= 0) {
+            this.devices[idx].endpoints_json = frame.endpoints;
+            this.devices[idx].is_online = frame.is_online;
+          }
+        }
         await this.refreshDevices();
+        if (this.selectedDaemon?.is_online) {
+          void this.tryNegotiateDirectLanWs(this.selectedDaemon);
+        } else if (this.directWsPeerId === frame.device_id && !frame.is_online) {
+          this.directWs?.close();
+        }
         this.render();
       } else if (frame.frame_type === "route_packet") {
         const peer = this.devices.find((d) => d.id === frame.src_device_id);
@@ -212,6 +227,194 @@ class CodaTerminalWebApp {
         this.handlePeerMessage(msg);
       }
     };
+  }
+
+  private queryDaemonOverview(peer: Device) {
+    this.sendEncrypted(peer, {
+      op: "ping",
+      req_id: `p-${Date.now()}`,
+      sent_ms: Date.now(),
+    });
+    this.sendEncrypted(peer, {
+      op: "list_terminals",
+      req_id: `ls-${Date.now()}`,
+      include_finished: false,
+    });
+    this.sendEncrypted(peer, {
+      op: "list_workspaces",
+      req_id: `ws-${Date.now()}`,
+      root_dirs: [],
+    });
+  }
+
+  private collectDirectWsCandidates(peer: Device): string[] {
+    const out: string[] = [];
+    const pushUnique = (u: string) => {
+      if (!u) return;
+      if (location.protocol === "https:") {
+        const isLocalWs = u.startsWith("ws://127.0.0.1") || u.startsWith("ws://localhost");
+        if (!u.startsWith("wss://") && !isLocalWs) return;
+      }
+      if (!out.includes(u)) out.push(u);
+    };
+
+    for (const ep of peer.endpoints_json || []) {
+      if (ep.kind === "lan_ws" || ep.kind === "ipv6_ws") {
+        pushUnique(ep.addr);
+      } else if (ep.kind === "lan_ipv4" || ep.kind === "cn_public_ipv6") {
+        pushUnique(`ws://${ep.addr}`);
+      }
+    }
+
+    if (location.hostname === "127.0.0.1" || location.hostname === "localhost") {
+      pushUnique("ws://127.0.0.1:24444");
+    }
+    return out;
+  }
+
+  private async tryNegotiateDirectLanWs(peer: Device) {
+    if (!peer.is_online || !this.myClientDevice) return;
+    if (this.directWs && this.directWs.readyState === WebSocket.OPEN && this.directWsPeerId === peer.id) {
+      return;
+    }
+    if (this.negotiatingPeerId === peer.id) return;
+    this.negotiatingPeerId = peer.id;
+
+    try {
+      const candidates = this.collectDirectWsCandidates(peer);
+      for (const wsUrl of candidates) {
+        const ok = await this.probeSingleDirectWs(peer, wsUrl);
+        if (ok) {
+          this.sendEncrypted(peer, {
+            op: "ping",
+            req_id: `lan-p-${Date.now()}`,
+            sent_ms: Date.now(),
+          });
+          this.render();
+          break;
+        }
+      }
+    } finally {
+      this.negotiatingPeerId = null;
+    }
+  }
+
+  private probeSingleDirectWs(peer: Device, wsUrl: string): Promise<boolean> {
+    return new Promise((resolve) => {
+      if (!this.myClientDevice) {
+        resolve(false);
+        return;
+      }
+      let settled = false;
+      const done = (val: boolean) => {
+        if (!settled) {
+          settled = true;
+          clearTimeout(timer);
+          resolve(val);
+        }
+      };
+
+      let sock: WebSocket;
+      try {
+        sock = new WebSocket(wsUrl);
+      } catch {
+        done(false);
+        return;
+      }
+
+      const timer = setTimeout(() => {
+        if (!settled) {
+          try {
+            sock.close();
+          } catch {}
+          done(false);
+        }
+      }, 600);
+
+      sock.onopen = () => {
+        if (!this.myClientDevice) {
+          done(false);
+          return;
+        }
+        const tsMs = Date.now();
+        const signedMsg = `p2p:${this.myClientDevice.id}:${peer.id}:${tsMs}`;
+        const sigB64 = signWebMessage(this.webIdentity, signedMsg);
+        sock.send(
+          JSON.stringify({
+            frame_type: "direct_p2p_hello",
+            client_device_id: this.myClientDevice.id,
+            target_device_id: peer.id,
+            client_ed25519_pub_b64: this.webIdentity.ed25519PublicB64,
+            client_x25519_pub_b64: this.webIdentity.x25519PublicB64,
+            timestamp_ms: tsMs,
+            signature_b64: sigB64,
+          })
+        );
+      };
+
+      sock.onmessage = (ev) => {
+        let frame: any;
+        try {
+          frame = JSON.parse(ev.data);
+        } catch {
+          return;
+        }
+
+        if (!settled) {
+          if (frame.frame_type === "direct_p2p_ack" && frame.ok) {
+            const directSess = new BrowserE2EESession(
+              this.webIdentity.x25519SecretB64,
+              frame.daemon_x25519_pub_b64 || peer.x25519_pubkey
+            );
+            this.directWs?.close();
+            this.directWs = sock;
+            this.directWsPeerId = peer.id;
+            this.directE2eeSessions.set(peer.id, directSess);
+            this.activeTransportMode = "lan_ws";
+            done(true);
+          } else {
+            try {
+              sock.close();
+            } catch {}
+            done(false);
+          }
+          return;
+        }
+
+        if (frame.frame_type === "route_packet") {
+          const directSess = this.directE2eeSessions.get(peer.id);
+          if (!directSess) return;
+          try {
+            const msg = directSess.openMessage(frame.e2ee);
+            this.handlePeerMessage(msg);
+          } catch {
+            // ignore malformed/out-of-order frame
+          }
+        }
+      };
+
+      sock.onerror = () => {
+        if (this.directWs === sock) {
+          this.directWs = null;
+          this.directWsPeerId = null;
+          this.directE2eeSessions.delete(peer.id);
+          this.activeTransportMode = "relay_ws";
+          this.render();
+        }
+        done(false);
+      };
+
+      sock.onclose = () => {
+        if (this.directWs === sock) {
+          this.directWs = null;
+          this.directWsPeerId = null;
+          this.directE2eeSessions.delete(peer.id);
+          this.activeTransportMode = "relay_ws";
+          this.render();
+        }
+        done(false);
+      };
+    });
   }
 
   private getOrCreateSession(peer: Device): BrowserE2EESession {
@@ -224,7 +427,31 @@ class CodaTerminalWebApp {
   }
 
   private sendEncrypted(peer: Device, msg: unknown) {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN || !this.myClientDevice) return;
+    if (!this.myClientDevice) return;
+
+    if (
+      this.directWs &&
+      this.directWs.readyState === WebSocket.OPEN &&
+      this.directWsPeerId === peer.id
+    ) {
+      const directSess = this.directE2eeSessions.get(peer.id);
+      if (directSess) {
+        const e2ee = directSess.sealMessage(msg);
+        this.directWs.send(
+          JSON.stringify({
+            frame_type: "route_packet",
+            src_device_id: this.myClientDevice.id,
+            dst_device_id: peer.id,
+            lane: "control_p0",
+            e2ee,
+            sender_x25519_pub_b64: this.webIdentity.x25519PublicB64,
+          })
+        );
+        return;
+      }
+    }
+
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
     const sess = this.getOrCreateSession(peer);
     const e2ee = sess.sealMessage(msg);
     this.ws.send(
@@ -397,7 +624,9 @@ class CodaTerminalWebApp {
             <div style="padding:14px 16px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid #141417;">
               <div>
                 <div style="font-size:14px;font-weight:500;">${this.user.email}</div>
-                <div style="font-size:12px;color:var(--emerald);margin-top:2px;">已连接</div>
+                <div style="font-size:12px;color:var(--emerald);margin-top:2px;">已连接 · ${
+                  this.activeTransportMode === "lan_ws" ? "⚡ 局域网直连" : "🌐 智能中继"
+                }${this.rttMs !== null ? ` (${this.rttMs}ms)` : ""}</div>
               </div>
               <div style="display:flex;gap:8px;">
                 <button id="btn-open-settings" class="circle-btn" title="配对机器与好友邀请码">⚙</button>
@@ -562,7 +791,11 @@ class CodaTerminalWebApp {
             <div style="font-size:12px;font-weight:700;">${nowTime}</div>
             <div style="margin-top:6px;width:42px;height:42px;border-radius:999px;border:2px solid #3f3f46;border-top-color:#f4f4f5;display:flex;flex-direction:column;align-items:center;justify-content:center;font-size:11px;">
               <strong>68</strong>
-              <span style="color:var(--muted);">5G</span>
+              ${
+                this.activeTransportMode === "lan_ws"
+                  ? `<span style="color:var(--emerald);">LAN</span>`
+                  : `<span style="color:var(--muted);">5G</span>`
+              }
             </div>
           </div>
 
@@ -672,6 +905,7 @@ class CodaTerminalWebApp {
       this.token = null;
       this.user = null;
       this.showSettingsModal = false;
+      this.directWs?.close();
       this.ws?.close();
       this.render();
     });
@@ -750,6 +984,22 @@ class CodaTerminalWebApp {
       }
       this.showSettingsModal = false;
       this.render();
+    });
+
+    document.querySelectorAll("[data-dev]").forEach((el) => {
+      el.addEventListener("click", () => {
+        const devId = (el as HTMLElement).dataset.dev!;
+        const peer = this.devices.find((d) => d.id === devId);
+        if (!peer) return;
+        this.selectedDaemon = peer;
+        this.terminals = [];
+        this.activeTerminalAddr = null;
+        if (peer.is_online) {
+          this.queryDaemonOverview(peer);
+          void this.tryNegotiateDirectLanWs(peer);
+        }
+        this.render();
+      });
     });
 
     document.querySelectorAll("[data-term]").forEach((el) => {
