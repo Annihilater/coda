@@ -85,10 +85,56 @@ struct CodaSelfTest {
         precondition(repo.branches.first?.diffAdded == 1233)
         precondition(repo.branches.first?.statusSummary == "4 个终端运行中")
 
-        // 5. Verify Auto-LAN UDP Discovery + Direct P2P TCP Handshake + E2EE Ping/Pong + Relay Fallback
+        // 5. Verify RFC 8628 Device Auth JSON Wire Compatibility (Linux `daemon` + macOS `hybrid`)
+        let startJSON = Data("""
+        {
+          "device_code": "dev_test_123",
+          "user_code": "ABCD-2345",
+          "verification_uri": "https://coda.example.com/activate",
+          "verification_uri_complete": "https://coda.example.com/activate?code=ABCD-2345",
+          "expires_in_secs": 600,
+          "interval_secs": 2
+        }
+        """.utf8)
+        let authStart = try JSONDecoder().decode(CodaDeviceAuthStart.self, from: startJSON)
+        precondition(authStart.userCode == "ABCD-2345")
+        precondition(authStart.verificationURIComplete.contains("ABCD-2345"))
+
+        let pollJSON = Data("""
+        {
+          "state": "approved",
+          "session_token": "tok_test_abc",
+          "owner_handle": "alice",
+          "daemon_relay_ticket": "ticket_xyz",
+          "device": {
+            "id": "\(UUID().uuidString.lowercased())",
+            "name": "MacBook-Pro",
+            "role": "hybrid",
+            "platform": "macos",
+            "x25519_pubkey": "\(iphoneDuo.x25519PublicB64)",
+            "endpoints_json": [{"kind": "lan_ipv4", "addr": "192.168.1.20:24444"}],
+            "is_online": true
+          },
+          "relays": [
+            {
+              "id": "global-cdn-wss",
+              "region": "Global Edge CDN / CF Tunnel (WSS 443)",
+              "mode": "cdn_wss",
+              "endpoint": "wss://coda.example.com/v1/tunnel/ws",
+              "priority": 5
+            }
+          ]
+        }
+        """.utf8)
+        let pollResult = try JSONDecoder().decode(CodaDeviceAuthPollResult.self, from: pollJSON)
+        precondition(pollResult.state == "approved")
+        precondition(pollResult.device?.role == "hybrid")
+        precondition(pollResult.relays?.first?.endpoint == "wss://coda.example.com/v1/tunnel/ws")
+
+        // 6. Verify Auto-LAN UDP Discovery + Direct P2P TCP Handshake + E2EE Ping/Pong + Relay Fallback
         try await runAutoLanSmartPathLoopbackTest()
 
-        print("✅ CodaSelfTest passed: Apple CryptoKit E2EE + OSC 7501 + PTY Live Stream + Worktrees + iPhone Duo Reflow + Auto-LAN SmartPath P2P verified!")
+        print("✅ CodaSelfTest passed: Apple CryptoKit E2EE + OSC 7501 + PTY Live Stream + RFC 8628 + Auto-LAN SmartPath P2P verified!")
     }
 
     static func runAutoLanSmartPathLoopbackTest() async throws {

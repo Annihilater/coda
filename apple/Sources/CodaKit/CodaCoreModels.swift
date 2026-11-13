@@ -371,3 +371,49 @@ public struct CodaRemoteDevice: Identifiable, Codable, Sendable, Equatable {
         isOnline = try c.decode(Bool.self, forKey: .isOnline)
     }
 }
+
+public struct CodaDeviceAuthStart: Codable, Sendable, Equatable {
+    public let deviceCode: String
+    public let userCode: String
+    public let verificationURI: String
+    public let verificationURIComplete: String
+    public let expiresInSecs: Int
+    public let intervalSecs: Int
+
+    enum CodingKeys: String, CodingKey {
+        case deviceCode = "device_code"
+        case userCode = "user_code"
+        case verificationURI = "verification_uri"
+        case verificationURIComplete = "verification_uri_complete"
+        case expiresInSecs = "expires_in_secs"
+        case intervalSecs = "interval_secs"
+    }
+}
+
+public struct CodaRelayNodeInfo: Codable, Sendable, Equatable {
+    public let id: String
+    public let region: String
+    public let mode: String
+    public let endpoint: String
+    public let priority: Int
+}
+
+public struct CodaDeviceAuthPollResult: Codable, Sendable, Equatable {
+    public let state: String
+    public let expiresInSecs: Int?
+    public let sessionToken: String?
+    public let ownerHandle: String?
+    public let device: CodaRemoteDevice?
+    public let daemonRelayTicket: String?
+    public let relays: [CodaRelayNodeInfo]?
+
+    enum CodingKeys: String, CodingKey {
+        case state
+        case expiresInSecs = "expires_in_secs"
+        case sessionToken = "session_token"
+        case ownerHandle = "owner_handle"
+        case device
+        case daemonRelayTicket = "daemon_relay_ticket"
+        case relays
+    }
+}

@@ -25,10 +25,77 @@ public final class CodaWorkspaceStore: ObservableObject {
     @Published public var voiceConfig: CodaVoiceModelConfig = CodaVoiceModelConfig()
     @Published public var showVoiceConfigSheet: Bool = false
     @Published public var routeMode: SmartPathRouteMode = .lanDirect
+    @Published public var serverURLString: String = "https://coda.example.com"
+    @Published public var accountLabel: String = "vampire@coda.dev"
+    @Published public var remoteHosts: [CodaRemoteDevice] = []
+    @Published public var selectedHostId: UUID? = nil
+    @Published public var showAccountSheet: Bool = false
+    @Published public var pendingVerificationURL: String? = nil
+    @Published public var pendingUserCode: String? = nil
+    @Published public var authStatusMessage: String? = nil
+
+    private var networkClient: CodaNetworkClient?
+    private var localIdentity: CodaDeviceIdentity = CodaDeviceIdentity.generate(name: "Apple-Device")
 
     public init(initialSessions: [CodaAgentSession] = CodaAdaptiveRootView.sampleSessions) {
         self.sessions = initialSessions
         self.selectedSessionId = initialSessions.first?.id ?? ""
+    }
+
+    public func startBrowserDeviceLogin() async {
+        guard let url = URL(string: serverURLString.trimmingCharacters(in: .whitespacesAndNewlines)) else {
+            authStatusMessage = "服务器地址格式无效"
+            return
+        }
+        let client = CodaNetworkClient(serverBaseURL: url)
+        self.networkClient = client
+        do {
+            #if os(iOS)
+            let platform = "ios"
+            #else
+            let platform = "macos"
+            #endif
+            let started = try await client.startDeviceAuth(
+                deviceName: localIdentity.name,
+                role: "client",
+                platform: platform,
+                identity: localIdentity
+            )
+            self.pendingUserCode = started.userCode
+            self.pendingVerificationURL = started.verificationURIComplete
+            self.authStatusMessage = "请在浏览器打开链接确认授权码：\(started.userCode)"
+
+            for _ in 0..<150 {
+                try await Task.sleep(nanoseconds: UInt64(max(1, started.intervalSecs)) * 1_000_000_000)
+                let polled = try await client.pollDeviceAuth(deviceCode: started.deviceCode)
+                if polled.state == "approved" {
+                    self.accountLabel = "@\(polled.ownerHandle ?? "owner")"
+                    self.pendingUserCode = nil
+                    self.pendingVerificationURL = nil
+                    self.authStatusMessage = "授权成功！正在加载云端主机列表..."
+                    await refreshAccountHosts()
+                    return
+                } else if polled.state == "expired" {
+                    self.authStatusMessage = "授权码已过期，请重新生成"
+                    return
+                }
+            }
+        } catch {
+            self.authStatusMessage = "连接失败：\(error.localizedDescription)"
+        }
+    }
+
+    public func refreshAccountHosts() async {
+        guard let client = networkClient else { return }
+        do {
+            let all = try await client.listDevices()
+            self.remoteHosts = all.filter { $0.role == "daemon" || $0.role == "hybrid" }
+            if selectedHostId == nil {
+                selectedHostId = remoteHosts.first(where: { $0.isOnline })?.id ?? remoteHosts.first?.id
+            }
+        } catch {
+            self.authStatusMessage = "拉取设备失败：\(error.localizedDescription)"
+        }
     }
 
     public var activeSession: CodaAgentSession {
@@ -145,7 +212,7 @@ struct CodaRepoBranchSidebar: View {
         VStack(alignment: .leading, spacing: 0) {
             HStack {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("vampire@coda.dev")
+                    Text(store.accountLabel)
                         .font(.system(size: 14, weight: .medium))
                     Text(store.routeMode == .lanDirect ? "已连接 · ⚡ 局域网直连" : "已连接 · \(store.routeMode.rawValue)")
                         .font(.system(size: 12, weight: .medium))
@@ -153,6 +220,9 @@ struct CodaRepoBranchSidebar: View {
                 }
                 Spacer()
                 HStack(spacing: 8) {
+                    CircleIconButton(symbol: "person.badge.key") {
+                        store.showAccountSheet.toggle()
+                    }
                     CircleIconButton(symbol: "gearshape") {
                         store.showVoiceConfigSheet.toggle()
                     }
@@ -163,6 +233,40 @@ struct CodaRepoBranchSidebar: View {
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 12)
+            .sheet(isPresented: $store.showAccountSheet) {
+                CodaAccountMeshSheet(store: store)
+            }
+
+            if !store.remoteHosts.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 6) {
+                        ForEach(store.remoteHosts) { host in
+                            Button {
+                                store.selectedHostId = host.id
+                            } label: {
+                                HStack(spacing: 4) {
+                                    Circle()
+                                        .fill(host.isOnline ? CodaPalette.workingEmerald : Color.gray)
+                                        .frame(width: 6, height: 6)
+                                    Text(host.name)
+                                        .font(.system(size: 11, weight: .medium))
+                                }
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 5)
+                                .background(
+                                    store.selectedHostId == host.id
+                                        ? CodaPalette.keyBorder
+                                        : CodaPalette.keySurface
+                                )
+                                .clipShape(Capsule())
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.bottom, 8)
+                }
+            }
 
             Divider().background(Color.white.opacity(0.06))
 
@@ -472,5 +576,64 @@ struct CircleIconButton: View {
                 .clipShape(Circle())
         }
         .buttonStyle(.plain)
+    }
+}
+
+struct CodaAccountMeshSheet: View {
+    @ObservedObject var store: CodaWorkspaceStore
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                Text("连接 Coda 云端主控网络")
+                    .font(.headline)
+                Spacer()
+                Button("关闭") {
+                    store.showAccountSheet = false
+                }
+            }
+
+            Text("Cloudflare Tunnel / 主控域名")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            TextField("https://coda.example.com", text: $store.serverURLString)
+                .textFieldStyle(.roundedBorder)
+
+            Button {
+                Task {
+                    await store.startBrowserDeviceLogin()
+                }
+            } label: {
+                Text("一键浏览器设备码授权 (RFC 8628)")
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 8)
+            }
+            .buttonStyle(.borderedProminent)
+
+            if let userCode = store.pendingUserCode {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("设备授权码：\(userCode)")
+                        .font(.system(size: 18, weight: .bold, design: .monospaced))
+                    if let urlStr = store.pendingVerificationURL, let linkURL = URL(string: urlStr) {
+                        Link("在 Safari 打开确认页面 →", destination: linkURL)
+                            .font(.caption)
+                    }
+                }
+                .padding(10)
+                .background(Color.white.opacity(0.06))
+                .clipShape(RoundedRectangle(cornerRadius: 10))
+            }
+
+            if let msg = store.authStatusMessage {
+                Text(msg)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Spacer()
+        }
+        .padding(20)
+        .frame(minWidth: 340, minHeight: 280)
+        .preferredColorScheme(.dark)
     }
 }

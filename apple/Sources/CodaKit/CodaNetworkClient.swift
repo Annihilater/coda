@@ -27,6 +27,20 @@ private final class OnceResume<T: Sendable>: @unchecked Sendable {
     }
 }
 
+public struct CodaRelayTicketResult: Sendable {
+    public let ticket: String
+    public let rawTCPHost: String?
+    public let rawTCPPort: UInt16?
+    public let wssURL: URL?
+
+    public init(ticket: String, rawTCPHost: String?, rawTCPPort: UInt16?, wssURL: URL?) {
+        self.ticket = ticket
+        self.rawTCPHost = rawTCPHost
+        self.rawTCPPort = rawTCPPort
+        self.wssURL = wssURL
+    }
+}
+
 /// Native Apple `actor` managing Multi-Tenant Auth, Device Pairing, and SmartPath Auto-Negotiation
 /// (`L0 LAN IPv4` UDP+TCP `<5ms` / `L1 CN Public IPv6` <-> `L2 Raw TCP No-SNI` / `L2 CDN WSS`).
 public actor CodaNetworkClient {
@@ -73,6 +87,138 @@ public actor CodaNetworkClient {
         }
         self.bearerToken = token
         return token
+    }
+
+    public func register(
+        email: String,
+        handle: String,
+        displayName: String,
+        password: String,
+        inviteCode: String? = nil
+    ) async throws -> String {
+        let url = serverBaseURL.appendingPathComponent("api/v1/auth/register")
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        var body: [String: Any] = [
+            "email": email,
+            "handle": handle,
+            "display_name": displayName,
+            "password": password,
+        ]
+        if let inviteCode, !inviteCode.isEmpty {
+            body["invite_code"] = inviteCode
+        }
+        req.httpBody = try JSONSerialization.data(withJSONObject: body)
+
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            throw URLError(.userAuthenticationRequired)
+        }
+        let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        guard let token = json?["token"] as? String else {
+            throw URLError(.cannotParseResponse)
+        }
+        self.bearerToken = token
+        return token
+    }
+
+    public func startDeviceAuth(
+        deviceName: String,
+        role: String = "client",
+        platform: String = "ios",
+        identity: CodaDeviceIdentity,
+        endpoints: [CodaEndpointCandidate] = []
+    ) async throws -> CodaDeviceAuthStart {
+        let url = serverBaseURL.appendingPathComponent("api/v1/auth/device/start")
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let epObjs = endpoints.map { ["kind": $0.kind, "addr": $0.addr] }
+        let body: [String: Any] = [
+            "device_name": deviceName,
+            "role": role,
+            "platform": platform,
+            "ed25519_pubkey": identity.ed25519PublicB64,
+            "x25519_pubkey": identity.x25519PublicB64,
+            "endpoints": epObjs,
+        ]
+        req.httpBody = try JSONSerialization.data(withJSONObject: body)
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            throw URLError(.badServerResponse)
+        }
+        return try JSONDecoder().decode(CodaDeviceAuthStart.self, from: data)
+    }
+
+    public func pollDeviceAuth(deviceCode: String) async throws -> CodaDeviceAuthPollResult {
+        let url = serverBaseURL.appendingPathComponent("api/v1/auth/device/poll")
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try JSONSerialization.data(withJSONObject: ["device_code": deviceCode])
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            throw URLError(.badServerResponse)
+        }
+        let decoded = try JSONDecoder().decode(CodaDeviceAuthPollResult.self, from: data)
+        if decoded.state == "approved", let tok = decoded.sessionToken {
+            self.bearerToken = tok
+        }
+        return decoded
+    }
+
+    public func mintRelayTicket(deviceId: UUID, peerDeviceId: UUID? = nil) async throws -> CodaRelayTicketResult {
+        let url = serverBaseURL.appendingPathComponent("api/v1/relay/ticket")
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if let token = bearerToken {
+            req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
+        var body: [String: Any] = ["device_id": deviceId.uuidString.lowercased()]
+        if let peerDeviceId {
+            body["peer_device_id"] = peerDeviceId.uuidString.lowercased()
+        }
+        req.httpBody = try JSONSerialization.data(withJSONObject: body)
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            throw URLError(.userAuthenticationRequired)
+        }
+        struct TicketWireResp: Codable {
+            let ticket: String
+            let relays: [CodaRelayNodeInfo]
+        }
+        let wire = try JSONDecoder().decode(TicketWireResp.self, from: data)
+        let isRemoteServer = serverBaseURL.scheme == "https" || !Self.isLoopbackHost(serverBaseURL.host ?? "")
+
+        var rawTCPHost: String?
+        var rawTCPPort: UInt16?
+        var wssURL: URL?
+
+        for relay in wire.relays {
+            if relay.mode == "raw_tcp_no_sni",
+               let parsed = Self.parseHostPort(relay.endpoint),
+               !(isRemoteServer && Self.isLoopbackHost(parsed.0)) {
+                if rawTCPHost == nil {
+                    rawTCPHost = parsed.0
+                    rawTCPPort = parsed.1
+                }
+            } else if relay.mode == "cdn_wss", let url = URL(string: relay.endpoint), wssURL == nil {
+                wssURL = url
+            }
+        }
+        return CodaRelayTicketResult(
+            ticket: wire.ticket,
+            rawTCPHost: rawTCPHost,
+            rawTCPPort: rawTCPPort,
+            wssURL: wssURL
+        )
+    }
+
+    private static func isLoopbackHost(_ host: String) -> Bool {
+        let h = host.lowercased()
+        return h == "127.0.0.1" || h == "localhost" || h == "::1" || h == "0.0.0.0"
     }
 
     public func createPairingCode(suggestedName: String?) async throws -> (code: String, oneLiner: String) {
@@ -515,12 +661,17 @@ public actor CodaNetworkClient {
             peerX25519PublicB64: targetDevice.x25519Pubkey,
             isClientInitiator: true
         )
-        if let raw = relayRawTCP, let ticket = relayTicket {
+        let isRemoteHTTPS = serverBaseURL.scheme == "https"
+        let hasReachableRawTCP = relayRawTCP.map { !Self.isLoopbackHost($0.host) } ?? false
+        if !(isRemoteHTTPS && !hasReachableRawTCP), let raw = relayRawTCP, let ticket = relayTicket {
             connectDomesticRawTCP(host: raw.host, port: raw.port, relayTicket: ticket)
             self.activeRouteMode = .domesticRawTCP
         } else if let wss = relayWSS, let ticket = relayTicket {
             try await connectOverseasCDNWSS(wssURL: wss, relayTicket: ticket)
             self.activeRouteMode = .globalCDNWSS
+        } else if let raw = relayRawTCP, let ticket = relayTicket {
+            connectDomesticRawTCP(host: raw.host, port: raw.port, relayTicket: ticket)
+            self.activeRouteMode = .domesticRawTCP
         } else {
             throw URLError(.cannotConnectToHost)
         }

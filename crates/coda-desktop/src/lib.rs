@@ -12,8 +12,9 @@ use std::sync::{Arc, Mutex};
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use chrono::Local;
 use coda_daemon::{
-    start_embedded_host_if_configured, DaemonConfig, DirectP2pClient, SmartPeerClient,
-    SmartRelayFallbackConfig,
+    list_account_hosts, mint_peer_relay_config, poll_device_login_until_approved,
+    start_device_login_flow, start_embedded_host_if_configured, DaemonConfig, DirectP2pClient,
+    RemoteHostSummary, SmartPeerClient, SmartRelayFallbackConfig,
 };
 use coda_herdr::{discover_hc_binary, scan_git_workspaces, HerdrClient};
 use coda_protocol::{
@@ -74,12 +75,18 @@ pub struct DesktopTerminalSession {
 #[derive(Debug, Clone)]
 pub struct CodaDesktopState {
     pub account_email: String,
+    pub server_url: String,
+    pub is_logged_in: bool,
     pub connected_route: String,
     pub show_sidebar: bool,
     pub show_voice_modal: bool,
     pub bypass_permissions: bool,
     pub draft_input: String,
     pub active_terminal_addr: String,
+    pub selected_host_id: Option<Uuid>,
+    pub remote_hosts: Vec<RemoteHostSummary>,
+    pub pending_login_url: Option<String>,
+    pub pending_login_code: Option<String>,
     pub sessions: Vec<DesktopTerminalSession>,
     pub repos: Vec<RepoWorkspaceSummary>,
     pub voice_config: VoiceModelConfig,
@@ -194,14 +201,23 @@ impl Default for CodaDesktopState {
             },
         ];
 
+        let default_server_url = std::env::var("CODA_SERVER_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:8080".into());
+
         Self {
             account_email: "vampire@coda.dev".into(),
+            server_url: default_server_url,
+            is_logged_in: false,
             connected_route: "已连接 · L0 GPUI Metal 120Hz".into(),
             show_sidebar: true,
             show_voice_modal: false,
             bypass_permissions: true,
             draft_input: "发个 iOS 版".into(),
             active_terminal_addr: "t1".into(),
+            selected_host_id: None,
+            remote_hosts: Vec::new(),
+            pending_login_url: None,
+            pending_login_code: None,
             sessions,
             repos,
             voice_config: VoiceModelConfig {
@@ -476,11 +492,20 @@ impl CodaDesktopState {
                 let cmd = self.draft_input.trim().to_string();
                 if !cmd.is_empty() {
                     let active_addr = self.active_terminal_addr.clone();
+                    let target_host = self.selected_host_id.and_then(|id| {
+                        self.remote_hosts.iter().find(|h| h.id == id).cloned()
+                    });
                     self.active_session_mut()
                         .screen_text
-                        .push_str(&format!("\n\n> {cmd}\n● Executing in herdr-core ({active_addr})..."));
+                        .push_str(&format!("\n\n> {cmd}\n● Executing in {} ({active_addr})...",
+                            target_host.as_ref().map(|h| h.name.as_str()).unwrap_or("herdr-core")
+                        ));
                     self.draft_input.clear();
-                    spawn_background_herdr_send(active_addr, cmd);
+                    if let Some(host) = target_host {
+                        spawn_background_remote_send(host, active_addr, cmd);
+                    } else {
+                        spawn_background_herdr_send(active_addr, cmd);
+                    }
                 }
             }
             _ => {}
@@ -530,6 +555,248 @@ fn spawn_background_herdr_send(terminal_addr: String, text: String) {
     });
 }
 
+fn spawn_background_remote_send(host: RemoteHostSummary, terminal_addr: String, text: String) {
+    std::thread::spawn(move || {
+        if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            rt.block_on(async move {
+                let Ok(cfg) = DaemonConfig::load(&DaemonConfig::default_path()) else {
+                    return;
+                };
+                let Some(token) = cfg.session_token.as_deref() else {
+                    return;
+                };
+                let relay_cfg = mint_peer_relay_config(
+                    &cfg.server_url,
+                    token,
+                    cfg.device_id,
+                    host.id,
+                    &host.x25519_pubkey,
+                )
+                .await
+                .ok();
+                if let Ok(mut peer) = SmartPeerClient::connect_auto(
+                    cfg.identity,
+                    cfg.device_id,
+                    host.id,
+                    host.endpoints,
+                    Some("255.255.255.255:24444".parse().unwrap()),
+                    relay_cfg,
+                )
+                .await
+                {
+                    let _ = peer
+                        .request(
+                            &PeerMessage::SendTerminalText {
+                                req_id: format!("gpui-{}", Uuid::new_v4().simple()),
+                                terminal: terminal_addr,
+                                text,
+                            },
+                            TrafficLane::ControlP0,
+                        )
+                        .await;
+                }
+            });
+        }
+    });
+}
+
+fn open_browser_url(url: &str) {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open").arg(url).spawn();
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+    }
+}
+
+fn spawn_desktop_browser_login(state_bg: Arc<Mutex<CodaDesktopState>>, server_url: String) {
+    std::thread::spawn(move || {
+        let Ok(rt) = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+        else {
+            return;
+        };
+        rt.block_on(async move {
+            let cfg_path = DaemonConfig::default_path();
+            let existing = DaemonConfig::load(&cfg_path).ok().map(|c| c.identity);
+            let started = match start_device_login_flow(&server_url, "hybrid", None, existing).await {
+                Ok(s) => s,
+                Err(e) => {
+                    if let Ok(mut g) = state_bg.lock() {
+                        g.status_banner = Some(format!("✗ 连接服务器失败: {e}"));
+                    }
+                    return;
+                }
+            };
+            open_browser_url(&started.verification_uri_complete);
+            if let Ok(mut g) = state_bg.lock() {
+                g.pending_login_url = Some(started.verification_uri_complete.clone());
+                g.pending_login_code = Some(started.user_code.clone());
+                g.status_banner = Some(format!(
+                    "🔑 请在浏览器确认授权码 {} ({})",
+                    started.user_code, started.verification_uri_complete
+                ));
+            }
+            match poll_device_login_until_approved(&started).await {
+                Ok(cfg) => {
+                    let _ = cfg.save(&cfg_path);
+                    let mut hosts = Vec::new();
+                    if let Some(ref tok) = cfg.session_token {
+                        if let Ok(list) = list_account_hosts(&cfg.server_url, tok).await {
+                            hosts = list.into_iter().filter(|h| h.id != cfg.device_id).collect();
+                        }
+                    }
+                    let embedded_addr = start_embedded_host_if_configured(&cfg_path).await;
+                    if let Ok(mut g) = state_bg.lock() {
+                        g.is_logged_in = true;
+                        g.pending_login_url = None;
+                        g.pending_login_code = None;
+                        g.account_email = cfg
+                            .owner_email
+                            .clone()
+                            .unwrap_or_else(|| format!("@{}", cfg.owner_handle));
+                        g.remote_hosts = hosts;
+                        g.connected_route = match embedded_addr {
+                            Some(addr) => {
+                                format!("已登录 @{} · Hybrid :{}", cfg.owner_handle, addr.port())
+                            }
+                            None => format!("已登录 @{} · Hybrid Mesh", cfg.owner_handle),
+                        };
+                        g.status_banner = Some(format!(
+                            "✓ 已作为双角色主机 `{}` 接入账号 @{}",
+                            cfg.identity.name, cfg.owner_handle
+                        ));
+                    }
+                    if embedded_addr.is_some() {
+                        std::future::pending::<()>().await;
+                    }
+                }
+                Err(e) => {
+                    if let Ok(mut g) = state_bg.lock() {
+                        g.status_banner = Some(format!("✗ 浏览器授权未完成: {e}"));
+                    }
+                }
+            }
+        });
+    });
+}
+
+fn spawn_load_remote_host(state_bg: Arc<Mutex<CodaDesktopState>>, host: RemoteHostSummary) {
+    std::thread::spawn(move || {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
+            return;
+        };
+        rt.block_on(async move {
+            let Ok(cfg) = DaemonConfig::load(&DaemonConfig::default_path()) else {
+                return;
+            };
+            let relay_cfg = match cfg.session_token.as_deref() {
+                Some(tok) => mint_peer_relay_config(
+                    &cfg.server_url,
+                    tok,
+                    cfg.device_id,
+                    host.id,
+                    &host.x25519_pubkey,
+                )
+                .await
+                .ok(),
+                None => None,
+            };
+            match SmartPeerClient::connect_auto(
+                cfg.identity,
+                cfg.device_id,
+                host.id,
+                host.endpoints.clone(),
+                Some("255.255.255.255:24444".parse().unwrap()),
+                relay_cfg,
+            )
+            .await
+            {
+                Ok(mut peer) => {
+                    let route = peer.active_route().to_string();
+                    let req = PeerMessage::ListTerminals {
+                        req_id: format!("lt-{}", Uuid::new_v4().simple()),
+                        include_finished: true,
+                    };
+                    if let Ok(PeerMessage::TerminalsSnapshot { terminals, .. }) =
+                        peer.request(&req, TrafficLane::ControlP0).await
+                    {
+                        let first_addr = terminals.first().map(|t| t.address.clone());
+                        let mut screen = String::new();
+                        if let Some(ref addr) = first_addr {
+                            if let Ok(PeerMessage::TerminalScreenSnapshot { text, .. }) = peer
+                                .request(
+                                    &PeerMessage::ReadTerminalScreen {
+                                        req_id: format!("scr-{}", Uuid::new_v4().simple()),
+                                        terminal: addr.clone(),
+                                        history_lines: 80,
+                                    },
+                                    TrafficLane::BulkP1,
+                                )
+                                .await
+                            {
+                                screen = text;
+                            }
+                        }
+                        if let Ok(mut g) = state_bg.lock() {
+                            g.connected_route = format!("已连接 · {route} → {}", host.name);
+                            if !terminals.is_empty() {
+                                g.sessions = terminals
+                                    .into_iter()
+                                    .map(|t| DesktopTerminalSession {
+                                        address: t.address.clone(),
+                                        title: t
+                                            .status
+                                            .as_ref()
+                                            .and_then(|s| s.title.clone())
+                                            .or(t.name.clone())
+                                            .unwrap_or_else(|| t.address.clone()),
+                                        repo_name: host.name.clone(),
+                                        branch_name: t.name.unwrap_or(t.address),
+                                        machine_name: host.name.clone(),
+                                        model_badge: route.clone(),
+                                        status_label: t
+                                            .status
+                                            .as_ref()
+                                            .map(|s| s.state.clone())
+                                            .unwrap_or_else(|| "running".into()),
+                                        is_done: !t.alive,
+                                        diff_added: 0,
+                                        diff_deleted: 0,
+                                        screen_text: if screen.is_empty() {
+                                            format!("Connected to remote host `{}` via {route}", host.name)
+                                        } else {
+                                            screen.clone()
+                                        },
+                                    })
+                                    .collect();
+                                if let Some(addr) = first_addr {
+                                    g.active_terminal_addr = addr;
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    if let Ok(mut g) = state_bg.lock() {
+                        g.status_banner = Some(format!("✗ 无法连接 {}: {e}", host.name));
+                    }
+                }
+            }
+        });
+    });
+}
+
 // ============================================================================
 // GPUI Root View (`CodaGpuWorkspaceView`)
 // ============================================================================
@@ -562,16 +829,35 @@ impl CodaGpuWorkspaceView {
                     tmp.sync_from_local_herdr().await;
 
                     let cfg_path = DaemonConfig::default_path();
-                    let cfg_exists = cfg_path.exists();
+                    let loaded_cfg = DaemonConfig::load(&cfg_path).ok();
+                    let cfg_exists = loaded_cfg.is_some();
                     let embedded_addr = if cfg_exists {
                         start_embedded_host_if_configured(&cfg_path).await
                     } else {
                         None
                     };
+                    let mut remote_hosts = Vec::new();
+                    if let Some(ref cfg) = loaded_cfg {
+                        if let Some(ref tok) = cfg.session_token {
+                            if let Ok(list) = list_account_hosts(&cfg.server_url, tok).await {
+                                remote_hosts =
+                                    list.into_iter().filter(|h| h.id != cfg.device_id).collect();
+                            }
+                        }
+                    }
 
                     if let Ok(mut guard) = state_bg.lock() {
                         guard.repos = tmp.repos;
                         guard.voice_config = tmp.voice_config;
+                        if let Some(ref cfg) = loaded_cfg {
+                            guard.is_logged_in = true;
+                            guard.server_url = cfg.server_url.clone();
+                            guard.account_email = cfg
+                                .owner_email
+                                .clone()
+                                .unwrap_or_else(|| format!("@{}", cfg.owner_handle));
+                            guard.remote_hosts = remote_hosts;
+                        }
                         if let Some(addr) = embedded_addr {
                             guard.connected_route = format!("已连接 · ⚡ 内网直连主机 :{} 就绪", addr.port());
                         } else if cfg_exists {
@@ -688,7 +974,116 @@ impl CodaGpuWorkspaceView {
                             ),
                     ),
             )
-            // 2. Grouped Repo & Branch/Worktree List
+            // 2. Account / Remote Host Switcher + Repo/Branch List
+            .child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .border_b_1()
+                    .border_color(rgb(palette::DIVIDER))
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .when(!st.is_logged_in, |el| {
+                        let srv = st.server_url.clone();
+                        el.child(
+                            div()
+                                .px_3()
+                                .py_2()
+                                .rounded_lg()
+                                .bg(rgb(palette::KEY_SURFACE))
+                                .border_1()
+                                .border_color(rgb(palette::EMERALD_WORKING))
+                                .text_xs()
+                                .text_color(rgb(palette::EMERALD_WORKING))
+                                .child(SharedString::from(format!(
+                                    "🔑 浏览器登录 ({srv})"
+                                )))
+                                .hover(|s| s.bg(rgb(palette::KEY_HOVER)).cursor_pointer())
+                                .on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                                        let url = this.state.lock().map(|g| g.server_url.clone()).unwrap_or_default();
+                                        spawn_desktop_browser_login(Arc::clone(&this.state), url);
+                                        cx.notify();
+                                    }),
+                                ),
+                        )
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_md()
+                                    .text_xs()
+                                    .bg(if st.selected_host_id.is_none() {
+                                        rgb(palette::KEY_HOVER)
+                                    } else {
+                                        rgb(palette::KEY_SURFACE)
+                                    })
+                                    .border_1()
+                                    .border_color(rgb(palette::KEY_BORDER))
+                                    .text_color(rgb(palette::TEXT_PRIMARY))
+                                    .child("💻 本机")
+                                    .hover(|s| s.cursor_pointer())
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                                            if let Ok(mut g) = this.state.lock() {
+                                                g.selected_host_id = None;
+                                                g.connected_route = "已连接 · L0 本机 Herdr 直连".into();
+                                            }
+                                            cx.notify();
+                                        }),
+                                    ),
+                            )
+                            .children(st.remote_hosts.iter().map(|host| {
+                                let h_clone = host.clone();
+                                let is_cur = st.selected_host_id == Some(host.id);
+                                let dot = if host.is_online { "●" } else { "○" };
+                                div()
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_md()
+                                    .text_xs()
+                                    .bg(if is_cur {
+                                        rgb(palette::KEY_HOVER)
+                                    } else {
+                                        rgb(palette::KEY_SURFACE)
+                                    })
+                                    .border_1()
+                                    .border_color(if is_cur {
+                                        rgb(palette::SKY_DONE)
+                                    } else {
+                                        rgb(palette::KEY_BORDER)
+                                    })
+                                    .text_color(if host.is_online {
+                                        rgb(palette::TEXT_PRIMARY)
+                                    } else {
+                                        rgb(palette::TEXT_MUTED)
+                                    })
+                                    .child(SharedString::from(format!("{dot} {}", host.name)))
+                                    .hover(|s| s.cursor_pointer())
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _: &MouseUpEvent, _, cx| {
+                                            if let Ok(mut g) = this.state.lock() {
+                                                g.selected_host_id = Some(h_clone.id);
+                                                g.status_banner = Some(format!("正在经智能路由连接 {}...", h_clone.name));
+                                            }
+                                            spawn_load_remote_host(Arc::clone(&this.state), h_clone.clone());
+                                            cx.notify();
+                                        }),
+                                    )
+                            })),
+                    ),
+            )
+            // 3. Grouped Repo & Branch/Worktree List
             .child(
                 div()
                     .id("sidebar-scroll")
@@ -1420,15 +1815,36 @@ impl CodaGpuWorkspaceView {
                                 cx.listener(|this, _: &MouseUpEvent, _, cx| {
                                     if let Some(item) = cx.read_from_clipboard() {
                                         if let Some(txt) = item.text() {
+                                            let trimmed = txt.trim();
                                             if let Ok(mut g) = this.state.lock() {
-                                                g.draft_input.push_str(&txt);
+                                                if !g.is_logged_in
+                                                    && (trimmed.starts_with("http://")
+                                                        || trimmed.starts_with("https://"))
+                                                {
+                                                    g.server_url =
+                                                        trimmed.trim_end_matches('/').to_string();
+                                                    g.status_banner = Some(format!(
+                                                        "✓ 已更新服务器地址为 {}",
+                                                        g.server_url
+                                                    ));
+                                                } else {
+                                                    g.draft_input.push_str(&txt);
+                                                }
                                             }
                                             cx.notify();
                                         }
                                     } else {
-                                        cx.write_to_clipboard(ClipboardItem::new_string(
-                                            "coda-daemon pair --server http://127.0.0.1:8080".into(),
-                                        ));
+                                        let cmd = this
+                                            .state
+                                            .lock()
+                                            .map(|g| {
+                                                format!("coda-daemon login --server {}", g.server_url)
+                                            })
+                                            .unwrap_or_else(|_| {
+                                                "coda-daemon login --server http://127.0.0.1:8080"
+                                                    .into()
+                                            });
+                                        cx.write_to_clipboard(ClipboardItem::new_string(cmd));
                                     }
                                 }),
                             ),
