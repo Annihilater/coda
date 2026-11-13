@@ -27,11 +27,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
+    net::{TcpListener, TcpStream, UdpSocket as TokioUdpSocket},
     process::Command,
     sync::{mpsc, Mutex},
 };
-use tokio_tungstenite::{connect_async, tungstenite::Message as WsMsg};
+use tokio_tungstenite::{accept_async, connect_async, tungstenite::Message as WsMsg};
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -94,9 +94,14 @@ pub fn discover_local_endpoints_with_port(p2p_port: u16) -> Vec<NetworkEndpointC
         if sock4.connect("223.5.5.5:53").is_ok() {
             if let Ok(local) = sock4.local_addr() {
                 if !local.ip().is_loopback() {
+                    let ip4 = local.ip();
                     out.push(NetworkEndpointCandidate {
                         kind: "lan_ipv4".into(),
-                        addr: format!("{}:{}", local.ip(), p2p_port),
+                        addr: format!("{ip4}:{p2p_port}"),
+                    });
+                    out.push(NetworkEndpointCandidate {
+                        kind: "lan_ws".into(),
+                        addr: format!("ws://{ip4}:{p2p_port}"),
                     });
                 }
             }
@@ -106,9 +111,14 @@ pub fn discover_local_endpoints_with_port(p2p_port: u16) -> Vec<NetworkEndpointC
         if sock6.connect("[2400:3200::1]:53").is_ok() {
             if let Ok(local) = sock6.local_addr() {
                 if !local.ip().is_loopback() {
+                    let ip6 = local.ip();
                     out.push(NetworkEndpointCandidate {
                         kind: "cn_public_ipv6".into(),
-                        addr: format!("[{}]:{}", local.ip(), p2p_port),
+                        addr: format!("[{ip6}]:{p2p_port}"),
+                    });
+                    out.push(NetworkEndpointCandidate {
+                        kind: "ipv6_ws".into(),
+                        addr: format!("ws://[{ip6}]:{p2p_port}"),
                     });
                 }
             }
@@ -198,6 +208,15 @@ pub async fn pair_daemon_with_code(
 
 /// Runs a single connected Daemon session over either Raw TCP No-SNI or CDN WebSocket.
 pub async fn run_daemon_once(cfg: &DaemonConfig, prefer_mode: Option<&str>) -> Result<()> {
+    run_daemon_once_with_p2p(cfg, prefer_mode, Some(DEFAULT_DIRECT_P2P_PORT)).await
+}
+
+/// Runs a single connected Daemon session over Relay and dynamically advertises fresh LAN/IPv6 P2P endpoints.
+pub async fn run_daemon_once_with_p2p(
+    cfg: &DaemonConfig,
+    prefer_mode: Option<&str>,
+    p2p_port: Option<u16>,
+) -> Result<()> {
     let chosen = cfg
         .relays
         .iter()
@@ -289,6 +308,37 @@ pub async fn run_daemon_once(cfg: &DaemonConfig, prefer_mode: Option<&str>) -> R
             }
         });
     }
+
+    let endpoint_watcher = if let Some(port) = p2p_port {
+        let initial_eps = discover_local_endpoints_with_port(port);
+        let _ = out_tx
+            .send(RelayWireFrame::AdvertiseEndpoints {
+                endpoints: initial_eps.clone(),
+            })
+            .await;
+        let out_tx_watch = out_tx.clone();
+        Some(tokio::spawn(async move {
+            let mut last_eps = initial_eps;
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                let fresh = discover_local_endpoints_with_port(port);
+                if fresh != last_eps {
+                    last_eps = fresh.clone();
+                    if out_tx_watch
+                        .send(RelayWireFrame::AdvertiseEndpoints { endpoints: fresh })
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        }))
+    } else {
+        None
+    };
 
     let herdr = match HerdrClient::connect_default().await {
         Ok(hc) => {
@@ -396,12 +446,17 @@ pub async fn run_daemon_once(cfg: &DaemonConfig, prefer_mode: Option<&str>) -> R
         }
     }
 
+    if let Some(w) = endpoint_watcher {
+        w.abort();
+    }
+
     Ok(())
 }
 
 /// Phase 3 Direct P2P Listener (`L0 LAN IPv4` + `L1 Mainland China Native IPv6 Direct`).
-/// Binds a direct TCP socket (`SO_REUSEADDR`) so clients on the same LAN or Mainland China IPv6
-/// can establish a `< 10ms` zero-relay E2EE session directly to `coda-daemon`.
+/// Auto-detects incoming protocol on the SAME port (`:24444`):
+/// - Browser WebSocket (`GET ... HTTP/1.1` Upgrade -> JSON Text frames)
+/// - Native Raw Binary TCP (`[u32_be_len][json]` for iOS `NWConnection` & GPUI Desktop)
 pub async fn spawn_direct_p2p_listener(
     cfg: DaemonConfig,
     bind_addr: SocketAddr,
@@ -409,7 +464,7 @@ pub async fn spawn_direct_p2p_listener(
     let listener = TcpListener::bind(bind_addr).await?;
     let local_addr = listener.local_addr()?;
     info!(
-        "Direct P2P zero-relay listener active on {} (device={})",
+        "Direct P2P zero-relay listener active on {} (RawTCP + LAN WebSocket auto-detect, device={})",
         local_addr, cfg.device_id
     );
 
@@ -420,7 +475,22 @@ pub async fn spawn_direct_p2p_listener(
             let cfg_clone = cfg.clone();
             let herdr_clone = herdr.clone();
             tokio::spawn(async move {
-                if let Err(e) = handle_direct_p2p_socket(stream, peer_addr, cfg_clone, herdr_clone).await {
+                let _ = stream.set_nodelay(true);
+                let mut peek4 = [0u8; 4];
+                let is_ws = matches!(
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(3),
+                        stream.peek(&mut peek4),
+                    )
+                    .await,
+                    Ok(Ok(n)) if n >= 4 && &peek4 == b"GET "
+                );
+                let res = if is_ws {
+                    handle_direct_p2p_ws_socket(stream, peer_addr, cfg_clone, herdr_clone).await
+                } else {
+                    handle_direct_p2p_socket(stream, peer_addr, cfg_clone, herdr_clone).await
+                };
+                if let Err(e) = res {
                     warn!("direct P2P session from {peer_addr} ended: {e}");
                 }
             });
@@ -430,17 +500,8 @@ pub async fn spawn_direct_p2p_listener(
     Ok(local_addr)
 }
 
-async fn handle_direct_p2p_socket(
-    stream: TcpStream,
-    peer_addr: SocketAddr,
-    cfg: DaemonConfig,
-    herdr: Option<Arc<HerdrClient>>,
-) -> Result<()> {
-    let _ = stream.set_nodelay(true);
-    let (mut reader, mut writer) = stream.into_split();
-
-    let hello = read_raw_frame(&mut reader).await?;
-    let (client_device_id, client_x25519_pub_b64) = match hello {
+fn verify_direct_p2p_hello(cfg: &DaemonConfig, hello: RelayWireFrame) -> Result<(Uuid, String)> {
+    match hello {
         RelayWireFrame::DirectP2pHello {
             client_device_id,
             target_device_id,
@@ -458,10 +519,104 @@ async fn handle_direct_p2p_socket(
                 signed_msg.as_bytes(),
                 &signature_b64,
             )?;
-            (client_device_id, client_x25519_pub_b64)
+            Ok((client_device_id, client_x25519_pub_b64))
         }
         other => anyhow::bail!("expected DirectP2pHello, got {other:?}"),
-    };
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_direct_p2p_frame(
+    frame: RelayWireFrame,
+    cfg: &DaemonConfig,
+    herdr: &Option<Arc<HerdrClient>>,
+    sessions: &Arc<Mutex<HashMap<Uuid, E2eeSession>>>,
+    active_ptys: &Arc<Mutex<HashMap<(Uuid, String), PtyBridgeHandle>>>,
+    out_tx: &mpsc::Sender<RelayWireFrame>,
+) {
+    match frame {
+        RelayWireFrame::KeepAlive { ts_ms } => {
+            let _ = out_tx.send(RelayWireFrame::KeepAlive { ts_ms }).await;
+        }
+        RelayWireFrame::RoutePacket {
+            src_device_id,
+            e2ee,
+            ..
+        } => {
+            let req_msg = {
+                let mut map = sessions.lock().await;
+                let Some(s) = map.get_mut(&src_device_id) else {
+                    return;
+                };
+                match s.open_message(&e2ee) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        warn!("P2P E2EE open error: {e}");
+                        return;
+                    }
+                }
+            };
+
+            let my_dh_pub_b64 = &cfg.identity.x25519_public_b64;
+            if let Some((reply_msg, reply_lane)) = handle_peer_request_full(
+                src_device_id,
+                req_msg,
+                herdr.as_deref(),
+                &cfg.identity.name,
+                active_ptys,
+                sessions,
+                out_tx,
+                cfg.device_id,
+                my_dh_pub_b64,
+            )
+            .await
+            {
+                let mut map = sessions.lock().await;
+                if let Some(s) = map.get_mut(&src_device_id) {
+                    if let Ok(sealed) = s.seal_message(&reply_msg) {
+                        let _ = out_tx
+                            .send(RelayWireFrame::RoutePacket {
+                                src_device_id: cfg.device_id,
+                                dst_device_id: src_device_id,
+                                lane: reply_lane,
+                                e2ee: sealed,
+                                sender_x25519_pub_b64: Some(my_dh_pub_b64.clone()),
+                            })
+                            .await;
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+async fn init_p2p_session_state(
+    cfg: &DaemonConfig,
+    client_device_id: Uuid,
+    client_x25519_pub_b64: &str,
+) -> Result<(
+    Arc<Mutex<HashMap<Uuid, E2eeSession>>>,
+    Arc<Mutex<HashMap<(Uuid, String), PtyBridgeHandle>>>,
+)> {
+    let my_dh_secret = cfg.identity.x25519_secret()?;
+    let sess = E2eeSession::derive(&my_dh_secret, client_x25519_pub_b64, false)?;
+    let sessions = Arc::new(Mutex::new(HashMap::new()));
+    sessions.lock().await.insert(client_device_id, sess);
+    let active_ptys = Arc::new(Mutex::new(HashMap::new()));
+    Ok((sessions, active_ptys))
+}
+
+async fn handle_direct_p2p_socket(
+    stream: TcpStream,
+    peer_addr: SocketAddr,
+    cfg: DaemonConfig,
+    herdr: Option<Arc<HerdrClient>>,
+) -> Result<()> {
+    let (mut reader, mut writer) = stream.into_split();
+
+    let hello = read_raw_frame(&mut reader).await?;
+    let (client_device_id, client_x25519_pub_b64) = verify_direct_p2p_hello(&cfg, hello)?;
 
     let path_kind = if peer_addr.is_ipv6() {
         "cn_public_ipv6"
@@ -477,7 +632,7 @@ async fn handle_direct_p2p_socket(
     writer.write_all(&ack.encode_length_delimited()?).await?;
 
     let (out_tx, mut out_rx) = mpsc::channel::<RelayWireFrame>(256);
-    tokio::spawn(async move {
+    let write_task = tokio::spawn(async move {
         while let Some(f) = out_rx.recv().await {
             if let Ok(bytes) = f.encode_length_delimited() {
                 if writer.write_all(&bytes).await.is_err() {
@@ -487,70 +642,200 @@ async fn handle_direct_p2p_socket(
         }
     });
 
-    let my_dh_secret = cfg.identity.x25519_secret()?;
-    let sess = E2eeSession::derive(&my_dh_secret, &client_x25519_pub_b64, false)?;
-    let sessions: Arc<Mutex<HashMap<Uuid, E2eeSession>>> = Arc::new(Mutex::new(HashMap::new()));
-    sessions.lock().await.insert(client_device_id, sess);
-
-    let active_ptys: Arc<Mutex<HashMap<(Uuid, String), PtyBridgeHandle>>> =
-        Arc::new(Mutex::new(HashMap::new()));
-    let my_dh_pub_b64 = cfg.identity.x25519_public_b64.clone();
-    let my_device_id = cfg.device_id;
-    let hostname = cfg.identity.name.clone();
+    let (sessions, active_ptys) =
+        init_p2p_session_state(&cfg, client_device_id, &client_x25519_pub_b64).await?;
 
     while let Ok(frame) = read_raw_frame(&mut reader).await {
-        if let RelayWireFrame::RoutePacket {
-            src_device_id,
-            e2ee,
-            ..
-        } = frame
-        {
-            let req_msg = {
-                let mut map = sessions.lock().await;
-                let Some(s) = map.get_mut(&src_device_id) else {
-                    continue;
-                };
-                match s.open_message(&e2ee) {
-                    Ok(m) => m,
-                    Err(e) => {
-                        warn!("P2P E2EE open error: {e}");
-                        continue;
-                    }
-                }
-            };
+        dispatch_direct_p2p_frame(frame, &cfg, &herdr, &sessions, &active_ptys, &out_tx).await;
+    }
 
-            if let Some((reply_msg, reply_lane)) = handle_peer_request_full(
-                src_device_id,
-                req_msg,
-                herdr.as_deref(),
-                &hostname,
-                &active_ptys,
-                &sessions,
-                &out_tx,
-                my_device_id,
-                &my_dh_pub_b64,
-            )
-            .await
-            {
-                let mut map = sessions.lock().await;
-                if let Some(s) = map.get_mut(&src_device_id) {
-                    if let Ok(sealed) = s.seal_message(&reply_msg) {
-                        let _ = out_tx
-                            .send(RelayWireFrame::RoutePacket {
-                                src_device_id: my_device_id,
-                                dst_device_id: src_device_id,
-                                lane: reply_lane,
-                                e2ee: sealed,
-                                sender_x25519_pub_b64: Some(my_dh_pub_b64.clone()),
-                            })
-                            .await;
-                    }
+    write_task.abort();
+    Ok(())
+}
+
+async fn handle_direct_p2p_ws_socket(
+    stream: TcpStream,
+    peer_addr: SocketAddr,
+    cfg: DaemonConfig,
+    herdr: Option<Arc<HerdrClient>>,
+) -> Result<()> {
+    let ws_stream = accept_async(stream)
+        .await
+        .with_context(|| format!("direct P2P WebSocket upgrade failed for {peer_addr}"))?;
+    let (mut sink, mut rx) = ws_stream.split();
+
+    let Some(first_msg) = rx.next().await else {
+        anyhow::bail!("direct P2P WebSocket closed before hello");
+    };
+    let hello: RelayWireFrame = match first_msg? {
+        WsMsg::Text(t) => serde_json::from_str(&t)?,
+        WsMsg::Binary(b) => serde_json::from_slice(&b)?,
+        other => anyhow::bail!("unexpected initial WS message: {other:?}"),
+    };
+    let (client_device_id, client_x25519_pub_b64) = verify_direct_p2p_hello(&cfg, hello)?;
+
+    let path_kind = if peer_addr.is_ipv6() {
+        "ipv6_ws"
+    } else {
+        "lan_ws"
+    };
+    let ack = RelayWireFrame::DirectP2pAck {
+        ok: true,
+        daemon_device_id: cfg.device_id,
+        daemon_x25519_pub_b64: cfg.identity.x25519_public_b64.clone(),
+        path_kind: path_kind.into(),
+    };
+    sink.send(WsMsg::Text(serde_json::to_string(&ack)?.into()))
+        .await?;
+
+    let (out_tx, mut out_rx) = mpsc::channel::<RelayWireFrame>(256);
+    let write_task = tokio::spawn(async move {
+        while let Some(f) = out_rx.recv().await {
+            if let Ok(txt) = serde_json::to_string(&f) {
+                if sink.send(WsMsg::Text(txt.into())).await.is_err() {
+                    break;
                 }
             }
         }
+    });
+
+    let (sessions, active_ptys) =
+        init_p2p_session_state(&cfg, client_device_id, &client_x25519_pub_b64).await?;
+
+    while let Some(Ok(msg)) = rx.next().await {
+        let frame_opt: Option<RelayWireFrame> = match msg {
+            WsMsg::Text(t) => serde_json::from_str(&t).ok(),
+            WsMsg::Binary(b) => serde_json::from_slice(&b).ok(),
+            _ => None,
+        };
+        if let Some(frame) = frame_opt {
+            dispatch_direct_p2p_frame(frame, &cfg, &herdr, &sessions, &active_ptys, &out_tx).await;
+        }
     }
 
+    write_task.abort();
     Ok(())
+}
+
+/// Spawns a Local Wi-Fi UDP broadcast discovery responder on `bind_addr` (default `0.0.0.0:24444`).
+/// Replies unicast to `{"coda_lan_probe":1,"target_device_id":"<uuid>"}` with the host's TCP P2P port.
+pub async fn spawn_lan_udp_beacon(
+    device_id: Uuid,
+    tcp_p2p_port: u16,
+    bind_addr: SocketAddr,
+) -> Result<SocketAddr> {
+    let sock = TokioUdpSocket::bind(bind_addr).await?;
+    let local_addr = sock.local_addr()?;
+    info!(
+        "Local Wi-Fi UDP discovery beacon listening on {} (tcp_p2p_port={})",
+        local_addr, tcp_p2p_port
+    );
+
+    tokio::spawn(async move {
+        let mut buf = [0u8; 512];
+        loop {
+            let Ok((len, src_addr)) = sock.recv_from(&mut buf).await else {
+                break;
+            };
+            let Ok(v) = serde_json::from_slice::<serde_json::Value>(&buf[..len]) else {
+                continue;
+            };
+            if v.get("coda_lan_probe").and_then(|x| x.as_u64()) != Some(1) {
+                continue;
+            }
+            let Some(target_str) = v.get("target_device_id").and_then(|x| x.as_str()) else {
+                continue;
+            };
+            let Ok(target_id) = Uuid::parse_str(target_str) else {
+                continue;
+            };
+            if target_id == device_id {
+                let reply = json!({
+                    "coda_lan_here": 1,
+                    "device_id": device_id,
+                    "tcp_port": tcp_p2p_port,
+                });
+                if let Ok(bytes) = serde_json::to_vec(&reply) {
+                    let _ = sock.send_to(&bytes, src_addr).await;
+                }
+            }
+        }
+    });
+
+    Ok(local_addr)
+}
+
+/// Sends a zero-config Wi-Fi UDP discovery probe (NEVER `connect()`s the UDP socket so unicast
+/// replies from concrete LAN IPs are accepted cleanly) and returns the discovered TCP/WS `SocketAddr`.
+pub async fn probe_lan_udp_peer(
+    target_device_id: Uuid,
+    broadcast_or_target: SocketAddr,
+    timeout_ms: u64,
+) -> Option<SocketAddr> {
+    let sock = TokioUdpSocket::bind("0.0.0.0:0").await.ok()?;
+    let _ = sock.set_broadcast(true);
+    let probe_bytes = serde_json::to_vec(&json!({
+        "coda_lan_probe": 1,
+        "target_device_id": target_device_id,
+    }))
+    .ok()?;
+
+    let _ = sock.send_to(&probe_bytes, broadcast_or_target).await;
+    if matches!(broadcast_or_target.ip(), std::net::IpAddr::V4(v4) if v4.is_broadcast()) {
+        let loopback = SocketAddr::from(([127, 0, 0, 1], broadcast_or_target.port()));
+        let _ = sock.send_to(&probe_bytes, loopback).await;
+    }
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    let mut buf = [0u8; 512];
+    while tokio::time::Instant::now() < deadline {
+        let remain = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(remain, sock.recv_from(&mut buf)).await {
+            Ok(Ok((len, peer_src))) => {
+                let Ok(v) = serde_json::from_slice::<serde_json::Value>(&buf[..len]) else {
+                    continue;
+                };
+                if v.get("coda_lan_here").and_then(|x| x.as_u64()) != Some(1) {
+                    continue;
+                }
+                let Some(id_str) = v.get("device_id").and_then(|x| x.as_str()) else {
+                    continue;
+                };
+                let Ok(id) = Uuid::parse_str(id_str) else {
+                    continue;
+                };
+                let Some(tcp_port) = v.get("tcp_port").and_then(|x| x.as_u64()) else {
+                    continue;
+                };
+                if id == target_device_id && (1..=65535).contains(&tcp_port) {
+                    return Some(SocketAddr::new(peer_src.ip(), tcp_port as u16));
+                }
+            }
+            _ => break,
+        }
+    }
+    None
+}
+
+/// Starts embedded host P2P + UDP LAN beacon + Relay uplink inside desktop apps (e.g. `coda-desktop`)
+/// if `cfg_path` exists and port `24444` is not already owned by a standalone `coda-daemon` process.
+pub async fn start_embedded_host_if_configured(cfg_path: &Path) -> Option<SocketAddr> {
+    let cfg = DaemonConfig::load(cfg_path).ok()?;
+    let p2p_bind = SocketAddr::from(([0, 0, 0, 0], DEFAULT_DIRECT_P2P_PORT));
+    let p2p_addr = spawn_direct_p2p_listener(cfg.clone(), p2p_bind).await.ok()?;
+    let _ = spawn_lan_udp_beacon(cfg.device_id, p2p_addr.port(), p2p_bind).await;
+
+    let port = p2p_addr.port();
+    tokio::spawn(async move {
+        loop {
+            if let Err(e) = run_daemon_once_with_p2p(&cfg, None, Some(port)).await {
+                warn!("embedded Mac host relay disconnected ({e}); reconnecting in 2s...");
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+        }
+    });
+
+    Some(p2p_addr)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1154,5 +1439,301 @@ impl DirectP2pClient {
                 return self.e2ee.open_message(&e2ee);
             }
         }
+    }
+}
+
+// ============================================================================
+// Auto-SmartPath Negotiator (`SmartPeerClient`): LAN/IPv6 P2P <-> Relay Failover
+// ============================================================================
+
+#[derive(Debug, Clone)]
+pub struct SmartRelayFallbackConfig {
+    pub raw_tcp_addr: Option<String>,
+    pub wss_url: Option<String>,
+    pub relay_ticket: String,
+    pub peer_x25519_pub_b64: String,
+}
+
+enum RelaySocketTransport {
+    RawTcp {
+        reader: tokio::net::tcp::OwnedReadHalf,
+        writer: tokio::net::tcp::OwnedWriteHalf,
+    },
+    Wss {
+        sink: futures_util::stream::SplitSink<
+            tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<TcpStream>,
+            >,
+            WsMsg,
+        >,
+        stream: futures_util::stream::SplitStream<
+            tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<TcpStream>,
+            >,
+        >,
+    },
+}
+
+struct RelayClientConn {
+    route_label: String,
+    transport: RelaySocketTransport,
+    e2ee: E2eeSession,
+    client_device_id: Uuid,
+    target_device_id: Uuid,
+    client_x25519_pub_b64: String,
+}
+
+impl RelayClientConn {
+    async fn connect(
+        client_id: &StoredDeviceIdentity,
+        client_device_id: Uuid,
+        target_device_id: Uuid,
+        cfg: &SmartRelayFallbackConfig,
+    ) -> Result<Self> {
+        let e2ee = E2eeSession::derive(
+            &client_id.x25519_secret()?,
+            &cfg.peer_x25519_pub_b64,
+            true,
+        )?;
+        let gen = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let bind = RelayWireFrame::AuthBind {
+            ticket: cfg.relay_ticket.clone(),
+            lane: TrafficLane::ControlP0,
+            generation: gen.max(1),
+        };
+
+        if let Some(ref raw_addr) = cfg.raw_tcp_addr {
+            if let Ok(stream) = TcpStream::connect(raw_addr).await {
+                let _ = stream.set_nodelay(true);
+                let (mut reader, mut writer) = stream.into_split();
+                writer.write_all(&bind.encode_length_delimited()?).await?;
+                let ack = read_raw_frame(&mut reader).await?;
+                if matches!(ack, RelayWireFrame::AuthAck { ok: true, .. }) {
+                    return Ok(Self {
+                        route_label: "relay_raw_tcp".into(),
+                        transport: RelaySocketTransport::RawTcp { reader, writer },
+                        e2ee,
+                        client_device_id,
+                        target_device_id,
+                        client_x25519_pub_b64: client_id.x25519_public_b64.clone(),
+                    });
+                }
+            }
+        }
+
+        if let Some(ref wss_url) = cfg.wss_url {
+            let (ws_stream, _) = connect_async(wss_url).await?;
+            let (mut sink, mut stream) = ws_stream.split();
+            sink.send(WsMsg::Text(serde_json::to_string(&bind)?.into()))
+                .await?;
+            if let Some(Ok(WsMsg::Text(txt))) = stream.next().await {
+                let ack: RelayWireFrame = serde_json::from_str(&txt)?;
+                if matches!(ack, RelayWireFrame::AuthAck { ok: true, .. }) {
+                    return Ok(Self {
+                        route_label: "relay_wss".into(),
+                        transport: RelaySocketTransport::Wss { sink, stream },
+                        e2ee,
+                        client_device_id,
+                        target_device_id,
+                        client_x25519_pub_b64: client_id.x25519_public_b64.clone(),
+                    });
+                }
+            }
+        }
+
+        anyhow::bail!("no reachable relay fallback endpoint")
+    }
+
+    async fn request(&mut self, msg: &PeerMessage, lane: TrafficLane) -> Result<PeerMessage> {
+        let sealed = self.e2ee.seal_message(msg)?;
+        let pkt = RelayWireFrame::RoutePacket {
+            src_device_id: self.client_device_id,
+            dst_device_id: self.target_device_id,
+            lane,
+            e2ee: sealed,
+            sender_x25519_pub_b64: Some(self.client_x25519_pub_b64.clone()),
+        };
+
+        match &mut self.transport {
+            RelaySocketTransport::RawTcp { reader, writer } => {
+                writer.write_all(&pkt.encode_length_delimited()?).await?;
+                loop {
+                    let frame = read_raw_frame(reader).await?;
+                    match frame {
+                        RelayWireFrame::RoutePacket { e2ee, .. } => {
+                            return self.e2ee.open_message(&e2ee);
+                        }
+                        RelayWireFrame::Error { code, message } => {
+                            anyhow::bail!("relay error ({code}): {message}");
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            RelaySocketTransport::Wss { sink, stream } => {
+                sink.send(WsMsg::Text(serde_json::to_string(&pkt)?.into()))
+                    .await?;
+                while let Some(Ok(msg)) = stream.next().await {
+                    if let WsMsg::Text(t) = msg {
+                        if let Ok(frame) = serde_json::from_str::<RelayWireFrame>(&t) {
+                            match frame {
+                                RelayWireFrame::RoutePacket { e2ee, .. } => {
+                                    return self.e2ee.open_message(&e2ee);
+                                }
+                                RelayWireFrame::Error { code, message } => {
+                                    anyhow::bail!("relay error ({code}): {message}");
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                anyhow::bail!("relay WSS stream closed before reply")
+            }
+        }
+    }
+}
+
+/// Automatically negotiates the fastest path between Direct LAN/IPv6 P2P and Cloud Relay,
+/// maintaining separate E2EE sessions per leg for lossless hot-upgrade and relay failover.
+pub struct SmartPeerClient {
+    client_id: StoredDeviceIdentity,
+    client_device_id: Uuid,
+    target_device_id: Uuid,
+    endpoints: Vec<NetworkEndpointCandidate>,
+    udp_probe_addr: Option<SocketAddr>,
+    relay_cfg: Option<SmartRelayFallbackConfig>,
+    direct: Option<DirectP2pClient>,
+    relay_leg: Option<RelayClientConn>,
+}
+
+impl SmartPeerClient {
+    pub async fn connect_auto(
+        client_id: StoredDeviceIdentity,
+        client_device_id: Uuid,
+        target_device_id: Uuid,
+        endpoints: Vec<NetworkEndpointCandidate>,
+        udp_probe_addr: Option<SocketAddr>,
+        relay_cfg: Option<SmartRelayFallbackConfig>,
+    ) -> Result<Self> {
+        let mut me = Self {
+            client_id,
+            client_device_id,
+            target_device_id,
+            endpoints,
+            udp_probe_addr,
+            relay_cfg,
+            direct: None,
+            relay_leg: None,
+        };
+
+        if me.try_upgrade_to_direct().await {
+            return Ok(me);
+        }
+
+        if let Some(ref rcfg) = me.relay_cfg {
+            me.relay_leg = Some(
+                RelayClientConn::connect(&me.client_id, client_device_id, target_device_id, rcfg)
+                    .await?,
+            );
+            return Ok(me);
+        }
+
+        anyhow::bail!("neither Direct LAN/IPv6 P2P nor Relay could connect to {target_device_id}")
+    }
+
+    pub fn active_route(&self) -> &str {
+        if let Some(ref p2p) = self.direct {
+            &p2p.path_kind
+        } else if let Some(ref relay) = self.relay_leg {
+            &relay.route_label
+        } else {
+            "disconnected"
+        }
+    }
+
+    pub fn is_direct_p2p(&self) -> bool {
+        self.direct.is_some()
+    }
+
+    pub async fn try_upgrade_to_direct(&mut self) -> bool {
+        if self.direct.is_some() {
+            return true;
+        }
+        let mut candidates: Vec<String> = Vec::new();
+        if let Some(probe_addr) = self.udp_probe_addr {
+            if let Some(found) = probe_lan_udp_peer(self.target_device_id, probe_addr, 120).await {
+                candidates.push(found.to_string());
+            }
+        }
+        for ep in &self.endpoints {
+            if matches!(ep.kind.as_str(), "lan_ipv4" | "cn_public_ipv6")
+                && !candidates.contains(&ep.addr)
+            {
+                candidates.push(ep.addr.clone());
+            }
+        }
+        for addr in candidates {
+            if let Ok(p2p) = DirectP2pClient::connect_direct(
+                &addr,
+                &self.client_id,
+                self.client_device_id,
+                self.target_device_id,
+            )
+            .await
+            {
+                self.direct = Some(p2p);
+                return true;
+            }
+        }
+        false
+    }
+
+    pub async fn request(&mut self, msg: &PeerMessage, lane: TrafficLane) -> Result<PeerMessage> {
+        if let Some(p2p) = self.direct.as_mut() {
+            let direct_res = match p2p.send_message(msg, lane).await {
+                Ok(()) => tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    p2p.recv_message(),
+                )
+                .await
+                .map_err(|_| anyhow!("direct P2P recv timed out"))
+                .and_then(|r| r),
+                Err(e) => Err(e),
+            };
+            match direct_res {
+                Ok(reply) => return Ok(reply),
+                Err(e) if self.relay_cfg.is_some() => {
+                    warn!("Direct P2P leg dropped ({e}); failing over seamlessly to Relay");
+                    self.direct = None;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        if self.relay_leg.is_none() {
+            let rcfg = self
+                .relay_cfg
+                .as_ref()
+                .ok_or_else(|| anyhow!("no relay fallback configured"))?;
+            self.relay_leg = Some(
+                RelayClientConn::connect(
+                    &self.client_id,
+                    self.client_device_id,
+                    self.target_device_id,
+                    rcfg,
+                )
+                .await?,
+            );
+        }
+
+        self.relay_leg
+            .as_mut()
+            .expect("relay leg initialized")
+            .request(msg, lane)
+            .await
     }
 }

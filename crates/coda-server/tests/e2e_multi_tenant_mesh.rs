@@ -1,10 +1,14 @@
 use std::net::SocketAddr;
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-use coda_daemon::{spawn_direct_p2p_listener, DirectP2pClient};
+use coda_daemon::{
+    discover_local_endpoints_with_port, spawn_direct_p2p_listener, spawn_lan_udp_beacon,
+    DirectP2pClient, SmartPeerClient, SmartRelayFallbackConfig,
+};
 use coda_herdr::{discover_hc_binary, HerdrClient};
 use coda_protocol::{
-    E2eeSession, PeerMessage, RelayWireFrame, StoredDeviceIdentity, TrafficLane, VoiceModelConfig,
+    E2eeSession, NetworkEndpointCandidate, PeerMessage, RelayWireFrame, StoredDeviceIdentity,
+    TrafficLane, VoiceModelConfig,
 };
 use coda_server::{
     db::{DeviceRecord, InviteCodeRecord},
@@ -627,6 +631,256 @@ async fn test_multi_tenant_postgres_and_raw_tcp_e2ee_herdr_tunnel() {
         let hc = HerdrClient::connect_with_bin(hc_bin).await.unwrap();
         hc.kill_and_remove(&term_addr).await.unwrap();
     }
+
+    // 10. Verify Auto-LAN Protocol Auto-Detection (Browser WebSocket on SAME p2p_addr!),
+    //     Dynamic Endpoint Advertising, UDP LAN Beacon Discovery & SmartPeerClient Failover!
+    let custom_eps = discover_local_endpoints_with_port(p2p_addr.port());
+    if !custom_eps.is_empty() {
+        assert!(custom_eps.iter().any(|e| e.kind == "lan_ws" || e.kind == "ipv6_ws"));
+    }
+
+    // 10a. Browser WebSocket connecting DIRECTLY to `ws://<p2p_addr>` (same port as Raw TCP `DirectP2pClient`!)
+    let lan_ws_url = format!("ws://{p2p_addr}");
+    let (mut lan_ws, _) = connect_async(&lan_ws_url).await.unwrap();
+    let ts_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let web_id = StoredDeviceIdentity::generate("Browser Web Console");
+    let web_client_id = iphone_dev.id;
+    let signed_msg = format!("p2p:{web_client_id}:{}:{ts_ms}", daemon_cfg.device_id);
+    let sig_b64 = web_id.sign(signed_msg.as_bytes()).unwrap();
+
+    lan_ws
+        .send(WsMsg::Text(
+            serde_json::to_string(&RelayWireFrame::DirectP2pHello {
+                client_device_id: web_client_id,
+                target_device_id: daemon_cfg.device_id,
+                client_ed25519_pub_b64: web_id.ed25519_public_b64.clone(),
+                client_x25519_pub_b64: web_id.x25519_public_b64.clone(),
+                timestamp_ms: ts_ms,
+                signature_b64: sig_b64,
+            })
+            .unwrap()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    let ack_txt = match lan_ws.next().await.unwrap().unwrap() {
+        WsMsg::Text(t) => t,
+        other => panic!("expected DirectP2pAck text frame, got {other:?}"),
+    };
+    let ack_frame: RelayWireFrame = serde_json::from_str(&ack_txt).unwrap();
+    match ack_frame {
+        RelayWireFrame::DirectP2pAck {
+            ok: true,
+            daemon_device_id,
+            path_kind,
+            ..
+        } => {
+            assert_eq!(daemon_device_id, daemon_cfg.device_id);
+            assert_eq!(path_kind, "lan_ws");
+        }
+        other => panic!("unexpected direct WS ack: {other:?}"),
+    }
+
+    let mut lan_ws_e2ee = E2eeSession::derive(
+        &web_id.x25519_secret().unwrap(),
+        &daemon_cfg.identity.x25519_public_b64,
+        true,
+    )
+    .unwrap();
+    let sealed_ws_ping = lan_ws_e2ee
+        .seal_message(&PeerMessage::Ping {
+            req_id: "lan-ws-ping-1".into(),
+            sent_ms: 555,
+        })
+        .unwrap();
+    lan_ws
+        .send(WsMsg::Text(
+            serde_json::to_string(&RelayWireFrame::RoutePacket {
+                src_device_id: web_client_id,
+                dst_device_id: daemon_cfg.device_id,
+                lane: TrafficLane::ControlP0,
+                e2ee: sealed_ws_ping,
+                sender_x25519_pub_b64: Some(web_id.x25519_public_b64.clone()),
+            })
+            .unwrap()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    let pong_txt = match lan_ws.next().await.unwrap().unwrap() {
+        WsMsg::Text(t) => t,
+        other => panic!("expected Pong RoutePacket text frame, got {other:?}"),
+    };
+    if let RelayWireFrame::RoutePacket { e2ee: enc_p, .. } =
+        serde_json::from_str::<RelayWireFrame>(&pong_txt).unwrap()
+    {
+        match lan_ws_e2ee.open_message(&enc_p).unwrap() {
+            PeerMessage::Pong { req_id, .. } => assert_eq!(req_id, "lan-ws-ping-1"),
+            other => panic!("expected Pong, got {other:?}"),
+        }
+    } else {
+        panic!("expected RoutePacket over Direct LAN WebSocket");
+    }
+    let _ = lan_ws.close(None).await;
+
+    // 10b. Verify Dynamic `AdvertiseEndpoints` -> `PeerPresence` broadcast + PostgreSQL update!
+    let relay_hub_eps = vec![
+        NetworkEndpointCandidate {
+            kind: "lan_ipv4".into(),
+            addr: p2p_addr.to_string(),
+        },
+        NetworkEndpointCandidate {
+            kind: "lan_ws".into(),
+            addr: lan_ws_url.clone(),
+        },
+    ];
+    let (mut daemon_ad_ws, _) = connect_async(&ws_url).await.unwrap();
+    daemon_ad_ws
+        .send(WsMsg::Text(
+            serde_json::to_string(&RelayWireFrame::AuthBind {
+                ticket: daemon_cfg.daemon_relay_ticket.clone(),
+                lane: TrafficLane::BulkP1,
+                generation: 99,
+            })
+            .unwrap()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    let _ = daemon_ad_ws.next().await.unwrap().unwrap(); // AuthAck
+    daemon_ad_ws
+        .send(WsMsg::Text(
+            serde_json::to_string(&RelayWireFrame::AdvertiseEndpoints {
+                endpoints: relay_hub_eps.clone(),
+            })
+            .unwrap()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    let mut saw_presence_endpoints = false;
+    let pres_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while tokio::time::Instant::now() < pres_deadline {
+        if let Ok(Some(Ok(WsMsg::Text(txt)))) =
+            tokio::time::timeout(std::time::Duration::from_millis(300), ws_gen2.next()).await
+        {
+            if let Ok(RelayWireFrame::PeerPresence {
+                device_id,
+                is_online: true,
+                endpoints: Some(eps),
+            }) = serde_json::from_str::<RelayWireFrame>(&txt)
+            {
+                if device_id == daemon_cfg.device_id
+                    && eps.iter().any(|e| e.kind == "lan_ws" && e.addr == lan_ws_url)
+                {
+                    saw_presence_endpoints = true;
+                    break;
+                }
+            }
+        }
+    }
+    assert!(
+        saw_presence_endpoints,
+        "client should receive live PeerPresence with updated LAN endpoints"
+    );
+    let _ = daemon_ad_ws.close(None).await;
+
+    // 10c. Verify UDP LAN Beacon Discovery + `SmartPeerClient` Automatic Negotiation & Seamless Wi-Fi Drop Failover!
+    // Spawn a controllable TCP proxy in front of `p2p_addr` so we can simulate Wi-Fi loss mid-session.
+    let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let proxy_task = tokio::spawn(async move {
+        if let Ok((mut client_s, _)) = proxy_listener.accept().await {
+            if let Ok(mut server_s) = TcpStream::connect(p2p_addr).await {
+                let _ = tokio::io::copy_bidirectional(&mut client_s, &mut server_s).await;
+            }
+        }
+    });
+
+    let udp_beacon_addr = spawn_lan_udp_beacon(
+        daemon_cfg.device_id,
+        proxy_addr.port(),
+        "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+    )
+    .await
+    .unwrap();
+
+    let failover_ticket: MintRelayTicketResponse = http
+        .post(format!("{base}/api/v1/relay/ticket"))
+        .bearer_auth(&owner_auth.token)
+        .json(&json!({
+            "device_id": iphone_dev.id,
+            "peer_device_id": daemon_cfg.device_id,
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    // Pass EMPTY static endpoints so discovery relies 100% on the UDP LAN Beacon!
+    let mut smart = SmartPeerClient::connect_auto(
+        iphone_duo_id.clone(),
+        iphone_dev.id,
+        daemon_cfg.device_id,
+        vec![],
+        Some(udp_beacon_addr),
+        Some(SmartRelayFallbackConfig {
+            raw_tcp_addr: Some(server.raw_tcp_addr.to_string()),
+            wss_url: None,
+            relay_ticket: failover_ticket.ticket,
+            peer_x25519_pub_b64: daemon_cfg.identity.x25519_public_b64.clone(),
+        }),
+    )
+    .await
+    .unwrap();
+
+    assert!(smart.is_direct_p2p(), "SmartPeerClient should auto-negotiate Direct P2P via UDP beacon");
+    assert_eq!(smart.active_route(), "lan_ipv4");
+
+    match smart
+        .request(
+            &PeerMessage::Ping {
+                req_id: "smart-lan-1".into(),
+                sent_ms: 111,
+            },
+            TrafficLane::ControlP0,
+        )
+        .await
+        .unwrap()
+    {
+        PeerMessage::Pong { req_id, .. } => assert_eq!(req_id, "smart-lan-1"),
+        other => panic!("expected Pong over LAN Direct, got {other:?}"),
+    }
+
+    // Simulate iPhone leaving Wi-Fi -> kill the direct LAN TCP proxy socket!
+    proxy_task.abort();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Next request MUST seamlessly fail over to Relay (`relay_raw_tcp`) with zero error!
+    match smart
+        .request(
+            &PeerMessage::Ping {
+                req_id: "smart-failover-2".into(),
+                sent_ms: 222,
+            },
+            TrafficLane::ControlP0,
+        )
+        .await
+        .unwrap()
+    {
+        PeerMessage::Pong { req_id, .. } => assert_eq!(req_id, "smart-failover-2"),
+        other => panic!("expected Pong after relay failover, got {other:?}"),
+    }
+    assert!(!smart.is_direct_p2p());
+    assert_eq!(smart.active_route(), "relay_raw_tcp");
 
     daemon_task.abort();
 }

@@ -2,9 +2,7 @@ use std::{net::SocketAddr, path::PathBuf};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use coda_daemon::{
-    pair_daemon_with_code, run_daemon_once, spawn_direct_p2p_listener, DaemonConfig,
-};
+use coda_daemon::{pair_daemon_with_code, spawn_direct_p2p_listener, DaemonConfig};
 use tracing::{error, info, warn};
 
 #[derive(Debug, Parser)]
@@ -65,11 +63,30 @@ async fn main() -> Result<()> {
         }
         Commands::Run { mode, p2p_bind } => {
             let cfg = DaemonConfig::load(&cfg_path)?;
-            if let Err(e) = spawn_direct_p2p_listener(cfg.clone(), p2p_bind).await {
-                warn!("Direct P2P listener on {p2p_bind} not bound ({e}); continuing with Relay tunnel");
+            let bound_p2p = match spawn_direct_p2p_listener(cfg.clone(), p2p_bind).await {
+                Ok(addr) => Some(addr),
+                Err(e) => {
+                    let fallback = SocketAddr::new(p2p_bind.ip(), 0);
+                    match spawn_direct_p2p_listener(cfg.clone(), fallback).await {
+                        Ok(addr) => Some(addr),
+                        Err(_) => {
+                            warn!("Direct P2P listener on {p2p_bind} not bound ({e}); continuing with Relay tunnel");
+                            None
+                        }
+                    }
+                }
+            };
+            let bound_port = bound_p2p.map(|a| a.port());
+            if let Some(port) = bound_port {
+                let udp_bind = SocketAddr::new(p2p_bind.ip(), coda_daemon::DEFAULT_DIRECT_P2P_PORT);
+                if let Err(e) = coda_daemon::spawn_lan_udp_beacon(cfg.device_id, port, udp_bind).await {
+                    warn!("UDP LAN discovery beacon not bound on {udp_bind} ({e})");
+                }
             }
             loop {
-                if let Err(e) = run_daemon_once(&cfg, mode.as_deref()).await {
+                if let Err(e) =
+                    coda_daemon::run_daemon_once_with_p2p(&cfg, mode.as_deref(), bound_port).await
+                {
                     error!("tunnel disconnected ({e}); reconnecting in 2s...");
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                 }
