@@ -10,19 +10,45 @@ set -eu
 
 REPO="Annihilater/coda"
 VERSION="${CODA_VERSION:-latest}"
-RELAY_SECRET="coda-default-relay-secret-change-me"
-PORT="24443"
-REGION="CN-BGP-NoICP"
+ENV_SRC=""
+ARG_RELAY_SECRET=""
+ARG_PORT=""
+ARG_REGION=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --version) VERSION="$2"; shift 2 ;;
-    --relay-secret) RELAY_SECRET="$2"; shift 2 ;;
-    --port) PORT="$2"; shift 2 ;;
-    --region) REGION="$2"; shift 2 ;;
+    --env-file) ENV_SRC="$2"; shift 2 ;;
+    --relay-secret) ARG_RELAY_SECRET="$2"; shift 2 ;;
+    --port) ARG_PORT="$2"; shift 2 ;;
+    --region) ARG_REGION="$2"; shift 2 ;;
     *) shift 1 ;;
   esac
 done
+
+if [ -z "${ENV_SRC}" ] && [ -f "./.env" ]; then
+  ENV_SRC="./.env"
+elif [ -z "${ENV_SRC}" ] && [ -f "/etc/coda/.env" ]; then
+  ENV_SRC="/etc/coda/.env"
+fi
+
+if [ -n "${ENV_SRC}" ] && [ -f "${ENV_SRC}" ]; then
+  echo "==> Loading base configuration from ${ENV_SRC}..."
+  set -a
+  # shellcheck disable=SC1090
+  . "${ENV_SRC}"
+  set +a
+fi
+
+RELAY_SECRET="${ARG_RELAY_SECRET:-${CODA_RELAY_SECRET:-coda-default-relay-secret-change-me}}"
+if [ -n "${ARG_PORT}" ]; then
+  PORT="${ARG_PORT}"
+elif [ -n "${CODA_RAW_TCP_BIND:-}" ]; then
+  PORT="${CODA_RAW_TCP_BIND##*:}"
+else
+  PORT="24443"
+fi
+REGION="${ARG_REGION:-${CODA_REGION_LABEL:-CN-BGP-NoICP}}"
 
 if [ "${VERSION}" = "latest" ]; then
   EFFECTIVE_URL="$(curl -fsSLI -o /dev/null -w '%{url_effective}' "https://github.com/${REPO}/releases/latest")"
@@ -52,21 +78,30 @@ echo "==> [2/4] Downloading Coda Relay ${VERSION} (${PKG})..."
 TMP_DIR="$(mktemp -d)"
 curl -fsSL "https://github.com/${REPO}/releases/download/${VERSION}/${PKG}" -o "${TMP_DIR}/${PKG}"
 tar -C "${TMP_DIR}" -xzf "${TMP_DIR}/${PKG}"
+mkdir -p /opt/coda /etc/coda
 cp "${TMP_DIR}/${DIR}/coda-server" /usr/local/bin/coda-server
 chmod +x /usr/local/bin/coda-server
 rm -rf "${TMP_DIR}"
 
-echo "==> [3/4] Installing systemd unit /etc/systemd/system/coda-relay-cn.service..."
-cat > /etc/systemd/system/coda-relay-cn.service <<EOF
+echo "==> [3/4] Writing /etc/coda/.env (0600) & systemd unit /etc/systemd/system/coda-relay-cn.service..."
+cat > /etc/coda/.env <<EOF
+CODA_RELAY_SECRET=${RELAY_SECRET}
+CODA_RAW_TCP_BIND=0.0.0.0:${PORT}
+CODA_REGION_LABEL=${REGION}
+EOF
+chmod 600 /etc/coda/.env
+
+cat > /etc/systemd/system/coda-relay-cn.service <<'EOF'
 [Unit]
-Description=Coda Stateless Domestic Cloud No-ICP Relay Node (:${PORT})
+Description=Coda Stateless Domestic Cloud No-ICP Relay Node
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-Environment="CODA_RELAY_SECRET=${RELAY_SECRET}"
-ExecStart=/usr/local/bin/coda-server --relay-only --raw-tcp-bind 0.0.0.0:${PORT} --region-label ${REGION}
+WorkingDirectory=/opt/coda
+EnvironmentFile=/etc/coda/.env
+ExecStart=/usr/local/bin/coda-server --relay-only
 Restart=always
 RestartSec=2
 LimitNOFILE=1048576

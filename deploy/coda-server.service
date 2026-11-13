@@ -1,0 +1,21 @@
+# Systemd Unit for Coda Zero-Knowledge Coordinator & Web Console
+# Configuration (CODA_RELAY_SECRET, DATABASE_URL, CODA_PUBLIC_URL, etc.) is loaded
+# uniformly from `.env` (`/etc/coda/.env` or `/opt/coda/.env`) without inline secrets.
+
+[Unit]
+Description=Coda Zero-Knowledge Coordinator & Web Console
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/coda
+EnvironmentFile=-/etc/coda/.env
+EnvironmentFile=-/opt/coda/.env
+ExecStart=/usr/local/bin/coda-server --web-dist /opt/coda/web-dist
+Restart=always
+RestartSec=2
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target

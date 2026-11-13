@@ -2,11 +2,13 @@
 
 Coda 每次发布 Tag (`v*`) 时，GitHub Actions 流水线会自动构建并发布全平台制品包（位于 **GitHub Releases**）。
 
-> **目录规范说明**：所有发布压缩包文件名均携带版本号（例如 `-v0.2.1.tar.gz`），而 **解压后顶层目录名称均不带版本号**（例如 `coda-deploy-bundle/`、`coda-macos-aarch64/`），方便脚本与升级复用：
+> **目录与配置规范说明**：
+> - **产物命名**：所有发布压缩包文件名均携带版本号（例如 `-v0.2.2.tar.gz`），而 **解压后顶层目录名称均不带版本号**（例如 `coda-deploy-bundle/`、`coda-macos-aarch64/`），方便脚本与升级复用。
+> - **统一 `.env` 密钥管理**：`Docker Compose`、`coda-server.service`、`coda-relay-cn.service` 与直接运行 `coda-server` 二进制均**统一从 `.env`（或 `/etc/coda/.env`，`0600` 权限）读取 `CODA_RELAY_SECRET` 等环境变量**，`.service` 单元文件中不存放任何明文密钥！
 
 | 制品压缩包文件名 | 解压后目录 | 适用平台与内容 |
 | :--- | :--- | :--- |
-| **`coda-deploy-bundle-<version>.tar.gz`** | `coda-deploy-bundle/` | **完整自包含部署包**（含预编译多架构二进制、前端静态资源、`docker-compose.yml`、`.env.example`、一键安装脚本与本指南） |
+| **`coda-deploy-bundle-<version>.tar.gz`** | `coda-deploy-bundle/` | **完整自包含部署包**（含预编译多架构二进制、前端静态资源、`docker-compose.yml`、`.env.example`、`coda-server.service`、`coda-relay-cn.service`、一键脚本与本指南） |
 | **`coda-server-linux-x86_64-<version>.tar.gz`** | `coda-server-linux-x86_64/` | Linux x86_64 服务端（含 `coda-server` + 预构建 `web-dist` 前端 + `migrations` + `deploy`） |
 | **`coda-server-linux-aarch64-<version>.tar.gz`** | `coda-server-linux-aarch64/` | Linux ARM64 服务端（同上） |
 | **`coda-daemon-linux-x86_64-<version>.tar.gz`** | `coda-daemon-linux-x86_64/` | Linux x86_64 受控开发机守护进程 (`coda-daemon`) |
@@ -42,9 +44,9 @@ docker compose up -d
 
 ---
 
-### 方式 B：Linux 裸机一行命令安装（使用预编译 Release 二进制 + Systemd）
+### 方式 B：Linux 裸机一行命令安装（使用预编译 Release 二进制 + Systemd + `/etc/coda/.env`）
 
-如果服务器已安装 PostgreSQL，直接运行：
+脚本会自动生成权限为 `0600` 的 `/etc/coda/.env`，`.service` 仅通过 `EnvironmentFile=/etc/coda/.env` 引用，不包含明文密钥。如果你在解压后的 `coda-deploy-bundle/` 目录中先执行 `cp .env.example .env` 改好密钥，也可以直接运行 `sudo ./install-server.sh`（自动读取当前目录的 `.env` 写入 `/etc/coda/.env`）：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Annihilater/coda/main/deploy/install-server.sh | sudo sh -s -- \
@@ -57,15 +59,20 @@ curl -fsSL https://raw.githubusercontent.com/Annihilater/coda/main/deploy/instal
 
 ## 二、（可选）国内阿里云/腾讯云「免备案」中继节点一键部署
 
-如果你将主控制面放在海外，同时有一台国内阿里云/腾讯云机器（**不绑域名、不备案、不开 80/443 端口、不装数据库**），只需在安全组放行 **`24443/tcp`**，然后运行：
+如果你将主控制面放在海外，同时有一台国内阿里云/腾讯云机器（**不绑域名、不备案、不开 80/443 端口、不装数据库**），只需在安全组放行 **`24443/tcp`**。
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/Annihilater/coda/main/deploy/install-relay-cn.sh | sudo sh -s -- \
-  --relay-secret "与主控制面完全相同的CODA_RELAY_SECRET" \
-  --port 24443
-```
+- **方式 1（先配置 `.env` 再一键安装，推荐）**：将控制面上的 `.env` 复制到本机当前目录或 `/etc/coda/.env`（或仅保留 `CODA_RELAY_SECRET`），然后运行：
+  ```bash
+  curl -fsSL https://raw.githubusercontent.com/Annihilater/coda/main/deploy/install-relay-cn.sh | sudo sh
+  ```
+- **方式 2（命令行传参写入 `/etc/coda/.env`）**：
+  ```bash
+  curl -fsSL https://raw.githubusercontent.com/Annihilater/coda/main/deploy/install-relay-cn.sh | sudo sh -s -- \
+    --relay-secret "与主控制面完全相同的CODA_RELAY_SECRET" \
+    --port 24443
+  ```
 
-脚本会自动开启 Linux 内核 `tcp_bbr` 拥塞控制，并以 `--relay-only` 无状态模式常驻运行。
+`coda-relay-cn.service` 与直接运行 `coda-server --relay-only` 均统一从 `.env` / `/etc/coda/.env` 读取密钥，脚本还会自动开启 Linux 内核 `tcp_bbr` 拥塞控制。
 
 ---
 

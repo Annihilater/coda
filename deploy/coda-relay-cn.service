@@ -8,6 +8,7 @@
 #
 # Notice: This service binds ONLY port 24443 with length-prefixed binary ChaCha20-Poly1305 frames.
 # Zero HTTP headers, zero TLS SNI, and ports 80/443 remain completely closed — 100% exempt from ICP domain filing.
+# Configuration (including CODA_RELAY_SECRET) is loaded uniformly from `.env` (`/etc/coda/.env` or `/opt/coda/.env`).
 
 [Unit]
 Description=Coda Stateless Domestic Cloud No-ICP Relay Node (:24443)
@@ -16,8 +17,10 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-Environment="CODA_RELAY_SECRET=replace-with-shared-hmac-secret"
-ExecStart=/usr/local/bin/coda-server --relay-only --raw-tcp-bind 0.0.0.0:24443 --region-label CN-BGP-NoICP
+WorkingDirectory=/opt/coda
+EnvironmentFile=-/etc/coda/.env
+EnvironmentFile=-/opt/coda/.env
+ExecStart=/usr/local/bin/coda-server --relay-only
 Restart=always
 RestartSec=2
 LimitNOFILE=1048576

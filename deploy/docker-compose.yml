@@ -23,10 +23,15 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    env_file:
+      - path: .env
+        required: false
     environment:
       DATABASE_URL: postgres://coda:${POSTGRES_PASSWORD:-coda_prod_secret}@postgres:5432/coda_prod
       CODA_RELAY_SECRET: ${CODA_RELAY_SECRET:-change-me-shared-hmac-relay-secret-2026}
       CODA_PUBLIC_URL: ${CODA_PUBLIC_URL:-http://127.0.0.1:8080}
+      CODA_HTTP_BIND: ${CODA_HTTP_BIND:-0.0.0.0:8080}
+      CODA_RAW_TCP_BIND: ${CODA_RAW_TCP_BIND:-0.0.0.0:24443}
     ports:
       - "8080:8080"
       - "24443:24443"
@@ -42,10 +47,12 @@ services:
       - "--relay-only"
       - "--raw-tcp-bind"
       - "0.0.0.0:24444"
-      - "--region-label"
-      - "CN-Aliyun-NoICP-Edge"
+    env_file:
+      - path: .env
+        required: false
     environment:
       CODA_RELAY_SECRET: ${CODA_RELAY_SECRET:-change-me-shared-hmac-relay-secret-2026}
+      CODA_REGION_LABEL: ${CODA_REGION_LABEL:-CN-Aliyun-NoICP-Edge}
     ports:
       - "24444:24444"
 
