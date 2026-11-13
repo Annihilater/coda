@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   postgres:
     image: postgres:18-alpine
@@ -35,6 +33,7 @@ services:
 
   # Mode A: Stateless Domestic Cloud (Aliyun / Tencent Cloud) No-ICP Raw TCP Relay Node (:24443 only)
   coda-relay-cn:
+    profiles: ["relay-cn"]
     build:
       context: ..
       dockerfile: deploy/Dockerfile

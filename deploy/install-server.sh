@@ -8,6 +8,7 @@
 set -eu
 
 REPO="Annihilater/coda"
+VERSION="${CODA_VERSION:-latest}"
 PUBLIC_URL="http://127.0.0.1:8080"
 RELAY_SECRET="coda-default-relay-secret-change-me"
 DB_URL="postgres://coda:coda_prod_pass@127.0.0.1:5432/coda_prod"
@@ -16,6 +17,7 @@ RAW_TCP_BIND="0.0.0.0:24443"
 
 while [ $# -gt 0 ]; do
   case "$1" in
+    --version) VERSION="$2"; shift 2 ;;
     --public-url) PUBLIC_URL="$2"; shift 2 ;;
     --relay-secret) RELAY_SECRET="$2"; shift 2 ;;
     --database-url) DB_URL="$2"; shift 2 ;;
@@ -25,16 +27,22 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+if [ "${VERSION}" = "latest" ]; then
+  EFFECTIVE_URL="$(curl -fsSLI -o /dev/null -w '%{url_effective}' "https://github.com/${REPO}/releases/latest")"
+  VERSION="${EFFECTIVE_URL##*/}"
+fi
+
 ARCH="$(uname -m)"
 case "${ARCH}" in
-  x86_64|amd64) PKG="coda-server-linux-x86_64.tar.gz"; DIR="coda-server-linux-x86_64" ;;
-  aarch64|arm64) PKG="coda-server-linux-aarch64.tar.gz"; DIR="coda-server-linux-aarch64" ;;
+  x86_64|amd64) DIR="coda-server-linux-x86_64" ;;
+  aarch64|arm64) DIR="coda-server-linux-aarch64" ;;
   *) echo "Unsupported architecture: ${ARCH}"; exit 1 ;;
 esac
+PKG="${DIR}-${VERSION}.tar.gz"
 
-echo "==> [1/3] Downloading latest Coda Server release (${PKG})..."
+echo "==> [1/3] Downloading Coda Server ${VERSION} (${PKG})..."
 TMP_DIR="$(mktemp -d)"
-curl -fsSL "https://github.com/${REPO}/releases/latest/download/${PKG}" -o "${TMP_DIR}/${PKG}"
+curl -fsSL "https://github.com/${REPO}/releases/download/${VERSION}/${PKG}" -o "${TMP_DIR}/${PKG}"
 tar -C "${TMP_DIR}" -xzf "${TMP_DIR}/${PKG}"
 
 mkdir -p /opt/coda

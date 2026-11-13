@@ -9,12 +9,14 @@
 set -eu
 
 REPO="Annihilater/coda"
+VERSION="${CODA_VERSION:-latest}"
 RELAY_SECRET="coda-default-relay-secret-change-me"
 PORT="24443"
 REGION="CN-BGP-NoICP"
 
 while [ $# -gt 0 ]; do
   case "$1" in
+    --version) VERSION="$2"; shift 2 ;;
     --relay-secret) RELAY_SECRET="$2"; shift 2 ;;
     --port) PORT="$2"; shift 2 ;;
     --region) REGION="$2"; shift 2 ;;
@@ -22,12 +24,18 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+if [ "${VERSION}" = "latest" ]; then
+  EFFECTIVE_URL="$(curl -fsSLI -o /dev/null -w '%{url_effective}' "https://github.com/${REPO}/releases/latest")"
+  VERSION="${EFFECTIVE_URL##*/}"
+fi
+
 ARCH="$(uname -m)"
 case "${ARCH}" in
-  x86_64|amd64) PKG="coda-server-linux-x86_64.tar.gz"; DIR="coda-server-linux-x86_64" ;;
-  aarch64|arm64) PKG="coda-server-linux-aarch64.tar.gz"; DIR="coda-server-linux-aarch64" ;;
+  x86_64|amd64) DIR="coda-server-linux-x86_64" ;;
+  aarch64|arm64) DIR="coda-server-linux-aarch64" ;;
   *) echo "Unsupported architecture: ${ARCH}"; exit 1 ;;
 esac
+PKG="${DIR}-${VERSION}.tar.gz"
 
 echo "==> [1/4] Optimizing Linux Kernel TCP BBR & Low-Latency Socket Queue..."
 if [ -d /etc/sysctl.d ]; then
@@ -40,9 +48,9 @@ EOF
   sysctl --system >/dev/null 2>&1 || true
 fi
 
-echo "==> [2/4] Downloading Coda Relay binary (${PKG})..."
+echo "==> [2/4] Downloading Coda Relay ${VERSION} (${PKG})..."
 TMP_DIR="$(mktemp -d)"
-curl -fsSL "https://github.com/${REPO}/releases/latest/download/${PKG}" -o "${TMP_DIR}/${PKG}"
+curl -fsSL "https://github.com/${REPO}/releases/download/${VERSION}/${PKG}" -o "${TMP_DIR}/${PKG}"
 tar -C "${TMP_DIR}" -xzf "${TMP_DIR}/${PKG}"
 cp "${TMP_DIR}/${DIR}/coda-server" /usr/local/bin/coda-server
 chmod +x /usr/local/bin/coda-server

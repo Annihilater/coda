@@ -1,15 +1,18 @@
 # Coda 生产环境极简部署指南 (Deployment Guide)
 
-Coda 每次发布 Tag (`v*`) 时，GitHub Actions 流水线会自动构建并发布全平台制品包（位于 **GitHub Releases**）：
+Coda 每次发布 Tag (`v*`) 时，GitHub Actions 流水线会自动构建并发布全平台制品包（位于 **GitHub Releases**）。
 
-| 制品文件名 | 适用平台与内容 |
-| :--- | :--- |
-| **`coda-deploy-bundle.tar.gz`** | **完整部署目录包**（含 `docker-compose.yml`、`.env.example`、一键安装脚本与本指南） |
-| **`coda-server-linux-x86_64.tar.gz`** | Linux x86_64 服务端（含 `coda-server` + 预构建 `web-dist` 前端 + `migrations` + `deploy`） |
-| **`coda-server-linux-aarch64.tar.gz`** | Linux ARM64 服务端（同上） |
-| **`coda-daemon-linux-x86_64.tar.gz`** | Linux x86_64 受控开发机守护进程 (`coda-daemon`) |
-| **`coda-daemon-linux-aarch64.tar.gz`** | Linux ARM64 受控开发机守护进程 (`coda-daemon`) |
-| **`coda-macos-aarch64.tar.gz`** | macOS Apple Silicon 全家桶（含 **`coda-desktop` [Rust+GPUI 120Hz 桌面端]**、`CodaMacApp` [SwiftUI]、`coda-daemon`、`coda-server`） |
+> **目录规范说明**：所有发布压缩包文件名均携带版本号（例如 `-v0.2.1.tar.gz`），而 **解压后顶层目录名称均不带版本号**（例如 `coda-deploy-bundle/`、`coda-macos-aarch64/`），方便脚本与升级复用：
+
+| 制品压缩包文件名 | 解压后目录 | 适用平台与内容 |
+| :--- | :--- | :--- |
+| **`coda-deploy-bundle-<version>.tar.gz`** | `coda-deploy-bundle/` | **完整自包含部署包**（含预编译多架构二进制、前端静态资源、`docker-compose.yml`、`.env.example`、一键安装脚本与本指南） |
+| **`coda-server-linux-x86_64-<version>.tar.gz`** | `coda-server-linux-x86_64/` | Linux x86_64 服务端（含 `coda-server` + 预构建 `web-dist` 前端 + `migrations` + `deploy`） |
+| **`coda-server-linux-aarch64-<version>.tar.gz`** | `coda-server-linux-aarch64/` | Linux ARM64 服务端（同上） |
+| **`coda-daemon-linux-x86_64-<version>.tar.gz`** | `coda-daemon-linux-x86_64/` | Linux x86_64 受控开发机守护进程 (`coda-daemon`) |
+| **`coda-daemon-linux-aarch64-<version>.tar.gz`** | `coda-daemon-linux-aarch64/` | Linux ARM64 受控开发机守护进程 (`coda-daemon`) |
+| **`coda-macos-aarch64-<version>.tar.gz`** | `coda-macos-aarch64/` | macOS Apple Silicon 全家桶（含 **`coda-desktop` [Rust+GPUI 120Hz 桌面端]**、`CodaMacApp` [SwiftUI]、`coda-daemon`、`coda-server`） |
+| **`coda-daemon-macos-aarch64-<version>.tar.gz`** | `coda-daemon-macos-aarch64/` | macOS Apple Silicon 受控开发机守护进程 (`coda-daemon`) |
 
 ---
 
@@ -17,11 +20,12 @@ Coda 每次发布 Tag (`v*`) 时，GitHub Actions 流水线会自动构建并发
 
 ### 方式 A：Docker Compose 一键部署（推荐，自带 PostgreSQL 18）
 
-在你的服务器上下载 `coda-deploy-bundle.tar.gz` 并启动：
+在你的服务器上下载最新带版本号的 `coda-deploy-bundle-<version>.tar.gz` 并启动（解压后目录为干净的 `coda-deploy-bundle/`）：
 
 ```bash
-# 1. 下载并解压部署包
-curl -fsSL https://github.com/Annihilater/coda/releases/latest/download/coda-deploy-bundle.tar.gz | tar -xz
+# 1. 自动获取最新版本号并下载解压（也可手动指定如 VER=v0.2.1）
+VER="$(curl -fsSLI -o /dev/null -w '%{url_effective}' https://github.com/Annihilater/coda/releases/latest | awk -F/ '{print $NF}')"
+curl -fsSL "https://github.com/Annihilater/coda/releases/download/${VER}/coda-deploy-bundle-${VER}.tar.gz" | tar -xz
 cd coda-deploy-bundle
 
 # 2. 复制环境变量并修改密码与密钥
@@ -94,8 +98,10 @@ curl -fsSL http://你的服务器IP:8080/install.sh | sh -s -- \
 
 1. **Web 终端控制台（零安装）**：直接用手机或电脑浏览器访问 `http://你的服务器IP:8080`。
 2. **macOS 原生 120Hz GPUI 桌面客户端**：
-   下载并解压 `coda-macos-aarch64.tar.gz`，直接运行：
+   下载并解压带版本号的 `coda-macos-aarch64-<version>.tar.gz`（解压后目录固定为 `coda-macos-aarch64/`），直接运行：
    ```bash
+   VER="$(curl -fsSLI -o /dev/null -w '%{url_effective}' https://github.com/Annihilater/coda/releases/latest | awk -F/ '{print $NF}')"
+   curl -fsSL "https://github.com/Annihilater/coda/releases/download/${VER}/coda-macos-aarch64-${VER}.tar.gz" | tar -xz
    ./coda-macos-aarch64/coda-desktop
    ```
 3. **iPhone / iPhone Duo / iPad 原生客户端 (`apple/`)**：

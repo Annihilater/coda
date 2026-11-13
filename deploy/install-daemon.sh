@@ -6,6 +6,7 @@
 set -eu
 
 REPO="Annihilater/coda"
+VERSION="${CODA_VERSION:-latest}"
 SERVER_URL="http://127.0.0.1:8080"
 PAIR_CODE=""
 DEVICE_NAME=""
@@ -13,6 +14,10 @@ INSTALL_DIR="${HOME}/.local/bin"
 
 while [ $# -gt 0 ]; do
   case "$1" in
+    --version)
+      VERSION="$2"
+      shift 2
+      ;;
     --server)
       SERVER_URL="$2"
       shift 2
@@ -54,19 +59,25 @@ if ! command -v coda-daemon >/dev/null 2>&1; then
     PKG_NAME=""
     DIR_NAME=""
     if [ "${OS_NAME}" = "Darwin" ]; then
-      PKG_NAME="coda-daemon-macos-aarch64.tar.gz"
       DIR_NAME="coda-daemon-macos-aarch64"
     elif [ "${OS_NAME}" = "Linux" ]; then
       case "${ARCH_NAME}" in
-        x86_64|amd64) PKG_NAME="coda-daemon-linux-x86_64.tar.gz"; DIR_NAME="coda-daemon-linux-x86_64" ;;
-        aarch64|arm64) PKG_NAME="coda-daemon-linux-aarch64.tar.gz"; DIR_NAME="coda-daemon-linux-aarch64" ;;
+        x86_64|amd64) DIR_NAME="coda-daemon-linux-x86_64" ;;
+        aarch64|arm64) DIR_NAME="coda-daemon-linux-aarch64" ;;
       esac
     fi
 
-    if [ -n "${PKG_NAME}" ]; then
+    if [ -n "${DIR_NAME}" ]; then
+      if [ "${VERSION}" = "latest" ]; then
+        EFFECTIVE_URL="$(curl -fsSLI -o /dev/null -w '%{url_effective}' "https://github.com/${REPO}/releases/latest" 2>/dev/null || true)"
+        if [ -n "${EFFECTIVE_URL}" ]; then
+          VERSION="${EFFECTIVE_URL##*/}"
+        fi
+      fi
+      PKG_NAME="${DIR_NAME}-${VERSION}.tar.gz"
       echo "    Downloading prebuilt ${PKG_NAME} from GitHub Releases..."
       TMP_D="$(mktemp -d)"
-      if curl -fsSL "https://github.com/${REPO}/releases/latest/download/${PKG_NAME}" -o "${TMP_D}/${PKG_NAME}"; then
+      if [ "${VERSION}" != "latest" ] && curl -fsSL "https://github.com/${REPO}/releases/download/${VERSION}/${PKG_NAME}" -o "${TMP_D}/${PKG_NAME}"; then
         tar -C "${TMP_D}" -xzf "${TMP_D}/${PKG_NAME}"
         cp "${TMP_D}/${DIR_NAME}/coda-daemon" "${INSTALL_DIR}/coda-daemon"
       else
