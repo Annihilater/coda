@@ -1,9 +1,10 @@
 import CryptoKit
+import Darwin
 import Foundation
 
 // MARK: - Zero-Knowledge Device Identity & E2EE Session (100% Rust `coda-protocol` Wire Compatible)
 
-public struct CodaDeviceIdentity: Codable, Sendable {
+public struct CodaDeviceIdentity: Codable, Sendable, Equatable {
     public var deviceId: UUID?
     public let name: String
     public let ed25519SecretB64: String
@@ -20,6 +21,8 @@ public struct CodaDeviceIdentity: Codable, Sendable {
         case x25519PublicB64 = "x25519_public_b64"
     }
 
+    private static let persistedDefaultsKey = "dev.codahub.client.device_identity.v2"
+
     public static func generate(name: String) -> CodaDeviceIdentity {
         let signing = Curve25519.Signing.PrivateKey()
         let agreement = Curve25519.KeyAgreement.PrivateKey()
@@ -31,6 +34,22 @@ public struct CodaDeviceIdentity: Codable, Sendable {
             x25519SecretB64: agreement.rawRepresentation.base64EncodedString(),
             x25519PublicB64: agreement.publicKey.rawRepresentation.base64EncodedString()
         )
+    }
+
+    public static func loadOrCreatePersisted(defaultName: String) -> CodaDeviceIdentity {
+        if let data = UserDefaults.standard.data(forKey: persistedDefaultsKey),
+           let decoded = try? JSONDecoder().decode(CodaDeviceIdentity.self, from: data) {
+            return decoded
+        }
+        let created = generate(name: defaultName)
+        savePersisted(created)
+        return created
+    }
+
+    public static func savePersisted(_ identity: CodaDeviceIdentity) {
+        if let data = try? JSONEncoder().encode(identity) {
+            UserDefaults.standard.set(data, forKey: persistedDefaultsKey)
+        }
     }
 
     public func sign(message: Data) throws -> String {
@@ -54,7 +73,7 @@ public enum CodaCryptoError: Error, LocalizedError {
         case .invalidKeyEncoding: return "Invalid Curve25519 key encoding"
         case .replayDetected(let seq): return "Replay or out-of-order E2EE sequence: \(seq)"
         case .invalidCiphertext: return "Invalid ChaCha20-Poly1305 ciphertext"
-        case .compressedFrameRequiresRustFFI: return "zstd frame decompression delegates to libcoda_apple_ffi"
+        case .compressedFrameRequiresRustFFI: return "zstd frame decompression requires libcoda_apple_ffi or swift-* req_id negotiation"
         }
     }
 }
@@ -72,7 +91,7 @@ public struct CodaEncryptedPayload: Codable, Sendable {
 }
 
 /// Pure Apple `CryptoKit` implementation of Coda's directional E2EE session (`X25519 + HKDF-SHA256 + ChaChaPoly`).
-/// Matches `crates/coda-protocol/src/lib.rs` byte-for-byte!
+/// Matches `crates/coda-protocol/src/lib.rs` byte-for-byte, with dynamic `dlsym` FFI support for `zstd` frames.
 public struct CodaE2EESession: Sendable {
     private let txKey: SymmetricKey
     private let rxKey: SymmetricKey
@@ -80,6 +99,14 @@ public struct CodaE2EESession: Sendable {
     private let rxDirTag: UInt8
     private var nextTxSeq: UInt64 = 1
     private var highestRxSeq: UInt64?
+
+    private typealias ZstdDecompressFn = @convention(c) (UnsafePointer<CChar>?) -> UnsafeMutablePointer<CChar>?
+    private typealias StringFreeFn = @convention(c) (UnsafeMutablePointer<CChar>?) -> Void
+
+    public static var hasNativeZstdFFI: Bool {
+        let rtldDefault = UnsafeMutableRawPointer(bitPattern: -2)
+        return dlsym(rtldDefault, "coda_ffi_zstd_decompress_b64") != nil
+    }
 
     public init(myX25519SecretB64: String, peerX25519PublicB64: String, isClientInitiator: Bool = true) throws {
         guard let myRaw = Data(base64Encoded: myX25519SecretB64),
@@ -117,6 +144,14 @@ public struct CodaE2EESession: Sendable {
         }
     }
 
+    public init(myIdentity: CodaDeviceIdentity, peerX25519PublicB64: String, isInitiator: Bool = true) throws {
+        try self.init(
+            myX25519SecretB64: myIdentity.x25519SecretB64,
+            peerX25519PublicB64: peerX25519PublicB64,
+            isClientInitiator: isInitiator
+        )
+    }
+
     private static func makeNonce(dirTag: UInt8, seq: UInt64) throws -> ChaChaPoly.Nonce {
         var bytes = [UInt8](repeating: 0, count: 12)
         bytes[0] = dirTag
@@ -147,9 +182,6 @@ public struct CodaE2EESession: Sendable {
         if let prev = highestRxSeq, payload.seq <= prev {
             throw CodaCryptoError.replayDetected(payload.seq)
         }
-        if payload.compressed {
-            throw CodaCryptoError.compressedFrameRequiresRustFFI
-        }
         guard let raw = Data(base64Encoded: payload.ciphertextB64), raw.count >= 16 else {
             throw CodaCryptoError.invalidCiphertext
         }
@@ -157,77 +189,254 @@ public struct CodaE2EESession: Sendable {
         let tag = raw.suffix(16)
         let nonce = try Self.makeNonce(dirTag: rxDirTag, seq: payload.seq)
         let box = try ChaChaPoly.SealedBox(nonce: nonce, ciphertext: ct, tag: tag)
-        let aad = Data([0x00])
+        let aad = Data([payload.compressed ? 0x01 : 0x00])
         let pt = try ChaChaPoly.open(box, using: rxKey, authenticating: aad)
+
+        if payload.compressed {
+            let rtldDefault = UnsafeMutableRawPointer(bitPattern: -2)
+            if let zstdSym = dlsym(rtldDefault, "coda_ffi_zstd_decompress_b64"),
+               let freeSym = dlsym(rtldDefault, "coda_ffi_string_free") {
+                let decompFn = unsafeBitCast(zstdSym, to: ZstdDecompressFn.self)
+                let freeFn = unsafeBitCast(freeSym, to: StringFreeFn.self)
+                let outPtr = pt.base64EncodedString().withCString { decompFn($0) }
+                if let outPtr {
+                    defer { freeFn(outPtr) }
+                    let utf8 = String(cString: outPtr)
+                    highestRxSeq = payload.seq
+                    return Data(utf8.utf8)
+                }
+            }
+            if let zlibData = try? (pt as NSData).decompressed(using: .zlib) as Data {
+                highestRxSeq = payload.seq
+                return zlibData
+            }
+            throw CodaCryptoError.compressedFrameRequiresRustFFI
+        }
+
         highestRxSeq = payload.seq
         return pt
     }
 }
 
-// MARK: - Domain Models (Multi-Tenant Devices, SmartPath Routes & Herdr Agents)
+// MARK: - Domain Models (Herdr Lifecycle, Multi-Tenant Devices, SmartPath Routes)
 
 public enum SmartPathRouteMode: String, Codable, Sendable {
     case lanDirect = "L0 LAN Direct"
     case cnIPv6P2P = "L1 IPv6 P2P"
     case domesticRawTCP = "L2 CN RawTCP"
     case globalCDNWSS = "L2 CDN WSS"
+
+    public static var lanDirectP2P: SmartPathRouteMode { .lanDirect }
+    public static var ipv6DirectP2P: SmartPathRouteMode { .cnIPv6P2P }
 }
 
-public enum HerdrLifecycleState: String, Codable, Sendable, CaseIterable {
-    case working
-    case blocked
-    case idle
+public enum HerdrLifecycleState: String, Codable, Sendable, CaseIterable, Hashable {
+    case needsYou = "needs_you"
     case done
+    case working
+    case idle
     case error
-}
 
-public struct CodaAgentSession: Identifiable, Codable, Sendable, Equatable {
-    public let id: String          // e.g. "mac-studio/t3"
-    public let address: String     // e.g. "t3"
-    public let machineName: String
-    public let machinePlatform: String
-    public var agentApp: String    // "claude", "grok", "codex", "gemini"
-    public var title: String
-    public var statusMessage: String
-    public var cwd: String
-    public var state: HerdrLifecycleState
-    public var blockedKind: String? // "permission", "question", "auth"
-    public var progress: Int?
-    public var diffSummary: String?
-    public var screenPreview: String
+    public static var blocked: HerdrLifecycleState { .needsYou }
 
-    public init(
-        id: String,
-        address: String,
-        machineName: String,
-        machinePlatform: String,
-        agentApp: String,
-        title: String,
-        statusMessage: String,
-        cwd: String,
-        state: HerdrLifecycleState,
-        blockedKind: String? = nil,
-        progress: Int? = nil,
-        diffSummary: String? = nil,
-        screenPreview: String = ""
-    ) {
-        self.id = id
-        self.address = address
-        self.machineName = machineName
-        self.machinePlatform = machinePlatform
-        self.agentApp = agentApp
-        self.title = title
-        self.statusMessage = statusMessage
-        self.cwd = cwd
-        self.state = state
-        self.blockedKind = blockedKind
-        self.progress = progress
-        self.diffSummary = diffSummary
-        self.screenPreview = screenPreview
+    public var priorityRank: Int {
+        switch self {
+        case .needsYou: return 0
+        case .error: return 1
+        case .done: return 2
+        case .working: return 3
+        case .idle: return 4
+        }
+    }
+
+    public static func from(rawState: String?, kind: String? = nil) -> HerdrLifecycleState {
+        let s = (rawState ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let k = (kind ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if s == "blocked" || s == "needs_you" || s == "needsyou" || s == "permission" || s == "question" || s == "auth"
+            || k == "permission" || k == "question" || k == "auth" {
+            return .needsYou
+        }
+        if s == "done" || s == "completed" || s == "finished" {
+            return .done
+        }
+        if s == "working" || s == "running" || s == "busy" {
+            return .working
+        }
+        if s == "error" || s == "failed" {
+            return .error
+        }
+        return .idle
+    }
+
+    public init(from decoder: Decoder) throws {
+        let raw = try decoder.singleValueContainer().decode(String.self)
+        self = Self.from(rawState: raw)
     }
 }
 
-// MARK: - Phase 2 & 3 Models: Git Workspaces, Worktrees, Voice Config & Direct P2P Candidates
+public struct CodaAgentSession: Identifiable, Codable, Sendable, Equatable, Hashable {
+    public let id: String
+    public let terminalAddress: String
+    public let deviceId: UUID?
+    public let workspaceName: String
+    public let cwd: String
+    public let branch: String
+    public let hostName: String
+    public let agentName: String
+    public var taskTitle: String
+    public var statusMessage: String?
+    public var statusKind: String?
+    public var state: HerdrLifecycleState
+    public var helperCount: Int
+    public var workingHelperCount: Int
+    public var unreadCompletion: Bool
+    public var isPinned: Bool
+    public var updatedAt: Date
+    public var cols: Int
+    public var rows: Int
+    public var alive: Bool
+    public var diffAdded: Int
+    public var diffDeleted: Int
+    public var screenPreview: String
+
+    public var address: String { terminalAddress }
+
+    public init(
+        id: String,
+        terminalAddress: String,
+        deviceId: UUID? = nil,
+        workspaceName: String,
+        cwd: String = "",
+        branch: String = "main",
+        hostName: String,
+        agentName: String,
+        taskTitle: String,
+        statusMessage: String? = nil,
+        statusKind: String? = nil,
+        state: HerdrLifecycleState,
+        helperCount: Int = 0,
+        workingHelperCount: Int = 0,
+        unreadCompletion: Bool = false,
+        isPinned: Bool = false,
+        updatedAt: Date = Date(),
+        cols: Int = 100,
+        rows: Int = 32,
+        alive: Bool = true,
+        diffAdded: Int = 0,
+        diffDeleted: Int = 0,
+        screenPreview: String = ""
+    ) {
+        self.id = id
+        self.terminalAddress = terminalAddress
+        self.deviceId = deviceId
+        self.workspaceName = workspaceName
+        self.cwd = cwd
+        self.branch = branch
+        self.hostName = hostName
+        self.agentName = agentName
+        self.taskTitle = taskTitle
+        self.statusMessage = statusMessage
+        self.statusKind = statusKind
+        self.state = state
+        self.helperCount = helperCount
+        self.workingHelperCount = workingHelperCount
+        self.unreadCompletion = unreadCompletion
+        self.isPinned = isPinned
+        self.updatedAt = updatedAt
+        self.cols = cols
+        self.rows = rows
+        self.alive = alive
+        self.diffAdded = diffAdded
+        self.diffDeleted = diffDeleted
+        self.screenPreview = screenPreview
+    }
+
+    /// Canonical Herdr Inbox sort order: Needs you -> Error -> Done (unread first) -> Working -> Idle,
+    /// keeping pinned sessions prioritized inside each bucket.
+    public static func inboxOrder(_ lhs: CodaAgentSession, _ rhs: CodaAgentSession) -> Bool {
+        if lhs.state.priorityRank != rhs.state.priorityRank {
+            return lhs.state.priorityRank < rhs.state.priorityRank
+        }
+        if lhs.isPinned != rhs.isPinned {
+            return lhs.isPinned
+        }
+        if lhs.unreadCompletion != rhs.unreadCompletion {
+            return lhs.unreadCompletion
+        }
+        if lhs.updatedAt != rhs.updatedAt {
+            return lhs.updatedAt > rhs.updatedAt
+        }
+        return lhs.id < rhs.id
+    }
+}
+
+public enum CodaUILocale: String, Codable, CaseIterable, Sendable {
+    case en
+    case zh
+}
+
+public struct CodaPersistedSettings: Codable, Sendable, Equatable {
+    public var serverBaseURLString: String
+    public var sessionToken: String
+    public var ownerHandle: String
+    public var locale: CodaUILocale
+    public var pinnedSessionIDs: [String]
+    public var voiceConfig: CodaVoiceModelConfig
+
+    private static let defaultsKey = "dev.codahub.client.settings.v2"
+
+    public init(
+        serverBaseURLString: String = "https://codahub.dev",
+        sessionToken: String = "",
+        ownerHandle: String = "",
+        locale: CodaUILocale = .en,
+        pinnedSessionIDs: [String] = [],
+        voiceConfig: CodaVoiceModelConfig = CodaVoiceModelConfig()
+    ) {
+        self.serverBaseURLString = serverBaseURLString
+        self.sessionToken = sessionToken
+        self.ownerHandle = ownerHandle
+        self.locale = locale
+        self.pinnedSessionIDs = pinnedSessionIDs
+        self.voiceConfig = voiceConfig
+    }
+
+    public static func load() -> CodaPersistedSettings {
+        guard let data = UserDefaults.standard.data(forKey: defaultsKey),
+              let decoded = try? JSONDecoder().decode(CodaPersistedSettings.self, from: data) else {
+            return CodaPersistedSettings()
+        }
+        return decoded
+    }
+
+    public func save() {
+        if let data = try? JSONEncoder().encode(self) {
+            UserDefaults.standard.set(data, forKey: Self.defaultsKey)
+        }
+    }
+}
+
+// MARK: - Wire Structs matching `crates/coda-protocol` & `crates/coda-server`
+
+public struct CodaHerdrAgentStatus: Codable, Sendable, Equatable, Hashable {
+    public let state: String
+    public let kind: String?
+    public let app: String?
+    public let title: String?
+    public let msg: String?
+    public let progress: UInt8?
+}
+
+public struct CodaHerdrTerminalSummary: Codable, Sendable, Equatable, Hashable {
+    public let address: String
+    public let name: String?
+    public let argv: [String]
+    public let cwd: String
+    public let cols: UInt16
+    public let rows: UInt16
+    public let alive: Bool
+    public let status: CodaHerdrAgentStatus?
+}
 
 public struct CodaBranchWorktreeItem: Identifiable, Codable, Sendable, Equatable {
     public var id: String { "\(worktreePath)#\(branch)" }
@@ -235,6 +444,7 @@ public struct CodaBranchWorktreeItem: Identifiable, Codable, Sendable, Equatable
     public let worktreePath: String
     public let diffAdded: UInt32
     public let diffDeleted: UInt32
+    public let activeTerminals: [CodaHerdrTerminalSummary]
     public let statusSummary: String
 
     enum CodingKeys: String, CodingKey {
@@ -242,6 +452,7 @@ public struct CodaBranchWorktreeItem: Identifiable, Codable, Sendable, Equatable
         case worktreePath = "worktree_path"
         case diffAdded = "diff_added"
         case diffDeleted = "diff_deleted"
+        case activeTerminals = "active_terminals"
         case statusSummary = "status_summary"
     }
 
@@ -250,13 +461,25 @@ public struct CodaBranchWorktreeItem: Identifiable, Codable, Sendable, Equatable
         worktreePath: String,
         diffAdded: UInt32,
         diffDeleted: UInt32,
+        activeTerminals: [CodaHerdrTerminalSummary] = [],
         statusSummary: String
     ) {
         self.branch = branch
         self.worktreePath = worktreePath
         self.diffAdded = diffAdded
         self.diffDeleted = diffDeleted
+        self.activeTerminals = activeTerminals
         self.statusSummary = statusSummary
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        branch = try c.decode(String.self, forKey: .branch)
+        worktreePath = try c.decode(String.self, forKey: .worktreePath)
+        diffAdded = try c.decode(UInt32.self, forKey: .diffAdded)
+        diffDeleted = try c.decode(UInt32.self, forKey: .diffDeleted)
+        activeTerminals = (try? c.decodeIfPresent([CodaHerdrTerminalSummary].self, forKey: .activeTerminals)) ?? []
+        statusSummary = try c.decode(String.self, forKey: .statusSummary)
     }
 }
 
@@ -313,7 +536,7 @@ public struct CodaVoiceModelConfig: Codable, Sendable, Equatable {
     }
 }
 
-public struct CodaEndpointCandidate: Codable, Sendable, Equatable {
+public struct CodaEndpointCandidate: Codable, Sendable, Equatable, Hashable {
     public let kind: String
     public let addr: String
 
@@ -323,7 +546,7 @@ public struct CodaEndpointCandidate: Codable, Sendable, Equatable {
     }
 }
 
-public struct CodaRemoteDevice: Identifiable, Codable, Sendable, Equatable {
+public struct CodaRemoteDevice: Identifiable, Codable, Sendable, Equatable, Hashable {
     public let id: UUID
     public let name: String
     public let role: String
@@ -331,6 +554,8 @@ public struct CodaRemoteDevice: Identifiable, Codable, Sendable, Equatable {
     public let x25519Pubkey: String
     public let endpoints: [CodaEndpointCandidate]
     public let isOnline: Bool
+
+    public var x25519PublicB64: String { x25519Pubkey }
 
     enum CodingKeys: String, CodingKey {
         case id
