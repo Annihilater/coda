@@ -11,11 +11,14 @@ use std::sync::{Arc, Mutex};
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use chrono::Local;
-use coda_daemon::DirectP2pClient;
+use coda_daemon::{
+    start_embedded_host_if_configured, DaemonConfig, DirectP2pClient, SmartPeerClient,
+    SmartRelayFallbackConfig,
+};
 use coda_herdr::{discover_hc_binary, scan_git_workspaces, HerdrClient};
 use coda_protocol::{
-    BranchWorktreeItem, HerdrTerminalSummary, PeerMessage, RepoWorkspaceSummary,
-    StoredDeviceIdentity, TrafficLane, VoiceModelConfig,
+    BranchWorktreeItem, HerdrTerminalSummary, NetworkEndpointCandidate, PeerMessage,
+    RepoWorkspaceSummary, StoredDeviceIdentity, TrafficLane, VoiceModelConfig,
 };
 use gpui::{
     actions, black, div, prelude::*, px, rgb, rgba, size, white, App, Application, Bounds,
@@ -301,6 +304,57 @@ impl CodaDesktopState {
         Ok(())
     }
 
+    /// Auto-negotiates between LAN Direct P2P and Cloud Relay via `SmartPeerClient`
+    /// and updates the Mac client's connection status badge.
+    pub async fn sync_from_smart_peer(
+        &mut self,
+        client_id: StoredDeviceIdentity,
+        client_device_id: Uuid,
+        target_device_id: Uuid,
+        endpoints: Vec<NetworkEndpointCandidate>,
+        udp_probe_addr: Option<std::net::SocketAddr>,
+        relay_cfg: Option<SmartRelayFallbackConfig>,
+    ) -> anyhow::Result<()> {
+        let mut smart = SmartPeerClient::connect_auto(
+            client_id,
+            client_device_id,
+            target_device_id,
+            endpoints,
+            udp_probe_addr,
+            relay_cfg,
+        )
+        .await?;
+
+        self.connected_route = if smart.is_direct_p2p() {
+            "已连接 · ⚡ 局域网直连 LAN P2P".into()
+        } else {
+            "已连接 · 🌐 智能中继通道".into()
+        };
+
+        if let PeerMessage::WorkspacesSnapshot {
+            repos,
+            voice_config,
+            ..
+        } = smart
+            .request(
+                &PeerMessage::ListWorkspaces {
+                    req_id: "gpui-smart-ws".into(),
+                    root_dirs: vec![],
+                },
+                TrafficLane::ControlP0,
+            )
+            .await?
+        {
+            if !repos.is_empty() {
+                self.repos = repos;
+            }
+            if let Some(vc) = voice_config {
+                self.voice_config = vc;
+            }
+        }
+        Ok(())
+    }
+
     pub fn apply_voice_preset(&mut self, provider: &str) {
         let cfg = match provider {
             "groq" => VoiceModelConfig {
@@ -496,23 +550,42 @@ impl CodaGpuWorkspaceView {
         let state = Arc::new(Mutex::new(CodaDesktopState::default()));
         let state_bg = Arc::clone(&state);
 
-        // Background sync with local `herdr-core` (`hc`) daemon on startup
+        // Background sync with local `herdr-core` (`hc`) & embedded LAN P2P host listener
         std::thread::spawn(move || {
-            if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            if let Ok(rt) = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
                 .enable_all()
                 .build()
             {
                 rt.block_on(async move {
                     let mut tmp = CodaDesktopState::default();
                     tmp.sync_from_local_herdr().await;
+
+                    let cfg_path = DaemonConfig::default_path();
+                    let cfg_exists = cfg_path.exists();
+                    let embedded_addr = if cfg_exists {
+                        start_embedded_host_if_configured(&cfg_path).await
+                    } else {
+                        None
+                    };
+
                     if let Ok(mut guard) = state_bg.lock() {
                         guard.repos = tmp.repos;
                         guard.voice_config = tmp.voice_config;
+                        if let Some(addr) = embedded_addr {
+                            guard.connected_route = format!("已连接 · ⚡ 内网直连主机 :{} 就绪", addr.port());
+                        } else if cfg_exists {
+                            guard.connected_route = "已连接 · ⚡ 局域网直连引擎已激活 (GPUI 120Hz)".into();
+                        }
                         for s in tmp.sessions {
                             if !guard.sessions.iter().any(|existing| existing.address == s.address) {
                                 guard.sessions.push(s);
                             }
                         }
+                    }
+
+                    if embedded_addr.is_some() {
+                        std::future::pending::<()>().await;
                     }
                 });
             }
