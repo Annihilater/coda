@@ -1,43 +1,57 @@
 # Coda 生产环境极简部署指南 (Deployment Guide)
 
-Coda 每次发布 Tag (`v*`) 时，GitHub Actions 流水线会自动构建并发布全平台制品包（位于 **GitHub Releases**）。
+Coda 每次发布 Tag (`v*`) 时，GitHub Actions 流水线会自动构建并发布全平台制品包（位于 **GitHub Releases**）与多架构公开容器镜像（`ghcr.io/annihilater/coda:<version>` 与 `:latest`，同时支持 `linux/amd64` 与 `linux/arm64`）。
 
-> **目录与配置规范说明**：
-> - **产物命名**：所有发布压缩包文件名均携带版本号（例如 `-v0.2.2.tar.gz`），而 **解压后顶层目录名称均不带版本号**（例如 `coda-deploy-bundle/`、`coda-macos-aarch64/`），方便脚本与升级复用。
-> - **统一 `.env` 密钥管理**：`Docker Compose`、`coda-server.service`、`coda-relay-cn.service` 与直接运行 `coda-server` 二进制均**统一从 `.env`（或 `/etc/coda/.env`，`0600` 权限）读取 `CODA_RELAY_SECRET` 等环境变量**，`.service` 单元文件中不存放任何明文密钥！
+> **目录、镜像与配置规范说明**：
+> - **产物命名**：所有发布压缩包文件名均携带版本号（例如 `-v0.2.3.tar.gz`），而 **解压后顶层目录名称均不带版本号**（例如 `coda-deploy-bundle/`、`coda-macos-aarch64/`），方便脚本与升级复用。
+> - **预构建镜像（部署包无需 Dockerfile）**：`coda-deploy-bundle/` 直接引用公网镜像仓库 `ghcr.io/annihilater/coda:<version>`；同时 `start.sh` / `update.sh` 内置自动回落逻辑——若服务器无法访问 GHCR，会自动从 GitHub Releases 下载离线镜像包 `coda-image-linux-{amd64,arm64}-<version>.tar.gz` 并 `docker load` 导入。
+> - **统一 `.env` 密钥管理**：`./start.sh`、`docker-compose.yml`、`coda-server.service`、`coda-relay-cn.service` 与直接运行 `coda-server` 二进制均**统一从 `.env`（或 `/etc/coda/.env`，`0600` 权限）读取 `CODA_RELAY_SECRET` 等环境变量**，`.service` 单元文件中不存放任何明文密钥。
 
-| 制品压缩包文件名 | 解压后目录 | 适用平台与内容 |
+| 制品 / 镜像名称 | 解压后目录 / 平台 | 说明 |
 | :--- | :--- | :--- |
-| **`coda-deploy-bundle-<version>.tar.gz`** | `coda-deploy-bundle/` | **完整自包含部署包**（含预编译多架构二进制、前端静态资源、`docker-compose.yml`、`.env.example`、`coda-server.service`、`coda-relay-cn.service`、一键脚本与本指南） |
-| **`coda-server-linux-x86_64-<version>.tar.gz`** | `coda-server-linux-x86_64/` | Linux x86_64 服务端（含 `coda-server` + 预构建 `web-dist` 前端 + `migrations` + `deploy`） |
-| **`coda-server-linux-aarch64-<version>.tar.gz`** | `coda-server-linux-aarch64/` | Linux ARM64 服务端（同上） |
-| **`coda-daemon-linux-x86_64-<version>.tar.gz`** | `coda-daemon-linux-x86_64/` | Linux x86_64 受控开发机守护进程 (`coda-daemon`) |
-| **`coda-daemon-linux-aarch64-<version>.tar.gz`** | `coda-daemon-linux-aarch64/` | Linux ARM64 受控开发机守护进程 (`coda-daemon`) |
+| **`ghcr.io/annihilater/coda:<version>`** | `linux/amd64` / `linux/arm64` | **预构建多架构服务端容器镜像**（内置 `coda-server`、`coda-daemon` 与前端资源） |
+| **`coda-deploy-bundle-<version>.tar.gz`** | `coda-deploy-bundle/` | **极简部署运维包**（含 `start.sh`/`stop.sh`/`restart.sh`/`status.sh`/`logs.sh`/`update.sh`、`docker-compose.yml`、`.env.example`、`*.service`、安装脚本与本指南，**无 `Dockerfile`**） |
+| **`coda-image-linux-{amd64,arm64}-<version>.tar.gz`** | 离线容器镜像包 | 供内网或 GHCR 不可达环境执行 `docker load` 离线导入使用 |
+| **`coda-server-linux-{x86_64,aarch64}-<version>.tar.gz`** | `coda-server-linux-*/` | Linux 服务端裸机包（含 `coda-server` + `web-dist` + `migrations` + `deploy`） |
+| **`coda-daemon-linux-{x86_64,aarch64}-<version>.tar.gz`** | `coda-daemon-linux-*/` | Linux 受控开发机守护进程 (`coda-daemon`) |
 | **`coda-macos-aarch64-<version>.tar.gz`** | `coda-macos-aarch64/` | macOS Apple Silicon 全家桶（含 **`coda-desktop` [Rust+GPUI 120Hz 桌面端]**、`CodaMacApp` [SwiftUI]、`coda-daemon`、`coda-server`） |
 | **`coda-daemon-macos-aarch64-<version>.tar.gz`** | `coda-daemon-macos-aarch64/` | macOS Apple Silicon 受控开发机守护进程 (`coda-daemon`) |
 
 ---
 
-## 一、服务端部署（二选一：Docker 一键启动 或 裸机一键脚本）
+## 一、服务端部署（极简运维脚本，无需本地构建）
 
-### 方式 A：Docker Compose 一键部署（推荐，自带 PostgreSQL 18）
+### 方式 A：Docker Compose + 一键启停脚本（推荐，自带 PostgreSQL 18）
 
-在你的服务器上下载最新带版本号的 `coda-deploy-bundle-<version>.tar.gz` 并启动（解压后目录为干净的 `coda-deploy-bundle/`）：
+在你的服务器上下载最新带版本号的 `coda-deploy-bundle-<version>.tar.gz`，修改 `.env` 后直接执行 `./start.sh` 即可：
 
 ```bash
-# 1. 自动获取最新版本号并下载解压（也可手动指定如 VER=v0.2.1）
+# 1. 自动获取最新版本号并下载解压（解压后目录固定为 coda-deploy-bundle/）
 VER="$(curl -fsSLI -o /dev/null -w '%{url_effective}' https://github.com/Annihilater/coda/releases/latest | awk -F/ '{print $NF}')"
 curl -fsSL "https://github.com/Annihilater/coda/releases/download/${VER}/coda-deploy-bundle-${VER}.tar.gz" | tar -xz
 cd coda-deploy-bundle
 
-# 2. 复制环境变量并修改密码与密钥
+# 2. 复制配置文件并修改关键环境变量（DEPLOY_MODE / CODA_PUBLIC_URL / CODA_RELAY_SECRET / POSTGRES_PASSWORD）
 cp .env.example .env
-# 编辑 .env 设置 POSTGRES_PASSWORD、CODA_RELAY_SECRET 和 CODA_PUBLIC_URL (例如 http://你的公网IP:8080 或 https://你的域名)
+vim .env
 
-# 3. 启动控制面 (:8080) + 免备案裸 TCP 中继 (:24443)
-docker compose up -d
+# 3. 一键启动（自动拉取预构建镜像 + 启动容器 + 健康检查）
+./start.sh
 ```
 
+#### 日常运维脚本一览（改完 `.env` 后直接执行即可）
+
+| 脚本 | 作用说明 |
+| :--- | :--- |
+| **`./start.sh`** | 首次检查 `.env`，拉取/加载预构建镜像并启动服务（根据 `.env` 中的 `DEPLOY_MODE` 启动主控或国内中继） |
+| **`./stop.sh`** | 停止运行中的容器（传 `--down` 可移除容器但保留 `coda_pgdata` 数据卷） |
+| **`./restart.sh`** | **修改 `.env` 后推荐执行**：重新加载 `.env` 并重建 Coda 容器使新配置立即生效 |
+| **`./status.sh`** | 查看容器运行状态、端口监听（`:8080` / `:24443`）与 `/api/v1/health` 健康检查结果 |
+| **`./logs.sh`** | 实时跟踪查看日志（`Ctrl+C` 退出；支持传服务名如 `./logs.sh coda-coordinator`） |
+| **`./update.sh`** | 拉取最新版本容器镜像并平滑重启 |
+
+> 以上脚本同样支持 `--systemd`（或 `DEPLOY_RUNTIME=systemd`）管理方式 B 安装的系统服务。
+>
 > **防火墙/安全组放行端口**：
 > - `8080/tcp`（Web 终端控制台、注册登录 API、海外 CDN WebSocket `/v1/tunnel/ws`）
 > - `24443/tcp`（国内免备案纯二进制裸 TCP 隧道，零 HTTP/零 SNI）
@@ -59,13 +73,10 @@ curl -fsSL https://raw.githubusercontent.com/Annihilater/coda/main/deploy/instal
 
 ## 二、（可选）国内阿里云/腾讯云「免备案」中继节点一键部署
 
-如果你将主控制面放在海外，同时有一台国内阿里云/腾讯云机器（**不绑域名、不备案、不开 80/443 端口、不装数据库**），只需在安全组放行 **`24443/tcp`**。
+如果你将主控制面放在海外，同时有一台国内阿里云/腾讯云机器（**不绑域名、不备案、不开 80/443 端口、不装数据库**），只需在安全组放行 **`24443/tcp`**：
 
-- **方式 1（先配置 `.env` 再一键安装，推荐）**：将控制面上的 `.env` 复制到本机当前目录或 `/etc/coda/.env`（或仅保留 `CODA_RELAY_SECRET`），然后运行：
-  ```bash
-  curl -fsSL https://raw.githubusercontent.com/Annihilater/coda/main/deploy/install-relay-cn.sh | sudo sh
-  ```
-- **方式 2（命令行传参写入 `/etc/coda/.env`）**：
+- **方式 1（Docker + 统一脚本，推荐）**：解压 `coda-deploy-bundle-<version>.tar.gz`，在 `.env` 中设置 `DEPLOY_MODE=relay-cn` 及与主控相同的 `CODA_RELAY_SECRET`，然后执行 **`./start.sh`**（如国内拉取 GHCR 较慢，可在 `.env` 设置 `GITHUB_PROXY=https://ghfast.top/` 自动走离线镜像包回落）。
+- **方式 2（裸机 Systemd 一键安装）**：将控制面上的 `.env` 复制到本机当前目录或 `/etc/coda/.env`，然后运行 `sudo ./install-relay-cn.sh` 或：
   ```bash
   curl -fsSL https://raw.githubusercontent.com/Annihilater/coda/main/deploy/install-relay-cn.sh | sudo sh -s -- \
     --relay-secret "与主控制面完全相同的CODA_RELAY_SECRET" \
