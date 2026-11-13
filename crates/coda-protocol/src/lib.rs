@@ -307,6 +307,12 @@ pub enum RelayWireFrame {
     PeerPresence {
         device_id: Uuid,
         is_online: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        endpoints: Option<Vec<NetworkEndpointCandidate>>,
+    },
+    /// Dynamic LAN / IPv6 P2P endpoint refresh pushed by `coda-daemon` or embedded Mac host on connect & Wi-Fi changes.
+    AdvertiseEndpoints {
+        endpoints: Vec<NetworkEndpointCandidate>,
     },
     /// Phase 3 Direct P2P (LAN IPv4 / Mainland China Public IPv6) zero-relay handshake initiation.
     DirectP2pHello {
@@ -351,9 +357,9 @@ impl RelayWireFrame {
 // 4. End-to-End Encrypted Inner Application Messages (`PeerMessage`)
 // ============================================================================
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NetworkEndpointCandidate {
-    pub kind: String, // "lan_ipv4" | "cn_public_ipv6" | "stun_ipv4"
+    pub kind: String, // "lan_ipv4" | "lan_ws" | "cn_public_ipv6" | "ipv6_ws" | "stun_ipv4"
     pub addr: String,
 }
 

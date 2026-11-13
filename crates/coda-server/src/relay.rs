@@ -14,7 +14,9 @@ use std::{
 use anyhow::{Context, Result};
 use axum::extract::ws::{Message as WsMessage, WebSocket};
 use chrono::Utc;
-use coda_protocol::{RelayTicketClaims, RelayWireFrame, TrafficLane, MAX_WIRE_FRAME_BYTES};
+use coda_protocol::{
+    NetworkEndpointCandidate, RelayTicketClaims, RelayWireFrame, TrafficLane, MAX_WIRE_FRAME_BYTES,
+};
 use futures_util::{SinkExt, StreamExt};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -35,6 +37,7 @@ struct DeviceSlots {
     user_id: Uuid,
     control_p0: Option<ActiveLaneConn>,
     bulk_p1: Option<ActiveLaneConn>,
+    endpoints: Vec<NetworkEndpointCandidate>,
 }
 
 struct TenantBucket {
@@ -278,6 +281,7 @@ impl RelayHub {
                 user_id: claims.user_id,
                 control_p0: None,
                 bulk_p1: None,
+                endpoints: Vec::new(),
             });
             let was_empty = entry.control_p0.is_none() && entry.bulk_p1.is_none();
 
@@ -309,10 +313,16 @@ impl RelayHub {
         };
 
         if became_online {
+            let cached_eps = {
+                let map = self.devices.read().await;
+                map.get(&claims.device_id)
+                    .map(|s| s.endpoints.clone())
+                    .filter(|eps| !eps.is_empty())
+            };
             if let Some(db) = &self.db {
                 let _ = db.set_device_online(claims.device_id, true).await;
             }
-            self.broadcast_presence_to_tenant(claims.user_id, claims.device_id, true)
+            self.broadcast_presence_to_tenant(claims.user_id, claims.device_id, true, cached_eps)
                 .await;
         }
     }
@@ -353,15 +363,22 @@ impl RelayHub {
             if let Some(db) = &self.db {
                 let _ = db.set_device_online(device_id, false).await;
             }
-            self.broadcast_presence_to_tenant(user_id, device_id, false)
+            self.broadcast_presence_to_tenant(user_id, device_id, false, None)
                 .await;
         }
     }
 
-    async fn broadcast_presence_to_tenant(&self, user_id: Uuid, device_id: Uuid, is_online: bool) {
+    async fn broadcast_presence_to_tenant(
+        &self,
+        user_id: Uuid,
+        device_id: Uuid,
+        is_online: bool,
+        endpoints: Option<Vec<NetworkEndpointCandidate>>,
+    ) {
         let notice = Arc::new(RelayWireFrame::PeerPresence {
             device_id,
             is_online,
+            endpoints,
         });
         let targets: Vec<mpsc::Sender<Arc<RelayWireFrame>>> = {
             let map = self.devices.read().await;
@@ -434,6 +451,26 @@ impl RelayHub {
                         message: format!("target device {dst_device_id} is offline or in another tenant"),
                     }));
                 }
+            }
+            RelayWireFrame::AdvertiseEndpoints { mut endpoints } => {
+                endpoints.truncate(16);
+                {
+                    let mut map = self.devices.write().await;
+                    if let Some(slots) = map.get_mut(&sender.device_id) {
+                        slots.endpoints = endpoints.clone();
+                    }
+                }
+                if let Some(db) = &self.db {
+                    let val = serde_json::to_value(&endpoints).unwrap_or_default();
+                    let _ = db.update_device_endpoints(sender.device_id, &val).await;
+                }
+                self.broadcast_presence_to_tenant(
+                    sender.user_id,
+                    sender.device_id,
+                    true,
+                    Some(endpoints),
+                )
+                .await;
             }
             _ => {}
         }
