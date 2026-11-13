@@ -46,3 +46,12 @@ zstd = "0.13"
 argon2 = "0.5"
 libc = "0.2"
 gpui = { version = "0.2.2", features = ["runtime_shaders"] }
+
+[profile.release]
+strip = "symbols"
+codegen-units = 16
+lto = false
+
+[profile.release.build-override]
+opt-level = 0
+codegen-units = 256
