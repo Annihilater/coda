@@ -63,6 +63,36 @@ interface VoiceModelConfig {
   model: string;
 }
 
+interface SiteInfo {
+  version: string;
+  open_registration: boolean;
+  has_any_users: boolean;
+  public_base_url: string;
+  install_command: string;
+  downloads: {
+    daemon_linux_x64: string;
+    daemon_linux_arm64: string;
+    daemon_macos_arm64: string;
+    server_linux_x64: string;
+    server_linux_arm64: string;
+    server_macos_arm64: string;
+    desktop_macos_dmg: string;
+    desktop_macos_tar: string;
+    deploy_bundle: string;
+    ios_beta_url?: string | null;
+    releases_page: string;
+  };
+}
+
+interface DeviceAuthPublicInfo {
+  user_code: string;
+  device_name: string;
+  role: string;
+  platform: string;
+  status: string;
+  expires_at: string;
+}
+
 function mascotSVG(color = "#e06c50") {
   return `<svg width="18" height="18" viewBox="0 0 16 16" fill="none">
     <rect x="3" y="4" width="10" height="6" fill="${color}"/>
@@ -80,6 +110,12 @@ function mascotSVG(color = "#e06c50") {
 class CodaTerminalWebApp {
   private token: string | null = localStorage.getItem("coda_token");
   private authMode: "login" | "register" = "login";
+  private portalShowAuthModal = false;
+  private siteInfo: SiteInfo | null = null;
+  private pendingActivationCode: string = "";
+  private pendingDeviceInfo: DeviceAuthPublicInfo | null = null;
+  private activationSuccessMsg = "";
+  private copiedToast = "";
   private user: User | null = null;
   private devices: Device[] = [];
   private myClientDevice: Device | null = null;
@@ -112,6 +148,12 @@ class CodaTerminalWebApp {
   private errorMsg = "";
 
   async init() {
+    const params = new URLSearchParams(window.location.search);
+    const codeParam = params.get("code") || "";
+    if (window.location.pathname === "/activate" || codeParam) {
+      this.pendingActivationCode = codeParam.trim().toUpperCase();
+    }
+
     window.addEventListener("online", () => {
       if (this.selectedDaemon?.is_online) {
         void this.tryNegotiateDirectLanWs(this.selectedDaemon);
@@ -129,6 +171,17 @@ class CodaTerminalWebApp {
         });
       }
     });
+
+    try {
+      this.siteInfo = await this.api("/api/v1/public/site-info");
+    } catch {
+      this.siteInfo = null;
+    }
+
+    if (this.pendingActivationCode) {
+      await this.lookupActivationCode(this.pendingActivationCode);
+    }
+
     if (this.token) {
       try {
         this.user = await this.api("/api/v1/auth/me");
@@ -139,6 +192,24 @@ class CodaTerminalWebApp {
       }
     }
     this.render();
+  }
+
+  private async lookupActivationCode(code: string) {
+    const cleaned = code.trim().toUpperCase();
+    this.pendingActivationCode = cleaned;
+    if (!cleaned) {
+      this.pendingDeviceInfo = null;
+      return;
+    }
+    try {
+      this.pendingDeviceInfo = await this.api(
+        `/api/v1/auth/device/info?code=${encodeURIComponent(cleaned)}`
+      );
+      this.errorMsg = "";
+    } catch (err: any) {
+      this.pendingDeviceInfo = null;
+      this.errorMsg = err.message || "授权码无效或已过期";
+    }
   }
 
   private async api(path: string, method = "GET", body?: unknown): Promise<any> {
@@ -167,7 +238,7 @@ class CodaTerminalWebApp {
 
   private async refreshDevices() {
     const all: Device[] = await this.api("/api/v1/devices");
-    this.devices = all.filter((d) => d.role === "daemon");
+    this.devices = all.filter((d) => d.role === "daemon" || d.role === "hybrid");
     if (!this.selectedDaemon && this.devices.length > 0) {
       this.selectedDaemon = this.devices.find((d) => d.is_online) || this.devices[0];
     } else if (this.selectedDaemon) {
@@ -540,49 +611,235 @@ class CodaTerminalWebApp {
 
   render() {
     const root = document.getElementById("app")!;
+    const baseUrl = this.siteInfo?.public_base_url || window.location.origin;
+    const installCmd = this.siteInfo?.install_command || `curl -fsSL ${baseUrl}/install.sh | sh`;
+    const ver = this.siteInfo?.version || "v0.3.0";
+    const dl = this.siteInfo?.downloads;
+    const isActivateView =
+      window.location.pathname === "/activate" || !!this.pendingActivationCode;
+
     if (!this.user) {
+      const openReg = this.siteInfo?.open_registration ?? true;
       root.innerHTML = `
-        <div class="modal-mask">
-          <div class="modal-card">
-            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;">
-              <div style="display:flex;align-items:center;gap:8px;">
+        <div class="portal-root">
+          <div class="portal-container">
+            <nav class="portal-nav">
+              <div style="display:flex;align-items:center;gap:10px;">
                 ${mascotSVG("#e06c50")}
-                <strong class="coda-mono" style="font-size:15px;">CODA TERMINAL MESH</strong>
+                <strong class="coda-mono" style="font-size:15px;">CODA MESH</strong>
+                <span class="badge">${this.escapeHtml(ver)}</span>
+                <span class="badge" style="color:var(--emerald);border-color:rgba(34,197,94,0.35);">Zero-Knowledge E2EE</span>
               </div>
-              <button id="toggle-auth" style="background:none;border:none;color:var(--sky);font-size:12px;cursor:pointer;">
-                ${this.authMode === "login" ? "注册新账号 →" : "返回登录 →"}
-              </button>
-            </div>
-            ${this.errorMsg ? `<div style="color:var(--rose);font-size:12px;margin-bottom:10px;">${this.errorMsg}</div>` : ""}
-            <form id="auth-form">
-              ${
-                this.authMode === "register"
-                  ? `
-                <label style="font-size:12px;color:var(--muted);">邮箱</label>
-                <input name="email" class="inp" required placeholder="vampire@coda.dev" />
-                <label style="font-size:12px;color:var(--muted);">用户名</label>
-                <input name="handle" class="inp" required placeholder="vampire" />
-                <label style="font-size:12px;color:var(--muted);">昵称</label>
-                <input name="display_name" class="inp" required placeholder="Vampire" />
-                <label style="font-size:12px;color:var(--muted);">密码 (>= 6位)</label>
-                <input type="password" name="password" class="inp" required />
-                <label style="font-size:12px;color:var(--muted);">好友邀请码 (首位管理员可留空)</label>
-                <input name="invite_code" class="inp" placeholder="CODA-XXXXXX" />
-              `
-                  : `
-                <label style="font-size:12px;color:var(--muted);">邮箱或用户名</label>
-                <input name="email_or_handle" class="inp" required placeholder="vampire" />
-                <label style="font-size:12px;color:var(--muted);">密码</label>
-                <input type="password" name="password" class="inp" required />
-              `
-              }
-              <button type="submit" style="width:100%;background:#f4f4f5;color:#000;border:none;border-radius:12px;padding:10px;font-weight:600;cursor:pointer;margin-top:4px;">
-                ${this.authMode === "login" ? "连接终端算力网" : "注册并开启 E2EE 组网"}
-              </button>
-            </form>
+              <div style="display:flex;gap:8px;flex-wrap:wrap;">
+                <a class="btn-ghost" href="#downloads">免登录下载全端</a>
+                <button id="btn-nav-login" class="btn-ghost">登录控制台</button>
+                <button id="btn-nav-register" class="btn-primary">免费注册账号</button>
+              </div>
+            </nav>
+
+            ${
+              isActivateView || this.pendingDeviceInfo
+                ? `
+              <section class="portal-panel" style="margin-bottom:22px;border-color:rgba(56,189,248,0.45);">
+                <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;">
+                  <div>
+                    <div style="font-size:16px;font-weight:700;">🔑 浏览器设备码授权 (/activate)</div>
+                    <div style="font-size:12px;color:#a1a1aa;margin-top:4px;">请先在下方登录或注册你的 Coda 账号，即可一键将远端电脑/服务器加入你的私有终端网络。</div>
+                  </div>
+                  <span class="coda-mono" style="font-size:18px;font-weight:700;color:var(--sky);letter-spacing:2px;">
+                    ${this.escapeHtml(this.pendingActivationCode || "XXXX-XXXX")}
+                  </span>
+                </div>
+                ${
+                  this.pendingDeviceInfo
+                    ? `<div class="coda-mono" style="margin-top:12px;padding:10px 12px;border-radius:10px;background:#070709;border:1px solid #272730;font-size:12px;color:#d4d4d8;">
+                        待授权主机：<b>${this.escapeHtml(this.pendingDeviceInfo.device_name)}</b> · 平台：${this.escapeHtml(this.pendingDeviceInfo.platform)} · 角色：${this.escapeHtml(this.pendingDeviceInfo.role)} · 状态：${this.escapeHtml(this.pendingDeviceInfo.status)}
+                      </div>`
+                    : ""
+                }
+              </section>
+            `
+                : ""
+            }
+
+            <section class="portal-hero">
+              <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;">
+                <span class="badge" style="color:var(--sky);">Cloudflare Tunnel WSS 即开即用</span>
+                <span class="badge" style="color:var(--emerald);">Wi-Fi 局域网零中继自动直连</span>
+              </div>
+              <h1 style="font-size:28px;line-height:1.25;font-weight:800;margin-bottom:10px;">
+                只登录一次，全端互控写代码
+              </h1>
+              <p style="font-size:14px;color:#a1a1aa;line-height:1.65;max-width:760px;">
+                将你的阿里云/腾讯云 Linux 服务器、家里或公司的 Mac、随身 iPhone/Web 浏览器接入同一账号。
+                同 Wi-Fi 下自动毫秒级局域网直连；跨网自动经 Cloudflare WSS / 免备案节点加密中继。服务器与中继永远无法解密你的终端内容与代码。
+              </p>
+
+              <div class="cmd-box">
+                <div style="min-width:0;flex:1;">
+                  <div style="font-size:11px;color:#71717a;margin-bottom:4px;">⚡ Linux / macOS 服务器一键接入命令（无需提前登录，执行后弹出浏览器授权链接）</div>
+                  <code class="coda-mono" style="font-size:13px;color:var(--emerald);word-break:break-all;">${this.escapeHtml(installCmd)}</code>
+                </div>
+                <button id="btn-copy-install" class="btn-primary">
+                  ${this.copiedToast ? this.escapeHtml(this.copiedToast) : "复制安装命令"}
+                </button>
+              </div>
+            </section>
+
+            <section id="downloads" class="dl-grid">
+              <div class="dl-card">
+                <div>
+                  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+                    <strong style="font-size:16px;">🖥 Server / Host Daemon</strong>
+                    <span class="badge">Linux & macOS</span>
+                  </div>
+                  <p style="font-size:13px;color:#a1a1aa;line-height:1.6;">
+                    运行在远端写代码机器上，桥接本机 <code>herdr-core (hc)</code> 终端与 <code>git diff</code>，支持浏览器设备码授权 <code>coda-daemon login</code>。
+                  </p>
+                </div>
+                <div style="display:flex;gap:8px;flex-wrap:wrap;">
+                  ${dl ? `<a class="btn-ghost" href="${dl.daemon_linux_x64}" target="_blank">Linux x86_64</a>` : ""}
+                  ${dl ? `<a class="btn-ghost" href="${dl.daemon_linux_arm64}" target="_blank">Linux ARM64</a>` : ""}
+                  ${dl ? `<a class="btn-ghost" href="${dl.daemon_macos_arm64}" target="_blank">macOS Daemon</a>` : ""}
+                </div>
+              </div>
+
+              <div class="dl-card">
+                <div>
+                  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+                    <strong style="font-size:16px;">💻 macOS 桌面端 (Coda.app)</strong>
+                    <span class="badge" style="color:var(--coral);">Hybrid 双向节点</span>
+                  </div>
+                  <p style="font-size:13px;color:#a1a1aa;line-height:1.6;">
+                    原生 GPUI 极速终端桌面端，既可以控制你的云端 Linux 服务器，也可以把这台 Mac 作为算力主机让 iOS / 浏览器随时遥控。
+                  </p>
+                </div>
+                <div style="display:flex;gap:8px;flex-wrap:wrap;">
+                  ${dl ? `<a class="btn-primary" href="${dl.desktop_macos_dmg}" target="_blank">下载 Mac .dmg 安装包</a>` : ""}
+                  ${dl ? `<a class="btn-ghost" href="${dl.desktop_macos_tar}" target="_blank">全套 .tar.gz</a>` : ""}
+                </div>
+              </div>
+
+              <div class="dl-card">
+                <div>
+                  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+                    <strong style="font-size:16px;">📱 iOS 移动端 (TestFlight / PWA)</strong>
+                    <span class="badge" style="color:var(--sky);">Beta 先行版</span>
+                  </div>
+                  <p style="font-size:13px;color:#a1a1aa;line-height:1.6;">
+                    在 iPhone Safari 打开当前网址点击「分享 → 添加到主屏幕」即可免上架全屏使用 E2EE 终端键盘与语音输入，同 Wi-Fi 自动走 <code>ws://</code> 局域网直连。
+                  </p>
+                </div>
+                <div style="display:flex;gap:8px;flex-wrap:wrap;">
+                  ${
+                    dl?.ios_beta_url
+                      ? `<a class="btn-primary" href="${this.escapeHtml(dl.ios_beta_url)}" target="_blank">打开 TestFlight 安装 iOS Beta</a>`
+                      : `<span class="badge">TestFlight / IPA 构建已就绪（当前推荐直接添加到主屏幕使用）</span>`
+                  }
+                </div>
+              </div>
+
+              <div class="dl-card">
+                <div>
+                  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+                    <strong style="font-size:16px;">☁ 自建主控端部署套件</strong>
+                    <span class="badge">Docker + CF Tunnel</span>
+                  </div>
+                  <p style="font-size:13px;color:#a1a1aa;line-height:1.6;">
+                    想自己搭一套私有中控？下载精简部署包即可 1 分钟启动 PostgreSQL + Coordinator + Web 官网 + 免备案中继。
+                  </p>
+                </div>
+                <div style="display:flex;gap:8px;flex-wrap:wrap;">
+                  ${dl ? `<a class="btn-ghost" href="${dl.deploy_bundle}" target="_blank">下载 deploy-bundle</a>` : ""}
+                  ${dl ? `<a class="btn-ghost" href="${dl.releases_page}" target="_blank">GitHub Releases (${this.escapeHtml(ver)})</a>` : ""}
+                </div>
+              </div>
+            </section>
+
+            <section id="portal-auth-section" class="portal-auth-grid">
+              <div class="portal-panel">
+                <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;">
+                  <strong style="font-size:16px;">${this.authMode === "login" ? "登录我的 Coda 网络" : "注册新的 Coda 账号"}</strong>
+                  <button id="toggle-auth" style="background:none;border:none;color:var(--sky);font-size:12px;cursor:pointer;">
+                    ${this.authMode === "login" ? "没有账号？免费注册 →" : "已有账号？直接登录 →"}
+                  </button>
+                </div>
+                ${this.errorMsg ? `<div style="color:var(--rose);font-size:12px;margin-bottom:10px;">${this.escapeHtml(this.errorMsg)}</div>` : ""}
+                <form id="auth-form">
+                  ${
+                    this.authMode === "register"
+                      ? `
+                    <label style="font-size:12px;color:var(--muted);">邮箱</label>
+                    <input name="email" class="inp" required placeholder="dev@example.com" />
+                    <label style="font-size:12px;color:var(--muted);">用户名 (小写英文/数字)</label>
+                    <input name="handle" class="inp" required placeholder="alice" />
+                    <label style="font-size:12px;color:var(--muted);">显示昵称</label>
+                    <input name="display_name" class="inp" required placeholder="Alice" />
+                    <label style="font-size:12px;color:var(--muted);">密码 (>= 6位)</label>
+                    <input type="password" name="password" class="inp" required />
+                    ${
+                      openReg
+                        ? `<div style="font-size:11px;color:var(--emerald);margin-bottom:10px;">当前站点已开放自由注册，无需填写邀请码。</div>`
+                        : `<label style="font-size:12px;color:var(--muted);">邀请码 (首位管理员留空)</label><input name="invite_code" class="inp" placeholder="CODA-XXXXXX" />`
+                    }
+                  `
+                      : `
+                    <label style="font-size:12px;color:var(--muted);">邮箱或用户名</label>
+                    <input name="email_or_handle" class="inp" required placeholder="alice" />
+                    <label style="font-size:12px;color:var(--muted);">密码</label>
+                    <input type="password" name="password" class="inp" required />
+                  `
+                  }
+                  <button type="submit" class="btn-primary" style="width:100%;margin-top:4px;padding:11px;">
+                    ${this.authMode === "login" ? "登录并进入控制台" : "立即注册并开启 E2EE 组网"}
+                  </button>
+                </form>
+              </div>
+
+              <div class="portal-panel" style="display:flex;flex-direction:column;justify-content:space-between;">
+                <div>
+                  <strong style="font-size:16px;">3 步接入任何写代码设备</strong>
+                  <ol style="margin-top:12px;padding-left:18px;font-size:13px;color:#a1a1aa;line-height:1.85;">
+                    <li>在官网直接注册并登录（或先在服务器上装好再登录）。</li>
+                    <li>在任何服务器/Mac 上执行上方 <code>curl | sh</code> 或运行 <code>coda-daemon login --server ${this.escapeHtml(baseUrl)}</code>。</li>
+                    <li>打开终端输出的 <code>/activate?code=XXXX-XXXX</code> 授权链接点击批准，这台机器立刻出现在左侧所有设备列表中。</li>
+                  </ol>
+                </div>
+                <div style="margin-top:16px;padding:12px;border-radius:12px;background:#070709;border:1px solid #222229;font-size:12px;color:#a1a1aa;">
+                  端到端密钥始终保存在设备本地（<code>Ed25519 + X25519</code> + <code>ChaCha20-Poly1305</code>），主控节点仅做加密包转发。
+                </div>
+              </div>
+            </section>
           </div>
         </div>
       `;
+
+      document.getElementById("btn-copy-install")?.addEventListener("click", async () => {
+        try {
+          await navigator.clipboard.writeText(installCmd);
+          this.copiedToast = "✓ 已复制";
+          this.render();
+          setTimeout(() => {
+            this.copiedToast = "";
+            if (!this.user) this.render();
+          }, 1800);
+        } catch {
+          this.copiedToast = "请手动复制上方命令";
+          this.render();
+        }
+      });
+
+      document.getElementById("btn-nav-login")?.addEventListener("click", () => {
+        this.authMode = "login";
+        this.render();
+        document.getElementById("portal-auth-section")?.scrollIntoView({ behavior: "smooth" });
+      });
+
+      document.getElementById("btn-nav-register")?.addEventListener("click", () => {
+        this.authMode = "register";
+        this.render();
+        document.getElementById("portal-auth-section")?.scrollIntoView({ behavior: "smooth" });
+      });
 
       document.getElementById("toggle-auth")?.addEventListener("click", () => {
         this.authMode = this.authMode === "login" ? "register" : "login";
@@ -600,6 +857,7 @@ class CodaTerminalWebApp {
               : await this.api("/api/v1/auth/register", "POST", payload);
           this.token = res.token;
           this.user = res.user;
+          this.errorMsg = "";
           localStorage.setItem("coda_token", res.token);
           await this.bootstrapMesh();
           this.render();
@@ -637,8 +895,11 @@ class CodaTerminalWebApp {
             <div style="flex:1;overflow-y:auto;padding:12px;">
               ${
                 this.devices.length === 0
-                  ? `<div style="padding:12px;font-size:12px;color:var(--muted);line-height:1.6;">
-                      当前账号下暂无在线主机。<br/>点击右上角 <b>⚙</b> 生成 6 位配对码接入你的 Mac 或 Linux 服务器。
+                  ? `<div style="padding:12px;font-size:12px;color:var(--muted);line-height:1.65;">
+                      当前账号下暂无在线主机。<br/><br/>
+                      在任意 Linux / Mac 运行：<br/>
+                      <code class="coda-mono" style="color:var(--emerald);word-break:break-all;">${this.escapeHtml(installCmd)}</code><br/><br/>
+                      打开终端输出的激活链接即可接入。或点右上角 <b>⚙</b>。
                     </div>`
                   : this.devices
                       .map(
@@ -818,14 +1079,62 @@ class CodaTerminalWebApp {
       </div>
 
       ${
+        this.pendingActivationCode || this.showSettingsModal
+          ? ""
+          : ""
+      }
+      ${
+        this.pendingActivationCode
+          ? `
+        <div class="modal-mask">
+          <div class="modal-card">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+              <strong style="font-size:15px;">🔑 确认授权设备接入账号 @${this.escapeHtml(this.user.handle)}</strong>
+              <button id="btn-dismiss-activate" class="circle-btn" style="width:28px;height:28px;">✕</button>
+            </div>
+            ${this.errorMsg ? `<div style="color:var(--rose);font-size:12px;margin-bottom:8px;">${this.escapeHtml(this.errorMsg)}</div>` : ""}
+            <div class="coda-mono" style="font-size:20px;font-weight:700;color:var(--sky);letter-spacing:2px;margin-bottom:10px;">
+              ${this.escapeHtml(this.pendingActivationCode)}
+            </div>
+            ${
+              this.pendingDeviceInfo
+                ? `<div style="background:#070709;border:1px solid #27272a;border-radius:12px;padding:12px;font-size:12px;line-height:1.7;margin-bottom:14px;">
+                    设备名称：<b>${this.escapeHtml(this.pendingDeviceInfo.device_name)}</b><br/>
+                    平台 / 角色：${this.escapeHtml(this.pendingDeviceInfo.platform)} / ${this.escapeHtml(this.pendingDeviceInfo.role)}<br/>
+                    当前状态：${this.escapeHtml(this.pendingDeviceInfo.status)}
+                  </div>`
+                : `<div style="font-size:12px;color:var(--muted);margin-bottom:12px;">点击下方确认，将把该授权码对应的设备绑定到当前账号。</div>`
+            }
+            <button id="btn-approve-device" class="btn-primary" style="width:100%;padding:11px;">
+              ✓ 批准此设备接入我的私有网络
+            </button>
+          </div>
+        </div>
+      `
+          : ""
+      }
+      ${
         this.showSettingsModal
           ? `
         <div class="modal-mask" id="modal-bg">
           <div class="modal-card">
             <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;">
-              <strong style="font-size:15px;">机器配对、好友邀请与语音模型配置</strong>
+              <strong style="font-size:15px;">接入新设备、授权码与语音模型配置</strong>
               <button id="btn-close-modal" class="circle-btn" style="width:28px;height:28px;">✕</button>
             </div>
+            ${
+              this.activationSuccessMsg
+                ? `<div style="background:rgba(34,197,94,0.12);border:1px solid rgba(34,197,94,0.35);color:var(--emerald);padding:9px 11px;border-radius:10px;font-size:12px;margin-bottom:10px;">${this.escapeHtml(this.activationSuccessMsg)}</div>`
+                : ""
+            }
+            <div class="coda-mono" style="background:#070709;border:1px solid #27272a;padding:10px;border-radius:10px;font-size:11px;margin-bottom:10px;word-break:break-all;">
+              在任意 Linux / Mac 终端执行后打开返回的激活链接：<br/>
+              <span style="color:var(--emerald);">${this.escapeHtml(installCmd)}</span>
+            </div>
+            <form id="quick-approve-form" style="display:flex;gap:8px;margin-bottom:12px;">
+              <input name="user_code" class="inp" style="margin:0;flex:1;" placeholder="输入终端设备码 如 ABCD-2345" />
+              <button type="submit" class="k-btn" style="padding:8px 12px;font-size:12px;white-space:nowrap;">授权接入</button>
+            </form>
             <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;">
               <button id="btn-gen-pair" class="k-btn" style="padding:8px 12px;font-size:12px;">+ 生成 6 位机器配对码</button>
               ${
@@ -885,6 +1194,50 @@ class CodaTerminalWebApp {
     document.getElementById("rail-more-btn")?.addEventListener("click", () => {
       this.showSettingsModal = true;
       this.render();
+    });
+    document.getElementById("btn-dismiss-activate")?.addEventListener("click", () => {
+      this.pendingActivationCode = "";
+      this.pendingDeviceInfo = null;
+      this.errorMsg = "";
+      window.history.replaceState({}, "", "/");
+      this.render();
+    });
+    document.getElementById("btn-approve-device")?.addEventListener("click", async () => {
+      try {
+        const dev = await this.api("/api/v1/auth/device/approve", "POST", {
+          user_code: this.pendingActivationCode,
+        });
+        this.pendingActivationCode = "";
+        this.pendingDeviceInfo = null;
+        this.errorMsg = "";
+        this.activationSuccessMsg = `✓ 已授权设备 ${dev.name} (${dev.platform})`;
+        window.history.replaceState({}, "", "/");
+        await this.refreshDevices();
+        this.selectedDaemon = this.devices.find((d) => d.id === dev.id) || this.selectedDaemon;
+        if (this.selectedDaemon?.is_online) {
+          this.queryDaemonOverview(this.selectedDaemon);
+          void this.tryNegotiateDirectLanWs(this.selectedDaemon);
+        }
+        this.render();
+      } catch (err: any) {
+        this.errorMsg = err.message;
+        this.render();
+      }
+    });
+    document.getElementById("quick-approve-form")?.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const fd = Object.fromEntries(new FormData(e.target as HTMLFormElement).entries()) as any;
+      const code = String(fd.user_code || "").trim();
+      if (!code) return;
+      try {
+        const dev = await this.api("/api/v1/auth/device/approve", "POST", { user_code: code });
+        this.activationSuccessMsg = `✓ 已授权设备 ${dev.name} (${dev.platform})`;
+        await this.refreshDevices();
+        this.render();
+      } catch (err: any) {
+        this.activationSuccessMsg = `✗ ${err.message}`;
+        this.render();
+      }
     });
     document.getElementById("btn-close-modal")?.addEventListener("click", () => {
       this.showSettingsModal = false;
