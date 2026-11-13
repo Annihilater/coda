@@ -5,7 +5,7 @@ use std::{
 
 use anyhow::Result;
 use clap::Parser;
-use coda_server::{relay::RelayHub, start_full_server};
+use coda_server::{relay::RelayHub, start_full_server_with_options, ServerOptions};
 use tracing::info;
 
 #[derive(Debug, Parser)]
@@ -42,6 +42,26 @@ struct Args {
     /// Static web assets directory (`web/dist`)
     #[arg(long, env = "CODA_WEB_DIST", default_value = "web/dist")]
     web_dist: PathBuf,
+
+    /// Allow anyone to register without an invite code (recommended for public portal)
+    #[arg(long, env = "CODA_OPEN_REGISTRATION", default_value_t = false)]
+    open_registration: bool,
+
+    /// Optional public Raw TCP relay endpoint (`host:port`); omit when behind Cloudflare Tunnel HTTPS
+    #[arg(long, env = "CODA_RAW_TCP_PUBLIC_ENDPOINT")]
+    raw_tcp_public_endpoint: Option<String>,
+
+    /// Release version advertised on the public download center (e.g. `v0.3.0`)
+    #[arg(long, env = "CODA_RELEASE_VERSION", default_value = concat!("v", env!("CARGO_PKG_VERSION")))]
+    release_version: String,
+
+    /// GitHub repository slug used to build download links
+    #[arg(long, env = "CODA_GITHUB_REPO", default_value = "Annihilater/coda")]
+    github_repo: String,
+
+    /// Optional iOS TestFlight / Ad-hoc OTA install URL
+    #[arg(long, env = "CODA_IOS_BETA_URL")]
+    ios_beta_url: Option<String>,
 
     /// Run ONLY as a stateless domestic relay node (zero PostgreSQL needed!)
     #[arg(long, default_value_t = false)]
@@ -138,13 +158,20 @@ async fn async_main(args: Args) -> Result<()> {
         return Ok(());
     }
 
-    let running = start_full_server(
+    let running = start_full_server_with_options(
         &args.database_url,
         args.http_bind,
         args.raw_tcp_bind,
         args.relay_secret.into_bytes(),
         args.public_url,
         Some(args.web_dist),
+        ServerOptions {
+            open_registration: args.open_registration,
+            raw_tcp_public_endpoint: args.raw_tcp_public_endpoint,
+            release_version: args.release_version,
+            github_repo: args.github_repo,
+            ios_beta_url: args.ios_beta_url,
+        },
     )
     .await?;
 

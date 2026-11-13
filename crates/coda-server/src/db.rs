@@ -63,6 +63,30 @@ pub struct RelayNodeRecord {
     pub priority: i32,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceAuthPublicInfo {
+    pub user_code: String,
+    pub device_name: String,
+    pub role: String,
+    pub platform: String,
+    pub status: String,
+    pub expires_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum DeviceAuthPollState {
+    Pending {
+        expires_in_secs: i64,
+    },
+    Approved {
+        session_token: String,
+        user: UserRecord,
+        device: DeviceRecord,
+    },
+    Expired,
+}
+
 #[derive(Clone)]
 pub struct Db {
     client: Arc<Client>,
@@ -102,15 +126,30 @@ impl Db {
         cdn_wss_endpoint: &str,
         server_pubkey: &str,
     ) -> Result<()> {
+        self.seed_smart_relays(raw_tcp_endpoint, true, cdn_wss_endpoint, server_pubkey)
+            .await
+    }
+
+    pub async fn seed_smart_relays(
+        &self,
+        raw_tcp_endpoint: &str,
+        raw_tcp_active: bool,
+        cdn_wss_endpoint: &str,
+        server_pubkey: &str,
+    ) -> Result<()> {
+        let wss_priority: i32 = if raw_tcp_active { 20 } else { 5 };
         self.client
             .execute(
                 r#"
                 INSERT INTO relay_nodes (id, region, mode, endpoint, node_pubkey, priority, is_active)
-                VALUES ('cn-direct-tcp', 'CN-BGP (No-ICP Raw TCP)', 'raw_tcp_no_sni', $1, $2, 10, TRUE)
+                VALUES ('cn-direct-tcp', 'CN-BGP (No-ICP Raw TCP)', 'raw_tcp_no_sni', $1, $2, 10, $3)
                 ON CONFLICT (id) DO UPDATE
-                SET endpoint = EXCLUDED.endpoint, node_pubkey = EXCLUDED.node_pubkey, updated_at = NOW()
+                SET endpoint = EXCLUDED.endpoint,
+                    node_pubkey = EXCLUDED.node_pubkey,
+                    is_active = EXCLUDED.is_active,
+                    updated_at = NOW()
                 "#,
-                &[&raw_tcp_endpoint, &server_pubkey],
+                &[&raw_tcp_endpoint, &server_pubkey, &raw_tcp_active],
             )
             .await?;
 
@@ -118,19 +157,32 @@ impl Db {
             .execute(
                 r#"
                 INSERT INTO relay_nodes (id, region, mode, endpoint, node_pubkey, priority, is_active)
-                VALUES ('global-cdn-wss', 'Global Edge CDN (WSS 443)', 'cdn_wss', $1, $2, 20, TRUE)
+                VALUES ('global-cdn-wss', 'Global Edge CDN / CF Tunnel (WSS 443)', 'cdn_wss', $1, $2, $3, TRUE)
                 ON CONFLICT (id) DO UPDATE
-                SET endpoint = EXCLUDED.endpoint, node_pubkey = EXCLUDED.node_pubkey, updated_at = NOW()
+                SET region = EXCLUDED.region,
+                    endpoint = EXCLUDED.endpoint,
+                    node_pubkey = EXCLUDED.node_pubkey,
+                    priority = EXCLUDED.priority,
+                    is_active = TRUE,
+                    updated_at = NOW()
                 "#,
-                &[&cdn_wss_endpoint, &server_pubkey],
+                &[&cdn_wss_endpoint, &server_pubkey, &wss_priority],
             )
             .await?;
         Ok(())
     }
 
+    pub async fn has_any_users(&self) -> Result<bool> {
+        let row = self
+            .client
+            .query_one("SELECT EXISTS(SELECT 1 FROM users)", &[])
+            .await?;
+        Ok(row.get(0))
+    }
+
     /// Registers a new user.
     /// - If `users` table is completely empty, this user becomes the Owner/Admin (`is_admin = true`) without needing an invite code.
-    /// - All subsequent users (friends) MUST supply a valid, non-exhausted `invite_code`.
+    /// - Subsequent users require a valid `invite_code` unless `open_registration` is enabled.
     pub async fn register_user(
         &self,
         email: &str,
@@ -138,6 +190,19 @@ impl Db {
         display_name: &str,
         password: &str,
         invite_code: Option<&str>,
+    ) -> Result<(UserRecord, String)> {
+        self.register_user_with_policy(email, handle, display_name, password, invite_code, false)
+            .await
+    }
+
+    pub async fn register_user_with_policy(
+        &self,
+        email: &str,
+        handle: &str,
+        display_name: &str,
+        password: &str,
+        invite_code: Option<&str>,
+        open_registration: bool,
     ) -> Result<(UserRecord, String)> {
         let email = email.trim().to_lowercase();
         let handle = handle.trim().to_lowercase();
@@ -158,27 +223,27 @@ impl Db {
         let user_count: i64 = count_row.get(0);
         let is_first_admin = user_count == 0;
 
+        let trimmed_invite = invite_code.map(str::trim).filter(|s| !s.is_empty());
         if !is_first_admin {
-            let code = invite_code
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .ok_or_else(|| anyhow!("invite_code is required to register on this server"))?;
-
-            let updated = self
-                .client
-                .execute(
-                    r#"
-                    UPDATE invite_codes
-                    SET used_count = used_count + 1
-                    WHERE code = $1
-                      AND used_count < max_uses
-                      AND (expires_at IS NULL OR expires_at > NOW())
-                    "#,
-                    &[&code],
-                )
-                .await?;
-            if updated == 0 {
-                bail!("invalid, expired, or exhausted invite code");
+            if let Some(code) = trimmed_invite {
+                let updated = self
+                    .client
+                    .execute(
+                        r#"
+                        UPDATE invite_codes
+                        SET used_count = used_count + 1
+                        WHERE code = $1
+                          AND used_count < max_uses
+                          AND (expires_at IS NULL OR expires_at > NOW())
+                        "#,
+                        &[&code],
+                    )
+                    .await?;
+                if updated == 0 {
+                    bail!("invalid, expired, or exhausted invite code");
+                }
+            } else if !open_registration {
+                bail!("invite_code is required to register on this server");
             }
         }
 
@@ -484,6 +549,8 @@ impl Db {
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, FALSE, NOW())
                 ON CONFLICT (ed25519_pubkey) DO UPDATE
                 SET name = EXCLUDED.name,
+                    role = EXCLUDED.role,
+                    platform = EXCLUDED.platform,
                     x25519_pubkey = EXCLUDED.x25519_pubkey,
                     endpoints_json = EXCLUDED.endpoints_json,
                     herdr_core_id = EXCLUDED.herdr_core_id,
@@ -602,6 +669,289 @@ impl Db {
             })
             .collect())
     }
+
+    pub async fn create_device_auth_request(
+        &self,
+        device_name: &str,
+        role: &str,
+        platform: &str,
+        ed25519_pubkey: &str,
+        x25519_pubkey: &str,
+        endpoints: &Value,
+        herdr_core_id: &str,
+        herdr_version: &str,
+        ttl_secs: i64,
+    ) -> Result<(String, String, DateTime<Utc>)> {
+        let device_code = format!("dev_{}_{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+        let user_code = generate_user_code();
+        let expires_at = Utc::now() + Duration::seconds(ttl_secs.max(60));
+        self.client
+            .execute(
+                r#"
+                INSERT INTO device_auth_requests (
+                    device_code, user_code, device_name, role, platform,
+                    ed25519_pubkey, x25519_pubkey, endpoints_json,
+                    herdr_core_id, herdr_version, status, expires_at
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'pending', $11)
+                "#,
+                &[
+                    &device_code,
+                    &user_code,
+                    &device_name,
+                    &role,
+                    &platform,
+                    &ed25519_pubkey,
+                    &x25519_pubkey,
+                    endpoints,
+                    &herdr_core_id,
+                    &herdr_version,
+                    &expires_at,
+                ],
+            )
+            .await?;
+        Ok((device_code, user_code, expires_at))
+    }
+
+    pub async fn get_device_auth_info(
+        &self,
+        user_code: &str,
+    ) -> Result<Option<DeviceAuthPublicInfo>> {
+        let normalized = normalize_user_code(user_code);
+        if normalized.is_empty() {
+            return Ok(None);
+        }
+        let row = self
+            .client
+            .query_opt(
+                r#"
+                SELECT user_code, device_name, role, platform, status, expires_at
+                FROM device_auth_requests
+                WHERE user_code = $1
+                "#,
+                &[&normalized],
+            )
+            .await?;
+        Ok(row.map(|r| {
+            let status: String = r.get(4);
+            let expires_at: DateTime<Utc> = r.get(5);
+            let effective_status = if status == "pending" && expires_at < Utc::now() {
+                "expired".to_string()
+            } else {
+                status
+            };
+            DeviceAuthPublicInfo {
+                user_code: r.get(0),
+                device_name: r.get(1),
+                role: r.get(2),
+                platform: r.get(3),
+                status: effective_status,
+                expires_at,
+            }
+        }))
+    }
+
+    pub async fn approve_device_auth(
+        &self,
+        user_id: Uuid,
+        user_code: &str,
+        device_name_override: Option<&str>,
+    ) -> Result<DeviceRecord> {
+        let normalized = normalize_user_code(user_code);
+        let row = self
+            .client
+            .query_opt(
+                r#"
+                SELECT device_code, device_name, role, platform,
+                       ed25519_pubkey, x25519_pubkey, endpoints_json,
+                       herdr_core_id, herdr_version, status, expires_at
+                FROM device_auth_requests
+                WHERE user_code = $1
+                "#,
+                &[&normalized],
+            )
+            .await?
+            .ok_or_else(|| anyhow!("device authorization code not found"))?;
+
+        let device_code: String = row.get(0);
+        let mut device_name: String = row.get(1);
+        let role: String = row.get(2);
+        let platform: String = row.get(3);
+        let ed25519_pubkey: String = row.get(4);
+        let x25519_pubkey: String = row.get(5);
+        let endpoints_json: Value = row.get(6);
+        let herdr_core_id: String = row.get(7);
+        let herdr_version: String = row.get(8);
+        let status: String = row.get(9);
+        let expires_at: DateTime<Utc> = row.get(10);
+
+        if status != "pending" {
+            bail!("device authorization code is already {status}");
+        }
+        if expires_at < Utc::now() {
+            let _ = self
+                .client
+                .execute(
+                    "UPDATE device_auth_requests SET status = 'expired' WHERE device_code = $1",
+                    &[&device_code],
+                )
+                .await;
+            bail!("device authorization code expired");
+        }
+
+        if let Some(override_name) = device_name_override.map(str::trim).filter(|s| !s.is_empty()) {
+            device_name = override_name.to_string();
+        }
+
+        let device = self
+            .upsert_device(
+                user_id,
+                &device_name,
+                &role,
+                &platform,
+                &ed25519_pubkey,
+                &x25519_pubkey,
+                &endpoints_json,
+                Some(herdr_core_id.as_str()).filter(|s| !s.is_empty()),
+                Some(herdr_version.as_str()).filter(|s| !s.is_empty()),
+            )
+            .await?;
+
+        let token = self
+            .issue_session_token(user_id, &format!("device:{}", device.name))
+            .await?;
+
+        self.client
+            .execute(
+                r#"
+                UPDATE device_auth_requests
+                SET status = 'approved',
+                    approved_user_id = $2,
+                    issued_session_token = $3,
+                    issued_device_id = $4,
+                    device_name = $5
+                WHERE device_code = $1
+                "#,
+                &[
+                    &device_code,
+                    &user_id,
+                    &token,
+                    &device.id,
+                    &device.name,
+                ],
+            )
+            .await?;
+
+        Ok(device)
+    }
+
+    pub async fn poll_device_auth(&self, device_code: &str) -> Result<DeviceAuthPollState> {
+        let row = self
+            .client
+            .query_opt(
+                r#"
+                SELECT status, approved_user_id, issued_session_token, issued_device_id, expires_at
+                FROM device_auth_requests
+                WHERE device_code = $1
+                "#,
+                &[&device_code],
+            )
+            .await?;
+
+        let Some(row) = row else {
+            return Ok(DeviceAuthPollState::Expired);
+        };
+
+        let status: String = row.get(0);
+        let approved_user_id: Option<Uuid> = row.get(1);
+        let session_token: String = row.get(2);
+        let issued_device_id: Option<Uuid> = row.get(3);
+        let expires_at: DateTime<Utc> = row.get(4);
+
+        if status == "pending" {
+            let remaining = (expires_at - Utc::now()).num_seconds();
+            if remaining <= 0 {
+                let _ = self
+                    .client
+                    .execute(
+                        "UPDATE device_auth_requests SET status = 'expired' WHERE device_code = $1",
+                        &[&device_code],
+                    )
+                    .await;
+                return Ok(DeviceAuthPollState::Expired);
+            }
+            return Ok(DeviceAuthPollState::Pending {
+                expires_in_secs: remaining,
+            });
+        }
+
+        if status == "approved" {
+            if let (Some(user_id), Some(device_id)) = (approved_user_id, issued_device_id) {
+                if !session_token.is_empty() {
+                    let user_row = self
+                        .client
+                        .query_one(
+                            "SELECT id, email, handle, display_name, is_admin, bandwidth_quota_mbps, created_at FROM users WHERE id = $1",
+                            &[&user_id],
+                        )
+                        .await?;
+                    let user = UserRecord {
+                        id: user_row.get(0),
+                        email: user_row.get(1),
+                        handle: user_row.get(2),
+                        display_name: user_row.get(3),
+                        is_admin: user_row.get(4),
+                        bandwidth_quota_mbps: user_row.get(5),
+                        created_at: user_row.get(6),
+                    };
+                    let device = self
+                        .get_device_by_id(device_id)
+                        .await?
+                        .ok_or_else(|| anyhow!("issued device not found"))?;
+                    self.client
+                        .execute(
+                            "UPDATE device_auth_requests SET status = 'consumed', issued_session_token = '' WHERE device_code = $1",
+                            &[&device_code],
+                        )
+                        .await?;
+                    return Ok(DeviceAuthPollState::Approved {
+                        session_token,
+                        user,
+                        device,
+                    });
+                }
+            }
+        }
+
+        Ok(DeviceAuthPollState::Expired)
+    }
+}
+
+pub fn normalize_user_code(raw: &str) -> String {
+    let cleaned: String = raw
+        .trim()
+        .to_uppercase()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect();
+    if cleaned.len() == 8 {
+        format!("{}-{}", &cleaned[..4], &cleaned[4..])
+    } else if raw.contains('-') {
+        raw.trim().to_uppercase()
+    } else {
+        cleaned
+    }
+}
+
+fn generate_user_code() -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    let mut rng = rand::thread_rng();
+    let mut part = |len: usize| -> String {
+        (0..len)
+            .map(|_| ALPHABET[rng.gen_range(0..ALPHABET.len())] as char)
+            .collect()
+    };
+    format!("{}-{}", part(4), part(4))
 }
 
 fn map_device_row(row: &tokio_postgres::Row) -> DeviceRecord {

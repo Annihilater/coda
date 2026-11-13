@@ -49,9 +49,37 @@ pub struct DaemonRelayEntry {
 pub struct DaemonConfig {
     pub server_url: String,
     pub owner_handle: String,
+    #[serde(default)]
+    pub owner_email: Option<String>,
+    #[serde(default)]
+    pub session_token: Option<String>,
     pub device_id: Uuid,
     pub daemon_relay_ticket: String,
     pub relays: Vec<DaemonRelayEntry>,
+    pub identity: StoredDeviceIdentity,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteHostSummary {
+    pub id: Uuid,
+    pub name: String,
+    pub role: String,
+    pub platform: String,
+    pub x25519_pubkey: String,
+    #[serde(default)]
+    pub endpoints: Vec<NetworkEndpointCandidate>,
+    pub is_online: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct DeviceAuthStartResult {
+    pub server_url: String,
+    pub device_code: String,
+    pub user_code: String,
+    pub verification_uri: String,
+    pub verification_uri_complete: String,
+    pub expires_in_secs: i64,
+    pub interval_secs: u64,
     pub identity: StoredDeviceIdentity,
 }
 
@@ -199,10 +227,354 @@ pub async fn pair_daemon_with_code(
     Ok(DaemonConfig {
         server_url: server_url.trim_end_matches('/').to_string(),
         owner_handle,
+        owner_email: None,
+        session_token: None,
         device_id,
         daemon_relay_ticket,
         relays,
         identity,
+    })
+}
+
+fn detect_platform_name() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "macos"
+    } else if cfg!(target_os = "windows") {
+        "windows"
+    } else {
+        "linux"
+    }
+}
+
+fn is_loopback_endpoint(endpoint: &str) -> bool {
+    let lower = endpoint.trim().to_ascii_lowercase();
+    lower.starts_with("127.0.0.1:")
+        || lower.starts_with("localhost:")
+        || lower.starts_with("0.0.0.0:")
+        || lower.starts_with("http://127.0.0.1")
+        || lower.starts_with("http://localhost")
+}
+
+fn parse_relays_value(val: &serde_json::Value) -> Vec<DaemonRelayEntry> {
+    val.as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|v| {
+            Some(DaemonRelayEntry {
+                id: v["id"].as_str()?.to_string(),
+                mode: v["mode"].as_str()?.to_string(),
+                endpoint: v["endpoint"].as_str()?.to_string(),
+            })
+        })
+        .collect()
+}
+
+/// Starts an RFC 8628-style browser device authorization request.
+/// Works without reading stdin so `curl ... | sh` pipes work seamlessly.
+pub async fn start_device_login_flow(
+    server_url: &str,
+    role: &str,
+    custom_name: Option<String>,
+    existing_identity: Option<StoredDeviceIdentity>,
+) -> Result<DeviceAuthStartResult> {
+    let clean_server = server_url.trim().trim_end_matches('/').to_string();
+    let hostname = custom_name.unwrap_or_else(detect_hostname);
+    let mut identity = existing_identity.unwrap_or_else(|| StoredDeviceIdentity::generate(&hostname));
+    identity.name = hostname.clone();
+
+    let (herdr_id, herdr_ver) = match HerdrClient::connect_default().await {
+        Ok(hc) => (
+            Some(hc.info().core_id.clone()),
+            Some(hc.info().version.clone()),
+        ),
+        Err(_) => (None, None),
+    };
+    let endpoints = discover_local_endpoints();
+
+    let http = reqwest::Client::new();
+    let url = format!("{clean_server}/api/v1/auth/device/start");
+    let resp = http
+        .post(&url)
+        .json(&json!({
+            "device_name": hostname,
+            "role": role,
+            "platform": detect_platform_name(),
+            "ed25519_pubkey": identity.ed25519_public_b64,
+            "x25519_pubkey": identity.x25519_public_b64,
+            "endpoints": endpoints,
+            "herdr_core_id": herdr_id,
+            "herdr_version": herdr_ver,
+        }))
+        .send()
+        .await?
+        .error_for_status()
+        .context("failed starting browser device authorization")?
+        .json::<serde_json::Value>()
+        .await?;
+
+    Ok(DeviceAuthStartResult {
+        server_url: clean_server,
+        device_code: resp["device_code"]
+            .as_str()
+            .ok_or_else(|| anyhow!("missing device_code"))?
+            .to_string(),
+        user_code: resp["user_code"]
+            .as_str()
+            .ok_or_else(|| anyhow!("missing user_code"))?
+            .to_string(),
+        verification_uri: resp["verification_uri"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string(),
+        verification_uri_complete: resp["verification_uri_complete"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string(),
+        expires_in_secs: resp["expires_in_secs"].as_i64().unwrap_or(600),
+        interval_secs: resp["interval_secs"].as_u64().unwrap_or(2).max(1),
+        identity,
+    })
+}
+
+/// Polls `/api/v1/auth/device/poll` once; returns `Ok(Some(cfg))` when approved, `Ok(None)` while pending.
+pub async fn poll_device_login_once(started: &DeviceAuthStartResult) -> Result<Option<DaemonConfig>> {
+    let http = reqwest::Client::new();
+    let url = format!("{}/api/v1/auth/device/poll", started.server_url);
+    let resp = http
+        .post(&url)
+        .json(&json!({ "device_code": started.device_code }))
+        .send()
+        .await?
+        .error_for_status()
+        .context("device authorization poll failed")?
+        .json::<serde_json::Value>()
+        .await?;
+
+    match resp["state"].as_str().unwrap_or("expired") {
+        "pending" => Ok(None),
+        "approved" => {
+            let device_id: Uuid = serde_json::from_value(resp["device"]["id"].clone())?;
+            let mut identity = started.identity.clone();
+            identity.device_id = Some(device_id);
+            if let Some(name) = resp["device"]["name"].as_str() {
+                identity.name = name.to_string();
+            }
+            let owner_handle = resp["owner_handle"]
+                .as_str()
+                .or_else(|| resp["user"]["handle"].as_str())
+                .unwrap_or("owner")
+                .to_string();
+            let owner_email = resp["user"]["email"].as_str().map(|s| s.to_string());
+            let session_token = resp["session_token"].as_str().map(|s| s.to_string());
+            let daemon_relay_ticket = resp["daemon_relay_ticket"]
+                .as_str()
+                .ok_or_else(|| anyhow!("missing daemon_relay_ticket"))?
+                .to_string();
+            let relays = parse_relays_value(&resp["relays"]);
+            Ok(Some(DaemonConfig {
+                server_url: started.server_url.clone(),
+                owner_handle,
+                owner_email,
+                session_token,
+                device_id,
+                daemon_relay_ticket,
+                relays,
+                identity,
+            }))
+        }
+        other => anyhow::bail!("device authorization {other}; run login again"),
+    }
+}
+
+/// Polls `/api/v1/auth/device/poll` until the user clicks "Authorize" in the browser or the code expires.
+pub async fn poll_device_login_until_approved(
+    started: &DeviceAuthStartResult,
+) -> Result<DaemonConfig> {
+    let deadline = tokio::time::Instant::now()
+        + std::time::Duration::from_secs(started.expires_in_secs.max(30) as u64);
+    let step = std::time::Duration::from_secs(started.interval_secs.max(1));
+    loop {
+        if let Some(cfg) = poll_device_login_once(started).await? {
+            return Ok(cfg);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!("device authorization timed out waiting for browser confirmation");
+        }
+        tokio::time::sleep(step).await;
+    }
+}
+
+/// Logs in directly using email/handle + password and enrolls this device as a `daemon` or `hybrid` host.
+pub async fn login_with_password_and_enroll(
+    server_url: &str,
+    email_or_handle: &str,
+    password: &str,
+    role: &str,
+    custom_name: Option<String>,
+) -> Result<DaemonConfig> {
+    let clean_server = server_url.trim().trim_end_matches('/').to_string();
+    let http = reqwest::Client::new();
+    let login_resp = http
+        .post(format!("{clean_server}/api/v1/auth/login"))
+        .json(&json!({
+            "email_or_handle": email_or_handle,
+            "password": password,
+            "client_label": format!("{}-{}", detect_platform_name(), role),
+        }))
+        .send()
+        .await?
+        .error_for_status()
+        .context("login rejected by server")?
+        .json::<serde_json::Value>()
+        .await?;
+
+    let token = login_resp["token"]
+        .as_str()
+        .ok_or_else(|| anyhow!("missing session token"))?
+        .to_string();
+    let owner_email = login_resp["user"]["email"].as_str().map(|s| s.to_string());
+
+    let hostname = custom_name.unwrap_or_else(detect_hostname);
+    let mut identity = StoredDeviceIdentity::generate(&hostname);
+    let (herdr_id, herdr_ver) = match HerdrClient::connect_default().await {
+        Ok(hc) => (
+            Some(hc.info().core_id.clone()),
+            Some(hc.info().version.clone()),
+        ),
+        Err(_) => (None, None),
+    };
+    let endpoints = discover_local_endpoints();
+
+    let enroll_resp = http
+        .post(format!("{clean_server}/api/v1/devices/enroll-host"))
+        .bearer_auth(&token)
+        .json(&json!({
+            "name": hostname,
+            "role": role,
+            "platform": detect_platform_name(),
+            "ed25519_pubkey": identity.ed25519_public_b64,
+            "x25519_pubkey": identity.x25519_public_b64,
+            "endpoints": endpoints,
+            "herdr_core_id": herdr_id,
+            "herdr_version": herdr_ver,
+        }))
+        .send()
+        .await?
+        .error_for_status()
+        .context("host enrollment rejected by server")?
+        .json::<serde_json::Value>()
+        .await?;
+
+    let device_id: Uuid = serde_json::from_value(enroll_resp["device"]["id"].clone())?;
+    identity.device_id = Some(device_id);
+    let owner_handle = enroll_resp["owner_handle"]
+        .as_str()
+        .unwrap_or("owner")
+        .to_string();
+    let daemon_relay_ticket = enroll_resp["daemon_relay_ticket"]
+        .as_str()
+        .ok_or_else(|| anyhow!("missing daemon_relay_ticket"))?
+        .to_string();
+    let relays = parse_relays_value(&enroll_resp["relays"]);
+
+    Ok(DaemonConfig {
+        server_url: clean_server,
+        owner_handle,
+        owner_email,
+        session_token: Some(token),
+        device_id,
+        daemon_relay_ticket,
+        relays,
+        identity,
+    })
+}
+
+/// Fetches all remote controllable hosts (`daemon` and `hybrid`) under this account.
+pub async fn list_account_hosts(
+    server_url: &str,
+    session_token: &str,
+) -> Result<Vec<RemoteHostSummary>> {
+    let clean_server = server_url.trim().trim_end_matches('/');
+    let http = reqwest::Client::new();
+    let raw = http
+        .get(format!("{clean_server}/api/v1/devices"))
+        .bearer_auth(session_token)
+        .send()
+        .await?
+        .error_for_status()
+        .context("failed listing account devices")?
+        .json::<Vec<serde_json::Value>>()
+        .await?;
+
+    let mut out = Vec::new();
+    for item in raw {
+        let role = item["role"].as_str().unwrap_or("");
+        if role != "daemon" && role != "hybrid" {
+            continue;
+        }
+        let Ok(id) = serde_json::from_value::<Uuid>(item["id"].clone()) else {
+            continue;
+        };
+        let endpoints: Vec<NetworkEndpointCandidate> =
+            serde_json::from_value(item["endpoints_json"].clone()).unwrap_or_default();
+        out.push(RemoteHostSummary {
+            id,
+            name: item["name"].as_str().unwrap_or("coda-host").to_string(),
+            role: role.to_string(),
+            platform: item["platform"].as_str().unwrap_or("linux").to_string(),
+            x25519_pubkey: item["x25519_pubkey"].as_str().unwrap_or("").to_string(),
+            endpoints,
+            is_online: item["is_online"].as_bool().unwrap_or(false),
+        });
+    }
+    Ok(out)
+}
+
+/// Mints a short-lived relay ticket to connect this device to a remote peer host under the same user.
+pub async fn mint_peer_relay_config(
+    server_url: &str,
+    session_token: &str,
+    src_device_id: Uuid,
+    target_device_id: Uuid,
+    peer_x25519_pub_b64: &str,
+) -> Result<SmartRelayFallbackConfig> {
+    let clean_server = server_url.trim().trim_end_matches('/');
+    let remote_server = clean_server.starts_with("https://") || !is_loopback_endpoint(clean_server.trim_start_matches("http://"));
+    let http = reqwest::Client::new();
+    let resp = http
+        .post(format!("{clean_server}/api/v1/relay/ticket"))
+        .bearer_auth(session_token)
+        .json(&json!({
+            "device_id": src_device_id,
+            "peer_device_id": target_device_id,
+        }))
+        .send()
+        .await?
+        .error_for_status()
+        .context("failed minting peer relay ticket")?
+        .json::<serde_json::Value>()
+        .await?;
+
+    let relay_ticket = resp["ticket"]
+        .as_str()
+        .ok_or_else(|| anyhow!("missing relay ticket"))?
+        .to_string();
+    let relays = parse_relays_value(&resp["relays"]);
+    let raw_tcp_addr = relays
+        .iter()
+        .find(|r| r.mode == "raw_tcp_no_sni" && !(remote_server && is_loopback_endpoint(&r.endpoint)))
+        .map(|r| r.endpoint.clone());
+    let wss_url = relays
+        .iter()
+        .find(|r| r.mode == "cdn_wss")
+        .map(|r| r.endpoint.clone());
+
+    Ok(SmartRelayFallbackConfig {
+        raw_tcp_addr,
+        wss_url,
+        relay_ticket,
+        peer_x25519_pub_b64: peer_x25519_pub_b64.to_string(),
     })
 }
 
@@ -217,17 +589,24 @@ pub async fn run_daemon_once_with_p2p(
     prefer_mode: Option<&str>,
     p2p_port: Option<u16>,
 ) -> Result<()> {
-    let chosen = cfg
+    let remote_server = cfg.server_url.starts_with("https://")
+        || !is_loopback_endpoint(cfg.server_url.trim_start_matches("http://"));
+    let mut candidates: Vec<&DaemonRelayEntry> = cfg
         .relays
         .iter()
-        .find(|r| prefer_mode.map_or(true, |m| r.mode == m))
-        .or_else(|| cfg.relays.first())
-        .ok_or_else(|| anyhow!("no relay nodes configured"))?;
-
-    info!(
-        "Connecting Coda Daemon `{}` ({}) via {} [{}]",
-        cfg.identity.name, cfg.device_id, chosen.endpoint, chosen.mode
-    );
+        .filter(|r| {
+            if let Some(m) = prefer_mode {
+                return r.mode == m;
+            }
+            !(remote_server && r.mode == "raw_tcp_no_sni" && is_loopback_endpoint(&r.endpoint))
+        })
+        .collect();
+    if candidates.is_empty() {
+        candidates = cfg.relays.iter().collect();
+    }
+    if candidates.is_empty() {
+        anyhow::bail!("no relay nodes configured");
+    }
 
     let (out_tx, mut out_rx) = mpsc::channel::<RelayWireFrame>(256);
     let (in_tx, mut in_rx) = mpsc::channel::<RelayWireFrame>(256);
@@ -238,75 +617,133 @@ pub async fn run_daemon_once_with_p2p(
         generation: 1,
     };
 
-    if chosen.mode == "raw_tcp_no_sni" {
-        let stream = TcpStream::connect(&chosen.endpoint)
-            .await
-            .with_context(|| format!("failed connecting raw TCP relay {}", chosen.endpoint))?;
-        let _ = stream.set_nodelay(true);
-        let (mut reader, mut writer) = stream.into_split();
-        writer
-            .write_all(&bind_frame.encode_length_delimited()?)
-            .await?;
+    let mut connected = false;
+    let mut last_err: Option<anyhow::Error> = None;
 
-        let ack = read_raw_frame(&mut reader).await?;
-        match ack {
-            RelayWireFrame::AuthAck { ok: true, .. } => {}
-            other => anyhow::bail!("unexpected raw TCP relay auth response: {other:?}"),
-        }
+    for chosen in candidates {
+        info!(
+            "Connecting Coda Daemon `{}` ({}) via {} [{}]",
+            cfg.identity.name, cfg.device_id, chosen.endpoint, chosen.mode
+        );
 
-        tokio::spawn(async move {
-            while let Some(f) = out_rx.recv().await {
-                if let Ok(bytes) = f.encode_length_delimited() {
-                    if writer.write_all(&bytes).await.is_err() {
-                        break;
-                    }
+        if chosen.mode == "raw_tcp_no_sni" {
+            let conn_res = tokio::time::timeout(
+                std::time::Duration::from_secs(4),
+                TcpStream::connect(&chosen.endpoint),
+            )
+            .await;
+            let stream = match conn_res {
+                Ok(Ok(s)) => s,
+                Ok(Err(e)) => {
+                    warn!("raw TCP relay {} failed ({e}); trying next relay", chosen.endpoint);
+                    last_err = Some(e.into());
+                    continue;
+                }
+                Err(_) => {
+                    warn!("raw TCP relay {} timed out; trying next relay", chosen.endpoint);
+                    last_err = Some(anyhow!("raw TCP relay {} timed out", chosen.endpoint));
+                    continue;
+                }
+            };
+            let _ = stream.set_nodelay(true);
+            let (mut reader, mut writer) = stream.into_split();
+            writer
+                .write_all(&bind_frame.encode_length_delimited()?)
+                .await?;
+
+            let ack = read_raw_frame(&mut reader).await?;
+            match ack {
+                RelayWireFrame::AuthAck { ok: true, .. } => {}
+                other => {
+                    last_err = Some(anyhow!("unexpected raw TCP relay auth response: {other:?}"));
+                    continue;
                 }
             }
-        });
 
-        tokio::spawn(async move {
-            while let Ok(f) = read_raw_frame(&mut reader).await {
-                if in_tx.send(f).await.is_err() {
-                    break;
-                }
-            }
-        });
-    } else {
-        let (ws_stream, _) = connect_async(&chosen.endpoint)
-            .await
-            .with_context(|| format!("failed connecting WSS relay {}", chosen.endpoint))?;
-        let (mut sink, mut stream) = ws_stream.split();
-        sink.send(WsMsg::Text(serde_json::to_string(&bind_frame)?.into()))
-            .await?;
-
-        if let Some(Ok(WsMsg::Text(txt))) = stream.next().await {
-            let ack: RelayWireFrame = serde_json::from_str(&txt)?;
-            if !matches!(ack, RelayWireFrame::AuthAck { ok: true, .. }) {
-                anyhow::bail!("unexpected WSS relay auth response: {ack:?}");
-            }
-        }
-
-        tokio::spawn(async move {
-            while let Some(f) = out_rx.recv().await {
-                if let Ok(txt) = serde_json::to_string(&f) {
-                    if sink.send(WsMsg::Text(txt.into())).await.is_err() {
-                        break;
-                    }
-                }
-            }
-        });
-
-        tokio::spawn(async move {
-            while let Some(Ok(msg)) = stream.next().await {
-                if let WsMsg::Text(t) = msg {
-                    if let Ok(f) = serde_json::from_str::<RelayWireFrame>(&t) {
-                        if in_tx.send(f).await.is_err() {
+            let in_tx_c = in_tx.clone();
+            tokio::spawn(async move {
+                while let Some(f) = out_rx.recv().await {
+                    if let Ok(bytes) = f.encode_length_delimited() {
+                        if writer.write_all(&bytes).await.is_err() {
                             break;
                         }
                     }
                 }
+            });
+
+            tokio::spawn(async move {
+                while let Ok(f) = read_raw_frame(&mut reader).await {
+                    if in_tx_c.send(f).await.is_err() {
+                        break;
+                    }
+                }
+            });
+            connected = true;
+            break;
+        } else {
+            let ws_res = tokio::time::timeout(
+                std::time::Duration::from_secs(6),
+                connect_async(&chosen.endpoint),
+            )
+            .await;
+            let (ws_stream, _) = match ws_res {
+                Ok(Ok(pair)) => pair,
+                Ok(Err(e)) => {
+                    warn!("WSS relay {} failed ({e}); trying next relay", chosen.endpoint);
+                    last_err = Some(e.into());
+                    continue;
+                }
+                Err(_) => {
+                    warn!("WSS relay {} timed out; trying next relay", chosen.endpoint);
+                    last_err = Some(anyhow!("WSS relay {} timed out", chosen.endpoint));
+                    continue;
+                }
+            };
+            let (mut sink, mut stream) = ws_stream.split();
+            sink.send(WsMsg::Text(serde_json::to_string(&bind_frame)?.into()))
+                .await?;
+
+            if let Some(Ok(WsMsg::Text(txt))) = stream.next().await {
+                let ack: RelayWireFrame = serde_json::from_str(&txt)?;
+                if !matches!(ack, RelayWireFrame::AuthAck { ok: true, .. }) {
+                    last_err = Some(anyhow!("unexpected WSS relay auth response: {ack:?}"));
+                    continue;
+                }
+            } else {
+                last_err = Some(anyhow!("WSS relay closed before AuthAck"));
+                continue;
             }
-        });
+
+            let in_tx_c = in_tx.clone();
+            tokio::spawn(async move {
+                while let Some(f) = out_rx.recv().await {
+                    if let Ok(txt) = serde_json::to_string(&f) {
+                        if sink.send(WsMsg::Text(txt.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            });
+
+            tokio::spawn(async move {
+                while let Some(Ok(msg)) = stream.next().await {
+                    if let WsMsg::Text(t) = msg {
+                        if let Ok(f) = serde_json::from_str::<RelayWireFrame>(&t) {
+                            if in_tx_c.send(f).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+            connected = true;
+            break;
+        }
+    }
+
+    drop(in_tx);
+    if !connected {
+        return Err(last_err.unwrap_or_else(|| anyhow!("all relay endpoints failed")));
     }
 
     let endpoint_watcher = if let Some(port) = p2p_port {
@@ -1506,7 +1943,12 @@ impl RelayClientConn {
         };
 
         if let Some(ref raw_addr) = cfg.raw_tcp_addr {
-            if let Ok(stream) = TcpStream::connect(raw_addr).await {
+            if let Ok(Ok(stream)) = tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                TcpStream::connect(raw_addr),
+            )
+            .await
+            {
                 let _ = stream.set_nodelay(true);
                 let (mut reader, mut writer) = stream.into_split();
                 writer.write_all(&bind.encode_length_delimited()?).await?;

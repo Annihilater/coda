@@ -84,3 +84,25 @@ CREATE TABLE IF NOT EXISTS relay_nodes (
     is_active BOOLEAN NOT NULL DEFAULT TRUE,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- 7. RFC 8628 Device Authorization Requests (Browser Approval for CLI / Desktop / Mobile)
+CREATE TABLE IF NOT EXISTS device_auth_requests (
+    device_code TEXT PRIMARY KEY,
+    user_code TEXT NOT NULL UNIQUE,
+    device_name TEXT NOT NULL,
+    role TEXT NOT NULL DEFAULT 'daemon' CHECK (role IN ('daemon', 'client', 'hybrid')),
+    platform TEXT NOT NULL DEFAULT 'linux',
+    ed25519_pubkey TEXT NOT NULL DEFAULT '',
+    x25519_pubkey TEXT NOT NULL DEFAULT '',
+    endpoints_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+    herdr_core_id TEXT NOT NULL DEFAULT '',
+    herdr_version TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'consumed', 'expired')),
+    approved_user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+    issued_session_token TEXT NOT NULL DEFAULT '',
+    issued_device_id UUID REFERENCES devices(id) ON DELETE SET NULL,
+    expires_at TIMESTAMPTZ NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_device_auth_user_code ON device_auth_requests (user_code, expires_at);

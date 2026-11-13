@@ -1,9 +1,11 @@
-use std::net::SocketAddr;
+use std::{net::SocketAddr, sync::OnceLock};
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use coda_daemon::{
-    discover_local_endpoints_with_port, spawn_direct_p2p_listener, spawn_lan_udp_beacon,
-    DirectP2pClient, SmartPeerClient, SmartRelayFallbackConfig,
+    discover_local_endpoints_with_port, list_account_hosts, mint_peer_relay_config,
+    poll_device_login_once, run_daemon_once_with_p2p, spawn_direct_p2p_listener,
+    spawn_lan_udp_beacon, start_device_login_flow, DirectP2pClient, SmartPeerClient,
+    SmartRelayFallbackConfig,
 };
 use coda_herdr::{discover_hc_binary, HerdrClient};
 use coda_protocol::{
@@ -11,19 +13,24 @@ use coda_protocol::{
     TrafficLane, VoiceModelConfig,
 };
 use coda_server::{
-    db::{DeviceRecord, InviteCodeRecord},
-    start_full_server, AuthResponse, MintRelayTicketResponse, PairTokenResponse,
+    db::{DeviceAuthPublicInfo, DeviceRecord, InviteCodeRecord},
+    start_full_server, start_full_server_with_options, AuthResponse, MintRelayTicketResponse,
+    PairTokenResponse, ServerOptions,
 };
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
+    sync::Mutex,
 };
 use tokio_tungstenite::{connect_async, tungstenite::Message as WsMsg};
 
+static DB_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
 #[tokio::test]
 async fn test_multi_tenant_postgres_and_raw_tcp_e2ee_herdr_tunnel() {
+    let _guard = DB_TEST_LOCK.get_or_init(|| Mutex::new(())).lock().await;
     let db_url = std::env::var("TEST_DATABASE_URL")
         .unwrap_or_else(|_| "postgres://vampire@localhost:5432/coda_test".to_string());
 
@@ -40,7 +47,7 @@ async fn test_multi_tenant_postgres_and_raw_tcp_e2ee_herdr_tunnel() {
         let _ = conn.await;
     });
     pg.batch_execute(
-        "TRUNCATE pairing_tokens, devices, auth_sessions, invite_codes, users RESTART IDENTITY CASCADE;",
+        "TRUNCATE device_auth_requests, pairing_tokens, devices, auth_sessions, invite_codes, users RESTART IDENTITY CASCADE;",
     )
     .await
     .unwrap();
@@ -904,6 +911,250 @@ async fn test_multi_tenant_postgres_and_raw_tcp_e2ee_herdr_tunnel() {
     }
     assert!(!smart.is_direct_p2p());
     assert_eq!(smart.active_route(), "relay_raw_tcp");
+
+    daemon_task.abort();
+}
+
+#[tokio::test]
+async fn test_open_portal_device_code_rfc8628_and_cloudflare_wss_mesh() {
+    let _guard = DB_TEST_LOCK.get_or_init(|| Mutex::new(())).lock().await;
+    let db_url = std::env::var("TEST_DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://vampire@localhost:5432/coda_test".to_string());
+
+    let _ = coda_server::db::Db::connect_and_migrate(&db_url)
+        .await
+        .expect("PostgreSQL coda_test should be reachable");
+
+    let (pg, conn) = tokio_postgres::connect(&db_url, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    pg.batch_execute(
+        "TRUNCATE device_auth_requests, pairing_tokens, devices, auth_sessions, invite_codes, users RESTART IDENTITY CASCADE;",
+    )
+    .await
+    .unwrap();
+
+    let server = start_full_server_with_options(
+        &db_url,
+        "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+        "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+        b"cf-wss-device-flow-secret-2026".to_vec(),
+        None,
+        None,
+        ServerOptions {
+            open_registration: true,
+            raw_tcp_public_endpoint: None,
+            release_version: "v0.3.0".into(),
+            github_repo: "Annihilater/coda".into(),
+            ios_beta_url: Some("https://testflight.apple.com/join/CodaBeta".into()),
+        },
+    )
+    .await
+    .unwrap();
+
+    let base = format!("http://{}", server.http_addr);
+    let http = reqwest::Client::new();
+
+    // 1. Public unauthenticated portal metadata + Cloudflare forwarded header detection
+    let site: serde_json::Value = http
+        .get(format!("{base}/api/v1/public/site-info"))
+        .header("x-forwarded-host", "coda.example.com")
+        .header("cf-visitor", r#"{"scheme":"https"}"#)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(site["open_registration"], true);
+    assert_eq!(
+        site["install_command"],
+        "curl -fsSL https://coda.example.com/install.sh | sh"
+    );
+    assert!(site["downloads"]["desktop_macos_dmg"]
+        .as_str()
+        .unwrap()
+        .ends_with("Coda-Desktop-macos-aarch64-v0.3.0.dmg"));
+    let relays = site["relays"].as_array().unwrap();
+    assert!(!relays.iter().any(|r| r["mode"] == "raw_tcp_no_sni"));
+    assert!(relays
+        .iter()
+        .any(|r| r["endpoint"] == "wss://coda.example.com/v1/tunnel/ws"));
+
+    let install_sh = http
+        .get(format!("{base}/install.sh"))
+        .header("x-forwarded-host", "coda.example.com")
+        .header("cf-visitor", r#"{"scheme":"https"}"#)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(install_sh.contains("DEFAULT_SERVER_URL=\"https://coda.example.com\""));
+
+    // 2. Open registration works even for 2nd user without invite code
+    let _first: AuthResponse = http
+        .post(format!("{base}/api/v1/auth/register"))
+        .json(&json!({
+            "email": "admin@coda.dev",
+            "handle": "admin",
+            "display_name": "Admin",
+            "password": "password123",
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let alice: AuthResponse = http
+        .post(format!("{base}/api/v1/auth/register"))
+        .json(&json!({
+            "email": "alice@coda.dev",
+            "handle": "alice",
+            "display_name": "Alice",
+            "password": "password123",
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(!alice.user.is_admin);
+
+    // 3. RFC 8628 browser device authorization for Linux daemon + macOS hybrid desktop
+    let linux_started =
+        start_device_login_flow(&base, "daemon", Some("Aliyun-Dev-Box".into()), None)
+            .await
+            .unwrap();
+    assert!(linux_started
+        .verification_uri_complete
+        .contains(&linux_started.user_code));
+
+    let info: DeviceAuthPublicInfo = http
+        .get(format!(
+            "{base}/api/v1/auth/device/info?code={}",
+            linux_started.user_code
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(info.device_name, "Aliyun-Dev-Box");
+    assert_eq!(info.status, "pending");
+
+    let pending_cfg = poll_device_login_once(&linux_started).await.unwrap();
+    assert!(pending_cfg.is_none());
+
+    http.post(format!("{base}/api/v1/auth/device/approve"))
+        .bearer_auth(&alice.token)
+        .json(&json!({ "user_code": linux_started.user_code }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    let linux_cfg = poll_device_login_once(&linux_started)
+        .await
+        .unwrap()
+        .expect("linux daemon should now be approved");
+    assert_eq!(linux_cfg.owner_handle, "alice");
+    assert!(linux_cfg.session_token.is_some());
+
+    let mac_started =
+        start_device_login_flow(&base, "hybrid", Some("Alice-MacBook".into()), None)
+            .await
+            .unwrap();
+    http.post(format!("{base}/api/v1/auth/device/approve"))
+        .bearer_auth(&alice.token)
+        .json(&json!({ "user_code": mac_started.user_code }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let mac_cfg = poll_device_login_once(&mac_started)
+        .await
+        .unwrap()
+        .expect("mac hybrid host should be approved");
+
+    // 4. Both `daemon` and `hybrid` hosts appear in list_account_hosts & talk over WSS relay
+    let hosts = list_account_hosts(&base, mac_cfg.session_token.as_deref().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(hosts.len(), 2);
+    assert!(hosts
+        .iter()
+        .any(|h| h.id == linux_cfg.device_id && h.role == "daemon"));
+    assert!(hosts
+        .iter()
+        .any(|h| h.id == mac_cfg.device_id && h.role == "hybrid"));
+
+    let daemon_cfg_run = linux_cfg.clone();
+    let daemon_task = tokio::spawn(async move {
+        let _ = run_daemon_once_with_p2p(&daemon_cfg_run, Some("cdn_wss"), None).await;
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+
+    let rcfg = mint_peer_relay_config(
+        &base,
+        mac_cfg.session_token.as_deref().unwrap(),
+        mac_cfg.device_id,
+        linux_cfg.device_id,
+        &linux_cfg.identity.x25519_public_b64,
+    )
+    .await
+    .unwrap();
+    let mut smart = SmartPeerClient::connect_auto(
+        mac_cfg.identity.clone(),
+        mac_cfg.device_id,
+        linux_cfg.device_id,
+        vec![],
+        None,
+        Some(SmartRelayFallbackConfig {
+            raw_tcp_addr: None,
+            wss_url: rcfg.wss_url,
+            relay_ticket: rcfg.relay_ticket,
+            peer_x25519_pub_b64: rcfg.peer_x25519_pub_b64,
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(smart.active_route(), "relay_wss");
+
+    match smart
+        .request(
+            &PeerMessage::Ping {
+                req_id: "cf-wss-ping-1".into(),
+                sent_ms: 999,
+            },
+            TrafficLane::ControlP0,
+        )
+        .await
+        .unwrap()
+    {
+        PeerMessage::Pong { req_id, .. } => assert_eq!(req_id, "cf-wss-ping-1"),
+        other => panic!("expected Pong over WSS relay, got {other:?}"),
+    }
 
     daemon_task.abort();
 }
