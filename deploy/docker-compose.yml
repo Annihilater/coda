@@ -14,11 +14,9 @@ services:
       timeout: 3s
       retries: 10
 
-  # Mode B: Overseas Coordinator + CDN WSS Tunnel (:8080 behind Cloudflare/CloudFront) + Raw TCP (:24443)
+  # Mode B: Overseas / Main Coordinator + Web Console (:8080) + Raw TCP Relay (:24443)
   coda-coordinator:
-    build:
-      context: ..
-      dockerfile: deploy/Dockerfile
+    image: ${CODA_IMAGE:-ghcr.io/annihilater/coda:latest}
     restart: always
     depends_on:
       postgres:
@@ -27,34 +25,32 @@ services:
       - path: .env
         required: false
     environment:
-      DATABASE_URL: postgres://coda:${POSTGRES_PASSWORD:-coda_prod_secret}@postgres:5432/coda_prod
+      DATABASE_URL: ${DOCKER_DATABASE_URL:-postgres://coda:${POSTGRES_PASSWORD:-coda_prod_secret}@postgres:5432/coda_prod}
       CODA_RELAY_SECRET: ${CODA_RELAY_SECRET:-change-me-shared-hmac-relay-secret-2026}
       CODA_PUBLIC_URL: ${CODA_PUBLIC_URL:-http://127.0.0.1:8080}
-      CODA_HTTP_BIND: ${CODA_HTTP_BIND:-0.0.0.0:8080}
-      CODA_RAW_TCP_BIND: ${CODA_RAW_TCP_BIND:-0.0.0.0:24443}
+      CODA_REGION_LABEL: ${CODA_REGION_LABEL:-CN-BGP-NoICP}
+      CODA_HTTP_BIND: 0.0.0.0:8080
+      CODA_RAW_TCP_BIND: 0.0.0.0:24443
     ports:
-      - "8080:8080"
-      - "24443:24443"
+      - "${CODA_HTTP_PORT:-8080}:8080"
+      - "${CODA_RAW_TCP_PORT:-24443}:24443"
 
   # Mode A: Stateless Domestic Cloud (Aliyun / Tencent Cloud) No-ICP Raw TCP Relay Node (:24443 only)
   coda-relay-cn:
     profiles: ["relay-cn"]
-    build:
-      context: ..
-      dockerfile: deploy/Dockerfile
+    image: ${CODA_IMAGE:-ghcr.io/annihilater/coda:latest}
     restart: always
     command:
       - "--relay-only"
-      - "--raw-tcp-bind"
-      - "0.0.0.0:24444"
     env_file:
       - path: .env
         required: false
     environment:
       CODA_RELAY_SECRET: ${CODA_RELAY_SECRET:-change-me-shared-hmac-relay-secret-2026}
-      CODA_REGION_LABEL: ${CODA_REGION_LABEL:-CN-Aliyun-NoICP-Edge}
+      CODA_REGION_LABEL: ${CODA_REGION_LABEL:-CN-BGP-NoICP}
+      CODA_RAW_TCP_BIND: 0.0.0.0:24443
     ports:
-      - "24444:24444"
+      - "${CODA_RAW_TCP_PORT:-24443}:24443"
 
 volumes:
   coda_pgdata:

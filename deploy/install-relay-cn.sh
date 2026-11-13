@@ -45,6 +45,8 @@ if [ -n "${ARG_PORT}" ]; then
   PORT="${ARG_PORT}"
 elif [ -n "${CODA_RAW_TCP_BIND:-}" ]; then
   PORT="${CODA_RAW_TCP_BIND##*:}"
+elif [ -n "${CODA_RAW_TCP_PORT:-}" ]; then
+  PORT="${CODA_RAW_TCP_PORT}"
 else
   PORT="24443"
 fi
