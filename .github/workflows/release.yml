@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       tag_name:
-        description: "Release tag (e.g. v0.2.1)"
+        description: "Release tag (e.g. v0.2.2)"
         required: true
-        default: "v0.2.1"
+        default: "v0.2.2"
 
 permissions:
   contents: write
@@ -150,6 +150,8 @@ jobs:
 
           cp deploy/DEPLOY.md "${BUNDLE_DIR}/DEPLOY.md"
           cp deploy/.env.example "${BUNDLE_DIR}/.env.example"
+          cp deploy/coda-server.service "${BUNDLE_DIR}/coda-server.service"
+          cp deploy/coda-relay-cn.service "${BUNDLE_DIR}/coda-relay-cn.service"
           cp deploy/install-server.sh "${BUNDLE_DIR}/install-server.sh"
           cp deploy/install-relay-cn.sh "${BUNDLE_DIR}/install-relay-cn.sh"
           cp deploy/install-daemon.sh "${BUNDLE_DIR}/install-daemon.sh"
@@ -196,10 +198,15 @@ jobs:
               depends_on:
                 postgres:
                   condition: service_healthy
+              env_file:
+                - path: .env
+                  required: false
               environment:
                 DATABASE_URL: postgres://coda:${POSTGRES_PASSWORD:-coda_prod_secret}@postgres:5432/coda_prod
                 CODA_RELAY_SECRET: ${CODA_RELAY_SECRET:-change-me-shared-hmac-relay-secret-2026}
                 CODA_PUBLIC_URL: ${CODA_PUBLIC_URL:-http://127.0.0.1:8080}
+                CODA_HTTP_BIND: ${CODA_HTTP_BIND:-0.0.0.0:8080}
+                CODA_RAW_TCP_BIND: ${CODA_RAW_TCP_BIND:-0.0.0.0:24443}
               ports:
                 - "8080:8080"
                 - "24443:24443"
@@ -214,10 +221,12 @@ jobs:
                 - "--relay-only"
                 - "--raw-tcp-bind"
                 - "0.0.0.0:24444"
-                - "--region-label"
-                - "CN-Aliyun-NoICP-Edge"
+              env_file:
+                - path: .env
+                  required: false
               environment:
                 CODA_RELAY_SECRET: ${CODA_RELAY_SECRET:-change-me-shared-hmac-relay-secret-2026}
+                CODA_REGION_LABEL: ${CODA_REGION_LABEL:-CN-Aliyun-NoICP-Edge}
               ports:
                 - "24444:24444"
 
