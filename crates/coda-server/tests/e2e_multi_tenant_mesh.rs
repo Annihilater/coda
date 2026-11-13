@@ -956,7 +956,7 @@ async fn test_open_portal_device_code_rfc8628_and_cloudflare_wss_mesh() {
         ServerOptions {
             open_registration: true,
             raw_tcp_public_endpoint: None,
-            release_version: "v0.3.6".into(),
+            release_version: "v99.99.99-unreleased".into(),
             github_repo: "Annihilater/coda".into(),
             ios_beta_url: Some("https://testflight.apple.com/join/CodaBeta".into()),
         },
@@ -1008,7 +1008,7 @@ async fn test_open_portal_device_code_rfc8628_and_cloudflare_wss_mesh() {
     for (key, val) in site["downloads"].as_object().unwrap() {
         if let Some(url) = val.as_str() {
             assert!(
-                !url.contains("v0.3.6"),
+                !url.contains("v99.99.99-unreleased"),
                 "download URL `{key}` must not be pinned to a hardcoded release tag: {url}"
             );
         }
@@ -1048,7 +1048,7 @@ async fn test_open_portal_device_code_rfc8628_and_cloudflare_wss_mesh() {
         redirect_location.starts_with("https://github.com/Annihilater/coda/releases/"),
         "unexpected redirect location: {redirect_location}"
     );
-    assert!(!redirect_location.contains("v0.3.6"));
+    assert!(!redirect_location.contains("v99.99.99-unreleased"));
 
     let unknown_dl_resp = no_redirect_http
         .get(format!("{base}/download/unknown.bin"))
