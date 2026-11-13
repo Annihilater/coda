@@ -7,7 +7,7 @@
 //!   2. Left `PROJECTS` Explorer (`SERVICES`, `AGENTS`, `ACTIONS`) with collapsible repositories.
 //!   3. Center Workspace Preview / Worktree Diff Inspector / Mesh & Voice Hub.
 //!   4. Right AI Agent & Live PTY Stream Pane with Desktop Prompt Composer (no mobile soft keypad).
-//!   5. Bottom Global Focus & Route Telemetry Status Bar (`v0.3.6`).
+//!   5. Bottom Global Focus & Route Telemetry Status Bar (`v0.3.7`).
 
 use std::sync::{Arc, Mutex};
 
