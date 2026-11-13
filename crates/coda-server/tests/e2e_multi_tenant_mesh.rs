@@ -947,7 +947,7 @@ async fn test_open_portal_device_code_rfc8628_and_cloudflare_wss_mesh() {
         ServerOptions {
             open_registration: true,
             raw_tcp_public_endpoint: None,
-            release_version: "v0.3.3".into(),
+            release_version: "v0.3.4".into(),
             github_repo: "Annihilater/coda".into(),
             ios_beta_url: Some("https://testflight.apple.com/join/CodaBeta".into()),
         },
@@ -979,7 +979,7 @@ async fn test_open_portal_device_code_rfc8628_and_cloudflare_wss_mesh() {
     assert!(site["downloads"]["desktop_macos_dmg"]
         .as_str()
         .unwrap()
-        .ends_with("Coda-Desktop-macos-aarch64-v0.3.3.dmg"));
+        .ends_with("Coda-Desktop-macos-aarch64-v0.3.4.dmg"));
     let relays = site["relays"].as_array().unwrap();
     assert!(!relays.iter().any(|r| r["mode"] == "raw_tcp_no_sni"));
     assert!(relays

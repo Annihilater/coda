@@ -23,7 +23,7 @@ Coda 运维管理脚本
 命令:
   pull               预拉取所需容器镜像（postgres:18-alpine 与 coda 镜像；GHCR 不可达时自动回落离线包）
   start              首次检查 .env、拉取/加载预编译镜像并启动服务（按 .env 中的 DEPLOY_MODE）
-  stop [--down] [-v] 停止服务（加 --down 移除容器；加 --down -v 同时清理数据库卷 coda_pgdata）
+  stop [-v]          执行 docker compose down 停止并移除容器（默认保留数据卷 coda_pgdata；加 -v 同时删除数据卷）
   restart            重新读取 .env 并重建 Coda 容器以使新配置生效
   status             查看运行状态、端口监听情况与健康检查结果
   logs [service...]  实时跟踪查看日志（可用 Ctrl+C 退出；可传服务名如 coda-coordinator）
@@ -132,15 +132,31 @@ load_env() {
       template_env="${SCRIPT_DIR}/env.example"
     fi
 
-    if [ "${RUNTIME}" != "systemd" ] && [ -n "${template_env}" ] && { [ "${require_configured}" = "1" ] || [ "${CMD}" = "pull" ]; }; then
+    if [ "${RUNTIME}" != "systemd" ] && { [ "${require_configured}" = "1" ] || [ "${CMD}" = "pull" ]; }; then
       rand_relay_secret="$(gen_secret_hex)"
       rand_pg_pass="$(gen_secret_hex)"
-      sed \
-        -e "s|coda_shared_hmac_relay_secret_change_me_2026|${rand_relay_secret}|g" \
-        -e "s|coda_prod_change_me_2026|${rand_pg_pass}|g" \
-        "${template_env}" > "${SCRIPT_DIR}/.env"
+      if [ -n "${template_env}" ]; then
+        sed \
+          -e "s|coda_shared_hmac_relay_secret_change_me_2026|${rand_relay_secret}|g" \
+          -e "s|coda_prod_change_me_2026|${rand_pg_pass}|g" \
+          "${template_env}" > "${SCRIPT_DIR}/.env"
+      else
+        cat > "${SCRIPT_DIR}/.env" <<EOF
+DEPLOY_MODE=coordinator
+CODA_IMAGE=ghcr.io/annihilater/coda:latest
+CODA_HOST_BIND_IP=127.0.0.1
+CODA_HTTP_PORT=8080
+CODA_RAW_TCP_PORT=24443
+CODA_PUBLIC_URL=https://codahub.dev
+CODA_REGION_LABEL=CN-BGP-NoICP
+CODA_OPEN_REGISTRATION=true
+CODA_GITHUB_REPO=Annihilater/coda
+CODA_RELAY_SECRET=${rand_relay_secret}
+POSTGRES_PASSWORD=${rand_pg_pass}
+EOF
+      fi
       chmod 600 "${SCRIPT_DIR}/.env" 2>/dev/null || true
-      echo "[INFO] 已根据模板自动生成配置文件 ${SCRIPT_DIR}/.env（默认域名 https://codahub.dev，已自动生成随机数据库密码与中继密钥；如需自定义可编辑 .env 后执行 ./restart.sh）。"
+      echo "[INFO] 已自动生成配置文件 ${SCRIPT_DIR}/.env（默认仅监听 127.0.0.1，公网入口 https://codahub.dev，已自动生成随机密码与中继密钥；如需调整可编辑 .env 后执行 ./restart.sh）。"
     elif [ -f "/etc/coda/.env" ]; then
       set -a
       # shellcheck disable=SC1091
@@ -157,10 +173,11 @@ load_env() {
   fi
 
   DEPLOY_MODE="${OVERRIDE_MODE:-${DEPLOY_MODE:-coordinator}}"
+  HOST_BIND_IP="${CODA_HOST_BIND_IP:-127.0.0.1}"
   HTTP_PORT="${CODA_HTTP_PORT:-8080}"
   RAW_TCP_PORT="${CODA_RAW_TCP_PORT:-24443}"
   IMAGE="${CODA_IMAGE:-ghcr.io/annihilater/coda:latest}"
-  PUBLIC_URL="${CODA_PUBLIC_URL:-http://127.0.0.1:${HTTP_PORT}}"
+  PUBLIC_URL="${CODA_PUBLIC_URL:-https://codahub.dev}"
 
   if [ "${require_configured}" = "1" ]; then
     case "${CODA_RELAY_SECRET:-}" in
@@ -313,33 +330,30 @@ case "${CMD}" in
       else
         echo "[WARN] 容器已启动，等待健康检查响应超时，可执行 ./logs.sh 查看详细日志。" >&2
       fi
-      echo "    Web 控制台与 API : ${PUBLIC_URL} (本地端口 :${HTTP_PORT})"
-      echo "    免备案裸 TCP 隧道 : :${RAW_TCP_PORT}"
+      echo "    公网访问入口     : ${PUBLIC_URL}"
+      echo "    宿主机本地监听   : ${HOST_BIND_IP}:${HTTP_PORT} (HTTP/WSS) | ${HOST_BIND_IP}:${RAW_TCP_PORT}"
     fi
     echo "    常用命令: ./pull.sh | ./status.sh | ./logs.sh | ./restart.sh | ./stop.sh"
     ;;
   stop)
     load_env 0
     if [ "${DOWN_VOLUMES_FLAG}" = "1" ]; then
-      echo "==> 正在停止并移除 Coda 容器及数据卷 (coda_pgdata)..."
-      run_compose --profile relay-cn down -v
-    elif [ "${DOWN_FLAG}" = "1" ]; then
-      echo "==> 正在停止并移除 Coda 容器（保留数据卷 coda_pgdata）..."
-      run_compose --profile relay-cn down
+      echo "==> 正在执行 docker compose down -v（停止并移除容器及数据卷 coda_pgdata）..."
+      run_compose --profile relay-cn down -v --remove-orphans
     else
-      echo "==> 正在停止 Coda 容器..."
-      run_compose --profile relay-cn stop
+      echo "==> 正在执行 docker compose down（停止并移除容器，保留数据卷 coda_pgdata）..."
+      run_compose --profile relay-cn down --remove-orphans
     fi
     ;;
   restart)
     load_env 1
     ensure_image 0
-    echo "==> 正在重载 .env 并重建服务 (DEPLOY_MODE=${DEPLOY_MODE})..."
+    echo "==> 正在重启服务 (docker compose down && up -d, DEPLOY_MODE=${DEPLOY_MODE})..."
+    run_compose --profile relay-cn down --remove-orphans
     if [ "${DEPLOY_MODE}" = "relay-cn" ]; then
-      run_compose --profile relay-cn up -d --force-recreate --no-deps coda-relay-cn
+      run_compose --profile relay-cn up -d --no-deps coda-relay-cn
     else
-      run_compose up -d postgres
-      run_compose up -d --force-recreate --no-deps coda-coordinator
+      run_compose up -d postgres coda-coordinator
       wait_coordinator_health || true
     fi
     run_compose --profile relay-cn ps

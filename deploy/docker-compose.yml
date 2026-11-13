@@ -36,8 +36,8 @@ services:
       CODA_HTTP_BIND: 0.0.0.0:8080
       CODA_RAW_TCP_BIND: 0.0.0.0:24443
     ports:
-      - "${CODA_HTTP_PORT:-8080}:8080"
-      - "${CODA_RAW_TCP_PORT:-24443}:24443"
+      - "${CODA_HOST_BIND_IP:-127.0.0.1}:${CODA_HTTP_PORT:-8080}:8080"
+      - "${CODA_HOST_BIND_IP:-127.0.0.1}:${CODA_RAW_TCP_PORT:-24443}:24443"
 
   # Mode A: Stateless Domestic Cloud (Aliyun / Tencent Cloud) No-ICP Raw TCP Relay Node (:24443 only)
   coda-relay-cn:
@@ -54,7 +54,7 @@ services:
       CODA_REGION_LABEL: ${CODA_REGION_LABEL:-CN-BGP-NoICP}
       CODA_RAW_TCP_BIND: 0.0.0.0:24443
     ports:
-      - "${CODA_RAW_TCP_PORT:-24443}:24443"
+      - "${CODA_RELAY_BIND_IP:-0.0.0.0}:${CODA_RAW_TCP_PORT:-24443}:24443"
 
 volumes:
   coda_pgdata:

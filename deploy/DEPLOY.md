@@ -24,10 +24,12 @@ Coda 每次发布 Tag (`v*`) 时，GitHub Actions 流水线会自动构建并发
 
 主控面板官方域名已预设为 **`https://codahub.dev`**（桌面端 `Coda.app`、iOS 客户端、`coda-daemon` 均默认指向此地址；同时 `.dev` 域名受浏览器 HSTS 强制 HTTPS 约束，Cloudflare Tunnel 自动终结 TLS 并升级 `wss://`）：
 
-1. 在 Cloudflare Zero Trust Dashboard 的 **Cloudflare Tunnel (`cloudflared`)** 中配置 Public Hostname：
-   - **Domain / Hostname**: `codahub.dev`
-   - **Service Type / URL**: `HTTP` → **`http://127.0.0.1:8080`**
-   - 确保 Cloudflare 网络设置中的 **WebSockets** 为开启状态（用于 `/v1/tunnel/ws` 隧道转发），**SSL/TLS** 建议为 `Full` 或 `Flexible`（由 `cloudflared` 本地回源走 HTTP，外网访问全链路 HTTPS/WSS）。
+1. 在 Cloudflare Zero Trust Dashboard 的 **Cloudflare Tunnel (`cloudflared`) -> Published applications -> Add published application** 中按如下填写：
+   - **Subdomain**：留空不填（即直接绑定根域名 `codahub.dev`）
+   - **Domain / Zone**：选择 `codahub.dev`
+   - **Path**：留空不填（转发所有页面、API 与 `/v1/tunnel/ws` WebSocket 隧道）
+   - **Service Type / URL**：`HTTP` → **`http://127.0.0.1:8080`**（勿填 `https://`；建议写 `127.0.0.1` 避免 `localhost` 解析为 IPv6 `[::1]`）
+   - 在 Cloudflare 域名 **Network** 设置中确认 **WebSockets** 为开启状态（用于 `/v1/tunnel/ws` 隧道转发）。
 2. 检查服务端 `.env`（默认模板 `.env.example` 已预设好）：
    ```dotenv
    CODA_PUBLIC_URL=https://codahub.dev
@@ -66,17 +68,17 @@ vim .env
 | :--- | :--- |
 | **`./pull.sh`** | 预拉取所需容器镜像（`postgres:18-alpine` 与 `coda` 镜像；GHCR 不可达时自动回落 GitHub Releases 离线镜像包） |
 | **`./start.sh`** | 首次检查 `.env`，拉取/加载预构建镜像并启动服务（根据 `.env` 中的 `DEPLOY_MODE` 启动主控或国内中继） |
-| **`./stop.sh`** | 停止运行中的容器（传 `--down` 可移除容器但保留 `coda_pgdata` 数据卷） |
-| **`./restart.sh`** | **修改 `.env` 后推荐执行**：重新加载 `.env` 并重建 Coda 容器使新配置立即生效 |
+| **`./stop.sh`** | 执行 `docker compose down` 停止并移除容器（默认保留 `coda_pgdata` 数据库卷；传 `-v` 可同时清理数据卷） |
+| **`./restart.sh`** | **修改 `.env` 后推荐执行**：执行 `docker compose down && up -d` 重新加载 `.env` 并重建服务 |
 | **`./status.sh`** | 查看容器运行状态、端口监听（`:8080` / `:24443`）与 `/api/v1/health` 健康检查结果 |
 | **`./logs.sh`** | 实时跟踪查看日志（`Ctrl+C` 退出；支持传服务名如 `./logs.sh coda-coordinator`） |
 | **`./update.sh`** | 拉取最新版本容器镜像并平滑重启 |
 
 > 以上脚本同样支持 `--systemd`（或 `DEPLOY_RUNTIME=systemd`）管理方式 B 安装的系统服务。
 >
-> **防火墙/安全组放行端口**：
-> - `8080/tcp`（Web 终端控制台、注册登录 API、海外 CDN WebSocket `/v1/tunnel/ws`）
-> - `24443/tcp`（国内免备案纯二进制裸 TCP 隧道，零 HTTP/零 SNI）
+> **端口安全说明**：
+> - 主控端（`coordinator`）默认设置了 `CODA_HOST_BIND_IP=127.0.0.1`，仅在本机回环暴露 `127.0.0.1:8080` 与 `127.0.0.1:24443`，**不向公网暴露 `0.0.0.0` / `[::]` 端口**，配合 Cloudflare Tunnel 使用无需在云安全组放行任何入站端口。
+> - 如需无隧道公网直连部署，在 `.env` 将 `CODA_HOST_BIND_IP=0.0.0.0` 并执行 `./restart.sh`，再按需放行 `8080/tcp` 与 `24443/tcp`（纯国内中继 `DEPLOY_MODE=relay-cn` 默认监听 `0.0.0.0:24443`）。
 
 ---
 
