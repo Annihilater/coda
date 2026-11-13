@@ -15,6 +15,10 @@ permissions:
   contents: write
   packages: write
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   RELEASE_TAG: ${{ github.event.inputs.tag_name || github.ref_name }}

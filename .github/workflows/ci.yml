@@ -3,15 +3,97 @@ name: CI
 on:
   push:
     branches: ["main"]
+    paths-ignore:
+      - "**.md"
+      - "LICENSE"
+      - ".gitignore"
   pull_request:
     branches: ["main"]
+    paths-ignore:
+      - "**.md"
+      - "LICENSE"
+      - ".gitignore"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  rust-server-and-daemon:
+  changes:
+    name: Detect Changed Components
+    runs-on: ubuntu-latest
+    outputs:
+      deploy: ${{ steps.filter.outputs.deploy }}
+      web: ${{ steps.filter.outputs.web }}
+      rust_core: ${{ steps.filter.outputs.rust_core }}
+      apple_desktop: ${{ steps.filter.outputs.apple_desktop }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            deploy:
+              - 'deploy/**'
+              - '.github/workflows/ci.yml'
+            web:
+              - 'web/**'
+            rust_core:
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'migrations/**'
+              - 'crates/coda-protocol/**'
+              - 'crates/coda-herdr/**'
+              - 'crates/coda-daemon/**'
+              - 'crates/coda-server/**'
+            apple_desktop:
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'crates/coda-protocol/**'
+              - 'crates/coda-desktop/**'
+              - 'crates/coda-apple-ffi/**'
+              - 'apple/**'
+
+  deploy-lint:
+    name: Deploy Scripts & Compose Check
+    needs: changes
+    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.deploy == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Lint shell scripts & Docker Compose config
+        run: |
+          for f in deploy/*.sh; do
+            sh -n "$f"
+          done
+          docker compose -f deploy/docker-compose.yml config >/dev/null
+          docker compose --profile relay-cn -f deploy/docker-compose.yml config >/dev/null
+
+  web-console:
+    name: Web Console Build
+    needs: changes
+    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.web == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - name: Install & Build Web Console
+        run: cd web && bun install && bun run build
+
+  rust-core:
     name: Rust Core (Protocol, Herdr, Daemon & Server)
+    needs: changes
+    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.rust_core == 'true'
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -40,15 +122,14 @@ jobs:
           cargo test -p coda-protocol -p coda-herdr -p coda-daemon -p coda-server -- --nocapture
 
   macos-gpui-and-apple:
-    name: macOS (GPUI Desktop + Apple Swift 6 + Web Console)
+    name: macOS (GPUI Desktop + Apple Swift 6)
+    needs: changes
+    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.apple_desktop == 'true'
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: oven-sh/setup-bun@v2
       - uses: Swatinem/rust-cache@v2
-      - name: Build Web Console
-        run: cd web && bun install && bun run build
       - name: Test GPUI Desktop Client (Metal runtime_shaders)
         run: |
           cargo test -p coda-desktop
