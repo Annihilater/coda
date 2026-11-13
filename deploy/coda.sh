@@ -119,7 +119,7 @@ load_env() {
 [INFO] 首次运行，已自动生成默认配置文件: ${SCRIPT_DIR}/.env
        请先修改其中的关键配置后再重新执行 ./start.sh ：
          1) DEPLOY_MODE       : coordinator (主控制面) 或 relay-cn (国内免备案裸TCP中继)
-         2) CODA_PUBLIC_URL   : 例如 http://你的公网IP:8080 或 https://你的域名
+         2) CODA_PUBLIC_URL   : 例如 https://codahub.dev 或 http://你的公网IP:8080
          3) CODA_RELAY_SECRET : 主控制面与所有中继必须一致（可用 openssl rand -hex 32 生成）
          4) POSTGRES_PASSWORD : 数据库密码（仅 coordinator 模式需要）
        （如确定仅用默认值直接启动，可执行: CODA_AUTO_START=1 ./start.sh）

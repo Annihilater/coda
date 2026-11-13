@@ -25,8 +25,8 @@ public final class CodaWorkspaceStore: ObservableObject {
     @Published public var voiceConfig: CodaVoiceModelConfig = CodaVoiceModelConfig()
     @Published public var showVoiceConfigSheet: Bool = false
     @Published public var routeMode: SmartPathRouteMode = .lanDirect
-    @Published public var serverURLString: String = "https://coda.example.com"
-    @Published public var accountLabel: String = "vampire@coda.dev"
+    @Published public var serverURLString: String = "https://codahub.dev"
+    @Published public var accountLabel: String = "vampire@codahub.dev"
     @Published public var remoteHosts: [CodaRemoteDevice] = []
     @Published public var selectedHostId: UUID? = nil
     @Published public var showAccountSheet: Bool = false
@@ -596,7 +596,7 @@ struct CodaAccountMeshSheet: View {
             Text("Cloudflare Tunnel / 主控域名")
                 .font(.caption)
                 .foregroundStyle(.secondary)
-            TextField("https://coda.example.com", text: $store.serverURLString)
+            TextField("https://codahub.dev", text: $store.serverURLString)
                 .textFieldStyle(.roundedBorder)
 
             Button {

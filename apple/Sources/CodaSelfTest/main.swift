@@ -90,8 +90,8 @@ struct CodaSelfTest {
         {
           "device_code": "dev_test_123",
           "user_code": "ABCD-2345",
-          "verification_uri": "https://coda.example.com/activate",
-          "verification_uri_complete": "https://coda.example.com/activate?code=ABCD-2345",
+          "verification_uri": "https://codahub.dev/activate",
+          "verification_uri_complete": "https://codahub.dev/activate?code=ABCD-2345",
           "expires_in_secs": 600,
           "interval_secs": 2
         }
@@ -120,7 +120,7 @@ struct CodaSelfTest {
               "id": "global-cdn-wss",
               "region": "Global Edge CDN / CF Tunnel (WSS 443)",
               "mode": "cdn_wss",
-              "endpoint": "wss://coda.example.com/v1/tunnel/ws",
+              "endpoint": "wss://codahub.dev/v1/tunnel/ws",
               "priority": 5
             }
           ]
@@ -129,7 +129,7 @@ struct CodaSelfTest {
         let pollResult = try JSONDecoder().decode(CodaDeviceAuthPollResult.self, from: pollJSON)
         precondition(pollResult.state == "approved")
         precondition(pollResult.device?.role == "hybrid")
-        precondition(pollResult.relays?.first?.endpoint == "wss://coda.example.com/v1/tunnel/ws")
+        precondition(pollResult.relays?.first?.endpoint == "wss://codahub.dev/v1/tunnel/ws")
 
         // 6. Verify Auto-LAN UDP Discovery + Direct P2P TCP Handshake + E2EE Ping/Pong + Relay Fallback
         try await runAutoLanSmartPathLoopbackTest()

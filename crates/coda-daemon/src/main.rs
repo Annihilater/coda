@@ -22,7 +22,7 @@ struct Cli {
 enum Commands {
     /// Authorize this Mac or Linux server via browser confirmation link (RFC 8628 Device Flow)
     Login {
-        #[arg(long, env = "CODA_SERVER_URL", default_value = "http://127.0.0.1:8080")]
+        #[arg(long, env = "CODA_SERVER_URL", default_value = "https://codahub.dev")]
         server: String,
         #[arg(long)]
         name: Option<String>,
@@ -31,7 +31,7 @@ enum Commands {
     },
     /// Pair this Mac or Linux server to your Coda account using a 6-digit code
     Pair {
-        #[arg(long, default_value = "http://127.0.0.1:8080")]
+        #[arg(long, env = "CODA_SERVER_URL", default_value = "https://codahub.dev")]
         server: String,
         #[arg(long)]
         code: String,

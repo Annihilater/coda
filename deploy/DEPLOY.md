@@ -20,19 +20,22 @@ Coda 每次发布 Tag (`v*`) 时，GitHub Actions 流水线会自动构建并发
 
 ---
 
-## Cloudflare Tunnel 域名接入（日本 / 海外主控服务器零端口暴露推荐）
+## Cloudflare Tunnel 域名接入（日本主控服务器 `codahub.dev` 推荐配置）
 
-如果你把主控端部署在日本 / 海外 VPS，并通过 **Cloudflare Tunnel (`cloudflared`)** 映射到自己的域名（如 `https://coda.yourdomain.com`）：
+主控面板官方域名已预设为 **`https://codahub.dev`**（桌面端 `Coda.app`、iOS 客户端、`coda-daemon` 均默认指向此地址；同时 `.dev` 域名受浏览器 HSTS 强制 HTTPS 约束，Cloudflare Tunnel 自动终结 TLS 并升级 `wss://`）：
 
-1. 在 `cloudflared` 中将公网域名指向本机 **`http://127.0.0.1:8080`**（Cloudflare Tunnel 原生支持 `/v1/tunnel/ws` 的 WebSocket 隧道转发）。
-2. 修改 `.env`：
+1. 在 Cloudflare Zero Trust Dashboard 的 **Cloudflare Tunnel (`cloudflared`)** 中配置 Public Hostname：
+   - **Domain / Hostname**: `codahub.dev`
+   - **Service Type / URL**: `HTTP` → **`http://127.0.0.1:8080`**
+   - 确保 Cloudflare 网络设置中的 **WebSockets** 为开启状态（用于 `/v1/tunnel/ws` 隧道转发），**SSL/TLS** 建议为 `Full` 或 `Flexible`（由 `cloudflared` 本地回源走 HTTP，外网访问全链路 HTTPS/WSS）。
+2. 检查服务端 `.env`（默认模板 `.env.example` 已预设好）：
    ```dotenv
-   CODA_PUBLIC_URL=https://coda.yourdomain.com
+   CODA_PUBLIC_URL=https://codahub.dev
    CODA_OPEN_REGISTRATION=true
    ```
-   > 只要 `CODA_PUBLIC_URL` 是 `https://` 域名且未配置 `CODA_RAW_TCP_PUBLIC_ENDPOINT`，控制面会自动将 `global-cdn-wss`（`wss://coda.yourdomain.com/v1/tunnel/ws`）设为首选，并屏蔽不可达的内网 `127.0.0.1:24443` 地址。
-3. 执行 **`./restart.sh`** 让 `.env` 生效。
-4. 访问 `https://coda.yourdomain.com` 即可打开 **Coda 官网与免登录全端下载中心**，访客无需登录即可注册或下载 Linux Server / macOS 桌面端 / deploy-bundle；后期如加自选 CDN，直接把 CDN 回源指向该域名即可。
+   > 只要 `CODA_PUBLIC_URL` 是 `https://` 域名且未配置 `CODA_RAW_TCP_PUBLIC_ENDPOINT`，控制面会自动将 `global-cdn-wss`（`wss://codahub.dev/v1/tunnel/ws`）设为首选，并屏蔽不可达的内网 `127.0.0.1:24443` 地址。
+3. 修改配置后执行 **`./restart.sh`** 让 `.env` 生效。
+4. 访问 **`https://codahub.dev`** 即可打开 **Coda 官网与免登录全端下载中心**，访客无需登录即可注册或下载 Linux Server / macOS 桌面端 / deploy-bundle；后期如加自选 CDN，直接把 CDN 回源指向该域名即可。
 
 ---
 
@@ -106,17 +109,17 @@ curl -fsSL https://raw.githubusercontent.com/Annihilater/coda/main/deploy/instal
 
 ## 三、只登录一次，全端浏览器授权接入开发机 (Server / Mac / iOS)
 
-1. **注册账号**：打开浏览器访问 **`https://你的域名`**（或 `http://你的服务器IP:8080`）：
+1. **注册账号**：打开浏览器访问 **`https://codahub.dev`**（或 `http://你的服务器IP:8080`）：
    - 当 `.env` 设置了 `CODA_OPEN_REGISTRATION=true` 时，任何人都可**免邀请码自由注册**并直接进入控制台（第一个注册的用户同时拥有管理员权限）；
    - 如需封闭内测，设 `CODA_OPEN_REGISTRATION=false`，则除首位管理员外需使用管理员签发的 `CODA-XXXXXX` 邀请码。
 2. **Linux / macOS 服务器一键接入（推荐浏览器设备码授权）**：
-   直接在目标开发机或云服务器上执行官网首页的一键命令（脚本会自动读取你主控域名，无需提前复制配对码）：
+   直接在目标开发机或云服务器上执行官网首页的一键命令（脚本与 `coda-daemon login` 均已默认指向 `https://codahub.dev`，无需额外传 `--server`）：
 
 ```bash
-curl -fsSL https://你的域名/install.sh | sh
+curl -fsSL https://codahub.dev/install.sh | sh
 ```
 
-执行后终端会打印激活链接与 8 位设备码（例如 **`https://你的域名/activate?code=ABCD-2345`**）。在任意浏览器打开并登录确认批准，服务器即自动绑定到你的账号并后台启动 `coda-daemon`。（同时兼容传统 6 位 `--code 839-204` 配对方式。）
+执行后终端会打印激活链接与 8 位设备码（例如 **`https://codahub.dev/activate?code=ABCD-2345`**）。在任意浏览器打开并登录确认批准，服务器即自动绑定到你的账号并后台启动 `coda-daemon`。（同时兼容传统 6 位 `--code 839-204` 配对方式。）
 
 ```bash
 # 查看当前绑定的设备状态与中继链路
@@ -128,7 +131,7 @@ curl -fsSL https://你的域名/install.sh | sh
 ## 四、使用各端客户端连接开发（Windows/Mac/iOS 互控）
 
 1. **Web 终端 & iOS Safari PWA（零上架零安装）**：
-   用电脑浏览器或 iPhone Safari 访问 `https://你的域名`；在 iPhone Safari 点击「分享 → 添加到主屏幕」即可全屏当原生 App 使用；如有苹果开发者账号测试分发的 **TestFlight** 链接，可在 `.env` 中配置 `CODA_IOS_BETA_URL`，官网下载卡片会自动显示按钮。
+   用电脑浏览器或 iPhone Safari 访问 `https://codahub.dev`；在 iPhone Safari 点击「分享 → 添加到主屏幕」即可全屏当原生 App 使用；如有苹果开发者账号测试分发的 **TestFlight** 链接，可在 `.env` 中配置 `CODA_IOS_BETA_URL`，官网下载卡片会自动显示按钮。
 2. **macOS 桌面端（`.dmg` 双击安装，`Hybrid` 双重角色）**：
    在官网下载中心直接点击下载 **`Coda-Desktop-macos-aarch64-<version>.dmg`** 并拖入 `Applications`；首次打开若提示未公证开发者，在终端执行一次：
    ```bash

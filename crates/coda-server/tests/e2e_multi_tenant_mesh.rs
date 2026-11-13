@@ -947,7 +947,7 @@ async fn test_open_portal_device_code_rfc8628_and_cloudflare_wss_mesh() {
         ServerOptions {
             open_registration: true,
             raw_tcp_public_endpoint: None,
-            release_version: "v0.3.0".into(),
+            release_version: "v0.3.1".into(),
             github_repo: "Annihilater/coda".into(),
             ios_beta_url: Some("https://testflight.apple.com/join/CodaBeta".into()),
         },
@@ -961,7 +961,7 @@ async fn test_open_portal_device_code_rfc8628_and_cloudflare_wss_mesh() {
     // 1. Public unauthenticated portal metadata + Cloudflare forwarded header detection
     let site: serde_json::Value = http
         .get(format!("{base}/api/v1/public/site-info"))
-        .header("x-forwarded-host", "coda.example.com")
+        .header("x-forwarded-host", "codahub.dev")
         .header("cf-visitor", r#"{"scheme":"https"}"#)
         .send()
         .await
@@ -974,21 +974,21 @@ async fn test_open_portal_device_code_rfc8628_and_cloudflare_wss_mesh() {
     assert_eq!(site["open_registration"], true);
     assert_eq!(
         site["install_command"],
-        "curl -fsSL https://coda.example.com/install.sh | sh"
+        "curl -fsSL https://codahub.dev/install.sh | sh"
     );
     assert!(site["downloads"]["desktop_macos_dmg"]
         .as_str()
         .unwrap()
-        .ends_with("Coda-Desktop-macos-aarch64-v0.3.0.dmg"));
+        .ends_with("Coda-Desktop-macos-aarch64-v0.3.1.dmg"));
     let relays = site["relays"].as_array().unwrap();
     assert!(!relays.iter().any(|r| r["mode"] == "raw_tcp_no_sni"));
     assert!(relays
         .iter()
-        .any(|r| r["endpoint"] == "wss://coda.example.com/v1/tunnel/ws"));
+        .any(|r| r["endpoint"] == "wss://codahub.dev/v1/tunnel/ws"));
 
     let install_sh = http
         .get(format!("{base}/install.sh"))
-        .header("x-forwarded-host", "coda.example.com")
+        .header("x-forwarded-host", "codahub.dev")
         .header("cf-visitor", r#"{"scheme":"https"}"#)
         .send()
         .await
@@ -998,7 +998,7 @@ async fn test_open_portal_device_code_rfc8628_and_cloudflare_wss_mesh() {
         .text()
         .await
         .unwrap();
-    assert!(install_sh.contains("DEFAULT_SERVER_URL=\"https://coda.example.com\""));
+    assert!(install_sh.contains("DEFAULT_SERVER_URL=\"https://codahub.dev\""));
 
     // 2. Open registration works even for 2nd user without invite code
     let _first: AuthResponse = http

@@ -202,10 +202,10 @@ impl Default for CodaDesktopState {
         ];
 
         let default_server_url = std::env::var("CODA_SERVER_URL")
-            .unwrap_or_else(|_| "http://127.0.0.1:8080".into());
+            .unwrap_or_else(|_| "https://codahub.dev".into());
 
         Self {
-            account_email: "vampire@coda.dev".into(),
+            account_email: "vampire@codahub.dev".into(),
             server_url: default_server_url,
             is_logged_in: false,
             connected_route: "已连接 · L0 GPUI Metal 120Hz".into(),
@@ -1841,7 +1841,7 @@ impl CodaGpuWorkspaceView {
                                                 format!("coda-daemon login --server {}", g.server_url)
                                             })
                                             .unwrap_or_else(|_| {
-                                                "coda-daemon login --server http://127.0.0.1:8080"
+                                                "coda-daemon login --server https://codahub.dev"
                                                     .into()
                                             });
                                         cx.write_to_clipboard(ClipboardItem::new_string(cmd));

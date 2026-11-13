@@ -11,7 +11,7 @@ REPO="Annihilater/coda"
 VERSION="${CODA_VERSION:-latest}"
 DEFAULT_SERVER_URL="__CODA_DEFAULT_SERVER_URL__"
 case "${DEFAULT_SERVER_URL}" in
-  __*__) DEFAULT_SERVER_URL="http://127.0.0.1:8080" ;;
+  __*__) DEFAULT_SERVER_URL="https://codahub.dev" ;;
 esac
 SERVER_URL="${CODA_SERVER_URL:-${DEFAULT_SERVER_URL}}"
 PAIR_CODE=""
