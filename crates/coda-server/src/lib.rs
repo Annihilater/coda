@@ -319,6 +319,7 @@ pub fn build_router(state: AppState, web_dist_dir: Option<PathBuf>) -> Router {
         .route("/download/{artifact}", get(download_latest_artifact_handler))
         .route("/install.sh", get(install_script_handler))
         .route("/v1/tunnel/ws", get(ws_tunnel_upgrade_handler))
+        .route("/api/v1/events/ws", get(ws_account_events_handler))
         .with_state(state);
 
     let app = if let Some(dir) = web_dist_dir.filter(|p| p.exists()) {
@@ -899,6 +900,15 @@ async fn approve_device_auth_handler(
         .approve_device_auth(user.id, &req.user_code, req.device_name.as_deref())
         .await
         .map_err(ApiError::bad_request)?;
+    st.relay_hub
+        .notify_device_enrolled(
+            user.id,
+            device.id,
+            &device.name,
+            &device.role,
+            Some(device.is_online),
+        )
+        .await;
     Ok(Json(device))
 }
 
@@ -953,6 +963,15 @@ async fn poll_device_auth_handler(
                 .map_err(ApiError::internal)?;
             let relays = effective_relays_for_request(&st, &headers).await?;
             let owner_handle = user.handle.clone();
+            st.relay_hub
+                .notify_device_enrolled(
+                    user.id,
+                    device.id,
+                    &device.name,
+                    &device.role,
+                    Some(device.is_online),
+                )
+                .await;
             Ok(Json(PollDeviceAuthResponse {
                 state: "approved".into(),
                 expires_in_secs: None,
@@ -1016,6 +1035,16 @@ async fn enroll_host_device_handler(
         .map_err(ApiError::internal)?;
     let relays = effective_relays_for_request(&st, &headers).await?;
 
+    st.relay_hub
+        .notify_device_enrolled(
+            user.id,
+            device.id,
+            &device.name,
+            &device.role,
+            Some(device.is_online),
+        )
+        .await;
+
     Ok(Json(ClaimPairResponse {
         device,
         owner_handle: user.handle,
@@ -1072,6 +1101,16 @@ async fn claim_pair_handler(
         .map_err(ApiError::internal)?;
     let relays = effective_relays_for_request(&st, &headers).await?;
 
+    st.relay_hub
+        .notify_device_enrolled(
+            owner.id,
+            device.id,
+            &device.name,
+            &device.role,
+            Some(device.is_online),
+        )
+        .await;
+
     Ok(Json(ClaimPairResponse {
         device,
         owner_handle: owner.handle,
@@ -1106,6 +1145,9 @@ async fn register_client_device_handler(
         )
         .await
         .map_err(ApiError::bad_request)?;
+    st.relay_hub
+        .notify_device_enrolled(user.id, dev.id, &dev.name, &dev.role, Some(dev.is_online))
+        .await;
     Ok(Json(dev))
 }
 
@@ -1169,6 +1211,43 @@ async fn ws_tunnel_upgrade_handler(
 ) -> impl IntoResponse {
     let hub = Arc::clone(&st.relay_hub);
     ws.on_upgrade(move |socket| hub.handle_ws_socket(socket))
+}
+
+#[derive(Debug, Deserialize)]
+struct EventsWsQuery {
+    #[serde(default)]
+    token: Option<String>,
+}
+
+async fn ws_account_events_handler(
+    ws: WebSocketUpgrade,
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<EventsWsQuery>,
+) -> Result<Response, ApiError> {
+    let token = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer ").or(Some(s)))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            query
+                .token
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        })
+        .ok_or_else(|| ApiError::unauthorized(anyhow::anyhow!("missing session token")))?;
+    let user = st
+        .db
+        .authenticate_token(&token)
+        .await
+        .map_err(ApiError::unauthorized)?;
+    let hub = Arc::clone(&st.relay_hub);
+    Ok(ws.on_upgrade(move |socket| async move { hub.handle_account_events_ws(socket, user.id).await }))
 }
 
 async fn require_auth(st: &AppState, headers: &HeaderMap) -> Result<UserRecord, ApiError> {

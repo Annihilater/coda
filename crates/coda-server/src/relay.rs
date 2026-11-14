@@ -15,13 +15,14 @@ use anyhow::{Context, Result};
 use axum::extract::ws::{Message as WsMessage, WebSocket};
 use chrono::Utc;
 use coda_protocol::{
-    NetworkEndpointCandidate, RelayTicketClaims, RelayWireFrame, TrafficLane, MAX_WIRE_FRAME_BYTES,
+    AccountLiveEvent, NetworkEndpointCandidate, RelayTicketClaims, RelayWireFrame, TrafficLane,
+    MAX_WIRE_FRAME_BYTES,
 };
 use futures_util::{SinkExt, StreamExt};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    sync::{mpsc, RwLock},
+    sync::{broadcast, mpsc, RwLock},
 };
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -35,6 +36,7 @@ struct ActiveLaneConn {
 
 struct DeviceSlots {
     user_id: Uuid,
+    role: String,
     control_p0: Option<ActiveLaneConn>,
     bulk_p1: Option<ActiveLaneConn>,
     endpoints: Vec<NetworkEndpointCandidate>,
@@ -82,6 +84,7 @@ pub struct RelayHub {
     region_label: String,
     devices: RwLock<HashMap<Uuid, DeviceSlots>>,
     tenant_buckets: RwLock<HashMap<Uuid, TenantBucket>>,
+    account_watchers: RwLock<HashMap<Uuid, broadcast::Sender<AccountLiveEvent>>>,
     /// Optional DB handle when running co-located with `coda-coord` to sync `is_online`.
     /// When deployed as a standalone stateless Domestic Aliyun/Tencent relay (`--relay-only`), `db` is `None`!
     db: Option<Db>,
@@ -94,8 +97,125 @@ impl RelayHub {
             region_label: region_label.into(),
             devices: RwLock::new(HashMap::new()),
             tenant_buckets: RwLock::new(HashMap::new()),
+            account_watchers: RwLock::new(HashMap::new()),
             db,
         })
+    }
+
+    pub async fn subscribe_account_events(
+        &self,
+        user_id: Uuid,
+    ) -> broadcast::Receiver<AccountLiveEvent> {
+        if let Some(tx) = self.account_watchers.read().await.get(&user_id) {
+            return tx.subscribe();
+        }
+        let mut map = self.account_watchers.write().await;
+        let tx = map
+            .entry(user_id)
+            .or_insert_with(|| broadcast::channel(64).0);
+        tx.subscribe()
+    }
+
+    pub async fn publish_account_event(&self, user_id: Uuid, event: AccountLiveEvent) {
+        let tx = {
+            let map = self.account_watchers.read().await;
+            map.get(&user_id).cloned()
+        };
+        if let Some(tx) = tx {
+            let _ = tx.send(event);
+        }
+    }
+
+    pub async fn notify_device_enrolled(
+        &self,
+        user_id: Uuid,
+        device_id: Uuid,
+        device_name: &str,
+        role: &str,
+        online: Option<bool>,
+    ) {
+        self.publish_account_event(
+            user_id,
+            AccountLiveEvent {
+                kind: "devices_changed".to_string(),
+                device_id: Some(device_id),
+                device_name: Some(device_name.to_string()),
+                role: Some(role.to_string()),
+                online,
+                timestamp_ms: Some(Utc::now().timestamp_millis().max(0) as u64),
+            },
+        )
+        .await;
+    }
+
+    /// Streams real-time account events (`/api/v1/events/ws`) to a logged-in desktop/mobile client.
+    pub async fn handle_account_events_ws(&self, mut socket: WebSocket, user_id: Uuid) {
+        let mut rx = self.subscribe_account_events(user_id).await;
+        let hello = AccountLiveEvent {
+            kind: "connected".to_string(),
+            device_id: None,
+            device_name: None,
+            role: None,
+            online: None,
+            timestamp_ms: Some(Utc::now().timestamp_millis().max(0) as u64),
+        };
+        if let Ok(json_text) = serde_json::to_string(&hello) {
+            if socket.send(WsMessage::Text(json_text.into())).await.is_err() {
+                return;
+            }
+        }
+
+        let mut keepalive = tokio::time::interval(std::time::Duration::from_secs(25));
+        keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        loop {
+            tokio::select! {
+                _ = keepalive.tick() => {
+                    if socket.send(WsMessage::Ping(Vec::new().into())).await.is_err() {
+                        break;
+                    }
+                }
+                recv = rx.recv() => {
+                    match recv {
+                        Ok(ev) => {
+                            if let Ok(text) = serde_json::to_string(&ev) {
+                                if socket.send(WsMessage::Text(text.into())).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(_)) => {
+                            let resync = AccountLiveEvent {
+                                kind: "devices_changed".to_string(),
+                                device_id: None,
+                                device_name: None,
+                                role: None,
+                                online: None,
+                                timestamp_ms: Some(Utc::now().timestamp_millis().max(0) as u64),
+                            };
+                            if let Ok(text) = serde_json::to_string(&resync) {
+                                if socket.send(WsMessage::Text(text.into())).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+                ws_msg = socket.recv() => {
+                    match ws_msg {
+                        Some(Ok(WsMessage::Ping(payload))) => {
+                            if socket.send(WsMessage::Pong(payload)).await.is_err() {
+                                break;
+                            }
+                        }
+                        Some(Ok(WsMessage::Close(_))) | None => break,
+                        Some(Ok(_)) => {}
+                        Some(Err(_)) => break,
+                    }
+                }
+            }
+        }
     }
 
     /// Spawns the Domestic Cloud No-ICP Raw TCP Relay Listener (zero HTTP, zero domain SNI).
@@ -279,10 +399,12 @@ impl RelayHub {
             let mut map = self.devices.write().await;
             let entry = map.entry(claims.device_id).or_insert_with(|| DeviceSlots {
                 user_id: claims.user_id,
+                role: claims.role.clone(),
                 control_p0: None,
                 bulk_p1: None,
                 endpoints: Vec::new(),
             });
+            entry.role = claims.role.clone();
             let was_empty = entry.control_p0.is_none() && entry.bulk_p1.is_none();
 
             let conn = ActiveLaneConn {
@@ -322,13 +444,19 @@ impl RelayHub {
             if let Some(db) = &self.db {
                 let _ = db.set_device_online(claims.device_id, true).await;
             }
-            self.broadcast_presence_to_tenant(claims.user_id, claims.device_id, true, cached_eps)
-                .await;
+            self.broadcast_presence_to_tenant(
+                claims.user_id,
+                claims.device_id,
+                true,
+                cached_eps,
+                Some(claims.role.clone()),
+            )
+            .await;
         }
     }
 
     async fn unregister_lane(&self, device_id: Uuid, lane: TrafficLane, generation: u64) {
-        let mut went_offline_user = None;
+        let mut went_offline_info = None;
         {
             let mut map = self.devices.write().await;
             if let Some(slots) = map.get_mut(&device_id) {
@@ -353,17 +481,17 @@ impl RelayHub {
                     }
                 }
                 if slots.control_p0.is_none() && slots.bulk_p1.is_none() {
-                    went_offline_user = Some(slots.user_id);
+                    went_offline_info = Some((slots.user_id, slots.role.clone()));
                     map.remove(&device_id);
                 }
             }
         }
 
-        if let Some(user_id) = went_offline_user {
+        if let Some((user_id, role)) = went_offline_info {
             if let Some(db) = &self.db {
                 let _ = db.set_device_online(device_id, false).await;
             }
-            self.broadcast_presence_to_tenant(user_id, device_id, false, None)
+            self.broadcast_presence_to_tenant(user_id, device_id, false, None, Some(role))
                 .await;
         }
     }
@@ -374,6 +502,7 @@ impl RelayHub {
         device_id: Uuid,
         is_online: bool,
         endpoints: Option<Vec<NetworkEndpointCandidate>>,
+        role: Option<String>,
     ) {
         let notice = Arc::new(RelayWireFrame::PeerPresence {
             device_id,
@@ -391,6 +520,19 @@ impl RelayHub {
         for tx in targets {
             let _ = tx.try_send(Arc::clone(&notice));
         }
+
+        self.publish_account_event(
+            user_id,
+            AccountLiveEvent {
+                kind: "peer_presence".to_string(),
+                device_id: Some(device_id),
+                device_name: None,
+                role,
+                online: Some(is_online),
+                timestamp_ms: Some(Utc::now().timestamp_millis().max(0) as u64),
+            },
+        )
+        .await;
     }
 
     async fn process_inbound_frame(&self, sender: &RelayTicketClaims, frame: RelayWireFrame) {
@@ -469,6 +611,7 @@ impl RelayHub {
                     sender.device_id,
                     true,
                     Some(endpoints),
+                    Some(sender.role.clone()),
                 )
                 .await;
             }
