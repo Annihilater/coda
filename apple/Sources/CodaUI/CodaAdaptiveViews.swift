@@ -38,6 +38,13 @@ public struct CodaAdaptiveRootView: View {
         )
     }
 
+    private func fullDisplaySize(geoSize: CGSize, safeAreas: CodaEdgeSafeAreas) -> CGSize {
+        CGSize(
+            width: geoSize.width + safeAreas.leading + safeAreas.trailing,
+            height: geoSize.height + safeAreas.top + safeAreas.bottom
+        )
+    }
+
     @ViewBuilder
     private func applyingSizeClassObservers<Content: View>(
         geo: GeometryProxy,
@@ -47,16 +54,18 @@ public struct CodaAdaptiveRootView: View {
 #if os(iOS)
         content()
             .onChange(of: horizontalSizeClass) { _, _ in
+                let displaySize = fullDisplaySize(geoSize: geo.size, safeAreas: safeAreas)
                 store.updateViewportGeometry(
-                    size: geo.size,
+                    size: displaySize,
                     safeAreas: safeAreas,
                     isHorizontalRegular: isHorizontalRegular,
                     isVerticalRegular: isVerticalRegular
                 )
             }
             .onChange(of: verticalSizeClass) { _, _ in
+                let displaySize = fullDisplaySize(geoSize: geo.size, safeAreas: safeAreas)
                 store.updateViewportGeometry(
-                    size: geo.size,
+                    size: displaySize,
                     safeAreas: safeAreas,
                     isHorizontalRegular: isHorizontalRegular,
                     isVerticalRegular: isVerticalRegular
@@ -70,11 +79,12 @@ public struct CodaAdaptiveRootView: View {
     public var body: some View {
         GeometryReader { geo in
             let safeAreas = edgeSafeAreas(from: geo.safeAreaInsets)
+            let displaySize = fullDisplaySize(geoSize: geo.size, safeAreas: safeAreas)
             let isHReg = isHorizontalRegular
             let isVReg = isVerticalRegular
             let factor = CodaFormFactor.detect(
-                width: geo.size.width,
-                height: geo.size.height,
+                width: displaySize.width,
+                height: displaySize.height,
                 isHorizontalRegular: isHReg,
                 isVerticalRegular: isVReg
             )
@@ -115,10 +125,10 @@ public struct CodaAdaptiveRootView: View {
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .background(CodaHerdrTheme.canvasBG)
+            .background(CodaHerdrTheme.canvasBG.ignoresSafeArea())
             .onAppear {
                 store.updateViewportGeometry(
-                    size: geo.size,
+                    size: displaySize,
                     safeAreas: safeAreas,
                     isHorizontalRegular: isHReg,
                     isVerticalRegular: isVReg
@@ -130,7 +140,7 @@ public struct CodaAdaptiveRootView: View {
             }
             .onChange(of: geo.size) { _, next in
                 store.updateViewportGeometry(
-                    size: next,
+                    size: fullDisplaySize(geoSize: next, safeAreas: safeAreas),
                     safeAreas: safeAreas,
                     isHorizontalRegular: isHReg,
                     isVerticalRegular: isVReg
@@ -138,7 +148,7 @@ public struct CodaAdaptiveRootView: View {
             }
             .onChange(of: store.showSidebar) { _, _ in
                 store.updateViewportGeometry(
-                    size: geo.size,
+                    size: displaySize,
                     safeAreas: safeAreas,
                     isHorizontalRegular: isHReg,
                     isVerticalRegular: isVReg
@@ -150,7 +160,7 @@ public struct CodaAdaptiveRootView: View {
                 }
                 if !factor.isCompact {
                     store.updateViewportGeometry(
-                        size: geo.size,
+                        size: displaySize,
                         safeAreas: safeAreas,
                         isHorizontalRegular: isHReg,
                         isVerticalRegular: isVReg
