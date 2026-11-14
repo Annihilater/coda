@@ -800,6 +800,7 @@ public final class CodaWorkspaceStore: ObservableObject {
 
         let usableW = max(240, size.width - safeAreas.leading - safeAreas.trailing)
         let usableH = max(180, size.height - safeAreas.top - safeAreas.bottom)
+        let duoExtraRail: CGFloat = safeAreas.trailing >= 64 ? 0 : CodaEdgeSafeAreas.duoSideRailWidth
 
         let paneW: CGFloat
         let paneH: CGFloat
@@ -808,24 +809,30 @@ public final class CodaWorkspaceStore: ObservableObject {
             paneW = usableW
             paneH = max(180, usableH - 118)
         case .iphoneDuoCoverPortrait:
-            paneW = usableW
+            paneW = max(260, usableW - duoExtraRail)
             paneH = max(180, usableH - 96)
-        case .iphoneLandscape, .iphoneDuoCoverLandscape:
+        case .iphoneLandscape:
             paneW = max(280, usableW - CodaEdgeSafeAreas.duoSideRailWidth)
+            paneH = max(160, usableH - 64)
+        case .iphoneDuoCoverLandscape:
+            paneW = max(280, usableW - duoExtraRail)
             paneH = max(160, usableH - 64)
         case .iphoneDuoInnerLandscape:
             if duoSplitMode == .expandedCanvas {
-                paneW = max(360, usableW - CodaEdgeSafeAreas.duoSideRailWidth)
+                paneW = max(360, usableW - duoExtraRail)
+            } else if duoSplitMode == .studioDiffSplit {
+                paneW = max(260, floor(size.width * 0.5) - 12 - safeAreas.leading)
             } else {
-                paneW = max(260, floor(size.width * 0.5) - 12 - safeAreas.trailing)
+                paneW = max(260, floor(size.width * 0.5) - 12 - max(safeAreas.trailing, CodaEdgeSafeAreas.duoSideRailWidth))
             }
-            paneH = max(200, usableH - 76)
+            paneH = max(200, usableH - 96)
         case .iphoneDuoInnerPortrait:
+            let contentW = max(300, usableW - duoExtraRail)
             if foldPosture == .tabletopLaptop {
-                paneW = usableW
+                paneW = contentW
                 paneH = max(160, floor(size.height * 0.5) - 12 - safeAreas.top - 42)
             } else {
-                paneW = showSidebar ? max(300, usableW - 236) : usableW
+                paneW = showSidebar ? max(280, contentW - 216) : contentW
                 paneH = max(220, usableH - 96)
             }
         case .ipadOrDesktop:

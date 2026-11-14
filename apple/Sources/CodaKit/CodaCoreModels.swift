@@ -688,6 +688,18 @@ public struct CodaReservedRegion: Sendable, Equatable {
         }
         return nil
     }
+
+    public static func duoRightSystemRail(
+        in size: CGSize,
+        railWidth: CGFloat = CodaEdgeSafeAreas.duoSideRailWidth
+    ) -> CodaReservedRegion? {
+        guard size.width > 0 && size.height > 0 else { return nil }
+        let w = min(railWidth, size.width)
+        return CodaReservedRegion(
+            kind: .occlusion,
+            rect: CGRect(x: max(0, size.width - w), y: 0, width: w, height: size.height)
+        )
+    }
 }
 
 public struct CodaEdgeSafeAreas: Sendable, Equatable {
@@ -740,11 +752,15 @@ public enum CodaFormFactor: String, Codable, Sendable, CaseIterable, Equatable {
 
     public var usesVerticalSideRail: Bool {
         switch self {
-        case .iphoneLandscape, .iphoneDuoCoverLandscape, .iphoneDuoInnerLandscape:
+        case .iphoneLandscape, .iphoneDuoCoverPortrait, .iphoneDuoCoverLandscape, .iphoneDuoInnerLandscape, .iphoneDuoInnerPortrait:
             return true
-        case .iphonePortrait, .iphoneDuoCoverPortrait, .iphoneDuoInnerPortrait, .ipadOrDesktop:
+        case .iphonePortrait, .ipadOrDesktop:
             return false
         }
+    }
+
+    public var placesSideRailOnTrailingEdge: Bool {
+        isIPhoneDuo
     }
 
     public func fluidHorizontalMargin(for width: CGFloat) -> CGFloat {
@@ -1089,8 +1105,8 @@ public struct CodaIPhoneDeviceSpec: Sendable, Equatable, Identifiable {
             generation: "Duo",
             logicalSize: CGSize(width: 466, height: 678),
             scaleFactor: 3,
-            portraitSafeArea: CodaEdgeSafeAreas(top: 54, leading: 0, bottom: 34, trailing: 0),
-            landscapeSafeArea: CodaEdgeSafeAreas(top: 0, leading: 84, bottom: 20, trailing: 54),
+            portraitSafeArea: CodaEdgeSafeAreas(top: 0, leading: 0, bottom: 34, trailing: 84),
+            landscapeSafeArea: CodaEdgeSafeAreas(top: 0, leading: 0, bottom: 20, trailing: 84),
             isHorizontalRegularInPortrait: false,
             isVerticalRegularInPortrait: true,
             isHorizontalRegularInLandscape: false,
@@ -1103,8 +1119,8 @@ public struct CodaIPhoneDeviceSpec: Sendable, Equatable, Identifiable {
             generation: "Duo",
             logicalSize: CGSize(width: 626, height: 890),
             scaleFactor: 3,
-            portraitSafeArea: CodaEdgeSafeAreas(top: 44, leading: 0, bottom: 34, trailing: 0),
-            landscapeSafeArea: CodaEdgeSafeAreas(top: 24, leading: 84, bottom: 20, trailing: 16),
+            portraitSafeArea: CodaEdgeSafeAreas(top: 0, leading: 0, bottom: 24, trailing: 84),
+            landscapeSafeArea: CodaEdgeSafeAreas(top: 0, leading: 0, bottom: 20, trailing: 84),
             isHorizontalRegularInPortrait: true,
             isVerticalRegularInPortrait: true,
             isHorizontalRegularInLandscape: true,

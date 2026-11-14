@@ -127,14 +127,20 @@ public enum CodaSideRailKind: Sendable, Equatable {
 public struct CodaVerticalSideToolbarRail: View {
     @ObservedObject public var store: CodaWorkspaceStore
     public let kind: CodaSideRailKind
+    public let edge: HorizontalEdge
 
-    public init(store: CodaWorkspaceStore, kind: CodaSideRailKind) {
+    public init(store: CodaWorkspaceStore, kind: CodaSideRailKind, edge: HorizontalEdge = .leading) {
         self.store = store
         self.kind = kind
+        self.edge = edge
     }
 
     public var body: some View {
-        VStack(spacing: 8) {
+        let extraEdgePadding: CGFloat = edge == .leading
+            ? store.edgeSafeAreas.leading
+            : (store.edgeSafeAreas.trailing < 64 ? store.edgeSafeAreas.trailing : 0)
+
+        return VStack(spacing: 8) {
             VStack(spacing: 4) {
                 HStack(spacing: 4) {
                     Circle()
@@ -271,11 +277,11 @@ public struct CodaVerticalSideToolbarRail: View {
             .padding(.bottom, max(10, store.edgeSafeAreas.bottom + 4))
         }
         .padding(.horizontal, 6)
-        .padding(.leading, store.edgeSafeAreas.leading)
-        .frame(width: CodaEdgeSafeAreas.duoSideRailWidth + store.edgeSafeAreas.leading)
+        .padding(edge == .leading ? .leading : .trailing, extraEdgePadding)
+        .frame(width: CodaEdgeSafeAreas.duoSideRailWidth + extraEdgePadding)
         .frame(maxHeight: .infinity)
         .background(CodaHerdrTheme.cardBG)
-        .overlay(alignment: .trailing) {
+        .overlay(alignment: edge == .leading ? .trailing : .leading) {
             Rectangle()
                 .fill(CodaHerdrTheme.borderHairline)
                 .frame(width: 1)
@@ -331,7 +337,7 @@ public struct CodaVerticalSideToolbarRail: View {
     }
 }
 
-// MARK: - Landscape Side-Rail Layout (Duo Cover 678x466 & Slab iPhones 14-18 Landscape)
+// MARK: - Landscape Side-Rail Layout (Slab iPhones 14-18 Landscape)
 
 public struct CodaCompactLandscapeSideRailLayout: View {
     @ObservedObject public var store: CodaWorkspaceStore
@@ -342,7 +348,7 @@ public struct CodaCompactLandscapeSideRailLayout: View {
 
     public var body: some View {
         HStack(spacing: 0) {
-            CodaVerticalSideToolbarRail(store: store, kind: .compactLandscape)
+            CodaVerticalSideToolbarRail(store: store, kind: .compactLandscape, edge: .leading)
 
             Group {
                 if let active = store.selectedSession {
@@ -365,6 +371,89 @@ public struct CodaCompactLandscapeSideRailLayout: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .background(CodaHerdrTheme.canvasBG)
+    }
+}
+
+// MARK: - iPhone Duo 5.4" Outer Cover Layout (466x678 Portrait & 678x466 Landscape, Right 84pt System Rail)
+
+public struct CodaDuoCoverLayout: View {
+    @ObservedObject public var store: CodaWorkspaceStore
+
+    public init(store: CodaWorkspaceStore) {
+        self.store = store
+    }
+
+    public var body: some View {
+        let needsFallbackRail = store.edgeSafeAreas.trailing < 64
+        let isLandscape = store.formFactor == .iphoneDuoCoverLandscape
+
+        HStack(spacing: 0) {
+            coverPrimaryContent(needsFallbackRail: needsFallbackRail, isLandscape: isLandscape)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+            if needsFallbackRail {
+                CodaVerticalSideToolbarRail(store: store, kind: .compactLandscape, edge: .trailing)
+            }
+        }
+        .background(CodaHerdrTheme.canvasBG)
+#if os(iOS)
+        .toolbar {
+            ToolbarItemGroup(placement: .primaryAction) {
+                Button {
+                    store.closeTerminalToInbox()
+                    store.selectedTab = .inbox
+                } label: {
+                    Label(tr("Inbox", "收件箱", locale: store.locale), systemImage: "tray.fill")
+                }
+                Button {
+                    store.closeTerminalToInbox()
+                    store.selectedTab = .spaces
+                } label: {
+                    Label(tr("Spaces", "空间", locale: store.locale), systemImage: "square.grid.2x2.fill")
+                }
+                Button {
+                    store.setLocale(store.locale == .en ? .zh : .en)
+                } label: {
+                    Text(store.locale == .en ? "EN" : "中文")
+                }
+                Button {
+                    store.settingsInitialFocusPairing = false
+                    store.showSettingsSheet = true
+                } label: {
+                    Label(tr("Settings", "设置", locale: store.locale), systemImage: "gearshape")
+                }
+            }
+        }
+#endif
+    }
+
+    @ViewBuilder
+    private func coverPrimaryContent(needsFallbackRail: Bool, isLandscape: Bool) -> some View {
+        if let active = store.selectedSession {
+            CodaTerminalSessionView(
+                store: store,
+                session: active,
+                isCompact: true,
+                isCompactHeight: isLandscape
+            )
+        } else {
+            ZStack(alignment: .bottom) {
+                Group {
+                    switch store.selectedTab {
+                    case .inbox:
+                        CodaMobileInboxTabView(store: store)
+                    case .spaces:
+                        CodaMobileSpacesTabView(store: store)
+                    }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+                if !needsFallbackRail {
+                    CodaFloatingBottomTabPill(store: store)
+                        .padding(.bottom, 12)
+                }
+            }
+        }
     }
 }
 
@@ -635,7 +724,7 @@ public struct CodaDuoDirectoryPane: View {
     }
 }
 
-// MARK: - iPhone Duo 7.6" Inner Unfolded Landscape Workbench (890 x 626 pt: 84pt Side Rail + Crease-Aware Split)
+// MARK: - iPhone Duo 7.6" Inner Unfolded Landscape Workbench (890 x 626 pt: 433 + 24 Crease + 349 + 84 Right Rail)
 
 public struct CodaDuoInnerLandscapeWorkbenchView: View {
     @ObservedObject public var store: CodaWorkspaceStore
@@ -646,40 +735,144 @@ public struct CodaDuoInnerLandscapeWorkbenchView: View {
 
     public var body: some View {
         GeometryReader { geo in
-            let railWidth = CodaEdgeSafeAreas.duoSideRailWidth + store.edgeSafeAreas.leading
+            let fullDisplayWidth = geo.size.width + store.edgeSafeAreas.leading + store.edgeSafeAreas.trailing
+            let needsFallbackRail = store.edgeSafeAreas.trailing < 64
 
             HStack(spacing: 0) {
-                CodaVerticalSideToolbarRail(store: store, kind: .duoInner)
+                VStack(spacing: 0) {
+                    duoLandscapeHeaderBar
+                        .frame(height: 34)
 
-                if store.duoSplitMode == .expandedCanvas {
-                    if let active = store.selectedSession {
-                        CodaTerminalSessionView(
-                            store: store,
-                            session: active,
-                            isCompact: false,
-                            isSplitThumb: true,
-                            isCompactHeight: true
-                        )
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    Divider().background(CodaHerdrTheme.borderHairline)
+
+                    if store.duoSplitMode == .expandedCanvas {
+                        if let active = store.selectedSession {
+                            CodaTerminalSessionView(
+                                store: store,
+                                session: active,
+                                isCompact: false,
+                                isSplitThumb: true,
+                                isCompactHeight: true
+                            )
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        } else {
+                            duoEmptyDetailPane
+                        }
                     } else {
-                        duoEmptyDetailPane
+                        CodaArrangementSplitView(
+                            axis: .horizontal,
+                            leadingOffset: store.edgeSafeAreas.leading,
+                            totalWindowSpan: fullDisplayWidth,
+                            creaseThickness: 24
+                        ) {
+                            leftLeafView
+                        } secondary: {
+                            rightLeafView
+                        }
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
                     }
-                } else {
-                    CodaArrangementSplitView(
-                        axis: .horizontal,
-                        leadingOffset: railWidth,
-                        totalWindowSpan: geo.size.width,
-                        creaseThickness: 24
-                    ) {
-                        leftLeafView
-                    } secondary: {
-                        rightLeafView
-                    }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+                if needsFallbackRail {
+                    CodaVerticalSideToolbarRail(store: store, kind: .duoInner, edge: .trailing)
                 }
             }
         }
         .background(CodaHerdrTheme.canvasBG)
+#if os(iOS)
+        .toolbar {
+            ToolbarItemGroup(placement: .primaryAction) {
+                ForEach(CodaDuoSplitMode.allCases) { mode in
+                    Button {
+                        withAnimation(.snappy(duration: 0.18)) {
+                            store.setDuoSplitMode(mode)
+                        }
+                    } label: {
+                        Text(mode.title(locale: store.locale))
+                    }
+                }
+            }
+        }
+#endif
+    }
+
+    private var duoLandscapeHeaderBar: some View {
+        HStack(spacing: 6) {
+            Circle()
+                .fill(store.remoteMachines.contains(where: { $0.isOnline }) ? CodaHerdrTheme.greenDiff : CodaHerdrTheme.textDim)
+                .frame(width: 7, height: 7)
+
+            Text("Coda Duo")
+                .font(.system(size: 12.5, weight: .bold))
+                .foregroundStyle(CodaHerdrTheme.textPrimary)
+
+            Text("\(store.terminalColumns)×\(store.terminalRows)")
+                .font(.system(size: 10, weight: .medium, design: .monospaced))
+                .foregroundStyle(CodaHerdrTheme.greenDiff)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 2)
+                .background(
+                    Capsule()
+                        .fill(CodaHerdrTheme.canvasBG)
+                        .overlay(Capsule().strokeBorder(CodaHerdrTheme.borderHairline, lineWidth: 1))
+                )
+
+            Spacer(minLength: 32)
+
+            HStack(spacing: 2) {
+                ForEach(CodaDuoSplitMode.allCases) { mode in
+                    let selected = store.duoSplitMode == mode
+                    Button {
+                        withAnimation(.snappy(duration: 0.18)) {
+                            store.setDuoSplitMode(mode)
+                        }
+                    } label: {
+                        Text(mode.title(locale: store.locale))
+                            .font(.system(size: 10, weight: selected ? .semibold : .medium))
+                            .foregroundStyle(selected ? CodaHerdrTheme.textPrimary : CodaHerdrTheme.textSecondary)
+                            .padding(.horizontal, 7)
+                            .padding(.vertical, 3.5)
+                            .background(
+                                Capsule().fill(selected ? CodaHerdrTheme.pillActiveBG : .clear)
+                            )
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(2)
+            .background(
+                Capsule()
+                    .fill(CodaHerdrTheme.canvasBG)
+                    .overlay(Capsule().strokeBorder(CodaHerdrTheme.borderHairline, lineWidth: 1))
+            )
+
+            Button {
+                store.setLocale(store.locale == .en ? .zh : .en)
+            } label: {
+                Text(store.locale == .en ? "EN" : "中文")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(CodaHerdrTheme.textSecondary)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 3.5)
+                    .background(Capsule().fill(CodaHerdrTheme.elevatedBG))
+            }
+            .buttonStyle(.plain)
+
+            Button {
+                store.settingsInitialFocusPairing = false
+                store.showSettingsSheet = true
+            } label: {
+                Image(systemName: "gearshape")
+                    .font(.system(size: 11.5))
+                    .foregroundStyle(CodaHerdrTheme.textPrimary)
+                    .frame(width: 24, height: 24)
+                    .background(Circle().fill(CodaHerdrTheme.elevatedBG))
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 10)
+        .background(CodaHerdrTheme.cardBG)
     }
 
     @ViewBuilder
@@ -796,7 +989,7 @@ public struct CodaDuoInnerLandscapeWorkbenchView: View {
     }
 }
 
-// MARK: - iPhone Duo 7.6" Inner Unfolded Portrait Workbench (626 x 890 pt: Flat 80-Col <-> Tabletop Laptop Pose)
+// MARK: - iPhone Duo 7.6" Inner Unfolded Portrait Workbench (626 x 890 pt: Right 84pt System Rail + Flat 80-Col <-> Tabletop Laptop Pose)
 
 public struct CodaDuoInnerPortraitWorkbenchView: View {
     @ObservedObject public var store: CodaWorkspaceStore
@@ -808,58 +1001,83 @@ public struct CodaDuoInnerPortraitWorkbenchView: View {
     public var body: some View {
         GeometryReader { geo in
             let headerHeight: CGFloat = 38
+            let fullDisplayHeight = geo.size.height + store.edgeSafeAreas.top + store.edgeSafeAreas.bottom
+            let needsFallbackRail = store.edgeSafeAreas.trailing < 64
 
-            VStack(spacing: 0) {
-                portraitHeaderBar
-                    .frame(height: headerHeight)
+            HStack(spacing: 0) {
+                VStack(spacing: 0) {
+                    portraitHeaderBar
+                        .frame(height: headerHeight)
 
-                Divider().background(CodaHerdrTheme.borderHairline)
+                    Divider().background(CodaHerdrTheme.borderHairline)
 
-                if store.foldPosture == .tabletopLaptop {
-                    CodaArrangementSplitView(
-                        axis: .vertical,
-                        leadingOffset: headerHeight,
-                        totalWindowSpan: geo.size.height,
-                        creaseThickness: 24
-                    ) {
-                        if let active = store.selectedSession {
-                            CodaTerminalSessionView(
-                                store: store,
-                                session: active,
-                                isCompact: false,
-                                isCompactHeight: true,
-                                hideBottomControls: true
-                            )
-                        } else {
-                            emptyPortraitTerminal
+                    if store.foldPosture == .tabletopLaptop {
+                        CodaArrangementSplitView(
+                            axis: .vertical,
+                            leadingOffset: store.edgeSafeAreas.top + headerHeight + 1,
+                            totalWindowSpan: fullDisplayHeight,
+                            creaseThickness: 24
+                        ) {
+                            if let active = store.selectedSession {
+                                CodaTerminalSessionView(
+                                    store: store,
+                                    session: active,
+                                    isCompact: false,
+                                    isCompactHeight: true,
+                                    hideBottomControls: true
+                                )
+                            } else {
+                                emptyPortraitTerminal
+                            }
+                        } secondary: {
+                            CodaDuoTabletopControlDeck(store: store, session: store.selectedSession)
                         }
-                    } secondary: {
-                        CodaDuoTabletopControlDeck(store: store, session: store.selectedSession)
+                    } else {
+                        HStack(spacing: 0) {
+                            if store.showSidebar {
+                                CodaDuoDirectoryPane(store: store)
+                                    .frame(width: 212)
+
+                                Divider().background(CodaHerdrTheme.borderHairline)
+                            }
+
+                            if let active = store.selectedSession {
+                                CodaTerminalSessionView(
+                                    store: store,
+                                    session: active,
+                                    isCompact: false
+                                )
+                                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                            } else {
+                                emptyPortraitTerminal
+                            }
+                        }
                     }
-                } else {
-                    HStack(spacing: 0) {
-                        if store.showSidebar {
-                            CodaDuoDirectoryPane(store: store)
-                                .frame(width: 236)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
 
-                            Divider().background(CodaHerdrTheme.borderHairline)
-                        }
-
-                        if let active = store.selectedSession {
-                            CodaTerminalSessionView(
-                                store: store,
-                                session: active,
-                                isCompact: false
-                            )
-                            .frame(maxWidth: .infinity, maxHeight: .infinity)
-                        } else {
-                            emptyPortraitTerminal
-                        }
-                    }
+                if needsFallbackRail {
+                    CodaVerticalSideToolbarRail(store: store, kind: .duoInner, edge: .trailing)
                 }
             }
         }
         .background(CodaHerdrTheme.canvasBG)
+#if os(iOS)
+        .toolbar {
+            ToolbarItemGroup(placement: .primaryAction) {
+                Button {
+                    store.setFoldPosture(.flat)
+                } label: {
+                    Label(tr("80-Col Flat", "80列平铺", locale: store.locale), systemImage: "rectangle")
+                }
+                Button {
+                    store.setFoldPosture(.tabletopLaptop)
+                } label: {
+                    Label(tr("Tabletop", "笔电半折", locale: store.locale), systemImage: "laptopcomputer")
+                }
+            }
+        }
+#endif
     }
 
     private var portraitHeaderBar: some View {

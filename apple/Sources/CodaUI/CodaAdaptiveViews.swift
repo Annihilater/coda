@@ -92,10 +92,12 @@ public struct CodaAdaptiveRootView: View {
             applyingSizeClassObservers(geo: geo, safeAreas: safeAreas) {
                 ZStack(alignment: .top) {
                     switch factor {
-                    case .iphonePortrait, .iphoneDuoCoverPortrait:
+                    case .iphonePortrait:
                         compactPhoneLayout
-                    case .iphoneLandscape, .iphoneDuoCoverLandscape:
+                    case .iphoneLandscape:
                         CodaCompactLandscapeSideRailLayout(store: store)
+                    case .iphoneDuoCoverPortrait, .iphoneDuoCoverLandscape:
+                        CodaDuoCoverLayout(store: store)
                     case .iphoneDuoInnerLandscape:
                         CodaDuoInnerLandscapeWorkbenchView(store: store)
                     case .iphoneDuoInnerPortrait:

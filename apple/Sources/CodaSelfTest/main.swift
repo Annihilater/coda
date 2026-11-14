@@ -117,7 +117,7 @@ struct CodaSelfTest {
         let authStart = try JSONDecoder().decode(CodaDeviceAuthStart.self, from: startJSON)
         precondition(authStart.userCode == "ABCD-2345")
 
-        // 6. iPhone Duo (466x678, 890x626 / 626x890) & Mainstream iPhone 14-18 Form-Factor Matrix + Fold Reflow
+        // 6. iPhone Duo (466x678, 890x626 / 626x890 with trailing 84pt system rail) & Mainstream iPhone 14-18 Form-Factor Matrix + Fold Reflow
         precondition(CodaIPhoneDeviceSpec.mainstreamCatalog.count == 23)
         for spec in CodaIPhoneDeviceSpec.mainstreamCatalog {
             let portrait = CodaFormFactor.detect(
@@ -130,7 +130,6 @@ struct CodaSelfTest {
                 portrait == spec.expectedPortraitFormFactor,
                 "Portrait form factor mismatch for \(spec.name): got \(portrait)"
             )
-            precondition(!portrait.usesVerticalSideRail)
 
             let landscape = CodaFormFactor.detect(
                 width: spec.logicalSize.height,
@@ -143,6 +142,19 @@ struct CodaSelfTest {
                 "Landscape form factor mismatch for \(spec.name): got \(landscape)"
             )
             precondition(landscape.usesVerticalSideRail)
+
+            if portrait.isIPhoneDuo {
+                precondition(portrait.usesVerticalSideRail && landscape.usesVerticalSideRail)
+                precondition(portrait.placesSideRailOnTrailingEdge && landscape.placesSideRailOnTrailingEdge)
+                precondition(spec.portraitSafeArea.trailing == CodaEdgeSafeAreas.duoSideRailWidth)
+                precondition(spec.landscapeSafeArea.trailing == CodaEdgeSafeAreas.duoSideRailWidth)
+                precondition(spec.portraitSafeArea.top == 0 && spec.landscapeSafeArea.top == 0)
+                precondition(spec.portraitSafeArea.isHorizontallyAsymmetric && spec.landscapeSafeArea.isHorizontallyAsymmetric)
+            } else {
+                precondition(!portrait.usesVerticalSideRail)
+                precondition(!portrait.placesSideRailOnTrailingEdge && !landscape.placesSideRailOnTrailingEdge)
+                precondition(!spec.portraitSafeArea.isHorizontallyAsymmetric)
+            }
 
             let expectedPlatform = (portrait.isIPhoneDuo || landscape.isIPhoneDuo) ? "iphone_duo" : "ios"
             precondition(portrait.platformIdentifier(forMacOS: false) == expectedPlatform)
@@ -159,9 +171,28 @@ struct CodaSelfTest {
         precondition(CodaFormFactor.detect(width: 1194, height: 834, isHorizontalRegular: true, isVerticalRegular: true) == .ipadOrDesktop)
         precondition(CodaFormFactor.ipadOrDesktop.platformIdentifier(forMacOS: false) == "ipados")
 
+        if let coverRightRail = CodaReservedRegion.duoRightSystemRail(in: CGSize(width: 466, height: 678)) {
+            precondition(coverRightRail.kind == .occlusion)
+            precondition(coverRightRail.rect == CGRect(x: 382, y: 0, width: 84, height: 678))
+        } else {
+            preconditionFailure("Expected right system rail region for Duo Cover 466x678")
+        }
+        if let innerRightRail = CodaReservedRegion.duoRightSystemRail(in: CGSize(width: 890, height: 626)) {
+            precondition(innerRightRail.kind == .occlusion)
+            precondition(innerRightRail.rect == CGRect(x: 806, y: 0, width: 84, height: 626))
+        } else {
+            preconditionFailure("Expected right system rail region for Duo Inner 890x626")
+        }
+
         if let landscapeCrease = CodaReservedRegion.duoFoldDivision(in: CGSize(width: 890, height: 626), posture: .bookHalfOpen) {
             precondition(landscapeCrease.kind == .division)
             precondition(landscapeCrease.rect == CGRect(x: 433, y: 0, width: 24, height: 626))
+            let leftSpan = landscapeCrease.rect.minX
+            let creaseSpan = landscapeCrease.rect.width
+            let rightRailSpan = CodaEdgeSafeAreas.duoSideRailWidth
+            let rightLeafSpan = 890 - landscapeCrease.rect.maxX - rightRailSpan
+            precondition(leftSpan == 433 && creaseSpan == 24 && rightLeafSpan == 349 && rightRailSpan == 84)
+            precondition(leftSpan + creaseSpan + rightLeafSpan + rightRailSpan == 890)
         } else {
             preconditionFailure("Expected vertical fold crease division for Duo inner landscape")
         }
@@ -172,7 +203,7 @@ struct CodaSelfTest {
         } else {
             preconditionFailure("Expected horizontal fold crease division for Duo tabletop pose")
         }
-        precondition(CodaEdgeSafeAreas(top: 0, leading: 62, bottom: 20, trailing: 0).isHorizontallyAsymmetric)
+        precondition(CodaEdgeSafeAreas(top: 0, leading: 0, bottom: 34, trailing: 84).isHorizontallyAsymmetric)
         precondition(!CodaEdgeSafeAreas(top: 0, leading: 59, bottom: 21, trailing: 59).isHorizontallyAsymmetric)
 
         let duoSample = "\u{1B}]7501:blocked:Run suite\u{07}\u{1B}[38;2;56;189;248m+    let prefer_raw = self.peer_lacks_zstd || req_id.starts_with(\"swift-\");\u{1B}[0m\n-    let old = true;\n1. Yes, approve cargo test\n"
