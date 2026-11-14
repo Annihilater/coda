@@ -227,7 +227,184 @@ struct CodaSelfTest {
         // 7. Auto-LAN UDP Discovery + Direct P2P TCP Handshake + One-Way PtyResize + E2EE RPCs
         try await runAutoLanSmartPathLoopbackTest()
 
+        // 8. Optional Live Multi-Host Mesh Test (`CODA_LIVE_MESH_TEST_URL`)
+        if let liveURL = ProcessInfo.processInfo.environment["CODA_LIVE_MESH_TEST_URL"], !liveURL.isEmpty {
+            try await runLiveMeshSelfTest(baseURLString: liveURL)
+        }
+
         print("[OK] ALL CODA APPLE NATIVE SELF-TESTS PASSED!")
+    }
+
+    private final class LiveMeshCaptureBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var chunks: [String: String] = [:]
+        private var wsEvents: [CodaAccountLiveEvent] = []
+
+        func appendChunk(deviceId: UUID, terminal: String, text: String) {
+            let key = "\(deviceId.uuidString.lowercased())/\(terminal)"
+            lock.lock()
+            chunks[key, default: ""] += text
+            lock.unlock()
+        }
+
+        func output(deviceId: UUID, terminal: String) -> String {
+            let key = "\(deviceId.uuidString.lowercased())/\(terminal)"
+            lock.lock()
+            let v = chunks[key] ?? ""
+            lock.unlock()
+            return v
+        }
+
+        func appendEvent(_ ev: CodaAccountLiveEvent) {
+            lock.lock()
+            wsEvents.append(ev)
+            lock.unlock()
+        }
+
+        func hasConnectedEvent() -> Bool {
+            lock.lock()
+            let ok = wsEvents.contains { $0.kind == "connected" }
+            lock.unlock()
+            return ok
+        }
+    }
+
+    static func runLiveMeshSelfTest(baseURLString: String) async throws {
+        guard let url = URL(string: baseURLString) else {
+            preconditionFailure("Invalid CODA_LIVE_MESH_TEST_URL: \(baseURLString)")
+        }
+        let email = ProcessInfo.processInfo.environment["CODA_LIVE_MESH_EMAIL"] ?? "mesh@coda.dev"
+        let password = ProcessInfo.processInfo.environment["CODA_LIVE_MESH_PASSWORD"] ?? "MeshPass2026!"
+        let minHosts = Int(ProcessInfo.processInfo.environment["CODA_EXPECTED_MIN_HOSTS"] ?? "1") ?? 1
+
+        var clientIdentity = CodaDeviceIdentity.generate(name: "Swift-Mobile-Verifier")
+        let net = CodaNetworkClient(serverBaseURL: url)
+        let token = try await net.login(emailOrHandle: email, password: password, clientLabel: "Swift-SelfTest")
+        let registeredDev = try await net.registerClientDevice(
+            identity: clientIdentity,
+            platform: CodaFormFactor.iphoneDuoInnerLandscape.platformIdentifier(forMacOS: false)
+        )
+        clientIdentity.deviceId = registeredDev.id
+        guard let clientDevId = clientIdentity.deviceId else {
+            preconditionFailure("registerClientDevice returned nil device id")
+        }
+
+        let capture = LiveMeshCaptureBox()
+        await net.setAsyncEventHandler { event in
+            if event.op == "pty_output_chunk",
+               let obj = try? JSONSerialization.jsonObject(with: event.payloadData) as? [String: Any],
+               let term = obj["terminal"] as? String,
+               let b64 = obj["data_b64"] as? String,
+               let bytes = Data(base64Encoded: b64) {
+                capture.appendChunk(
+                    deviceId: event.sourceDeviceId,
+                    terminal: term,
+                    text: String(decoding: bytes, as: UTF8.self)
+                )
+            }
+        }
+        await net.connectAccountEventsWebSocket(sessionToken: token) { ev in
+            capture.appendEvent(ev)
+        }
+
+        var gotConnected = false
+        for _ in 0..<50 {
+            if capture.hasConnectedEvent() {
+                gotConnected = true
+                break
+            }
+            try await Task.sleep(nanoseconds: 100_000_000)
+        }
+        precondition(gotConnected, "Timed out waiting for /api/v1/events/ws connected event in Swift client")
+
+        var onlineHosts: [CodaRemoteDevice] = []
+        for _ in 0..<40 {
+            let devices = try await net.listDevices()
+            onlineHosts = devices.filter { ($0.role == "daemon" || $0.role == "hybrid") && $0.isOnline }
+            if onlineHosts.count >= minHosts {
+                break
+            }
+            try await Task.sleep(nanoseconds: 250_000_000)
+        }
+        precondition(onlineHosts.count >= minHosts, "Expected at least \(minHosts) online hosts, got \(onlineHosts.count)")
+
+        for host in onlineHosts {
+            _ = try await net.connectBestAvailable(
+                sessionToken: token,
+                targetDevice: host,
+                clientIdentity: clientIdentity
+            )
+            let ws = try await net.listWorkspaces(
+                on: host,
+                clientIdentity: clientIdentity,
+                clientDeviceId: clientDevId
+            )
+            let launched = try await net.launchAgent(
+                on: host,
+                clientIdentity: clientIdentity,
+                clientDeviceId: clientDevId,
+                agent: "sh",
+                name: "swift-verify-\(UUID().uuidString.lowercased().prefix(8))",
+                cwd: ws.repos.first?.rootPath,
+                initialPrompt: nil,
+                cols: 100,
+                rows: 30
+            )
+            guard let termAddr = launched?.address else {
+                preconditionFailure("launchAgent failed to return terminal address for host \(host.name)")
+            }
+
+            let attached = try await net.attachTerminalPty(
+                on: host,
+                clientIdentity: clientIdentity,
+                clientDeviceId: clientDevId,
+                terminal: termAddr,
+                cols: 100,
+                rows: 30
+            )
+            precondition(attached, "attachTerminalPty failed for host \(host.name)")
+
+            let shortId = String(host.id.uuidString.lowercased().prefix(8))
+            let marker = "SWIFT_MOBILE_MESH_OK_\(shortId)"
+            try await net.sendPtyInput(
+                on: host,
+                clientIdentity: clientIdentity,
+                clientDeviceId: clientDevId,
+                terminal: termAddr,
+                data: Data("echo \(marker)\n".utf8)
+            )
+
+            var foundMarker = false
+            for _ in 0..<80 {
+                if capture.output(deviceId: host.id, terminal: termAddr).contains(marker) {
+                    foundMarker = true
+                    break
+                }
+                try await Task.sleep(nanoseconds: 100_000_000)
+            }
+            precondition(foundMarker, "Timed out waiting for \(marker) via pty_output_chunk from \(host.name)")
+
+            if let repo = ws.repos.first {
+                let diff = try await net.fetchGitDiff(
+                    on: host,
+                    clientIdentity: clientIdentity,
+                    clientDeviceId: clientDevId,
+                    cwd: repo.rootPath
+                )
+                precondition(!diff.branch.isEmpty, "Empty git diff branch on host \(host.name)")
+            }
+
+            try? await net.sendPtyInput(
+                on: host,
+                clientIdentity: clientIdentity,
+                clientDeviceId: clientDevId,
+                terminal: termAddr,
+                data: Data("exit\n".utf8)
+            )
+        }
+
+        await net.disconnectTransport()
+        print("[OK] CODA APPLE LIVE MESH VERIFIED ACROSS \(onlineHosts.count) HOSTS!")
     }
 
     static func runAutoLanSmartPathLoopbackTest() async throws {

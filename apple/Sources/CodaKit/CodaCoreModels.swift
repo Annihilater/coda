@@ -439,6 +439,24 @@ public struct CodaHerdrTerminalSummary: Codable, Sendable, Equatable, Hashable {
     public let status: CodaHerdrAgentStatus?
 }
 
+public struct CodaAccountLiveEvent: Codable, Sendable, Equatable {
+    public let kind: String
+    public let deviceId: UUID?
+    public let deviceName: String?
+    public let role: String?
+    public let online: Bool?
+    public let timestampMs: UInt64?
+
+    enum CodingKeys: String, CodingKey {
+        case kind
+        case deviceId = "device_id"
+        case deviceName = "device_name"
+        case role
+        case online
+        case timestampMs = "timestamp_ms"
+    }
+}
+
 public struct CodaBranchWorktreeItem: Identifiable, Codable, Sendable, Equatable {
     public var id: String { "\(worktreePath)#\(branch)" }
     public let branch: String

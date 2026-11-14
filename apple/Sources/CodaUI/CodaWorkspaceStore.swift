@@ -108,6 +108,8 @@ public final class CodaWorkspaceStore: ObservableObject {
     private var pollLoopTask: Task<Void, Never>?
     private var deviceAuthTask: Task<Void, Never>?
     private var readCompletedIDs: Set<String> = []
+    private var attachedSessionIDs: Set<String> = []
+    private var accountEventsConnectedToken: String? = nil
     private var previousStates: [String: HerdrLifecycleState] = [:]
     private var lastToastAt: Date = .distantPast
     private var lastViewportSize: CGSize = .zero
@@ -179,11 +181,20 @@ public final class CodaWorkspaceStore: ObservableObject {
         }
         let client = CodaNetworkClient(serverBaseURL: url)
         let tok = settings.sessionToken
-        if !tok.isEmpty {
-            Task { await client.setToken(tok) }
+        Task { [weak self] in
+            if !tok.isEmpty {
+                await client.setToken(tok)
+            }
+            await client.setAsyncEventHandler { [weak self] event in
+                Task { @MainActor in
+                    self?.handleAsyncPeerEvent(event)
+                }
+            }
         }
         self.networkClient = client
         self.networkClientURL = url
+        self.attachedSessionIDs.removeAll()
+        self.accountEventsConnectedToken = nil
         return client
     }
 
@@ -309,23 +320,38 @@ public final class CodaWorkspaceStore: ObservableObject {
         }
     }
 
-    // MARK: - Polling Lifecycle
+    // MARK: - Polling & Account Event WebSocket Lifecycle
 
     public func startLiveSync() {
         pollLoopTask?.cancel()
+        if isSignedIn {
+            let token = settings.sessionToken
+            if !token.isEmpty && accountEventsConnectedToken != token, let client = ensureClient() {
+                accountEventsConnectedToken = token
+                Task { [weak self] in
+                    await client.setAsyncEventHandler { [weak self] event in
+                        Task { @MainActor in
+                            self?.handleAsyncPeerEvent(event)
+                        }
+                    }
+                    await client.connectAccountEventsWebSocket(sessionToken: token) { [weak self] ev in
+                        guard ev.role != "client" else { return }
+                        if ev.kind == "connected" || ev.kind == "devices_changed" || ev.kind == "peer_presence" {
+                            Task { @MainActor in
+                                await self?.refreshMachinesAndSessions()
+                            }
+                        }
+                    }
+                }
+            }
+        }
         pollLoopTask = Task { [weak self] in
-            var tick = 0
             while !Task.isCancelled {
                 guard let self else { return }
                 if self.isSignedIn {
-                    if tick % 3 == 0 {
-                        await self.refreshMachinesAndSessions()
-                    } else if let selected = self.selectedSession {
-                        await self.refreshTerminalScreen(for: selected)
-                    }
+                    await self.refreshMachinesAndSessions()
                 }
-                tick += 1
-                try? await Task.sleep(nanoseconds: 1_400_000_000)
+                try? await Task.sleep(nanoseconds: 8_000_000_000)
             }
         }
     }
@@ -333,6 +359,73 @@ public final class CodaWorkspaceStore: ObservableObject {
     public func stopLiveSync() {
         pollLoopTask?.cancel()
         pollLoopTask = nil
+        accountEventsConnectedToken = nil
+        attachedSessionIDs.removeAll()
+        if let client = networkClient {
+            Task { await client.disconnectAccountEventsWebSocket() }
+        }
+    }
+
+    private func handleAsyncPeerEvent(_ event: CodaAsyncEvent) {
+        guard let obj = try? JSONSerialization.jsonObject(with: event.payloadData) as? [String: Any] else {
+            return
+        }
+        let hostPrefix = event.sourceDeviceId.uuidString.lowercased()
+        if event.op == "pty_output_chunk",
+           let terminal = obj["terminal"] as? String,
+           let b64 = obj["data_b64"] as? String,
+           let rawBytes = Data(base64Encoded: b64) {
+            let sid = "\(hostPrefix)/\(terminal)"
+            let chunk = String(decoding: rawBytes, as: UTF8.self)
+            var updated = (rawScreenTextBySession[sid] ?? "") + chunk
+            if updated.count > 65_536 {
+                updated = String(updated.suffix(65_536))
+            }
+            rawScreenTextBySession[sid] = updated
+            let rendered = GhosttyReflowEngine.renderStyledLines(
+                rawOutput: updated,
+                targetColumns: terminalColumns
+            )
+            terminalLinesBySession[sid] = rendered.lines
+            if let idx = sessions.firstIndex(where: { $0.id == sid }) {
+                let prevState = sessions[idx].state
+                sessions[idx].screenPreview = String(updated.suffix(420))
+                if let st = rendered.latestStatus {
+                    sessions[idx].state = st.state
+                    if let msg = st.message { sessions[idx].statusMessage = msg }
+                    if let title = st.title { sessions[idx].taskTitle = title }
+                    if st.state == .done && prevState != .done && selectedSessionID != sid {
+                        sessions[idx].unreadCompletion = true
+                        readCompletedIDs.remove(sid)
+                    }
+                    emitTransitionToastsIfNeeded(newSessions: [sessions[idx]])
+                }
+            }
+        } else if event.op == "herdr_live_event" {
+            let eventKind = (obj["event_kind"] as? String) ?? ""
+            if let termDict = obj["terminal"],
+               let termData = try? JSONSerialization.data(withJSONObject: termDict),
+               let term = try? JSONDecoder().decode(CodaHerdrTerminalSummary.self, from: termData) {
+                let sid = "\(hostPrefix)/\(term.address)"
+                if let idx = sessions.firstIndex(where: { $0.id == sid }) {
+                    let nextState = HerdrLifecycleState.from(rawState: term.status?.state, kind: term.status?.kind)
+                    let prevState = sessions[idx].state
+                    sessions[idx].alive = term.alive
+                    sessions[idx].state = nextState
+                    if let msg = term.status?.msg { sessions[idx].statusMessage = msg }
+                    if let title = term.status?.title ?? term.name { sessions[idx].taskTitle = title }
+                    if nextState == .done && prevState != .done && selectedSessionID != sid {
+                        sessions[idx].unreadCompletion = true
+                        readCompletedIDs.remove(sid)
+                    }
+                    emitTransitionToastsIfNeeded(newSessions: [sessions[idx]])
+                } else {
+                    Task { await self.refreshMachinesAndSessions() }
+                }
+            } else if eventKind.contains("create") || eventKind.contains("destroy") || eventKind.contains("exit") {
+                Task { await self.refreshMachinesAndSessions() }
+            }
+        }
     }
 
     // MARK: - Authentication & Machine Pairing (RFC 8628, Password, 6-Digit Host Pair)
@@ -378,6 +471,7 @@ public final class CodaWorkspaceStore: ObservableObject {
                             self.pendingDeviceAuth = nil
                             self.isPollingDeviceAuth = false
                             await self.ensureClientDeviceRegistered(using: client)
+                            self.startLiveSync()
                             await self.refreshMachinesAndSessions()
                             return
                         } else if res.state == "expired" {
@@ -421,6 +515,7 @@ public final class CodaWorkspaceStore: ObservableObject {
             }
             settings.save()
             await ensureClientDeviceRegistered(using: client)
+            startLiveSync()
             await refreshMachinesAndSessions()
         } catch {
             authError = tr("Sign in failed. Check credentials or server URL.", "登录失败，请检查账号密码或服务器地址。", locale: locale)
@@ -443,6 +538,7 @@ public final class CodaWorkspaceStore: ObservableObject {
             settings.ownerHandle = cleanHandle
             settings.save()
             await ensureClientDeviceRegistered(using: client)
+            startLiveSync()
             await refreshMachinesAndSessions()
         } catch {
             authError = tr("Registration failed.", "注册失败，请检查输入信息。", locale: locale)
@@ -694,6 +790,19 @@ public final class CodaWorkspaceStore: ObservableObject {
               let clientDevId = localIdentity.deviceId else { return }
 
         do {
+            if !attachedSessionIDs.contains(session.id) {
+                let attached = (try? await client.attachTerminalPty(
+                    on: dev,
+                    clientIdentity: localIdentity,
+                    clientDeviceId: clientDevId,
+                    terminal: session.terminalAddress,
+                    cols: terminalColumns,
+                    rows: terminalRows
+                )) ?? false
+                if attached {
+                    attachedSessionIDs.insert(session.id)
+                }
+            }
             let res = try await client.readTerminalScreen(
                 on: dev,
                 clientIdentity: localIdentity,
