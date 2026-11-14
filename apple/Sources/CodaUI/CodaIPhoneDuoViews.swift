@@ -3,144 +3,247 @@ import CodaKit
 import Combine
 import SwiftUI
 
-// MARK: - Unfolded iPhone Duo Book-Fold Workbench (7.6" 50/50 Hinge-Aligned Split)
+// MARK: - iOS 27 Structural Split Around Physical Hinge / `.division` Reserved Region
 
-private final class DuoLeftLeafLocalState: ObservableObject {
-    @Published var tab: CodaMobileTab = .inbox
-}
+public struct CodaFoldCreaseGutter: View {
+    public let axis: Axis
+    public let thickness: CGFloat
 
-public struct CodaDuoUnfoldedWorkbenchView: View {
-    @ObservedObject public var store: CodaWorkspaceStore
-    @StateObject private var leftState = DuoLeftLeafLocalState()
-
-    public init(store: CodaWorkspaceStore) {
-        self.store = store
+    public init(axis: Axis, thickness: CGFloat = 24) {
+        self.axis = axis
+        self.thickness = thickness
     }
 
     public var body: some View {
-        VStack(spacing: 0) {
-            duoModeTopBar
+        ZStack {
+            Rectangle()
+                .fill(CodaHerdrTheme.canvasBG)
 
-            Divider()
-                .background(CodaHerdrTheme.borderHairline)
-
-            GeometryReader { geo in
-                let leftLeafWidth = max(240, floor((geo.size.width - 1) * 0.5))
-
-                if store.duoSplitMode == .fullPanorama {
-                    if let active = store.selectedSession {
-                        CodaTerminalSessionView(
-                            store: store,
-                            session: active,
-                            isCompact: false,
-                            isSplitThumb: true
+            if axis == .vertical {
+                LinearGradient(
+                    colors: [.clear, Color.black.opacity(0.45), .clear],
+                    startPoint: .leading,
+                    endPoint: .trailing
+                )
+                Rectangle()
+                    .fill(CodaHerdrTheme.borderHairline.opacity(0.85))
+                    .frame(width: 1)
+                    .overlay(
+                        LinearGradient(
+                            colors: [.clear, CodaHerdrTheme.cyanWorking.opacity(0.28), .clear],
+                            startPoint: .top,
+                            endPoint: .bottom
                         )
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    } else {
-                        duoEmptyDetailPane
-                    }
-                } else {
-                    HStack(spacing: 0) {
-                        leftLeafView(geoWidth: leftLeafWidth)
-                            .frame(width: leftLeafWidth, height: geo.size.height)
-                            .clipped()
-
-                        CodaDuoHingeDivider()
-
-                        rightLeafView
-                            .frame(maxWidth: .infinity, maxHeight: .infinity)
-                            .clipped()
-                    }
+                    )
+            } else {
+                LinearGradient(
+                    colors: [.clear, Color.black.opacity(0.45), .clear],
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
+                HStack(spacing: 8) {
+                    Rectangle()
+                        .fill(CodaHerdrTheme.borderHairline.opacity(0.9))
+                        .frame(height: 1)
+                    Text("FOLD CREASE")
+                        .font(.system(size: 8.5, weight: .semibold, design: .monospaced))
+                        .foregroundStyle(CodaHerdrTheme.textDim)
+                    Rectangle()
+                        .fill(CodaHerdrTheme.borderHairline.opacity(0.9))
+                        .frame(height: 1)
                 }
+                .padding(.horizontal, 14)
             }
         }
-        .background(CodaHerdrTheme.canvasBG)
+        .frame(
+            width: axis == .vertical ? thickness : nil,
+            height: axis == .horizontal ? thickness : nil
+        )
+    }
+}
+
+/// Models iOS 27 `ArrangementView(.split)` by displacing primary and secondary panes
+/// cleanly outside the 24pt `.division` fold crease centered on the hardware fold line.
+public struct CodaArrangementSplitView<Primary: View, Secondary: View>: View {
+    public let axis: Axis
+    public let leadingOffset: CGFloat
+    public let totalWindowSpan: CGFloat
+    public let creaseThickness: CGFloat
+    public let primary: Primary
+    public let secondary: Secondary
+
+    public init(
+        axis: Axis,
+        leadingOffset: CGFloat,
+        totalWindowSpan: CGFloat,
+        creaseThickness: CGFloat = 24,
+        @ViewBuilder primary: () -> Primary,
+        @ViewBuilder secondary: () -> Secondary
+    ) {
+        self.axis = axis
+        self.leadingOffset = leadingOffset
+        self.totalWindowSpan = totalWindowSpan
+        self.creaseThickness = creaseThickness
+        self.primary = primary()
+        self.secondary = secondary()
     }
 
-    private var duoModeTopBar: some View {
-        HStack(spacing: 8) {
-            HStack(spacing: 6) {
-                Circle()
-                    .fill(store.remoteMachines.contains(where: { $0.isOnline }) ? CodaHerdrTheme.greenDiff : CodaHerdrTheme.textDim)
-                    .frame(width: 7, height: 7)
+    public var body: some View {
+        let mid = totalWindowSpan * 0.5
+        let halfCrease = creaseThickness * 0.5
+        let firstSpan = max(140, floor(mid - halfCrease - leadingOffset))
 
-                Text("Coda Duo")
-                    .font(.system(size: 13.5, weight: .bold))
-                    .foregroundStyle(CodaHerdrTheme.textPrimary)
-
-                if let route = store.activeRouteModeForSelected {
-                    Text(route.rawValue)
-                        .font(.system(size: 9.5, weight: .medium, design: .monospaced))
-                        .foregroundStyle(CodaHerdrTheme.greenDiff)
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2)
-                        .background(
-                            Capsule()
-                                .fill(CodaHerdrTheme.cardBG)
-                                .overlay(Capsule().strokeBorder(CodaHerdrTheme.borderHairline, lineWidth: 1))
-                        )
-                        .lineLimit(1)
-                }
-
-                if store.attentionBadgeCount > 0 {
-                    Text("\(store.attentionBadgeCount)")
-                        .font(.system(size: 10, weight: .bold))
-                        .foregroundStyle(.black)
-                        .padding(.horizontal, 5.5)
-                        .padding(.vertical, 1.5)
-                        .background(Capsule().fill(CodaHerdrTheme.amberNeedsYou))
-                }
+        if axis == .horizontal {
+            HStack(spacing: 0) {
+                primary
+                    .frame(width: firstSpan)
+                    .clipped()
+                CodaFoldCreaseGutter(axis: .vertical, thickness: creaseThickness)
+                secondary
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .clipped()
             }
+        } else {
+            VStack(spacing: 0) {
+                primary
+                    .frame(height: firstSpan)
+                    .clipped()
+                CodaFoldCreaseGutter(axis: .horizontal, thickness: creaseThickness)
+                secondary
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .clipped()
+            }
+        }
+    }
+}
 
-            Spacer(minLength: 4)
+// MARK: - iOS 27 Vertical 84pt Side Toolbar Rail (Cover Landscape, Duo Inner Landscape, Slab Landscape)
 
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 3) {
+public enum CodaSideRailKind: Sendable, Equatable {
+    case duoInner
+    case compactLandscape
+}
+
+public struct CodaVerticalSideToolbarRail: View {
+    @ObservedObject public var store: CodaWorkspaceStore
+    public let kind: CodaSideRailKind
+
+    public init(store: CodaWorkspaceStore, kind: CodaSideRailKind) {
+        self.store = store
+        self.kind = kind
+    }
+
+    public var body: some View {
+        VStack(spacing: 8) {
+            VStack(spacing: 4) {
+                HStack(spacing: 4) {
+                    Circle()
+                        .fill(store.remoteMachines.contains(where: { $0.isOnline }) ? CodaHerdrTheme.greenDiff : CodaHerdrTheme.textDim)
+                        .frame(width: 7, height: 7)
+                    Text(kind == .duoInner ? "Duo" : "Coda")
+                        .font(.system(size: 12, weight: .bold))
+                        .foregroundStyle(CodaHerdrTheme.textPrimary)
+                }
+
+                Text("\(store.terminalColumns)×\(store.terminalRows)")
+                    .font(.system(size: 9.5, weight: .medium, design: .monospaced))
+                    .foregroundStyle(CodaHerdrTheme.greenDiff)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(
+                        Capsule()
+                            .fill(CodaHerdrTheme.canvasBG)
+                            .overlay(Capsule().strokeBorder(CodaHerdrTheme.borderHairline, lineWidth: 1))
+                    )
+            }
+            .padding(.top, max(8, store.edgeSafeAreas.top + 4))
+
+            Divider().background(CodaHerdrTheme.borderHairline)
+
+            if kind == .duoInner {
+                VStack(spacing: 5) {
                     ForEach(CodaDuoSplitMode.allCases) { mode in
-                        let isSelected = store.duoSplitMode == mode
+                        let selected = store.duoSplitMode == mode
                         Button {
                             withAnimation(.snappy(duration: 0.18)) {
                                 store.setDuoSplitMode(mode)
                             }
                         } label: {
-                            Text(mode.title(locale: store.locale))
-                                .font(.system(size: 11, weight: isSelected ? .semibold : .medium))
-                                .foregroundStyle(isSelected ? CodaHerdrTheme.textPrimary : CodaHerdrTheme.textSecondary)
-                                .padding(.horizontal, 9)
-                                .padding(.vertical, 5)
-                                .background(
-                                    Capsule()
-                                        .fill(isSelected ? CodaHerdrTheme.pillActiveBG : .clear)
-                                        .overlay(
-                                            Capsule().strokeBorder(
-                                                isSelected ? CodaHerdrTheme.borderHairline : .clear,
-                                                lineWidth: 1
-                                            )
-                                        )
-                                )
+                            VStack(spacing: 2) {
+                                Image(systemName: iconForMode(mode))
+                                    .font(.system(size: 13, weight: .semibold))
+                                Text(mode.title(locale: store.locale))
+                                    .font(.system(size: 10, weight: selected ? .semibold : .medium))
+                            }
+                            .foregroundStyle(selected ? CodaHerdrTheme.textPrimary : CodaHerdrTheme.textSecondary)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 7)
+                            .background(
+                                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                    .fill(selected ? CodaHerdrTheme.pillActiveBG : .clear)
+                                    .overlay(
+                                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                            .strokeBorder(selected ? CodaHerdrTheme.cyanWorking.opacity(0.45) : .clear, lineWidth: 1)
+                                    )
+                            )
                         }
                         .buttonStyle(.plain)
                     }
                 }
-                .padding(3)
-                .background(
-                    Capsule()
-                        .fill(CodaHerdrTheme.canvasBG)
-                        .overlay(Capsule().strokeBorder(CodaHerdrTheme.borderHairline, lineWidth: 1))
-                )
+            } else {
+                VStack(spacing: 6) {
+                    compactTabButton(.inbox, icon: "tray.fill", label: tr("Inbox", "收件", locale: store.locale), badge: store.attentionBadgeCount)
+                    compactTabButton(.spaces, icon: "square.grid.2x2.fill", label: tr("Spaces", "空间", locale: store.locale), badge: 0)
+                }
+            }
+
+            if !store.filteredSessions.isEmpty {
+                Divider().background(CodaHerdrTheme.borderHairline)
+
+                ScrollView(.vertical, showsIndicators: false) {
+                    VStack(spacing: 6) {
+                        ForEach(store.filteredSessions.prefix(5)) { s in
+                            let active = store.selectedSessionID == s.id
+                            Button {
+                                store.selectSession(s)
+                            } label: {
+                                ZStack(alignment: .topTrailing) {
+                                    CodaWorkspaceAvatar(name: s.workspaceName, size: 32)
+                                        .overlay(
+                                            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                                .strokeBorder(active ? CodaHerdrTheme.cyanWorking : .clear, lineWidth: 1.5)
+                                        )
+                                    if s.state == .needsYou {
+                                        Circle()
+                                            .fill(CodaHerdrTheme.amberNeedsYou)
+                                            .frame(width: 8, height: 8)
+                                            .offset(x: 2, y: -2)
+                                    } else if s.state == .working {
+                                        Circle()
+                                            .fill(CodaHerdrTheme.cyanWorking)
+                                            .frame(width: 8, height: 8)
+                                            .offset(x: 2, y: -2)
+                                    }
+                                }
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                    .padding(.vertical, 2)
+                }
             }
 
             Spacer(minLength: 4)
 
-            HStack(spacing: 6) {
+            VStack(spacing: 6) {
                 Button {
                     store.setLocale(store.locale == .en ? .zh : .en)
                 } label: {
                     Text(store.locale == .en ? "EN" : "中文")
                         .font(.system(size: 10, weight: .semibold))
                         .foregroundStyle(CodaHerdrTheme.textSecondary)
-                        .padding(.horizontal, 7)
-                        .padding(.vertical, 4)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 5)
                         .background(
                             Capsule()
                                 .fill(CodaHerdrTheme.elevatedBG)
@@ -154,9 +257,9 @@ public struct CodaDuoUnfoldedWorkbenchView: View {
                     store.showSettingsSheet = true
                 } label: {
                     Image(systemName: "gearshape")
-                        .font(.system(size: 13))
+                        .font(.system(size: 14, weight: .medium))
                         .foregroundStyle(CodaHerdrTheme.textPrimary)
-                        .frame(width: 28, height: 28)
+                        .frame(width: 34, height: 34)
                         .background(
                             Circle()
                                 .fill(CodaHerdrTheme.elevatedBG)
@@ -165,116 +268,126 @@ public struct CodaDuoUnfoldedWorkbenchView: View {
                 }
                 .buttonStyle(.plain)
             }
+            .padding(.bottom, max(10, store.edgeSafeAreas.bottom + 4))
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 7)
+        .padding(.horizontal, 6)
+        .padding(.leading, store.edgeSafeAreas.leading)
+        .frame(width: CodaEdgeSafeAreas.duoSideRailWidth + store.edgeSafeAreas.leading)
+        .frame(maxHeight: .infinity)
         .background(CodaHerdrTheme.cardBG)
-    }
-
-    @ViewBuilder
-    private func leftLeafView(geoWidth: CGFloat) -> some View {
-        switch store.duoSplitMode {
-        case .inboxAndTerminal:
-            duoCompactDirectoryLeaf
-        case .studioDiffSplit, .dualTerminalSplit, .fullPanorama:
-            if let active = store.selectedSession {
-                CodaTerminalSessionView(
-                    store: store,
-                    session: active,
-                    isCompact: false
-                )
-            } else {
-                duoEmptyDetailPane
-            }
+        .overlay(alignment: .trailing) {
+            Rectangle()
+                .fill(CodaHerdrTheme.borderHairline)
+                .frame(width: 1)
         }
     }
 
-    @ViewBuilder
-    private var rightLeafView: some View {
-        switch store.duoSplitMode {
-        case .inboxAndTerminal:
-            if let active = store.selectedSession {
-                CodaTerminalSessionView(
-                    store: store,
-                    session: active,
-                    isCompact: false
+    private func iconForMode(_ mode: CodaDuoSplitMode) -> String {
+        switch mode {
+        case .inboxAndTerminal: return "sidebar.left"
+        case .studioDiffSplit: return "plus.forwardslash.minus"
+        case .dualTerminalSplit: return "rectangle.split.2x1"
+        case .expandedCanvas: return "rectangle.expand.diagonal"
+        }
+    }
+
+    private func compactTabButton(_ tab: CodaMobileTab, icon: String, label: String, badge: Int) -> some View {
+        let selected = store.selectedSessionID == nil && store.selectedTab == tab
+        return Button {
+            store.closeTerminalToInbox()
+            store.selectedTab = tab
+        } label: {
+            ZStack(alignment: .topTrailing) {
+                VStack(spacing: 3) {
+                    Image(systemName: icon)
+                        .font(.system(size: 13, weight: .semibold))
+                    Text(label)
+                        .font(.system(size: 10, weight: selected ? .semibold : .medium))
+                }
+                .foregroundStyle(selected ? CodaHerdrTheme.textPrimary : CodaHerdrTheme.textSecondary)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 7)
+                .background(
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .fill(selected ? CodaHerdrTheme.pillActiveBG : .clear)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                .strokeBorder(selected ? CodaHerdrTheme.borderHairline : .clear, lineWidth: 1)
+                        )
                 )
-            } else {
-                duoEmptyDetailPane
+
+                if badge > 0 {
+                    Text("\(badge)")
+                        .font(.system(size: 9, weight: .bold))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 4.5)
+                        .padding(.vertical, 1)
+                        .background(Capsule().fill(CodaHerdrTheme.redDiff))
+                        .offset(x: -2, y: 2)
+                }
             }
-        case .studioDiffSplit:
-            if let active = store.selectedSession {
-                CodaDuoInlineGitDiffLeaf(store: store, session: active)
-            } else {
-                duoEmptyDetailPane
-            }
-        case .dualTerminalSplit:
-            if let secondary = store.secondarySession {
-                VStack(spacing: 0) {
-                    dualSecondaryPickerBar(current: secondary)
-                    Divider().background(CodaHerdrTheme.borderHairline)
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+// MARK: - Landscape Side-Rail Layout (Duo Cover 678x466 & Slab iPhones 14-18 Landscape)
+
+public struct CodaCompactLandscapeSideRailLayout: View {
+    @ObservedObject public var store: CodaWorkspaceStore
+
+    public init(store: CodaWorkspaceStore) {
+        self.store = store
+    }
+
+    public var body: some View {
+        HStack(spacing: 0) {
+            CodaVerticalSideToolbarRail(store: store, kind: .compactLandscape)
+
+            Group {
+                if let active = store.selectedSession {
                     CodaTerminalSessionView(
                         store: store,
-                        session: secondary,
-                        isCompact: false,
-                        isSplitThumb: false,
-                        isSecondaryLeaf: true
+                        session: active,
+                        isCompact: true,
+                        isCompactHeight: true
                     )
-                }
-            } else {
-                duoEmptyDetailPane
-            }
-        case .fullPanorama:
-            EmptyView()
-        }
-    }
-
-    private func dualSecondaryPickerBar(current: CodaAgentSession) -> some View {
-        HStack(spacing: 6) {
-            Text(tr("LEAF 2", "副屏终端", locale: store.locale))
-                .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                .foregroundStyle(CodaHerdrTheme.textDim)
-
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 5) {
-                    ForEach(store.filteredSessions) { sess in
-                        let selected = sess.id == current.id
-                        Button {
-                            store.selectSecondarySession(sess)
-                        } label: {
-                            HStack(spacing: 4) {
-                                Circle()
-                                    .fill(sess.state == .needsYou ? CodaHerdrTheme.amberNeedsYou : (sess.state == .working ? CodaHerdrTheme.cyanWorking : CodaHerdrTheme.textDim))
-                                    .frame(width: 6, height: 6)
-                                Text("\(sess.workspaceName)/\(sess.agentName)")
-                                    .font(.system(size: 11, weight: selected ? .semibold : .regular))
-                                    .foregroundStyle(selected ? CodaHerdrTheme.textPrimary : CodaHerdrTheme.textSecondary)
-                                    .lineLimit(1)
-                            }
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 4)
-                            .background(
-                                Capsule()
-                                    .fill(selected ? CodaHerdrTheme.pillActiveBG : CodaHerdrTheme.canvasBG)
-                                    .overlay(Capsule().strokeBorder(CodaHerdrTheme.borderHairline, lineWidth: 1))
-                            )
-                        }
-                        .buttonStyle(.plain)
+                } else {
+                    switch store.selectedTab {
+                    case .inbox:
+                        CodaMobileInboxTabView(store: store)
+                    case .spaces:
+                        CodaMobileSpacesTabView(store: store)
                     }
                 }
             }
+            .padding(.trailing, store.edgeSafeAreas.trailing)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 6)
-        .background(CodaHerdrTheme.cardBG.opacity(0.9))
+        .background(CodaHerdrTheme.canvasBG)
+    }
+}
+
+// MARK: - Shared Directory Pane (Used in Duo Inner Landscape & Portrait Flat Sidebar)
+
+private final class DuoDirectoryLocalState: ObservableObject {
+    @Published var tab: CodaMobileTab = .inbox
+}
+
+public struct CodaDuoDirectoryPane: View {
+    @ObservedObject public var store: CodaWorkspaceStore
+    @StateObject private var local = DuoDirectoryLocalState()
+
+    public init(store: CodaWorkspaceStore) {
+        self.store = store
     }
 
-    private var duoCompactDirectoryLeaf: some View {
+    public var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 6) {
                 HStack(spacing: 3) {
-                    directoryTabButton(.inbox, title: tr("Inbox", "收件箱", locale: store.locale))
-                    directoryTabButton(.spaces, title: tr("Spaces", "空间", locale: store.locale))
+                    tabButton(.inbox, title: tr("Inbox", "收件箱", locale: store.locale))
+                    tabButton(.spaces, title: tr("Spaces", "空间", locale: store.locale))
                 }
                 .padding(3)
                 .background(RoundedRectangle(cornerRadius: 8).fill(CodaHerdrTheme.canvasBG))
@@ -319,9 +432,9 @@ public struct CodaDuoUnfoldedWorkbenchView: View {
 
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 10) {
-                    if leftState.tab == .inbox {
+                    if local.tab == .inbox {
                         if store.groupedInboxSections.isEmpty {
-                            duoSignedOutOrEmptyCard
+                            emptyCard
                         } else {
                             ForEach(store.groupedInboxSections) { section in
                                 Text(section.title.uppercased())
@@ -331,16 +444,16 @@ public struct CodaDuoUnfoldedWorkbenchView: View {
                                     .padding(.horizontal, 4)
 
                                 ForEach(section.sessions) { session in
-                                    duoInboxSessionCard(session)
+                                    sessionCard(session)
                                 }
                             }
                         }
                     } else {
                         if store.spacesByMachine.isEmpty {
-                            duoSignedOutOrEmptyCard
+                            emptyCard
                         } else {
                             ForEach(store.spacesByMachine) { group in
-                                duoMachineCard(group)
+                                machineCard(group)
                             }
                         }
                     }
@@ -371,7 +484,7 @@ public struct CodaDuoUnfoldedWorkbenchView: View {
                     store.settingsInitialFocusPairing = true
                     store.showSettingsSheet = true
                 } label: {
-                    Label(tr("Add machine", "添加主机", locale: store.locale), systemImage: "plus")
+                    Label(tr("Add", "添加", locale: store.locale), systemImage: "plus")
                         .font(.system(size: 11.5, weight: .semibold))
                         .foregroundStyle(CodaHerdrTheme.textPrimary)
                         .padding(.horizontal, 9)
@@ -390,51 +503,48 @@ public struct CodaDuoUnfoldedWorkbenchView: View {
         .background(CodaHerdrTheme.cardBG)
     }
 
-    private func directoryTabButton(_ tab: CodaMobileTab, title: String) -> some View {
-        let active = leftState.tab == tab
+    private func tabButton(_ tab: CodaMobileTab, title: String) -> some View {
+        let active = local.tab == tab
         return Button {
-            leftState.tab = tab
+            local.tab = tab
         } label: {
             Text(title)
                 .font(.system(size: 11.5, weight: active ? .semibold : .medium))
                 .foregroundStyle(active ? CodaHerdrTheme.textPrimary : CodaHerdrTheme.textSecondary)
                 .padding(.horizontal, 10)
                 .padding(.vertical, 5)
-                .background(
-                    RoundedRectangle(cornerRadius: 6, style: .continuous)
-                        .fill(active ? CodaHerdrTheme.pillActiveBG : .clear)
-                )
+                .background(RoundedRectangle(cornerRadius: 6, style: .continuous).fill(active ? CodaHerdrTheme.pillActiveBG : .clear))
         }
         .buttonStyle(.plain)
     }
 
-    private func duoInboxSessionCard(_ session: CodaAgentSession) -> some View {
+    private func sessionCard(_ session: CodaAgentSession) -> some View {
         let isSelected = store.selectedSessionID == session.id
         return Button {
             store.selectSession(session)
         } label: {
-            HStack(spacing: 10) {
-                CodaWorkspaceAvatar(name: session.workspaceName, size: 30)
+            HStack(spacing: 9) {
+                CodaWorkspaceAvatar(name: session.workspaceName, size: 28)
                 VStack(alignment: .leading, spacing: 2) {
                     HStack(spacing: 5) {
                         Text(session.workspaceName)
-                            .font(.system(size: 12.5, weight: .semibold))
+                            .font(.system(size: 12, weight: .semibold))
                             .foregroundStyle(CodaHerdrTheme.textPrimary)
                         Text(session.taskTitle)
-                            .font(.system(size: 12.5))
+                            .font(.system(size: 12))
                             .foregroundStyle(CodaHerdrTheme.textPrimary.opacity(0.86))
                             .lineLimit(1)
                     }
-                    Text("\(session.agentName) · \(session.branch) · \(session.hostName)")
-                        .font(.system(size: 11))
+                    Text("\(session.agentName) · \(session.branch)")
+                        .font(.system(size: 10.5))
                         .foregroundStyle(CodaHerdrTheme.textSecondary)
                         .lineLimit(1)
                 }
                 Spacer(minLength: 4)
                 CodaSessionStatusBadge(session: session, locale: store.locale)
             }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 9)
+            .padding(.horizontal, 9)
+            .padding(.vertical, 8)
             .background(
                 RoundedRectangle(cornerRadius: 10, style: .continuous)
                     .fill(isSelected ? CodaHerdrTheme.pillActiveBG : CodaHerdrTheme.canvasBG.opacity(0.7))
@@ -452,7 +562,7 @@ public struct CodaDuoUnfoldedWorkbenchView: View {
         .buttonStyle(.plain)
     }
 
-    private func duoMachineCard(_ group: CodaMachineSpacesGroup) -> some View {
+    private func machineCard(_ group: CodaMachineSpacesGroup) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 6) {
                 Circle()
@@ -468,7 +578,6 @@ public struct CodaDuoUnfoldedWorkbenchView: View {
                         .foregroundStyle(CodaHerdrTheme.cyanWorking)
                 }
             }
-
             ForEach(group.repos) { repo in
                 HStack(spacing: 8) {
                     CodaWorkspaceAvatar(name: repo.repoName, size: 22)
@@ -478,7 +587,7 @@ public struct CodaDuoUnfoldedWorkbenchView: View {
                     Spacer()
                     if let b = repo.branches.first {
                         Text("\(b.branch) +\(b.diffAdded)/-\(b.diffDeleted)")
-                            .font(.system(size: 10.5, design: .monospaced))
+                            .font(.system(size: 10, design: .monospaced))
                             .foregroundStyle(CodaHerdrTheme.greenDiff)
                     }
                 }
@@ -495,7 +604,7 @@ public struct CodaDuoUnfoldedWorkbenchView: View {
         )
     }
 
-    private var duoSignedOutOrEmptyCard: some View {
+    private var emptyCard: some View {
         VStack(alignment: .leading, spacing: 8) {
             Text(store.isSignedIn
                 ? tr("No active agent sessions", "暂无活跃 Agent 会话", locale: store.locale)
@@ -524,6 +633,154 @@ public struct CodaDuoUnfoldedWorkbenchView: View {
                 .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(CodaHerdrTheme.borderHairline, lineWidth: 1))
         )
     }
+}
+
+// MARK: - iPhone Duo 7.6" Inner Unfolded Landscape Workbench (890 x 626 pt: 84pt Side Rail + Crease-Aware Split)
+
+public struct CodaDuoInnerLandscapeWorkbenchView: View {
+    @ObservedObject public var store: CodaWorkspaceStore
+
+    public init(store: CodaWorkspaceStore) {
+        self.store = store
+    }
+
+    public var body: some View {
+        GeometryReader { geo in
+            let railWidth = CodaEdgeSafeAreas.duoSideRailWidth + store.edgeSafeAreas.leading
+
+            HStack(spacing: 0) {
+                CodaVerticalSideToolbarRail(store: store, kind: .duoInner)
+
+                if store.duoSplitMode == .expandedCanvas {
+                    if let active = store.selectedSession {
+                        CodaTerminalSessionView(
+                            store: store,
+                            session: active,
+                            isCompact: false,
+                            isSplitThumb: true,
+                            isCompactHeight: true
+                        )
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    } else {
+                        duoEmptyDetailPane
+                    }
+                } else {
+                    CodaArrangementSplitView(
+                        axis: .horizontal,
+                        leadingOffset: railWidth,
+                        totalWindowSpan: geo.size.width,
+                        creaseThickness: 24
+                    ) {
+                        leftLeafView
+                    } secondary: {
+                        rightLeafView
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
+            }
+        }
+        .background(CodaHerdrTheme.canvasBG)
+    }
+
+    @ViewBuilder
+    private var leftLeafView: some View {
+        switch store.duoSplitMode {
+        case .inboxAndTerminal:
+            CodaDuoDirectoryPane(store: store)
+        case .studioDiffSplit, .dualTerminalSplit, .expandedCanvas:
+            if let active = store.selectedSession {
+                CodaTerminalSessionView(
+                    store: store,
+                    session: active,
+                    isCompact: false,
+                    isCompactHeight: true
+                )
+            } else {
+                duoEmptyDetailPane
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var rightLeafView: some View {
+        switch store.duoSplitMode {
+        case .inboxAndTerminal:
+            if let active = store.selectedSession {
+                CodaTerminalSessionView(
+                    store: store,
+                    session: active,
+                    isCompact: false,
+                    isCompactHeight: true
+                )
+            } else {
+                duoEmptyDetailPane
+            }
+        case .studioDiffSplit:
+            if let active = store.selectedSession {
+                CodaDuoInlineGitDiffLeaf(store: store, session: active)
+            } else {
+                duoEmptyDetailPane
+            }
+        case .dualTerminalSplit:
+            if let secondary = store.secondarySession {
+                VStack(spacing: 0) {
+                    dualSecondaryPickerBar(current: secondary)
+                    Divider().background(CodaHerdrTheme.borderHairline)
+                    CodaTerminalSessionView(
+                        store: store,
+                        session: secondary,
+                        isCompact: false,
+                        isSecondaryLeaf: true,
+                        isCompactHeight: true
+                    )
+                }
+            } else {
+                duoEmptyDetailPane
+            }
+        case .expandedCanvas:
+            EmptyView()
+        }
+    }
+
+    private func dualSecondaryPickerBar(current: CodaAgentSession) -> some View {
+        HStack(spacing: 6) {
+            Text(tr("LEAF 2", "副屏终端", locale: store.locale))
+                .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                .foregroundStyle(CodaHerdrTheme.textDim)
+
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 5) {
+                    ForEach(store.filteredSessions) { sess in
+                        let selected = sess.id == current.id
+                        Button {
+                            store.selectSecondarySession(sess)
+                        } label: {
+                            HStack(spacing: 4) {
+                                Circle()
+                                    .fill(sess.state == .needsYou ? CodaHerdrTheme.amberNeedsYou : (sess.state == .working ? CodaHerdrTheme.cyanWorking : CodaHerdrTheme.textDim))
+                                    .frame(width: 6, height: 6)
+                                Text("\(sess.workspaceName)/\(sess.agentName)")
+                                    .font(.system(size: 11, weight: selected ? .semibold : .regular))
+                                    .foregroundStyle(selected ? CodaHerdrTheme.textPrimary : CodaHerdrTheme.textSecondary)
+                                    .lineLimit(1)
+                            }
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 4)
+                            .background(
+                                Capsule()
+                                    .fill(selected ? CodaHerdrTheme.pillActiveBG : CodaHerdrTheme.canvasBG)
+                                    .overlay(Capsule().strokeBorder(CodaHerdrTheme.borderHairline, lineWidth: 1))
+                            )
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 5)
+        .background(CodaHerdrTheme.cardBG.opacity(0.9))
+    }
 
     private var duoEmptyDetailPane: some View {
         VStack(spacing: 10) {
@@ -539,22 +796,346 @@ public struct CodaDuoUnfoldedWorkbenchView: View {
     }
 }
 
-// MARK: - 1pt Physical Fold / Hinge Crease Hairline
+// MARK: - iPhone Duo 7.6" Inner Unfolded Portrait Workbench (626 x 890 pt: Flat 80-Col <-> Tabletop Laptop Pose)
 
-public struct CodaDuoHingeDivider: View {
-    public init() {}
+public struct CodaDuoInnerPortraitWorkbenchView: View {
+    @ObservedObject public var store: CodaWorkspaceStore
+
+    public init(store: CodaWorkspaceStore) {
+        self.store = store
+    }
 
     public var body: some View {
-        Rectangle()
-            .fill(CodaHerdrTheme.borderHairline)
-            .frame(width: 1)
-            .overlay(
-                LinearGradient(
-                    colors: [.clear, CodaHerdrTheme.cyanWorking.opacity(0.22), .clear],
-                    startPoint: .top,
-                    endPoint: .bottom
+        GeometryReader { geo in
+            let headerHeight: CGFloat = 38
+
+            VStack(spacing: 0) {
+                portraitHeaderBar
+                    .frame(height: headerHeight)
+
+                Divider().background(CodaHerdrTheme.borderHairline)
+
+                if store.foldPosture == .tabletopLaptop {
+                    CodaArrangementSplitView(
+                        axis: .vertical,
+                        leadingOffset: headerHeight,
+                        totalWindowSpan: geo.size.height,
+                        creaseThickness: 24
+                    ) {
+                        if let active = store.selectedSession {
+                            CodaTerminalSessionView(
+                                store: store,
+                                session: active,
+                                isCompact: false,
+                                isCompactHeight: true,
+                                hideBottomControls: true
+                            )
+                        } else {
+                            emptyPortraitTerminal
+                        }
+                    } secondary: {
+                        CodaDuoTabletopControlDeck(store: store, session: store.selectedSession)
+                    }
+                } else {
+                    HStack(spacing: 0) {
+                        if store.showSidebar {
+                            CodaDuoDirectoryPane(store: store)
+                                .frame(width: 236)
+
+                            Divider().background(CodaHerdrTheme.borderHairline)
+                        }
+
+                        if let active = store.selectedSession {
+                            CodaTerminalSessionView(
+                                store: store,
+                                session: active,
+                                isCompact: false
+                            )
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        } else {
+                            emptyPortraitTerminal
+                        }
+                    }
+                }
+            }
+        }
+        .background(CodaHerdrTheme.canvasBG)
+    }
+
+    private var portraitHeaderBar: some View {
+        HStack(spacing: 8) {
+            if store.foldPosture != .tabletopLaptop {
+                Button {
+                    withAnimation(.snappy(duration: 0.18)) {
+                        store.showSidebar.toggle()
+                    }
+                } label: {
+                    Image(systemName: "sidebar.left")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(store.showSidebar ? CodaHerdrTheme.cyanWorking : CodaHerdrTheme.textPrimary)
+                        .frame(width: 28, height: 26)
+                        .background(
+                            RoundedRectangle(cornerRadius: 7, style: .continuous)
+                                .fill(CodaHerdrTheme.elevatedBG)
+                                .overlay(RoundedRectangle(cornerRadius: 7, style: .continuous).strokeBorder(CodaHerdrTheme.borderHairline, lineWidth: 1))
+                        )
+                }
+                .buttonStyle(.plain)
+            }
+
+            Circle()
+                .fill(store.remoteMachines.contains(where: { $0.isOnline }) ? CodaHerdrTheme.greenDiff : CodaHerdrTheme.textDim)
+                .frame(width: 7, height: 7)
+
+            Text("Coda Duo")
+                .font(.system(size: 13, weight: .bold))
+                .foregroundStyle(CodaHerdrTheme.textPrimary)
+
+            Text("\(store.terminalColumns)×\(store.terminalRows)")
+                .font(.system(size: 10, weight: .medium, design: .monospaced))
+                .foregroundStyle(CodaHerdrTheme.greenDiff)
+
+            Spacer()
+
+            HStack(spacing: 3) {
+                posturePill(.flat, title: tr("80-Col Flat", "80列平铺", locale: store.locale))
+                posturePill(.tabletopLaptop, title: tr("Tabletop", "笔电半折", locale: store.locale))
+            }
+            .padding(2)
+            .background(Capsule().fill(CodaHerdrTheme.canvasBG).overlay(Capsule().strokeBorder(CodaHerdrTheme.borderHairline, lineWidth: 1)))
+
+            Button {
+                store.setLocale(store.locale == .en ? .zh : .en)
+            } label: {
+                Text(store.locale == .en ? "EN" : "中文")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(CodaHerdrTheme.textSecondary)
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 4)
+                    .background(Capsule().fill(CodaHerdrTheme.elevatedBG))
+            }
+            .buttonStyle(.plain)
+
+            Button {
+                store.settingsInitialFocusPairing = false
+                store.showSettingsSheet = true
+            } label: {
+                Image(systemName: "gearshape")
+                    .font(.system(size: 12))
+                    .foregroundStyle(CodaHerdrTheme.textPrimary)
+                    .frame(width: 26, height: 26)
+                    .background(Circle().fill(CodaHerdrTheme.elevatedBG))
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 10)
+        .background(CodaHerdrTheme.cardBG)
+    }
+
+    private func posturePill(_ posture: CodaFoldPosture, title: String) -> some View {
+        let active = (posture == .tabletopLaptop && store.foldPosture == .tabletopLaptop)
+            || (posture == .flat && store.foldPosture != .tabletopLaptop)
+        return Button {
+            withAnimation(.snappy(duration: 0.18)) {
+                store.setFoldPosture(posture)
+            }
+        } label: {
+            Text(title)
+                .font(.system(size: 10.5, weight: active ? .semibold : .medium))
+                .foregroundStyle(active ? CodaHerdrTheme.textPrimary : CodaHerdrTheme.textSecondary)
+                .padding(.horizontal, 9)
+                .padding(.vertical, 3.5)
+                .background(
+                    Capsule().fill(active ? CodaHerdrTheme.pillActiveBG : .clear)
                 )
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var emptyPortraitTerminal: some View {
+        VStack(spacing: 8) {
+            Image(systemName: "terminal")
+                .font(.system(size: 26))
+                .foregroundStyle(CodaHerdrTheme.textSecondary)
+            Text(tr("Open sidebar or select a session", "请从侧边栏选择一个会话", locale: store.locale))
+                .font(.system(size: 13))
+                .foregroundStyle(CodaHerdrTheme.textSecondary)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(CodaHerdrTheme.canvasBG)
+    }
+}
+
+// MARK: - Lower-Half Tabletop Control Deck (Below Horizontal Crease on 626x890 Half-Folded Duo)
+
+private final class TabletopDeckLocalState: ObservableObject {
+    @Published var commandDraft: String = ""
+}
+
+public struct CodaDuoTabletopControlDeck: View {
+    @ObservedObject public var store: CodaWorkspaceStore
+    public let session: CodaAgentSession?
+    @StateObject private var local = TabletopDeckLocalState()
+    @FocusState private var inputFocused: Bool
+
+    public init(store: CodaWorkspaceStore, session: CodaAgentSession?) {
+        self.store = store
+        self.session = session
+    }
+
+    public var body: some View {
+        VStack(spacing: 10) {
+            HStack(spacing: 6) {
+                Text(tr("SESSIONS", "会话切换", locale: store.locale))
+                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(CodaHerdrTheme.textDim)
+
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 6) {
+                        ForEach(store.filteredSessions) { sess in
+                            let selected = store.selectedSessionID == sess.id
+                            Button {
+                                store.selectSession(sess)
+                            } label: {
+                                HStack(spacing: 5) {
+                                    Circle()
+                                        .fill(sess.state == .needsYou ? CodaHerdrTheme.amberNeedsYou : (sess.state == .working ? CodaHerdrTheme.cyanWorking : CodaHerdrTheme.textDim))
+                                        .frame(width: 6, height: 6)
+                                    Text("\(sess.workspaceName)/\(sess.agentName)")
+                                        .font(.system(size: 11, weight: selected ? .semibold : .medium))
+                                        .foregroundStyle(selected ? CodaHerdrTheme.textPrimary : CodaHerdrTheme.textSecondary)
+                                }
+                                .padding(.horizontal, 9)
+                                .padding(.vertical, 5)
+                                .background(
+                                    Capsule()
+                                        .fill(selected ? CodaHerdrTheme.pillActiveBG : CodaHerdrTheme.cardBG)
+                                        .overlay(
+                                            Capsule().strokeBorder(
+                                                selected ? CodaHerdrTheme.cyanWorking.opacity(0.5) : CodaHerdrTheme.borderHairline,
+                                                lineWidth: 1
+                                            )
+                                        )
+                                )
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                }
+
+                if let active = session {
+                    Button {
+                        store.loadGitDiffForSelected()
+                    } label: {
+                        Image(systemName: "plus.forwardslash.minus")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(active.diffAdded > 0 ? CodaHerdrTheme.greenDiff : CodaHerdrTheme.textSecondary)
+                            .frame(width: 28, height: 28)
+                            .background(RoundedRectangle(cornerRadius: 7).fill(CodaHerdrTheme.elevatedBG))
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+
+            if let active = session, active.state == .needsYou {
+                HStack(spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 12))
+                        .foregroundStyle(CodaHerdrTheme.amberNeedsYou)
+                    Text(active.statusMessage ?? tr("Waiting for confirmation", "等待输入确认", locale: store.locale))
+                        .font(.system(size: 11.5, weight: .medium))
+                        .foregroundStyle(CodaHerdrTheme.textPrimary)
+                        .lineLimit(1)
+                    Spacer()
+                    deckApproveButton("1 · Yes") { store.sendDirectText("1", submit: true, to: active) }
+                    deckApproveButton("2 · Always") { store.sendDirectText("2", submit: true, to: active) }
+                    deckApproveButton("Esc") { store.interruptSession(active) }
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 7)
+                .background(
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .fill(CodaHerdrTheme.amberNeedsYou.opacity(0.12))
+                        .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(CodaHerdrTheme.amberNeedsYou.opacity(0.45), lineWidth: 1))
+                )
+            }
+
+            HStack(spacing: 8) {
+                TextField(
+                    tr("Command or prompt to upper screen (Enter sends)...", "向下半屏发送命令或追问（回车发送）...", locale: store.locale),
+                    text: $local.commandDraft
+                )
+                .font(.system(size: 13, design: .monospaced))
+                .foregroundStyle(CodaHerdrTheme.textPrimary)
+                .focused($inputFocused)
+                .codaNoAutocapAndSpelling()
+                .onSubmit {
+                    submitCommand()
+                }
+
+                Button {
+                    submitCommand()
+                } label: {
+                    Image(systemName: "arrow.up.circle.fill")
+                        .font(.system(size: 22))
+                        .foregroundStyle(CodaHerdrTheme.cyanWorking)
+                }
+                .buttonStyle(.plain)
+
+                Button {
+                    store.showComposeSheet = true
+                } label: {
+                    Image(systemName: "square.and.pencil")
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(CodaHerdrTheme.textPrimary)
+                        .frame(width: 32, height: 32)
+                        .background(Circle().fill(CodaHerdrTheme.elevatedBG))
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 9)
+            .background(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(CodaHerdrTheme.cardBG)
+                    .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(CodaHerdrTheme.borderHairline, lineWidth: 1))
             )
+
+            CodaDuoTactileTwoRowKeypad(store: store, targetSession: session)
+
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 14)
+        .padding(.top, 10)
+        .padding(.bottom, max(12, store.edgeSafeAreas.bottom + 4))
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(CodaHerdrTheme.canvasBG)
+    }
+
+    private func submitCommand() {
+        let trimmed = local.commandDraft.trimmingCharacters(in: .newlines)
+        local.commandDraft = ""
+        if trimmed.isEmpty {
+            store.sendQuickKey(.enter, to: session)
+        } else {
+            store.sendDirectText(trimmed, submit: true, to: session)
+        }
+    }
+
+    private func deckApproveButton(_ title: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(title)
+                .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                .foregroundStyle(CodaHerdrTheme.amberNeedsYou)
+                .padding(.horizontal, 9)
+                .padding(.vertical, 4.5)
+                .background(
+                    Capsule()
+                        .fill(CodaHerdrTheme.canvasBG)
+                        .overlay(Capsule().strokeBorder(CodaHerdrTheme.amberNeedsYou.opacity(0.5), lineWidth: 1))
+                )
+        }
+        .buttonStyle(.plain)
     }
 }
 
@@ -663,7 +1244,7 @@ public struct CodaDuoInlineGitDiffLeaf: View {
     }
 }
 
-// MARK: - 2-Row Dedicated Tactile Terminal Keypad (Cover & Unfolded Duo)
+// MARK: - 2-Row Dedicated Tactile Terminal Keypad (Cover, Unfolded Canvas & Tabletop Control Deck)
 
 public struct CodaDuoTactileTwoRowKeypad: View {
     @ObservedObject public var store: CodaWorkspaceStore
@@ -747,74 +1328,6 @@ public struct CodaDuoTactileTwoRowKeypad: View {
                         .fill(active ? CodaHerdrTheme.cyanWorking : CodaHerdrTheme.elevatedBG)
                         .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).strokeBorder(active ? CodaHerdrTheme.cyanWorking : CodaHerdrTheme.borderHairline, lineWidth: 1))
                 )
-        }
-        .buttonStyle(.plain)
-    }
-}
-
-// MARK: - 5.4" Folded Cover Screen Single-Hand Vertical Thumb Action Rail
-
-public struct CodaCoverThumbRail: View {
-    @ObservedObject public var store: CodaWorkspaceStore
-    public let session: CodaAgentSession
-
-    public init(store: CodaWorkspaceStore, session: CodaAgentSession) {
-        self.store = store
-        self.session = session
-    }
-
-    public var body: some View {
-        VStack(spacing: 6) {
-            if session.state == .needsYou {
-                Button {
-                    store.sendDirectText("1", submit: true, to: session)
-                } label: {
-                    Text("1")
-                        .font(.system(size: 12, weight: .bold, design: .monospaced))
-                        .foregroundStyle(.black)
-                        .frame(width: 34, height: 30)
-                        .background(Capsule().fill(CodaHerdrTheme.amberNeedsYou))
-                }
-                .buttonStyle(.plain)
-            }
-
-            thumbIconButton("chevron.up") {
-                store.sendQuickKey(.up, to: session)
-            }
-            thumbIconButton("chevron.down") {
-                store.sendQuickKey(.down, to: session)
-            }
-            thumbIconButton("return", tint: CodaHerdrTheme.cyanWorking) {
-                store.sendQuickKey(.enter, to: session)
-            }
-            Button {
-                store.sendQuickKey(.esc, to: session)
-            } label: {
-                Text("esc")
-                    .font(.system(size: 9.5, weight: .bold, design: .monospaced))
-                    .foregroundStyle(CodaHerdrTheme.redDiff)
-                    .frame(width: 34, height: 28)
-                    .background(Capsule().fill(CodaHerdrTheme.canvasBG.opacity(0.85)))
-            }
-            .buttonStyle(.plain)
-        }
-        .padding(.vertical, 6)
-        .padding(.horizontal, 4)
-        .background(
-            Capsule()
-                .fill(CodaHerdrTheme.elevatedBG.opacity(0.92))
-                .overlay(Capsule().strokeBorder(CodaHerdrTheme.borderHairline, lineWidth: 1))
-                .shadow(color: .black.opacity(0.5), radius: 12, x: 0, y: 4)
-        )
-    }
-
-    private func thumbIconButton(_ symbol: String, tint: Color = CodaHerdrTheme.textPrimary, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Image(systemName: symbol)
-                .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(tint)
-                .frame(width: 34, height: 28)
-                .background(Circle().fill(CodaHerdrTheme.canvasBG.opacity(0.75)))
         }
         .buttonStyle(.plain)
     }

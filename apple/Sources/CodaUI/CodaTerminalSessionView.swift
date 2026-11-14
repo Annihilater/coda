@@ -18,6 +18,8 @@ public struct CodaTerminalSessionView: View {
     public let isCompact: Bool
     public let isSplitThumb: Bool
     public let isSecondaryLeaf: Bool
+    public let isCompactHeight: Bool
+    public let hideBottomControls: Bool
 
     @FocusState private var directKeyboardFocused: Bool
     @StateObject private var local = TerminalViewportLocalState()
@@ -27,13 +29,17 @@ public struct CodaTerminalSessionView: View {
         session: CodaAgentSession,
         isCompact: Bool,
         isSplitThumb: Bool = false,
-        isSecondaryLeaf: Bool = false
+        isSecondaryLeaf: Bool = false,
+        isCompactHeight: Bool = false,
+        hideBottomControls: Bool = false
     ) {
         self.store = store
         self.session = session
         self.isCompact = isCompact
         self.isSplitThumb = isSplitThumb
         self.isSecondaryLeaf = isSecondaryLeaf
+        self.isCompactHeight = isCompactHeight
+        self.hideBottomControls = hideBottomControls
     }
 
     public var body: some View {
@@ -72,34 +78,28 @@ public struct CodaTerminalSessionView: View {
                             }
                     )
 
-                VStack(spacing: 8) {
-                    if directKeyboardFocused {
-                        directKeystrokeStrip
-                            .padding(.horizontal, 12)
-                            .transition(.move(edge: .bottom).combined(with: .opacity))
-                    }
+                if !hideBottomControls {
+                    VStack(spacing: 8) {
+                        if directKeyboardFocused {
+                            directKeystrokeStrip
+                                .padding(.horizontal, 12)
+                                .transition(.move(edge: .bottom).combined(with: .opacity))
+                        }
 
-                    if store.dpadVisible {
-                        dpadRow
-                            .transition(.move(edge: .bottom).combined(with: .opacity))
-                    }
+                        if store.dpadVisible {
+                            dpadRow
+                                .transition(.move(edge: .bottom).combined(with: .opacity))
+                        }
 
-                    if store.showTactileTwoRowKeypad {
-                        CodaDuoTactileTwoRowKeypad(store: store, targetSession: session)
-                            .transition(.move(edge: .bottom).combined(with: .opacity))
-                    }
+                        if store.showTactileTwoRowKeypad {
+                            CodaDuoTactileTwoRowKeypad(store: store, targetSession: session)
+                                .transition(.move(edge: .bottom).combined(with: .opacity))
+                        }
 
-                    floatingQuickDock
-                }
-                .padding(.horizontal, 12)
-                .padding(.bottom, isCompact ? 10 : 14)
-            }
-            .overlay(alignment: .bottomTrailing) {
-                if store.formFactor == .iphoneCover && store.showCoverThumbRail {
-                    CodaCoverThumbRail(store: store, session: session)
-                        .padding(.trailing, 8)
-                        .padding(.bottom, (store.showTactileTwoRowKeypad ? 148 : 68) + (directKeyboardFocused ? 46 : 0))
-                        .transition(.move(edge: .trailing).combined(with: .opacity))
+                        floatingQuickDock
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.bottom, (isCompact || isCompactHeight) ? 8 : 14)
                 }
             }
         }
@@ -148,7 +148,9 @@ public struct CodaTerminalSessionView: View {
                     }
                 }
                 .buttonStyle(.plain)
-            } else if store.formFactor == .iphoneDuoUnfolded {
+            } else if store.formFactor == .iphoneDuoInnerLandscape
+                || (store.formFactor == .iphoneDuoInnerPortrait && store.foldPosture == .tabletopLaptop)
+            {
                 let badgeTitle = isSplitThumb ? "1+2" : (isSecondaryLeaf ? "L2" : "L1")
                 let badgeTint = isSecondaryLeaf ? CodaHerdrTheme.amberNeedsYou : CodaHerdrTheme.cyanWorking
                 Text(badgeTitle)
@@ -215,9 +217,9 @@ public struct CodaTerminalSessionView: View {
             Spacer(minLength: 4)
 
             HStack(spacing: 8) {
-                let duoDiffActive = store.formFactor == .iphoneDuoUnfolded && store.duoSplitMode == .studioDiffSplit
+                let duoDiffActive = store.formFactor == .iphoneDuoInnerLandscape && store.duoSplitMode == .studioDiffSplit
                 Button {
-                    if store.formFactor == .iphoneDuoUnfolded {
+                    if store.formFactor == .iphoneDuoInnerLandscape {
                         withAnimation(.snappy(duration: 0.18)) {
                             if store.duoSplitMode == .studioDiffSplit {
                                 store.setDuoSplitMode(.inboxAndTerminal)
@@ -264,7 +266,7 @@ public struct CodaTerminalSessionView: View {
             }
         }
         .padding(.horizontal, 12)
-        .padding(.vertical, 10)
+        .padding(.vertical, (isCompactHeight || store.formFactor == .iphoneDuoCoverPortrait || store.formFactor == .iphoneDuoInnerLandscape) ? 6 : 10)
         .background(CodaHerdrTheme.cardBG.opacity(0.65))
     }
 
@@ -290,10 +292,15 @@ public struct CodaTerminalSessionView: View {
                 quickApprovePill("2 · Always") {
                     store.sendDirectText("2", submit: true, to: session)
                 }
+                if isSplitThumb {
+                    Spacer(minLength: 28)
+                }
                 quickApprovePill("Esc") {
                     store.interruptSession(session)
                 }
-                Spacer()
+                if !isSplitThumb {
+                    Spacer()
+                }
             }
         }
         .padding(10)
@@ -356,7 +363,7 @@ public struct CodaTerminalSessionView: View {
                     }
 
                     Color.clear
-                        .frame(height: (directKeyboardFocused ? 148 : 88) + (store.showTactileTwoRowKeypad ? 86 : 0))
+                        .frame(height: hideBottomControls ? 18 : ((directKeyboardFocused ? 148 : 88) + (store.showTactileTwoRowKeypad ? 86 : 0)))
                         .id("terminal_bottom_anchor")
                 }
                 .padding(.horizontal, 12)
@@ -391,8 +398,8 @@ public struct CodaTerminalSessionView: View {
                         )
                 }
                 .buttonStyle(.plain)
-                .padding(.trailing, (store.formFactor == .iphoneCover && store.showCoverThumbRail) ? 56 : 14)
-                .padding(.bottom, (directKeyboardFocused ? 124 : 74) + (store.showTactileTwoRowKeypad ? 86 : 0))
+                .padding(.trailing, 14)
+                .padding(.bottom, hideBottomControls ? 14 : ((directKeyboardFocused ? 124 : 74) + (store.showTactileTwoRowKeypad ? 86 : 0)))
             }
         }
     }

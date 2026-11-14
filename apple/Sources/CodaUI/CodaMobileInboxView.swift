@@ -12,12 +12,14 @@ public struct CodaMobileInboxTabView: View {
     }
 
     public var body: some View {
-        VStack(spacing: 0) {
-            headerBar
-            searchBar
-                .padding(.horizontal, 16)
-                .padding(.top, 8)
-                .padding(.bottom, 10)
+        GeometryReader { geo in
+            let hPad = store.formFactor.fluidHorizontalMargin(for: geo.size.width)
+            VStack(spacing: 0) {
+                headerBar(horizontalPad: hPad)
+                searchBar
+                    .padding(.horizontal, hPad)
+                    .padding(.top, store.formFactor.usesVerticalSideRail ? 6 : 8)
+                    .padding(.bottom, store.formFactor.usesVerticalSideRail ? 8 : 10)
 
             if !store.isSignedIn {
                 ScrollView {
@@ -54,7 +56,7 @@ public struct CodaMobileInboxTabView: View {
                                 .buttonStyle(.plain)
                                 .listRowBackground(Color.clear)
                                 .listRowSeparator(.hidden)
-                                .listRowInsets(EdgeInsets(top: 0, leading: 16, bottom: 0, trailing: 16))
+                                .listRowInsets(EdgeInsets(top: 0, leading: hPad, bottom: 0, trailing: hPad))
                                 .swipeActions(edge: .leading, allowsFullSwipe: true) {
                                     Button {
                                         if session.unreadCompletion {
@@ -94,27 +96,35 @@ public struct CodaMobileInboxTabView: View {
                         }
                     }
 
-                    // Bottom safe clearance for floating bottom tab pill
-                    Color.clear
-                        .frame(height: 88)
-                        .listRowBackground(Color.clear)
-                        .listRowSeparator(.hidden)
-                }
-                .listStyle(.plain)
-                .scrollContentBackground(.hidden)
-                .codaDismissKeyboardInteractively()
-                .refreshable {
-                    await store.refreshMachinesAndSessions()
+                        if !store.formFactor.usesVerticalSideRail {
+                            // Bottom safe clearance for floating bottom tab pill
+                            Color.clear
+                                .frame(height: 88)
+                                .listRowBackground(Color.clear)
+                                .listRowSeparator(.hidden)
+                        }
+                    }
+                    .listStyle(.plain)
+                    .scrollContentBackground(.hidden)
+                    .codaDismissKeyboardInteractively()
+                    .refreshable {
+                        await store.refreshMachinesAndSessions()
+                    }
                 }
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(CodaHerdrTheme.canvasBG)
         }
-        .background(CodaHerdrTheme.canvasBG)
     }
 
-    private var headerBar: some View {
+    private var compactTitleSize: CGFloat {
+        (store.formFactor.usesVerticalSideRail || store.formFactor == .iphoneDuoCoverPortrait) ? 22 : 30
+    }
+
+    private func headerBar(horizontalPad: CGFloat) -> some View {
         HStack(spacing: 10) {
             Text(tr("Inbox", "收件箱", locale: store.locale))
-                .font(.system(size: 30, weight: .bold))
+                .font(.system(size: compactTitleSize, weight: .bold))
                 .foregroundStyle(CodaHerdrTheme.textPrimary)
 
             Spacer()
@@ -154,8 +164,8 @@ public struct CodaMobileInboxTabView: View {
             }
             .buttonStyle(.plain)
         }
-        .padding(.horizontal, 18)
-        .padding(.top, 10)
+        .padding(.horizontal, horizontalPad + 2)
+        .padding(.top, store.formFactor.usesVerticalSideRail ? 4 : 10)
     }
 
     private var searchBar: some View {
@@ -415,68 +425,72 @@ public struct CodaMobileSpacesTabView: View {
     }
 
     public var body: some View {
-        VStack(spacing: 0) {
-            HStack {
-                Text(tr("Spaces", "空间", locale: store.locale))
-                    .font(.system(size: 30, weight: .bold))
-                    .foregroundStyle(CodaHerdrTheme.textPrimary)
-                Spacer()
-                Button {
-                    store.settingsInitialFocusPairing = true
-                    store.showSettingsSheet = true
-                } label: {
-                    Image(systemName: "plus")
-                        .font(.system(size: 15, weight: .semibold))
+        GeometryReader { geo in
+            let hPad = store.formFactor.fluidHorizontalMargin(for: geo.size.width)
+            VStack(spacing: 0) {
+                HStack {
+                    Text(tr("Spaces", "空间", locale: store.locale))
+                        .font(.system(size: (store.formFactor.usesVerticalSideRail || store.formFactor == .iphoneDuoCoverPortrait) ? 22 : 30, weight: .bold))
                         .foregroundStyle(CodaHerdrTheme.textPrimary)
-                        .frame(width: 34, height: 34)
-                        .background(
-                            Circle()
-                                .fill(CodaHerdrTheme.elevatedBG)
-                                .overlay(Circle().strokeBorder(CodaHerdrTheme.borderHairline, lineWidth: 1))
-                        )
+                    Spacer()
+                    Button {
+                        store.settingsInitialFocusPairing = true
+                        store.showSettingsSheet = true
+                    } label: {
+                        Image(systemName: "plus")
+                            .font(.system(size: 15, weight: .semibold))
+                            .foregroundStyle(CodaHerdrTheme.textPrimary)
+                            .frame(width: 34, height: 34)
+                            .background(
+                                Circle()
+                                    .fill(CodaHerdrTheme.elevatedBG)
+                                    .overlay(Circle().strokeBorder(CodaHerdrTheme.borderHairline, lineWidth: 1))
+                            )
+                    }
+                    .buttonStyle(.plain)
                 }
-                .buttonStyle(.plain)
-            }
-            .padding(.horizontal, 18)
-            .padding(.top, 10)
-            .padding(.bottom, 10)
+                .padding(.horizontal, hPad + 2)
+                .padding(.top, store.formFactor.usesVerticalSideRail ? 4 : 10)
+                .padding(.bottom, store.formFactor.usesVerticalSideRail ? 6 : 10)
 
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 18) {
-                    if !store.isSignedIn || store.spacesByMachine.isEmpty {
-                        VStack(alignment: .leading, spacing: 10) {
-                            Text(tr("No connected workstations", "暂无已连接主机", locale: store.locale))
-                                .font(.system(size: 16, weight: .semibold))
-                                .foregroundStyle(CodaHerdrTheme.textPrimary)
-                            Text(tr(
-                                "Add a Mac or Linux host to browse repositories, branches, and live terminal panes.",
-                                "添加一台 Mac 或 Linux 主机以浏览代码仓库与实时终端窗格。",
-                                locale: store.locale
-                            ))
-                            .font(.system(size: 13))
-                            .foregroundStyle(CodaHerdrTheme.textSecondary)
-                        }
-                        .padding(18)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(
-                            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                                .fill(CodaHerdrTheme.cardBG)
-                                .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).strokeBorder(CodaHerdrTheme.borderHairline, lineWidth: 1))
-                        )
-                    } else {
-                        ForEach(store.spacesByMachine) { group in
-                            machineSection(group)
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 18) {
+                        if !store.isSignedIn || store.spacesByMachine.isEmpty {
+                            VStack(alignment: .leading, spacing: 10) {
+                                Text(tr("No connected workstations", "暂无已连接主机", locale: store.locale))
+                                    .font(.system(size: 16, weight: .semibold))
+                                    .foregroundStyle(CodaHerdrTheme.textPrimary)
+                                Text(tr(
+                                    "Add a Mac or Linux host to browse repositories, branches, and live terminal panes.",
+                                    "添加一台 Mac 或 Linux 主机以浏览代码仓库与实时终端窗格。",
+                                    locale: store.locale
+                                ))
+                                .font(.system(size: 13))
+                                .foregroundStyle(CodaHerdrTheme.textSecondary)
+                            }
+                            .padding(18)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(
+                                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                                    .fill(CodaHerdrTheme.cardBG)
+                                    .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).strokeBorder(CodaHerdrTheme.borderHairline, lineWidth: 1))
+                            )
+                        } else {
+                            ForEach(store.spacesByMachine) { group in
+                                machineSection(group)
+                            }
                         }
                     }
+                    .padding(.horizontal, hPad)
+                    .padding(.bottom, store.formFactor.usesVerticalSideRail ? 18 : 96)
                 }
-                .padding(.horizontal, 16)
-                .padding(.bottom, 96)
+                .refreshable {
+                    await store.refreshMachinesAndSessions()
+                }
             }
-            .refreshable {
-                await store.refreshMachinesAndSessions()
-            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(CodaHerdrTheme.canvasBG)
         }
-        .background(CodaHerdrTheme.canvasBG)
     }
 
     @ViewBuilder
@@ -569,7 +583,7 @@ public struct CodaMobileSpacesTabView: View {
     }
 
     private func paneMinimapGrid(sessions: [CodaAgentSession]) -> some View {
-        LazyVGrid(columns: [GridItem(.flexible(), spacing: 10), GridItem(.flexible(), spacing: 10)], spacing: 10) {
+        LazyVGrid(columns: [GridItem(.adaptive(minimum: 168, maximum: 280), spacing: 10)], spacing: 10) {
             ForEach(sessions) { session in
                 Button {
                     store.selectSession(session)

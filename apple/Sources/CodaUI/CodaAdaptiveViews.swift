@@ -6,22 +6,93 @@ import SwiftUI
 public struct CodaAdaptiveRootView: View {
     @StateObject private var store = CodaWorkspaceStore()
     @FocusState private var sidebarSearchFocused: Bool
+#if os(iOS)
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    @Environment(\.verticalSizeClass) private var verticalSizeClass
+#endif
 
     public init() {}
 
+    private var isHorizontalRegular: Bool? {
+#if os(iOS)
+        return horizontalSizeClass == .regular
+#else
+        return nil
+#endif
+    }
+
+    private var isVerticalRegular: Bool? {
+#if os(iOS)
+        return verticalSizeClass == .regular
+#else
+        return nil
+#endif
+    }
+
+    private func edgeSafeAreas(from insets: EdgeInsets) -> CodaEdgeSafeAreas {
+        CodaEdgeSafeAreas(
+            top: insets.top,
+            leading: insets.leading,
+            bottom: insets.bottom,
+            trailing: insets.trailing
+        )
+    }
+
+    @ViewBuilder
+    private func applyingSizeClassObservers<Content: View>(
+        geo: GeometryProxy,
+        safeAreas: CodaEdgeSafeAreas,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+#if os(iOS)
+        content()
+            .onChange(of: horizontalSizeClass) { _, _ in
+                store.updateViewportGeometry(
+                    size: geo.size,
+                    safeAreas: safeAreas,
+                    isHorizontalRegular: isHorizontalRegular,
+                    isVerticalRegular: isVerticalRegular
+                )
+            }
+            .onChange(of: verticalSizeClass) { _, _ in
+                store.updateViewportGeometry(
+                    size: geo.size,
+                    safeAreas: safeAreas,
+                    isHorizontalRegular: isHorizontalRegular,
+                    isVerticalRegular: isVerticalRegular
+                )
+            }
+#else
+        content()
+#endif
+    }
+
     public var body: some View {
         GeometryReader { geo in
-            let factor = CodaFormFactor.detect(width: geo.size.width, height: geo.size.height)
+            let safeAreas = edgeSafeAreas(from: geo.safeAreaInsets)
+            let isHReg = isHorizontalRegular
+            let isVReg = isVerticalRegular
+            let factor = CodaFormFactor.detect(
+                width: geo.size.width,
+                height: geo.size.height,
+                isHorizontalRegular: isHReg,
+                isVerticalRegular: isVReg
+            )
 
-            ZStack(alignment: .top) {
-                switch factor {
-                case .iphoneCover, .iphoneStandard:
-                    compactPhoneLayout
-                case .iphoneDuoUnfolded:
-                    CodaDuoUnfoldedWorkbenchView(store: store)
-                case .ipadOrDesktop:
-                    regularIPadSplitLayout
-                }
+            applyingSizeClassObservers(geo: geo, safeAreas: safeAreas) {
+                ZStack(alignment: .top) {
+                    switch factor {
+                    case .iphonePortrait, .iphoneDuoCoverPortrait:
+                        compactPhoneLayout
+                    case .iphoneLandscape, .iphoneDuoCoverLandscape:
+                        CodaCompactLandscapeSideRailLayout(store: store)
+                    case .iphoneDuoInnerLandscape:
+                        CodaDuoInnerLandscapeWorkbenchView(store: store)
+                    case .iphoneDuoInnerPortrait:
+                        CodaDuoInnerPortraitWorkbenchView(store: store)
+                    case .ipadOrDesktop:
+                        regularIPadSplitLayout
+                    }
 
                 if let toast = store.activeToast {
                     CodaToastBannerView(
@@ -46,25 +117,46 @@ public struct CodaAdaptiveRootView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(CodaHerdrTheme.canvasBG)
             .onAppear {
-                store.updateViewportGeometry(size: geo.size)
+                store.updateViewportGeometry(
+                    size: geo.size,
+                    safeAreas: safeAreas,
+                    isHorizontalRegular: isHReg,
+                    isVerticalRegular: isVReg
+                )
                 store.startLiveSync()
                 if !factor.isCompact, store.selectedSessionID == nil, let first = store.filteredSessions.first {
                     store.selectSession(first)
                 }
             }
             .onChange(of: geo.size) { _, next in
-                store.updateViewportGeometry(size: next)
+                store.updateViewportGeometry(
+                    size: next,
+                    safeAreas: safeAreas,
+                    isHorizontalRegular: isHReg,
+                    isVerticalRegular: isVReg
+                )
             }
             .onChange(of: store.showSidebar) { _, _ in
-                store.updateViewportGeometry(size: geo.size)
+                store.updateViewportGeometry(
+                    size: geo.size,
+                    safeAreas: safeAreas,
+                    isHorizontalRegular: isHReg,
+                    isVerticalRegular: isVReg
+                )
             }
             .onChange(of: store.sessions.count) { _, _ in
                 if !factor.isCompact, store.selectedSessionID == nil, let first = store.filteredSessions.first {
                     store.selectSession(first)
                 }
                 if !factor.isCompact {
-                    store.updateViewportGeometry(size: geo.size)
+                    store.updateViewportGeometry(
+                        size: geo.size,
+                        safeAreas: safeAreas,
+                        isHorizontalRegular: isHReg,
+                        isVerticalRegular: isVReg
+                    )
                 }
+            }
             }
         }
         .sheet(isPresented: $store.showSettingsSheet) {

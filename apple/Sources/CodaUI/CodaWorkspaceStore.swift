@@ -13,20 +13,20 @@ public enum CodaDuoSplitMode: String, CaseIterable, Sendable, Identifiable {
     case inboxAndTerminal
     case studioDiffSplit
     case dualTerminalSplit
-    case fullPanorama
+    case expandedCanvas
 
     public var id: String { rawValue }
 
     public func title(locale: CodaUILocale) -> String {
         switch self {
         case .inboxAndTerminal:
-            return locale == .zh ? "收件箱 | 终端" : "Inbox | Term"
+            return locale == .zh ? "分栏" : "Split"
         case .studioDiffSplit:
-            return locale == .zh ? "终端 | 差异" : "Studio Diff"
+            return locale == .zh ? "差异" : "Diff"
         case .dualTerminalSplit:
-            return locale == .zh ? "双窗格" : "Dual Pane"
-        case .fullPanorama:
-            return locale == .zh ? "全宽" : "Panorama"
+            return locale == .zh ? "双窗" : "Dual"
+        case .expandedCanvas:
+            return locale == .zh ? "全宽" : "Canvas"
         }
     }
 }
@@ -96,11 +96,12 @@ public final class CodaWorkspaceStore: ObservableObject {
     @Published public var terminalColumns: Int = 56
     @Published public var terminalRows: Int = 28
     @Published public var terminalFontSize: CGFloat = 12.5
-    @Published public var formFactor: CodaFormFactor = .iphoneStandard
+    @Published public var formFactor: CodaFormFactor = .iphonePortrait
+    @Published public var foldPosture: CodaFoldPosture = .flat
+    @Published public var edgeSafeAreas: CodaEdgeSafeAreas = .zero
     @Published public var duoSplitMode: CodaDuoSplitMode = .inboxAndTerminal
     @Published public var secondarySessionID: String? = nil
     @Published public var showTactileTwoRowKeypad: Bool = false
-    @Published public var showCoverThumbRail: Bool = true
 
     private var networkClient: CodaNetworkClient?
     private var networkClientURL: URL?
@@ -110,6 +111,8 @@ public final class CodaWorkspaceStore: ObservableObject {
     private var previousStates: [String: HerdrLifecycleState] = [:]
     private var lastToastAt: Date = .distantPast
     private var lastViewportSize: CGSize = .zero
+    private var lastIsHorizontalRegular: Bool? = nil
+    private var lastIsVerticalRegular: Bool? = nil
 
     public init() {
         let loadedSettings = CodaPersistedSettings.load()
@@ -754,28 +757,80 @@ public final class CodaWorkspaceStore: ObservableObject {
             loadGitDiffForSelected(presentModal: false)
         }
         if lastViewportSize.width > 0 && lastViewportSize.height > 0 {
-            updateViewportGeometry(size: lastViewportSize)
+            updateViewportGeometry(
+                size: lastViewportSize,
+                safeAreas: edgeSafeAreas,
+                isHorizontalRegular: lastIsHorizontalRegular,
+                isVerticalRegular: lastIsVerticalRegular
+            )
         }
     }
 
-    public func updateViewportGeometry(size: CGSize) {
+    public func setFoldPosture(_ next: CodaFoldPosture) {
+        foldPosture = next
+        if lastViewportSize.width > 0 && lastViewportSize.height > 0 {
+            updateViewportGeometry(
+                size: lastViewportSize,
+                safeAreas: edgeSafeAreas,
+                isHorizontalRegular: lastIsHorizontalRegular,
+                isVerticalRegular: lastIsVerticalRegular
+            )
+        }
+    }
+
+    public func updateViewportGeometry(
+        size: CGSize,
+        safeAreas: CodaEdgeSafeAreas = .zero,
+        isHorizontalRegular: Bool? = nil,
+        isVerticalRegular: Bool? = nil
+    ) {
         guard size.width > 0 && size.height > 0 else { return }
         lastViewportSize = size
-        let nextFactor = CodaFormFactor.detect(width: size.width, height: size.height)
+        lastIsHorizontalRegular = isHorizontalRegular
+        lastIsVerticalRegular = isVerticalRegular
+        edgeSafeAreas = safeAreas
+
+        let nextFactor = CodaFormFactor.detect(
+            width: size.width,
+            height: size.height,
+            isHorizontalRegular: isHorizontalRegular,
+            isVerticalRegular: isVerticalRegular
+        )
         formFactor = nextFactor
+
+        let usableW = max(240, size.width - safeAreas.leading - safeAreas.trailing)
+        let usableH = max(180, size.height - safeAreas.top - safeAreas.bottom)
 
         let paneW: CGFloat
         let paneH: CGFloat
         switch nextFactor {
-        case .iphoneCover, .iphoneStandard:
-            paneW = size.width
-            paneH = max(180, size.height - 130)
-        case .iphoneDuoUnfolded:
-            paneW = (duoSplitMode == .fullPanorama) ? size.width : max(240, floor((size.width - 1) * 0.5))
-            paneH = max(200, size.height - 140)
+        case .iphonePortrait:
+            paneW = usableW
+            paneH = max(180, usableH - 118)
+        case .iphoneDuoCoverPortrait:
+            paneW = usableW
+            paneH = max(180, usableH - 96)
+        case .iphoneLandscape, .iphoneDuoCoverLandscape:
+            paneW = max(280, usableW - CodaEdgeSafeAreas.duoSideRailWidth)
+            paneH = max(160, usableH - 64)
+        case .iphoneDuoInnerLandscape:
+            if duoSplitMode == .expandedCanvas {
+                paneW = max(360, usableW - CodaEdgeSafeAreas.duoSideRailWidth)
+            } else {
+                paneW = max(260, floor(size.width * 0.5) - 12 - safeAreas.trailing)
+            }
+            paneH = max(200, usableH - 76)
+        case .iphoneDuoInnerPortrait:
+            if foldPosture == .tabletopLaptop {
+                paneW = usableW
+                paneH = max(160, floor(size.height * 0.5) - 12 - safeAreas.top - 42)
+            } else {
+                paneW = showSidebar ? max(300, usableW - 236) : usableW
+                paneH = max(220, usableH - 96)
+            }
         case .ipadOrDesktop:
-            paneW = max(360, size.width - (showSidebar ? 288 : 0))
-            paneH = max(220, size.height - 130)
+            paneW = max(360, usableW - (showSidebar ? 288 : 0))
+            paneH = max(220, usableH - 110)
         }
 
         let charWidth = max(6.5, terminalFontSize * 0.61)
@@ -791,7 +846,7 @@ public final class CodaWorkspaceStore: ObservableObject {
                 secondarySessionID = filteredSessions.first(where: { $0.id != selectedSessionID })?.id
             }
         }
-        if nextFactor == .iphoneDuoUnfolded && duoSplitMode == .studioDiffSplit && gitDiffResult == nil {
+        if nextFactor == .iphoneDuoInnerLandscape && duoSplitMode == .studioDiffSplit && gitDiffResult == nil {
             loadGitDiffForSelected(presentModal: false)
         }
 
