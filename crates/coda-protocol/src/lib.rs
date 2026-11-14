@@ -418,6 +418,15 @@ pub struct RepoWorkspaceSummary {
     pub branches: Vec<BranchWorktreeItem>,
 }
 
+/// Directory entry returned from a remote daemon host for the desktop `Files` / `Code` explorer.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RemoteFileItem {
+    pub name: String,
+    pub rel_path: String,
+    pub is_dir: bool,
+    pub size_bytes: u64,
+}
+
 /// Voice Model configuration (`provider + baseurl + key`) persisted in `herdr-core` `doc.set`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VoiceModelConfig {
@@ -585,6 +594,36 @@ pub enum PeerMessage {
         status_short: String,
         diff_unified: String,
     },
+    /// Cleanly terminates and removes a remote `herdr` terminal session.
+    KillTerminal {
+        req_id: String,
+        terminal: String,
+    },
+    /// Lists a remote workspace directory (`sub_path` relative to `root_path`).
+    ListDirectory {
+        req_id: String,
+        root_path: String,
+        sub_path: String,
+    },
+    DirectoryListing {
+        req_id: String,
+        root_path: String,
+        sub_path: String,
+        entries: Vec<RemoteFileItem>,
+        error: Option<String>,
+    },
+    /// Reads a UTF-8 preview of a file on the remote host.
+    ReadFilePreview {
+        req_id: String,
+        path: String,
+        max_bytes: usize,
+    },
+    FilePreviewResponse {
+        req_id: String,
+        path: String,
+        content: String,
+        error: Option<String>,
+    },
     /// Zero-config remote localhost web port preview (`127.0.0.1:PORT` -> Mobile/Web preview sheet)
     HttpLocalPreviewRequest {
         req_id: String,
@@ -616,10 +655,50 @@ impl PeerMessage {
             | Self::InterruptTerminal { req_id, .. }
             | Self::ReadTerminalScreen { req_id, .. }
             | Self::GitDiffRequest { req_id, .. }
+            | Self::KillTerminal { req_id, .. }
+            | Self::ListDirectory { req_id, .. }
+            | Self::ReadFilePreview { req_id, .. }
             | Self::HttpLocalPreviewRequest { req_id, .. } => Some(req_id.as_str()),
             _ => None,
         }
     }
+
+    /// Returns the correlation `req_id` when this variant represents a daemon response.
+    pub fn response_req_id(&self) -> Option<&str> {
+        match self {
+            Self::Pong { req_id, .. }
+            | Self::TerminalsSnapshot { req_id, .. }
+            | Self::WorkspacesSnapshot { req_id, .. }
+            | Self::LaunchAgentResult { req_id, .. }
+            | Self::PtyAttached { req_id, .. }
+            | Self::UploadTerminalFileResult { req_id, .. }
+            | Self::VoiceConfigAck { req_id, .. }
+            | Self::TerminalScreenSnapshot { req_id, .. }
+            | Self::ActionAck { req_id, .. }
+            | Self::GitDiffResponse { req_id, .. }
+            | Self::DirectoryListing { req_id, .. }
+            | Self::FilePreviewResponse { req_id, .. }
+            | Self::HttpLocalPreviewResponse { req_id, .. } => Some(req_id.as_str()),
+            _ => None,
+        }
+    }
+}
+
+/// Real-time control-plane notification pushed by `coda-server` over `/api/v1/events/ws`
+/// whenever a device is enrolled, paired, removed, or changes online relay presence.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AccountLiveEvent {
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub online: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp_ms: Option<u64>,
 }
 
 #[cfg(test)]
@@ -739,5 +818,44 @@ mod tests {
             PeerMessage::TerminalScreenSnapshot { text, .. } => assert_eq!(text, big_screen),
             _ => panic!("unexpected variant"),
         }
+    }
+
+    #[test]
+    fn test_response_req_id_and_account_live_event_roundtrip() {
+        let ping = PeerMessage::Ping {
+            req_id: "r-ping".into(),
+            sent_ms: 42,
+        };
+        assert_eq!(ping.request_id(), Some("r-ping"));
+        assert_eq!(ping.response_req_id(), None);
+
+        let pong = PeerMessage::Pong {
+            req_id: "r-ping".into(),
+            sent_ms: 42,
+            daemon_hostname: "linux-box".into(),
+            herdr_version: "0.1.21".into(),
+        };
+        assert_eq!(pong.request_id(), None);
+        assert_eq!(pong.response_req_id(), Some("r-ping"));
+
+        let push = PeerMessage::PtyOutputChunk {
+            terminal: "t1".into(),
+            seq: 1,
+            data_b64: "".into(),
+        };
+        assert_eq!(push.request_id(), None);
+        assert_eq!(push.response_req_id(), None);
+
+        let ev = AccountLiveEvent {
+            kind: "devices_changed".into(),
+            device_id: Some(Uuid::new_v4()),
+            device_name: Some("openEuler Server".into()),
+            role: Some("host".into()),
+            online: Some(true),
+            timestamp_ms: Some(1_700_000_000_000),
+        };
+        let encoded = serde_json::to_string(&ev).unwrap();
+        let decoded: AccountLiveEvent = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, ev);
     }
 }

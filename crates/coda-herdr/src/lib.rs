@@ -92,29 +92,88 @@ impl From<RawTerminal> for HerdrTerminalSummary {
     }
 }
 
-/// Locates the `hc` (`herdr-core`) binary across standard macOS & Linux install paths.
+/// Locates the `herdr-core` / `hc` binary across standard macOS & Linux install paths.
+///
+/// Prefers `herdr-core` over bare `hc` to avoid collisions with unrelated binaries such as
+/// the `herbstclient` (`hc`) window manager tool.
 pub fn discover_hc_binary() -> Option<PathBuf> {
-    if let Ok(custom) = std::env::var("HC_BIN") {
-        let p = PathBuf::from(custom);
-        if p.is_file() {
-            return Some(p);
+    for var in ["HERDR_CORE_BIN", "HC_BIN"] {
+        if let Ok(custom) = std::env::var(var) {
+            let p = PathBuf::from(custom);
+            if p.is_file() {
+                return Some(p);
+            }
         }
     }
-    let mut candidates = Vec::new();
-    if let Ok(home) = std::env::var("HOME") {
-        candidates.push(PathBuf::from(&home).join(".local/bin/hc"));
-        candidates.push(PathBuf::from(&home).join(".cargo/bin/hc"));
-    }
-    candidates.push(PathBuf::from("/opt/homebrew/bin/hc"));
-    candidates.push(PathBuf::from("/usr/local/bin/hc"));
-    candidates.push(PathBuf::from("/usr/bin/hc"));
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let path_var = std::env::var_os("PATH");
+    discover_hc_binary_in(home.as_deref(), path_var.as_deref())
+}
 
-    for p in candidates {
-        if p.is_file() {
-            return Some(p);
+fn discover_hc_binary_in(home: Option<&Path>, path_var: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+    let mut base_dirs: Vec<PathBuf> = Vec::new();
+    if let Some(home) = home {
+        base_dirs.push(home.join(".local/bin"));
+        base_dirs.push(home.join(".cargo/bin"));
+    }
+    base_dirs.push(PathBuf::from("/opt/homebrew/bin"));
+    base_dirs.push(PathBuf::from("/usr/local/bin"));
+    base_dirs.push(PathBuf::from("/usr/bin"));
+    if let Some(pv) = path_var {
+        for entry in std::env::split_paths(pv) {
+            if !entry.as_os_str().is_empty() && !base_dirs.contains(&entry) {
+                base_dirs.push(entry);
+            }
+        }
+    }
+
+    for binary_name in ["herdr-core", "hc"] {
+        for dir in &base_dirs {
+            let candidate = dir.join(binary_name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
         }
     }
     None
+}
+
+/// Ensures `herdr-core` (`hc`) is installed locally, running the official install script if missing.
+pub async fn ensure_or_install_hc_binary() -> Result<PathBuf> {
+    if let Some(existing) = discover_hc_binary() {
+        return Ok(existing);
+    }
+    if std::env::var("CODA_SKIP_HC_INSTALL").as_deref() == Ok("1") {
+        bail!("herdr-core binary not found and CODA_SKIP_HC_INSTALL=1 is set");
+    }
+
+    tracing::info!("`herdr-core` binary not found; installing via https://releases.herdr.dev/core/install.sh");
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg("curl -fsSL https://releases.herdr.dev/core/install.sh | sh")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .context("failed to invoke shell installer for herdr-core")?;
+
+    if !output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "herdr-core installation exited with {}: stdout=`{}` stderr=`{}`",
+            output.status,
+            stdout.trim(),
+            stderr.trim()
+        );
+    }
+
+    discover_hc_binary().ok_or_else(|| {
+        anyhow!(
+            "herdr-core installer finished, but `herdr-core`/`hc` was still not found in standard paths"
+        )
+    })
 }
 
 pub struct HerdrClient {
@@ -124,6 +183,60 @@ pub struct HerdrClient {
     next_id: AtomicU64,
     hello_info: HerdrHelloInfo,
     _child: Arc<Mutex<Child>>,
+}
+
+static HC_NAME_SEQ: AtomicU64 = AtomicU64::new(1);
+
+/// Sanitizes an arbitrary label into a valid `herdr-core` terminal name (`1..=32` chars of `[a-z0-9._-]`).
+pub fn sanitize_hc_terminal_name(raw: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut prev_dash = false;
+    for ch in raw.chars() {
+        let lower = ch.to_ascii_lowercase();
+        if matches!(lower, 'a'..='z' | '0'..='9' | '_' | '.') {
+            out.push(lower);
+            prev_dash = false;
+        } else if (lower == '-' || !prev_dash) && !out.is_empty() && !prev_dash {
+            out.push('-');
+            prev_dash = true;
+        }
+        if out.len() >= 32 {
+            break;
+        }
+    }
+    let trimmed = out.trim_matches(|c| matches!(c, '-' | '_' | '.')).to_string();
+    if trimmed.is_empty() {
+        None
+    } else {
+        let mut cut: String = trimmed.chars().take(32).collect();
+        cut = cut
+            .trim_matches(|c| matches!(c, '-' | '_' | '.'))
+            .to_string();
+        if cut.is_empty() { None } else { Some(cut) }
+    }
+}
+
+fn next_unique_hc_name(prefix: Option<&str>) -> String {
+    let seq = HC_NAME_SEQ.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0);
+    let suffix = format!(
+        "{:06x}",
+        (nanos ^ seq.wrapping_mul(0x9e37_79b9)) & 0xff_ffff
+    );
+    let clean_prefix = prefix
+        .and_then(sanitize_hc_terminal_name)
+        .unwrap_or_else(|| "coda".to_string());
+    let mut base: String = clean_prefix.chars().take(23).collect();
+    base = base
+        .trim_end_matches(|c| matches!(c, '-' | '_' | '.'))
+        .to_string();
+    if base.is_empty() {
+        base = "coda".to_string();
+    }
+    format!("{base}-{suffix}")
 }
 
 impl HerdrClient {
@@ -295,14 +408,32 @@ impl HerdrClient {
                 "agent": agent,
             }
         });
-        if let Some(n) = name.filter(|s| !s.trim().is_empty()) {
+        if let Some(n) = name.and_then(sanitize_hc_terminal_name) {
             params["name"] = json!(n);
         }
         if let Some(dir) = cwd.filter(|s| !s.trim().is_empty()) {
             params["cwd"] = json!(dir);
         }
 
-        let res = self.call_rpc("terminal.run", params).await?;
+        let res = match self.call_rpc("terminal.run", params.clone()).await {
+            Ok(v) => v,
+            Err(err) => {
+                let msg = err.to_string().to_ascii_lowercase();
+                if msg.contains("name")
+                    || msg.contains("taken")
+                    || msg.contains("exist")
+                    || msg.contains("unique")
+                    || msg.contains("invalid")
+                {
+                    let fallback_name = next_unique_hc_name(name.or(Some(agent)));
+                    let mut retry_params = params;
+                    retry_params["name"] = json!(fallback_name);
+                    self.call_rpc("terminal.run", retry_params).await?
+                } else {
+                    return Err(err);
+                }
+            }
+        };
         let raw: RawTerminal = serde_json::from_value(res)?;
         Ok(raw.into())
     }
@@ -368,12 +499,40 @@ impl HerdrClient {
     }
 
     pub async fn kill_and_remove(&self, terminal: &str) -> Result<()> {
+        // Clear `keep: true` first so `herdr-core` does not auto-respawn a shell on kill.
+        let _ = self
+            .call_rpc(
+                "terminal.keep",
+                json!({ "terminal": terminal, "keep": false }),
+            )
+            .await;
         let _ = self
             .call_rpc("terminal.kill", json!({ "terminal": terminal }))
             .await;
-        let _ = self
-            .call_rpc("terminal.rm", json!({ "terminal": terminal }))
-            .await;
+
+        for _ in 0..15 {
+            if self
+                .call_rpc("terminal.rm", json!({ "terminal": terminal }))
+                .await
+                .is_ok()
+            {
+                return Ok(());
+            }
+            match self
+                .call_rpc("terminal.get", json!({ "terminal": terminal }))
+                .await
+            {
+                Err(_) => return Ok(()),
+                Ok(val) if val.get("state").and_then(|v| v.as_str()) == Some("finished") => {
+                    let _ = self
+                        .call_rpc("terminal.rm", json!({ "terminal": terminal }))
+                        .await;
+                    return Ok(());
+                }
+                Ok(_) => {}
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        }
         Ok(())
     }
 
@@ -683,6 +842,14 @@ pub async fn scan_git_workspaces(
             candidate_dirs.push(p);
         }
     }
+    if let Ok(env_roots) = std::env::var("CODA_WORKSPACE_ROOTS") {
+        for r in env_roots.split(':').filter(|s| !s.trim().is_empty()) {
+            let p = PathBuf::from(r.trim());
+            if p.is_dir() {
+                candidate_dirs.push(p);
+            }
+        }
+    }
     for t in terminals {
         if !t.cwd.is_empty() {
             let p = PathBuf::from(&t.cwd);
@@ -691,11 +858,12 @@ pub async fn scan_git_workspaces(
             }
         }
     }
-    if candidate_dirs.is_empty() {
-        if let Ok(cwd) = std::env::current_dir() {
+    if let Ok(cwd) = std::env::current_dir() {
+        if cwd.is_dir() {
             candidate_dirs.push(cwd);
         }
     }
+    collect_home_git_candidates(&mut candidate_dirs, 16);
 
     let mut seen_repo_roots: HashMap<String, RepoWorkspaceSummary> = HashMap::new();
 
@@ -783,6 +951,88 @@ pub async fn scan_git_workspaces(
     let mut list: Vec<RepoWorkspaceSummary> = seen_repo_roots.into_values().collect();
     list.sort_by(|a, b| a.repo_name.cmp(&b.repo_name));
     list
+}
+
+fn collect_home_git_candidates(candidate_dirs: &mut Vec<PathBuf>, max_total: usize) {
+    let Ok(home) = std::env::var("HOME") else {
+        return;
+    };
+    if home.trim().is_empty() {
+        return;
+    }
+    let home_path = PathBuf::from(home);
+    let subdirs = [
+        "",
+        "projects",
+        "Projects",
+        "workspace",
+        "Developer",
+        "Code",
+        "code",
+        "github",
+        "personal",
+        "personal/github",
+        "repos",
+        "src",
+    ];
+    for sub in subdirs {
+        if candidate_dirs.len() >= max_total {
+            break;
+        }
+        let base = if sub.is_empty() {
+            home_path.clone()
+        } else {
+            home_path.join(sub)
+        };
+        if base.is_dir() {
+            scan_dir_git_roots(&base, 0, 2, candidate_dirs, max_total);
+        }
+    }
+}
+
+fn scan_dir_git_roots(
+    dir: &Path,
+    depth: usize,
+    max_depth: usize,
+    out: &mut Vec<PathBuf>,
+    max_total: usize,
+) {
+    if out.len() >= max_total {
+        return;
+    }
+    if dir.join(".git").exists() {
+        let canonical = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+        if !out.contains(&canonical) {
+            out.push(canonical);
+        }
+        return;
+    }
+    if depth >= max_depth {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut dirs: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let name = e.file_name();
+            let s = name.to_string_lossy();
+            let p = e.path();
+            if !s.starts_with('.') && s != "node_modules" && s != "target" && p.is_dir() {
+                Some(p)
+            } else {
+                None
+            }
+        })
+        .collect();
+    dirs.sort();
+    for d in dirs {
+        scan_dir_git_roots(&d, depth + 1, max_depth, out, max_total);
+        if out.len() >= max_total {
+            break;
+        }
+    }
 }
 
 fn compute_branch_status_summary(terminals: &[HerdrTerminalSummary]) -> String {
@@ -928,5 +1178,71 @@ mod tests {
         assert!(!repos.is_empty(), "expected at least current git repository in scan");
 
         client.kill_and_remove(&term.address).await.unwrap();
+    }
+
+    #[test]
+    fn test_discover_prefers_herdr_core_over_hc() {
+        let dir = std::env::temp_dir().join(format!("coda-herdr-test-{}", std::process::id()));
+        let bin_dir = dir.join(".local/bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let hc_path = bin_dir.join("hc");
+        std::fs::write(&hc_path, "#!/bin/sh\n").unwrap();
+        let herdr_path = bin_dir.join("herdr-core");
+        std::fs::write(&herdr_path, "#!/bin/sh\n").unwrap();
+
+        let found = discover_hc_binary_in(Some(&dir), Some(std::ffi::OsStr::new("")));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(found.as_deref(), Some(herdr_path.as_path()));
+    }
+
+    #[tokio::test]
+    async fn test_launch_with_spaces_unicode_duplicate_names_and_clean_kill_remove() {
+        assert_eq!(sanitize_hc_terminal_name("coda · hc").as_deref(), Some("coda-hc"));
+        assert_eq!(
+            sanitize_hc_terminal_name("  My Space / Claude:v2  ").as_deref(),
+            Some("my-space-claude-v2")
+        );
+        assert_eq!(sanitize_hc_terminal_name("···"), None);
+
+        let Some(hc_bin) = discover_hc_binary() else {
+            eprintln!("skipping live duplicate/kill test: hc not installed");
+            return;
+        };
+        let client = HerdrClient::connect_with_bin(hc_bin).await.unwrap();
+
+        let term1 = client
+            .launch_agent("shell", Some("coda · hc"), None, None, 100, 28)
+            .await
+            .expect("first launch with spaces+unicode name must succeed");
+        let term2 = client
+            .launch_agent("shell", Some("coda · hc"), None, None, 100, 28)
+            .await
+            .expect("second launch with duplicate sanitized name must auto-fallback and succeed");
+
+        assert_ne!(term1.address, term2.address);
+        assert!(term1.alive && term2.alive);
+
+        client
+            .send_text(&term2.address, "echo CODA_DUP_LAUNCH_OK", true)
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let (scr, _) = client.read_screen(&term2.address, 20).await.unwrap();
+        assert!(
+            scr.contains("CODA_DUP_LAUNCH_OK"),
+            "expected output in duplicate-named shell, got: {scr}"
+        );
+
+        client.kill_and_remove(&term1.address).await.unwrap();
+        client.kill_and_remove(&term2.address).await.unwrap();
+
+        let remaining = client.list_terminals(true).await.unwrap();
+        assert!(
+            !remaining
+                .iter()
+                .any(|t| t.address == term1.address || t.address == term2.address),
+            "killed+removed terminals must not remain in list_terminals(true): {:?}",
+            remaining.iter().map(|t| &t.address).collect::<Vec<_>>()
+        );
     }
 }
