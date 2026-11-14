@@ -16,14 +16,24 @@ public struct CodaTerminalSessionView: View {
     @ObservedObject public var store: CodaWorkspaceStore
     public let session: CodaAgentSession
     public let isCompact: Bool
+    public let isSplitThumb: Bool
+    public let isSecondaryLeaf: Bool
 
     @FocusState private var directKeyboardFocused: Bool
     @StateObject private var local = TerminalViewportLocalState()
 
-    public init(store: CodaWorkspaceStore, session: CodaAgentSession, isCompact: Bool) {
+    public init(
+        store: CodaWorkspaceStore,
+        session: CodaAgentSession,
+        isCompact: Bool,
+        isSplitThumb: Bool = false,
+        isSecondaryLeaf: Bool = false
+    ) {
         self.store = store
         self.session = session
         self.isCompact = isCompact
+        self.isSplitThumb = isSplitThumb
+        self.isSecondaryLeaf = isSecondaryLeaf
     }
 
     public var body: some View {
@@ -74,10 +84,23 @@ public struct CodaTerminalSessionView: View {
                             .transition(.move(edge: .bottom).combined(with: .opacity))
                     }
 
+                    if store.showTactileTwoRowKeypad {
+                        CodaDuoTactileTwoRowKeypad(store: store, targetSession: session)
+                            .transition(.move(edge: .bottom).combined(with: .opacity))
+                    }
+
                     floatingQuickDock
                 }
                 .padding(.horizontal, 12)
                 .padding(.bottom, isCompact ? 10 : 14)
+            }
+            .overlay(alignment: .bottomTrailing) {
+                if store.formFactor == .iphoneCover && store.showCoverThumbRail {
+                    CodaCoverThumbRail(store: store, session: session)
+                        .padding(.trailing, 8)
+                        .padding(.bottom, (store.showTactileTwoRowKeypad ? 148 : 68) + (directKeyboardFocused ? 46 : 0))
+                        .transition(.move(edge: .trailing).combined(with: .opacity))
+                }
             }
         }
         .background(CodaHerdrTheme.canvasBG)
@@ -125,6 +148,21 @@ public struct CodaTerminalSessionView: View {
                     }
                 }
                 .buttonStyle(.plain)
+            } else if store.formFactor == .iphoneDuoUnfolded {
+                let badgeTitle = isSplitThumb ? "1+2" : (isSecondaryLeaf ? "L2" : "L1")
+                let badgeTint = isSecondaryLeaf ? CodaHerdrTheme.amberNeedsYou : CodaHerdrTheme.cyanWorking
+                Text(badgeTitle)
+                    .font(.system(size: 10.5, weight: .bold, design: .monospaced))
+                    .foregroundStyle(badgeTint)
+                    .frame(width: 32, height: 32)
+                    .background(
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .fill(CodaHerdrTheme.elevatedBG)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                    .strokeBorder(badgeTint.opacity(0.45), lineWidth: 1)
+                            )
+                    )
             } else {
                 Button {
                     withAnimation(.snappy(duration: 0.2)) {
@@ -177,17 +215,39 @@ public struct CodaTerminalSessionView: View {
             Spacer(minLength: 4)
 
             HStack(spacing: 8) {
+                let duoDiffActive = store.formFactor == .iphoneDuoUnfolded && store.duoSplitMode == .studioDiffSplit
                 Button {
-                    store.loadGitDiffForSelected()
+                    if store.formFactor == .iphoneDuoUnfolded {
+                        withAnimation(.snappy(duration: 0.18)) {
+                            if store.duoSplitMode == .studioDiffSplit {
+                                store.setDuoSplitMode(.inboxAndTerminal)
+                            } else {
+                                store.setDuoSplitMode(.studioDiffSplit)
+                                store.loadGitDiffForSelected(presentModal: false)
+                            }
+                        }
+                    } else {
+                        store.loadGitDiffForSelected()
+                    }
                 } label: {
                     Image(systemName: "plus.forwardslash.minus")
                         .font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(session.diffAdded > 0 || session.diffDeleted > 0 ? CodaHerdrTheme.greenDiff : CodaHerdrTheme.textSecondary)
+                        .foregroundStyle(
+                            duoDiffActive
+                                ? CodaHerdrTheme.cyanWorking
+                                : ((session.diffAdded > 0 || session.diffDeleted > 0) ? CodaHerdrTheme.greenDiff : CodaHerdrTheme.textSecondary)
+                        )
                         .frame(width: 32, height: 32)
                         .background(
                             RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                .fill(CodaHerdrTheme.elevatedBG)
-                                .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).strokeBorder(CodaHerdrTheme.borderHairline, lineWidth: 1))
+                                .fill(duoDiffActive ? CodaHerdrTheme.cyanWorking.opacity(0.14) : CodaHerdrTheme.elevatedBG)
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                        .strokeBorder(
+                                            duoDiffActive ? CodaHerdrTheme.cyanWorking.opacity(0.55) : CodaHerdrTheme.borderHairline,
+                                            lineWidth: 1
+                                        )
+                                )
                         )
                 }
                 .buttonStyle(.plain)
@@ -225,10 +285,10 @@ public struct CodaTerminalSessionView: View {
 
             HStack(spacing: 8) {
                 quickApprovePill("1 · Yes") {
-                    store.sendDirectText("1", submit: true)
+                    store.sendDirectText("1", submit: true, to: session)
                 }
                 quickApprovePill("2 · Always") {
-                    store.sendDirectText("2", submit: true)
+                    store.sendDirectText("2", submit: true, to: session)
                 }
                 quickApprovePill("Esc") {
                     store.interruptSession(session)
@@ -296,7 +356,7 @@ public struct CodaTerminalSessionView: View {
                     }
 
                     Color.clear
-                        .frame(height: directKeyboardFocused ? 148 : 88)
+                        .frame(height: (directKeyboardFocused ? 148 : 88) + (store.showTactileTwoRowKeypad ? 86 : 0))
                         .id("terminal_bottom_anchor")
                 }
                 .padding(.horizontal, 12)
@@ -331,8 +391,8 @@ public struct CodaTerminalSessionView: View {
                         )
                 }
                 .buttonStyle(.plain)
-                .padding(.trailing, 14)
-                .padding(.bottom, directKeyboardFocused ? 124 : 74)
+                .padding(.trailing, (store.formFactor == .iphoneCover && store.showCoverThumbRail) ? 56 : 14)
+                .padding(.bottom, (directKeyboardFocused ? 124 : 74) + (store.showTactileTwoRowKeypad ? 86 : 0))
             }
         }
     }
@@ -411,16 +471,16 @@ public struct CodaTerminalSessionView: View {
             .onChange(of: local.directInputBuffer) { _, next in
                 if (store.ctrlActive || store.altActive), let last = next.last {
                     local.directInputBuffer = ""
-                    store.sendDirectText(String(last), submit: false)
+                    store.sendDirectText(String(last), submit: false, to: session)
                 }
             }
             .onSubmit {
                 let text = local.directInputBuffer
                 local.directInputBuffer = ""
                 if text.isEmpty {
-                    store.sendQuickKey(.enter)
+                    store.sendQuickKey(.enter, to: session)
                 } else {
-                    store.sendDirectText(text, submit: true)
+                    store.sendDirectText(text, submit: true, to: session)
                 }
             }
 
@@ -428,9 +488,9 @@ public struct CodaTerminalSessionView: View {
                 let text = local.directInputBuffer
                 local.directInputBuffer = ""
                 if text.isEmpty {
-                    store.sendQuickKey(.enter)
+                    store.sendQuickKey(.enter, to: session)
                 } else {
-                    store.sendDirectText(text, submit: true)
+                    store.sendDirectText(text, submit: true, to: session)
                 }
             } label: {
                 Image(systemName: "arrow.up.circle.fill")
@@ -479,7 +539,7 @@ public struct CodaTerminalSessionView: View {
 
     private func dpadButton(_ symbol: String, key: HerdrQuickKey) -> some View {
         Button {
-            store.sendQuickKey(key)
+            store.sendQuickKey(key, to: session)
         } label: {
             Image(systemName: symbol)
                 .font(.system(size: 14, weight: .semibold))
@@ -492,90 +552,153 @@ public struct CodaTerminalSessionView: View {
 
     // MARK: - Bottom Floating Quick Bar + Keyboard + Compose
 
-    private var floatingQuickDock: some View {
-        HStack(spacing: 8) {
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 4) {
-                    quickKeyButton("esc") {
-                        store.sendQuickKey(.esc)
-                    }
-                    quickModifierButton("ctrl", active: store.ctrlActive) {
-                        store.ctrlActive.toggle()
-                    }
-                    quickModifierButton("alt", active: store.altActive) {
-                        store.altActive.toggle()
-                    }
-                    quickKeyButton("tab") {
-                        store.sendQuickKey(.tab)
-                    }
-                    quickKeyButton("⇧tab") {
-                        store.sendQuickKey(.shiftTab)
-                    }
-                    Button {
-                        withAnimation(.snappy(duration: 0.18)) {
-                            store.dpadVisible.toggle()
-                        }
-                    } label: {
-                        Image(systemName: "arrow.up.and.down.and.arrow.left.and.right")
-                            .font(.system(size: 12, weight: .semibold))
-                            .foregroundStyle(store.dpadVisible ? CodaHerdrTheme.cyanWorking : CodaHerdrTheme.textPrimary)
-                            .padding(.horizontal, 9)
-                            .padding(.vertical, 7)
-                            .background(
-                                Capsule()
-                                    .fill(store.dpadVisible ? CodaHerdrTheme.cyanWorking.opacity(0.16) : .clear)
-                            )
-                    }
-                    .buttonStyle(.plain)
-
-                    quickKeyButton("^C", tint: CodaHerdrTheme.redDiff) {
-                        store.sendQuickKey(.ctrlC)
-                    }
-                }
-                .padding(.horizontal, 6)
-                .padding(.vertical, 4)
+    private var leftQuickKeysCluster: some View {
+        HStack(spacing: 4) {
+            quickKeyButton("esc") {
+                store.sendQuickKey(.esc, to: session)
             }
+            quickModifierButton("ctrl", active: store.ctrlActive) {
+                store.ctrlActive.toggle()
+            }
+            quickModifierButton("alt", active: store.altActive) {
+                store.altActive.toggle()
+            }
+            quickKeyButton("tab") {
+                store.sendQuickKey(.tab, to: session)
+            }
+            quickKeyButton("⇧tab") {
+                store.sendQuickKey(.shiftTab, to: session)
+            }
+        }
+    }
+
+    private var rightQuickControlsCluster: some View {
+        HStack(spacing: 4) {
+            Button {
+                withAnimation(.snappy(duration: 0.18)) {
+                    store.dpadVisible.toggle()
+                }
+            } label: {
+                Image(systemName: "arrow.up.and.down.and.arrow.left.and.right")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(store.dpadVisible ? CodaHerdrTheme.cyanWorking : CodaHerdrTheme.textPrimary)
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 7)
+                    .background(
+                        Capsule()
+                            .fill(store.dpadVisible ? CodaHerdrTheme.cyanWorking.opacity(0.16) : .clear)
+                    )
+            }
+            .buttonStyle(.plain)
+
+            Button {
+                withAnimation(.snappy(duration: 0.18)) {
+                    store.showTactileTwoRowKeypad.toggle()
+                }
+            } label: {
+                Image(systemName: "square.grid.3x2.fill")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(store.showTactileTwoRowKeypad ? CodaHerdrTheme.cyanWorking : CodaHerdrTheme.textPrimary)
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 7)
+                    .background(
+                        Capsule()
+                            .fill(store.showTactileTwoRowKeypad ? CodaHerdrTheme.cyanWorking.opacity(0.16) : .clear)
+                    )
+            }
+            .buttonStyle(.plain)
+
+            quickKeyButton("^C", tint: CodaHerdrTheme.redDiff) {
+                store.sendQuickKey(.ctrlC, to: session)
+            }
+        }
+    }
+
+    private func dockPillContainer<Content: View>(@ViewBuilder content: () -> Content) -> some View {
+        content()
+            .padding(.horizontal, 6)
+            .padding(.vertical, 4)
             .background(
                 Capsule()
                     .fill(CodaHerdrTheme.elevatedBG.opacity(0.96))
                     .overlay(Capsule().strokeBorder(CodaHerdrTheme.borderHairline, lineWidth: 1))
                     .shadow(color: .black.opacity(0.45), radius: 14, x: 0, y: 6)
             )
+    }
 
-            Button {
-                directKeyboardFocused.toggle()
-            } label: {
-                Image(systemName: directKeyboardFocused ? "keyboard.chevron.compact.down" : "keyboard")
-                    .font(.system(size: 15, weight: .semibold))
-                    .foregroundStyle(directKeyboardFocused ? CodaHerdrTheme.cyanWorking : CodaHerdrTheme.textPrimary)
-                    .frame(width: 40, height: 40)
-                    .background(
-                        Circle()
-                            .fill(CodaHerdrTheme.elevatedBG.opacity(0.96))
-                            .overlay(
-                                Circle().strokeBorder(
-                                    directKeyboardFocused ? CodaHerdrTheme.cyanWorking.opacity(0.6) : CodaHerdrTheme.borderHairline,
-                                    lineWidth: 1
-                                )
+    @ViewBuilder
+    private var dockUtilityButtons: some View {
+        Button {
+            directKeyboardFocused.toggle()
+        } label: {
+            Image(systemName: directKeyboardFocused ? "keyboard.chevron.compact.down" : "keyboard")
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(directKeyboardFocused ? CodaHerdrTheme.cyanWorking : CodaHerdrTheme.textPrimary)
+                .frame(width: 40, height: 40)
+                .background(
+                    Circle()
+                        .fill(CodaHerdrTheme.elevatedBG.opacity(0.96))
+                        .overlay(
+                            Circle().strokeBorder(
+                                directKeyboardFocused ? CodaHerdrTheme.cyanWorking.opacity(0.6) : CodaHerdrTheme.borderHairline,
+                                lineWidth: 1
                             )
-                    )
-            }
-            .buttonStyle(.plain)
+                        )
+                )
+        }
+        .buttonStyle(.plain)
 
-            Button {
-                store.showComposeSheet = true
-            } label: {
-                Image(systemName: "square.and.pencil")
-                    .font(.system(size: 15, weight: .semibold))
-                    .foregroundStyle(CodaHerdrTheme.textPrimary)
-                    .frame(width: 40, height: 40)
-                    .background(
-                        Circle()
-                            .fill(CodaHerdrTheme.elevatedBG.opacity(0.96))
-                            .overlay(Circle().strokeBorder(CodaHerdrTheme.borderHairline, lineWidth: 1))
-                    )
+        Button {
+            store.showComposeSheet = true
+        } label: {
+            Image(systemName: "square.and.pencil")
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(CodaHerdrTheme.textPrimary)
+                .frame(width: 40, height: 40)
+                .background(
+                    Circle()
+                        .fill(CodaHerdrTheme.elevatedBG.opacity(0.96))
+                        .overlay(Circle().strokeBorder(CodaHerdrTheme.borderHairline, lineWidth: 1))
+                )
+        }
+        .buttonStyle(.plain)
+    }
+
+    @ViewBuilder
+    private var floatingQuickDock: some View {
+        if isSplitThumb {
+            HStack(spacing: 8) {
+                dockPillContainer {
+                    leftQuickKeysCluster
+                }
+
+                Spacer(minLength: 28)
+
+                dockPillContainer {
+                    rightQuickControlsCluster
+                }
+
+                dockUtilityButtons
             }
-            .buttonStyle(.plain)
+        } else {
+            HStack(spacing: 8) {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 4) {
+                        leftQuickKeysCluster
+                        rightQuickControlsCluster
+                    }
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 4)
+                }
+                .background(
+                    Capsule()
+                        .fill(CodaHerdrTheme.elevatedBG.opacity(0.96))
+                        .overlay(Capsule().strokeBorder(CodaHerdrTheme.borderHairline, lineWidth: 1))
+                        .shadow(color: .black.opacity(0.45), radius: 14, x: 0, y: 6)
+                )
+
+                dockUtilityButtons
+            }
         }
     }
 

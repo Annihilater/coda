@@ -1,11 +1,34 @@
 import Combine
 import CodaGhosttyKit
 import CodaKit
+import CoreGraphics
 import Foundation
 
 public enum CodaMobileTab: String, CaseIterable, Sendable {
     case inbox
     case spaces
+}
+
+public enum CodaDuoSplitMode: String, CaseIterable, Sendable, Identifiable {
+    case inboxAndTerminal
+    case studioDiffSplit
+    case dualTerminalSplit
+    case fullPanorama
+
+    public var id: String { rawValue }
+
+    public func title(locale: CodaUILocale) -> String {
+        switch self {
+        case .inboxAndTerminal:
+            return locale == .zh ? "收件箱 | 终端" : "Inbox | Term"
+        case .studioDiffSplit:
+            return locale == .zh ? "终端 | 差异" : "Studio Diff"
+        case .dualTerminalSplit:
+            return locale == .zh ? "双窗格" : "Dual Pane"
+        case .fullPanorama:
+            return locale == .zh ? "全宽" : "Panorama"
+        }
+    }
 }
 
 public struct CodaInboxSection: Identifiable, Sendable, Equatable {
@@ -71,7 +94,13 @@ public final class CodaWorkspaceStore: ObservableObject {
     @Published public var isRefreshing: Bool = false
     @Published public var activeToast: CodaToastBanner? = nil
     @Published public var terminalColumns: Int = 56
+    @Published public var terminalRows: Int = 28
     @Published public var terminalFontSize: CGFloat = 12.5
+    @Published public var formFactor: CodaFormFactor = .iphoneStandard
+    @Published public var duoSplitMode: CodaDuoSplitMode = .inboxAndTerminal
+    @Published public var secondarySessionID: String? = nil
+    @Published public var showTactileTwoRowKeypad: Bool = false
+    @Published public var showCoverThumbRail: Bool = true
 
     private var networkClient: CodaNetworkClient?
     private var networkClientURL: URL?
@@ -80,6 +109,7 @@ public final class CodaWorkspaceStore: ObservableObject {
     private var readCompletedIDs: Set<String> = []
     private var previousStates: [String: HerdrLifecycleState] = [:]
     private var lastToastAt: Date = .distantPast
+    private var lastViewportSize: CGSize = .zero
 
     public init() {
         let loadedSettings = CodaPersistedSettings.load()
@@ -159,6 +189,13 @@ public final class CodaWorkspaceStore: ObservableObject {
     public var selectedSession: CodaAgentSession? {
         guard let id = selectedSessionID else { return nil }
         return sessions.first(where: { $0.id == id })
+    }
+
+    public var secondarySession: CodaAgentSession? {
+        if let secId = secondarySessionID, let match = sessions.first(where: { $0.id == secId }) {
+            return match
+        }
+        return filteredSessions.first(where: { $0.id != selectedSessionID }) ?? selectedSession
     }
 
     public var attentionBadgeCount: Int {
@@ -305,7 +342,7 @@ public final class CodaWorkspaceStore: ObservableObject {
 
         do {
             #if os(iOS)
-            let platform = "ios"
+            let platform = formFactor.platformIdentifier(forMacOS: false)
             #else
             let platform = "macos"
             #endif
@@ -412,7 +449,7 @@ public final class CodaWorkspaceStore: ObservableObject {
     private func ensureClientDeviceRegistered(using client: CodaNetworkClient) async {
         if localIdentity.deviceId != nil { return }
         #if os(iOS)
-        let platform = "ios"
+        let platform = formFactor.platformIdentifier(forMacOS: false)
         #else
         let platform = "macos"
         #endif
@@ -697,6 +734,96 @@ public final class CodaWorkspaceStore: ObservableObject {
         Task { await refreshTerminalScreen(for: session) }
     }
 
+    public func selectSecondarySession(_ session: CodaAgentSession) {
+        secondarySessionID = session.id
+        if let idx = sessions.firstIndex(where: { $0.id == session.id }) {
+            if sessions[idx].unreadCompletion {
+                sessions[idx].unreadCompletion = false
+                readCompletedIDs.insert(session.id)
+            }
+        }
+        Task { await refreshTerminalScreen(for: session) }
+    }
+
+    public func setDuoSplitMode(_ mode: CodaDuoSplitMode) {
+        duoSplitMode = mode
+        if mode == .dualTerminalSplit && (secondarySessionID == nil || secondarySessionID == selectedSessionID) {
+            secondarySessionID = filteredSessions.first(where: { $0.id != selectedSessionID })?.id ?? selectedSessionID
+        }
+        if mode == .studioDiffSplit && gitDiffResult == nil {
+            loadGitDiffForSelected(presentModal: false)
+        }
+        if lastViewportSize.width > 0 && lastViewportSize.height > 0 {
+            updateViewportGeometry(size: lastViewportSize)
+        }
+    }
+
+    public func updateViewportGeometry(size: CGSize) {
+        guard size.width > 0 && size.height > 0 else { return }
+        lastViewportSize = size
+        let nextFactor = CodaFormFactor.detect(width: size.width, height: size.height)
+        formFactor = nextFactor
+
+        let paneW: CGFloat
+        let paneH: CGFloat
+        switch nextFactor {
+        case .iphoneCover, .iphoneStandard:
+            paneW = size.width
+            paneH = max(180, size.height - 130)
+        case .iphoneDuoUnfolded:
+            paneW = (duoSplitMode == .fullPanorama) ? size.width : max(240, floor((size.width - 1) * 0.5))
+            paneH = max(200, size.height - 140)
+        case .ipadOrDesktop:
+            paneW = max(360, size.width - (showSidebar ? 288 : 0))
+            paneH = max(220, size.height - 130)
+        }
+
+        let charWidth = max(6.5, terminalFontSize * 0.61)
+        let lineHeight = max(14.0, terminalFontSize * 1.35)
+        let nextCols = max(32, Int((paneW - 28) / charWidth))
+        let nextRows = max(12, Int(paneH / lineHeight))
+
+        if !nextFactor.isCompact {
+            if selectedSessionID == nil, let first = filteredSessions.first {
+                selectSession(first)
+            }
+            if secondarySessionID == nil || secondarySessionID == selectedSessionID {
+                secondarySessionID = filteredSessions.first(where: { $0.id != selectedSessionID })?.id
+            }
+        }
+        if nextFactor == .iphoneDuoUnfolded && duoSplitMode == .studioDiffSplit && gitDiffResult == nil {
+            loadGitDiffForSelected(presentModal: false)
+        }
+
+        let dimsChanged = (nextCols != terminalColumns || nextRows != terminalRows)
+        if dimsChanged {
+            terminalColumns = nextCols
+            terminalRows = nextRows
+            for (sid, raw) in rawScreenTextBySession {
+                terminalLinesBySession[sid] = GhosttyReflowEngine.renderStyledLines(
+                    rawOutput: raw,
+                    targetColumns: nextCols
+                ).lines
+            }
+            if let session = selectedSession,
+               let client = networkClient,
+               let devId = session.deviceId,
+               let dev = remoteMachines.first(where: { $0.id == devId }),
+               let clientDevId = localIdentity.deviceId {
+                Task {
+                    try? await client.resizeTerminalPty(
+                        on: dev,
+                        clientIdentity: localIdentity,
+                        clientDeviceId: clientDevId,
+                        terminal: session.terminalAddress,
+                        cols: nextCols,
+                        rows: nextRows
+                    )
+                }
+            }
+        }
+    }
+
     public func closeTerminalToInbox() {
         selectedSessionID = nil
         dpadVisible = false
@@ -754,8 +881,8 @@ public final class CodaWorkspaceStore: ObservableObject {
         }
     }
 
-    public func sendQuickKey(_ key: HerdrQuickKey) {
-        guard let session = selectedSession,
+    public func sendQuickKey(_ key: HerdrQuickKey, to targetSession: CodaAgentSession? = nil) {
+        guard let session = targetSession ?? selectedSession,
               let client = networkClient,
               let devId = session.deviceId,
               let dev = remoteMachines.first(where: { $0.id == devId }),
@@ -784,9 +911,9 @@ public final class CodaWorkspaceStore: ObservableObject {
         }
     }
 
-    public func sendDirectText(_ text: String, submit: Bool = false) {
+    public func sendDirectText(_ text: String, submit: Bool = false, to targetSession: CodaAgentSession? = nil) {
         guard !text.isEmpty,
-              let session = selectedSession,
+              let session = targetSession ?? selectedSession,
               let client = networkClient,
               let devId = session.deviceId,
               let dev = remoteMachines.first(where: { $0.id == devId }),
@@ -912,14 +1039,16 @@ public final class CodaWorkspaceStore: ObservableObject {
         }
     }
 
-    public func loadGitDiffForSelected() {
+    public func loadGitDiffForSelected(presentModal: Bool = true) {
         guard let session = selectedSession,
               let client = networkClient,
               let devId = session.deviceId,
               let dev = remoteMachines.first(where: { $0.id == devId }),
               let clientDevId = localIdentity.deviceId else { return }
         gitDiffLoading = true
-        showGitDiffSheet = true
+        if presentModal {
+            showGitDiffSheet = true
+        }
         Task {
             defer { self.gitDiffLoading = false }
             self.gitDiffResult = try? await client.fetchGitDiff(

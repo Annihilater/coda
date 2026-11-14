@@ -11,16 +11,15 @@ public struct CodaAdaptiveRootView: View {
 
     public var body: some View {
         GeometryReader { geo in
-            let isCompact = geo.size.width < 700
-            let paneWidth = isCompact
-                ? geo.size.width
-                : max(360, geo.size.width - (store.showSidebar ? 288 : 0))
-            let computedCols = max(42, Int((paneWidth - 28) / 7.5))
+            let factor = CodaFormFactor.detect(width: geo.size.width, height: geo.size.height)
 
             ZStack(alignment: .top) {
-                if isCompact {
+                switch factor {
+                case .iphoneCover, .iphoneStandard:
                     compactPhoneLayout
-                } else {
+                case .iphoneDuoUnfolded:
+                    CodaDuoUnfoldedWorkbenchView(store: store)
+                case .ipadOrDesktop:
                     regularIPadSplitLayout
                 }
 
@@ -47,18 +46,24 @@ public struct CodaAdaptiveRootView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(CodaHerdrTheme.canvasBG)
             .onAppear {
-                store.terminalColumns = computedCols
+                store.updateViewportGeometry(size: geo.size)
                 store.startLiveSync()
-                if !isCompact, store.selectedSessionID == nil, let first = store.filteredSessions.first {
+                if !factor.isCompact, store.selectedSessionID == nil, let first = store.filteredSessions.first {
                     store.selectSession(first)
                 }
             }
-            .onChange(of: computedCols) { _, next in
-                store.terminalColumns = next
+            .onChange(of: geo.size) { _, next in
+                store.updateViewportGeometry(size: next)
+            }
+            .onChange(of: store.showSidebar) { _, _ in
+                store.updateViewportGeometry(size: geo.size)
             }
             .onChange(of: store.sessions.count) { _, _ in
-                if !isCompact, store.selectedSessionID == nil, let first = store.filteredSessions.first {
+                if !factor.isCompact, store.selectedSessionID == nil, let first = store.filteredSessions.first {
                     store.selectSession(first)
+                }
+                if !factor.isCompact {
+                    store.updateViewportGeometry(size: geo.size)
                 }
             }
         }
