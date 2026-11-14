@@ -805,9 +805,18 @@ impl Drop for PtySessionHandle {
     }
 }
 
-/// Manages multiple local Unix `openpty` terminal sessions wired into GPUI.
+struct RemoteVtHandle {
+    cols: u16,
+    rows: u16,
+    alive: Arc<AtomicBool>,
+    started_at: Instant,
+    screen: Arc<Mutex<VtScreenBuffer>>,
+}
+
+/// Manages multiple local Unix `openpty` and streamed remote `herdr` terminal sessions wired into GPUI.
 pub struct LocalPtyManager {
     sessions: HashMap<String, PtySessionHandle>,
+    remote_buffers: HashMap<String, RemoteVtHandle>,
     ui_dirty: Arc<AtomicBool>,
 }
 
@@ -815,12 +824,57 @@ impl LocalPtyManager {
     pub fn new(ui_dirty: Arc<AtomicBool>) -> Self {
         Self {
             sessions: HashMap::new(),
+            remote_buffers: HashMap::new(),
             ui_dirty,
         }
     }
 
     pub fn has_session(&self, id: &str) -> bool {
-        self.sessions.contains_key(id)
+        self.sessions.contains_key(id) || self.remote_buffers.contains_key(id)
+    }
+
+    pub fn ensure_remote_buffer(&mut self, id: &str, cols: u16, rows: u16) {
+        if self.sessions.contains_key(id) || self.remote_buffers.contains_key(id) {
+            return;
+        }
+        let cols = cols.max(40);
+        let rows = rows.max(12);
+        self.remote_buffers.insert(
+            id.to_string(),
+            RemoteVtHandle {
+                cols,
+                rows,
+                alive: Arc::new(AtomicBool::new(true)),
+                started_at: Instant::now(),
+                screen: Arc::new(Mutex::new(VtScreenBuffer::new(
+                    cols as usize,
+                    rows as usize,
+                ))),
+            },
+        );
+        self.ui_dirty.store(true, Ordering::SeqCst);
+    }
+
+    pub fn feed_remote_output(&self, id: &str, bytes: &[u8]) {
+        if let Some(handle) = self.remote_buffers.get(id) {
+            if let Ok(mut guard) = handle.screen.lock() {
+                guard.feed_bytes(bytes);
+            }
+            self.ui_dirty.store(true, Ordering::SeqCst);
+        }
+    }
+
+    pub fn set_remote_alive(&self, id: &str, alive: bool) {
+        if let Some(handle) = self.remote_buffers.get(id) {
+            handle.alive.store(alive, Ordering::SeqCst);
+            self.ui_dirty.store(true, Ordering::SeqCst);
+        }
+    }
+
+    pub fn remove_remote_buffer(&mut self, id: &str) {
+        if self.remote_buffers.remove(id).is_some() {
+            self.ui_dirty.store(true, Ordering::SeqCst);
+        }
     }
 
     /// Spawns a local interactive shell inside a real PTY using `libc::openpty`.
@@ -1036,31 +1090,46 @@ impl LocalPtyManager {
                 guard.clear_all();
             }
             self.ui_dirty.store(true, Ordering::SeqCst);
+        } else if let Some(remote) = self.remote_buffers.get(id) {
+            if let Ok(mut guard) = remote.screen.lock() {
+                guard.clear_all();
+            }
+            self.ui_dirty.store(true, Ordering::SeqCst);
         }
     }
 
     pub fn resize(&mut self, id: &str, cols: u16, rows: u16) {
-        let Some(session) = self.sessions.get_mut(id) else {
-            return;
-        };
         let cols = cols.max(40);
         let rows = rows.max(12);
-        if session.cols == cols && session.rows == rows {
+        if let Some(session) = self.sessions.get_mut(id) {
+            if session.cols == cols && session.rows == rows {
+                return;
+            }
+            session.cols = cols;
+            session.rows = rows;
+            let win = libc::winsize {
+                ws_row: rows,
+                ws_col: cols,
+                ws_xpixel: 0,
+                ws_ypixel: 0,
+            };
+            unsafe {
+                libc::ioctl(session.master_fd, libc::TIOCSWINSZ as _, &win);
+            }
+            if let Ok(mut guard) = session.screen.lock() {
+                guard.resize(cols as usize, rows as usize);
+            }
             return;
         }
-        session.cols = cols;
-        session.rows = rows;
-        let win = libc::winsize {
-            ws_row: rows,
-            ws_col: cols,
-            ws_xpixel: 0,
-            ws_ypixel: 0,
-        };
-        unsafe {
-            libc::ioctl(session.master_fd, libc::TIOCSWINSZ as _, &win);
-        }
-        if let Ok(mut guard) = session.screen.lock() {
-            guard.resize(cols as usize, rows as usize);
+        if let Some(remote) = self.remote_buffers.get_mut(id) {
+            if remote.cols == cols && remote.rows == rows {
+                return;
+            }
+            remote.cols = cols;
+            remote.rows = rows;
+            if let Ok(mut guard) = remote.screen.lock() {
+                guard.resize(cols as usize, rows as usize);
+            }
         }
     }
 
@@ -1068,22 +1137,28 @@ impl LocalPtyManager {
         let mut out = HashMap::new();
         for (id, session) in &self.sessions {
             let alive = session.alive.load(Ordering::SeqCst);
-            let (styled_lines, osc_status) = session
-                .screen
-                .lock()
-                .map(|g| (g.render_styled_lines(max_lines, alive), g.osc_status()))
-                .unwrap_or_default();
-            let lines = styled_lines.iter().map(|l| l.text.clone()).collect();
             out.insert(
                 id.clone(),
-                PtySnapshot {
-                    lines,
-                    styled_lines,
+                build_pty_snapshot(
+                    &session.screen,
                     alive,
-                    osc_status,
-                    started_at: session.started_at,
-                    attached_hc: session.attached_hc,
-                },
+                    session.started_at,
+                    session.attached_hc,
+                    max_lines,
+                ),
+            );
+        }
+        for (id, remote) in &self.remote_buffers {
+            let alive = remote.alive.load(Ordering::SeqCst);
+            out.insert(
+                id.clone(),
+                build_pty_snapshot(
+                    &remote.screen,
+                    alive,
+                    remote.started_at,
+                    true,
+                    max_lines,
+                ),
             );
         }
         out
@@ -1094,7 +1169,63 @@ impl LocalPtyManager {
             handle.detach_on_drop = false;
             drop(handle);
         }
+        self.remote_buffers.remove(id);
         let _ = std::io::stdout().flush();
         self.ui_dirty.store(true, Ordering::SeqCst);
+    }
+}
+
+fn build_pty_snapshot(
+    screen: &Arc<Mutex<VtScreenBuffer>>,
+    alive: bool,
+    started_at: Instant,
+    attached_hc: bool,
+    max_lines: usize,
+) -> PtySnapshot {
+    let (styled_lines, osc_status) = screen
+        .lock()
+        .map(|g| (g.render_styled_lines(max_lines, alive), g.osc_status()))
+        .unwrap_or_default();
+    let lines = styled_lines.iter().map(|l| l.text.clone()).collect();
+    PtySnapshot {
+        lines,
+        styled_lines,
+        alive,
+        osc_status,
+        started_at,
+        attached_hc,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_remote_vt_buffer_snapshot_and_osc7501() {
+        let dirty = Arc::new(AtomicBool::new(false));
+        let mut mgr = LocalPtyManager::new(Arc::clone(&dirty));
+        let id = "remote:dev1:t1";
+        mgr.ensure_remote_buffer(id, 100, 30);
+        assert!(mgr.has_session(id));
+        mgr.feed_remote_output(
+            id,
+            b"\x1b[38;2;56;189;248mlinux@openeuler:~$\x1b[0m\x1b]7501;state=working;task=Building crates\x07",
+        );
+        assert!(dirty.swap(false, Ordering::SeqCst));
+
+        let snaps = mgr.snapshot_all(40);
+        let snap = snaps.get(id).expect("remote snapshot missing");
+        assert!(snap.attached_hc);
+        assert!(snap.alive);
+        assert!(snap.lines.iter().any(|l| l.contains("linux@openeuler:~$")));
+        let osc = snap.osc_status.as_ref().expect("expected OSC 7501");
+        assert_eq!(osc.state, AgentLifecycleState::Working);
+        assert_eq!(osc.task.as_deref(), Some("Building crates"));
+
+        mgr.set_remote_alive(id, false);
+        assert!(!mgr.snapshot_all(40)[id].alive);
+        mgr.remove_remote_buffer(id);
+        assert!(!mgr.has_session(id));
     }
 }

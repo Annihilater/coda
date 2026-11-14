@@ -104,6 +104,8 @@ pub struct DesktopPreferences {
     pub workspace_roots: Vec<String>,
     #[serde(default)]
     pub selected_repo_path: Option<String>,
+    #[serde(default)]
+    pub dismissed_spaces: Vec<String>,
 }
 
 fn default_server_url() -> String {
@@ -117,6 +119,7 @@ impl Default for DesktopPreferences {
             server_url: default_server_url(),
             workspace_roots: Vec::new(),
             selected_repo_path: None,
+            dismissed_spaces: Vec::new(),
         }
     }
 }
@@ -212,15 +215,23 @@ pub fn discover_local_git_repositories(saved_roots: &[String]) -> Vec<String> {
 
     // Only auto-scan $HOME developer directories when user has no saved workspaces yet.
     if found.is_empty() {
+        if let Ok(cwd) = std::env::current_dir() {
+            if cwd.join(".git").exists() {
+                let s = cwd.to_string_lossy().to_string();
+                if seen.insert(s.clone()) {
+                    found.push(s);
+                }
+            }
+        }
         if let Some(home) = home_opt {
             let roots_to_scan = [
+                home.join("personal/github"),
                 home.join("Developer"),
                 home.join("Projects"),
                 home.join("Code"),
                 home.join("workspace"),
                 home.join("github"),
                 home.join("personal"),
-                home.join("personal/github"),
                 home.join("repos"),
                 home.join("src"),
             ];
@@ -228,8 +239,8 @@ pub fn discover_local_git_repositories(saved_roots: &[String]) -> Vec<String> {
                 if !base.is_dir() {
                     continue;
                 }
-                scan_dir_for_git(&base, 0, 2, &mut seen, &mut found, 16);
-                if found.len() >= 16 {
+                scan_dir_for_git(&base, 0, 2, &mut seen, &mut found, 6);
+                if found.len() >= 6 {
                     break;
                 }
             }
@@ -367,14 +378,20 @@ pub fn reveal_in_finder(path: &str) {
     }
 }
 
-/// Top-level workspace layout mode matching the four Herdr workbench views.
+/// Top-level workspace layout mode matching `Herdr.app` (`main` workbench and `terminals` grid).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LayoutMode {
+    #[serde(
+        alias = "main",
+        alias = "code",
+        alias = "board",
+        alias = "editor",
+        alias = "kanban"
+    )]
     Workbench,
+    #[serde(alias = "terminal")]
     Terminals,
-    Code,
-    Board,
 }
 
 impl Default for LayoutMode {
@@ -387,8 +404,6 @@ impl LayoutMode {
     pub fn from_slug(slug: &str) -> Self {
         match slug.trim().to_ascii_lowercase().as_str() {
             "terminals" | "terminal" => Self::Terminals,
-            "code" | "editor" => Self::Code,
-            "board" | "kanban" => Self::Board,
             _ => Self::Workbench,
         }
     }
@@ -397,17 +412,13 @@ impl LayoutMode {
         match self {
             Self::Workbench => "workbench",
             Self::Terminals => "terminals",
-            Self::Code => "code",
-            Self::Board => "board",
         }
     }
 
     pub fn label(self, locale: UiLocale) -> &'static str {
         match self {
-            Self::Workbench => tr(locale, "Workbench", "工作台"),
-            Self::Terminals => tr(locale, "Terminals", "终端"),
-            Self::Code => tr(locale, "Code", "代码"),
-            Self::Board => tr(locale, "Board", "看板"),
+            Self::Workbench => tr(locale, "Main", "主工作台"),
+            Self::Terminals => tr(locale, "Terminals", "终端平铺"),
         }
     }
 }
@@ -514,12 +525,12 @@ Coda watches `~/.config/coda/layout.json` (hot-reloaded every 1s) so you or agen
 }
 ```
 
-- `"layout"`: `"workbench"` | `"terminals"` | `"code"` | `"board"`
+- `"layout"`: `"workbench"` | `"terminals"`
 - `"split_terminals"`: `true` enables side-by-side split terminals
 
 ## 2. Agent Lifecycle Status via OSC 7501
 
-Terminals running inside Coda parse OSC 7501 escape sequences in stdout to update the Agents inbox and Board view:
+Terminals running inside Coda parse OSC 7501 escape sequences in stdout to update the Agents inbox:
 
 ```sh
 printf '\033]7501;state=working;task=Running cargo test\007'
