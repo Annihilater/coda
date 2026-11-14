@@ -125,6 +125,8 @@ public enum HerdrQuickKey: String, CaseIterable, Sendable {
     case left
     case right
     case enter
+    case backspace
+    case slash
     case ctrlC
     case ctrlD
     case ctrlBackslash
@@ -139,6 +141,8 @@ public enum HerdrQuickKey: String, CaseIterable, Sendable {
         case .left: return ["Left"]
         case .right: return ["Right"]
         case .enter: return ["Enter"]
+        case .backspace: return ["BSpace"]
+        case .slash: return ["/"]
         case .ctrlC: return ["Ctrl+c"]
         case .ctrlD: return ["Ctrl+d"]
         case .ctrlBackslash: return ["Ctrl+\\"]
@@ -204,6 +208,8 @@ public struct GhosttyReflowEngine: GhosttyVTSurface {
         case .right: return Data("\u{1B}[C".utf8)
         case .left: return Data("\u{1B}[D".utf8)
         case .enter: return Data([0x0D])
+        case .backspace: return Data([0x7F])
+        case .slash: return Data("/".utf8)
         case .ctrlC: return Data([0x03])
         case .ctrlD: return Data([0x04])
         case .ctrlBackslash: return Data([0x1C])

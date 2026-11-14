@@ -888,6 +888,27 @@ public actor CodaNetworkClient {
 
     // MARK: - Unified E2EE PeerMessage RPC (Direct P2P, WSS Relay, Domestic Raw TCP)
 
+    private func buildRoutePacketDict(
+        sealed: CodaEncryptedPayload,
+        clientIdentity: CodaDeviceIdentity,
+        clientDeviceId: UUID,
+        targetDeviceId: UUID,
+        lane: String
+    ) -> [String: Any] {
+        [
+            "frame_type": "route_packet",
+            "src_device_id": clientDeviceId.uuidString.lowercased(),
+            "dst_device_id": targetDeviceId.uuidString.lowercased(),
+            "lane": lane,
+            "e2ee": [
+                "seq": sealed.seq,
+                "compressed": sealed.compressed,
+                "ciphertext_b64": sealed.ciphertextB64,
+            ],
+            "sender_x25519_pub_b64": clientIdentity.x25519PublicB64,
+        ]
+    }
+
     public func requestOverDirectP2P(
         _ rawMsg: Data,
         clientIdentity: CodaDeviceIdentity,
@@ -899,19 +920,17 @@ public actor CodaNetworkClient {
             throw URLError(.networkConnectionLost)
         }
         let sealed = try sess.sealJSON(rawMsg)
+        self.directE2EESession = sess
 
-        let packetData = try Self.encodeLengthDelimitedJSON([
-            "frame_type": "route_packet",
-            "src_device_id": clientDeviceId.uuidString.lowercased(),
-            "dst_device_id": targetDeviceId.uuidString.lowercased(),
-            "lane": lane,
-            "e2ee": [
-                "seq": sealed.seq,
-                "compressed": sealed.compressed,
-                "ciphertext_b64": sealed.ciphertextB64,
-            ],
-            "sender_x25519_pub_b64": clientIdentity.x25519PublicB64,
-        ])
+        let packetData = try Self.encodeLengthDelimitedJSON(
+            buildRoutePacketDict(
+                sealed: sealed,
+                clientIdentity: clientIdentity,
+                clientDeviceId: clientDeviceId,
+                targetDeviceId: targetDeviceId,
+                lane: lane
+            )
+        )
 
         try await Self.sendNW(conn, data: packetData)
 
@@ -1049,6 +1068,65 @@ public actor CodaNetworkClient {
                     throw URLError(.cannotConnectToHost)
                 }
             }
+        }
+
+        throw URLError(.networkConnectionLost)
+    }
+
+    /// Dispatches an un-acked one-way E2EE `PeerMessage` (such as `pty_resize` on Duo fold/unfold)
+    /// across Direct P2P, CDN WSS, or Domestic Raw TCP without waiting for a response frame.
+    public func sendOneWayPeerMessageData(
+        _ messageJSONData: Data,
+        to targetDevice: CodaRemoteDevice,
+        clientIdentity: CodaDeviceIdentity,
+        clientDeviceId: UUID,
+        lane: String = "control_p0"
+    ) async throws {
+        if (activeRouteMode == .lanDirect || activeRouteMode == .cnIPv6P2P),
+           let conn = self.directP2PConnection,
+           var sess = self.directE2EESession,
+           p2pPeerDeviceId == targetDevice.id {
+            let sealed = try sess.sealJSON(messageJSONData)
+            self.directE2EESession = sess
+            let packetData = try Self.encodeLengthDelimitedJSON(
+                buildRoutePacketDict(
+                    sealed: sealed,
+                    clientIdentity: clientIdentity,
+                    clientDeviceId: clientDeviceId,
+                    targetDeviceId: targetDevice.id,
+                    lane: lane
+                )
+            )
+            try await Self.sendNW(conn, data: packetData)
+            return
+        }
+
+        var sess = try relayPeerSessions[targetDevice.id] ?? CodaE2EESession(
+            myIdentity: clientIdentity,
+            peerX25519PublicB64: targetDevice.x25519Pubkey,
+            isInitiator: true
+        )
+        let sealed = try sess.sealJSON(messageJSONData)
+        relayPeerSessions[targetDevice.id] = sess
+
+        let routePacket = buildRoutePacketDict(
+            sealed: sealed,
+            clientIdentity: clientIdentity,
+            clientDeviceId: clientDeviceId,
+            targetDeviceId: targetDevice.id,
+            lane: lane
+        )
+
+        if let ws = self.wsTask {
+            let txt = String(data: try JSONSerialization.data(withJSONObject: routePacket), encoding: .utf8) ?? "{}"
+            try await ws.send(.string(txt))
+            return
+        }
+
+        if let tcpConn = self.rawTCPConnection {
+            let framed = try Self.encodeLengthDelimitedJSON(routePacket)
+            try await Self.sendNW(tcpConn, data: framed)
+            return
         }
 
         throw URLError(.networkConnectionLost)
@@ -1237,6 +1315,31 @@ public actor CodaNetworkClient {
                 lane: "control_p0"
             )
         }
+    }
+
+    public func resizeTerminalPty(
+        on device: CodaRemoteDevice,
+        clientIdentity: CodaDeviceIdentity,
+        clientDeviceId: UUID,
+        terminal: String,
+        cols: Int,
+        rows: Int
+    ) async throws {
+        let clampedCols = max(20, min(400, cols))
+        let clampedRows = max(6, min(200, rows))
+        let msgData = try JSONSerialization.data(withJSONObject: [
+            "op": "pty_resize",
+            "terminal": terminal,
+            "cols": clampedCols,
+            "rows": clampedRows,
+        ])
+        try await sendOneWayPeerMessageData(
+            msgData,
+            to: device,
+            clientIdentity: clientIdentity,
+            clientDeviceId: clientDeviceId,
+            lane: "control_p0"
+        )
     }
 
     public func interruptTerminal(

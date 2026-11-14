@@ -117,7 +117,36 @@ struct CodaSelfTest {
         let authStart = try JSONDecoder().decode(CodaDeviceAuthStart.self, from: startJSON)
         precondition(authStart.userCode == "ABCD-2345")
 
-        // 6. Auto-LAN UDP Discovery + Direct P2P TCP Handshake + E2EE ListTerminals / SendTerminalText RPCs
+        // 6. iPhone Duo Form-Factor Detection, 2-Row Keypad & Instant Fold/Unfold Reflow
+        precondition(CodaFormFactor.detect(width: 360, height: 780) == .iphoneCover)
+        precondition(CodaFormFactor.iphoneCover.isCompact && CodaFormFactor.iphoneCover.isIPhoneDuo)
+        precondition(CodaFormFactor.iphoneCover.platformIdentifier(forMacOS: false) == "iphone_duo")
+
+        precondition(CodaFormFactor.detect(width: 393, height: 852) == .iphoneStandard)
+        precondition(CodaFormFactor.iphoneStandard.platformIdentifier(forMacOS: false) == "ios")
+
+        precondition(CodaFormFactor.detect(width: 768, height: 832) == .iphoneDuoUnfolded)
+        precondition(CodaFormFactor.detect(width: 832, height: 768) == .iphoneDuoUnfolded)
+        precondition(!CodaFormFactor.iphoneDuoUnfolded.isCompact && CodaFormFactor.iphoneDuoUnfolded.isIPhoneDuo)
+        precondition(CodaFormFactor.iphoneDuoUnfolded.platformIdentifier(forMacOS: false) == "iphone_duo")
+
+        precondition(CodaFormFactor.detect(width: 1194, height: 834) == .ipadOrDesktop)
+        precondition(CodaFormFactor.ipadOrDesktop.platformIdentifier(forMacOS: false) == "ipados")
+
+        let duoSample = "\u{1B}]7501:blocked:Run suite\u{07}\u{1B}[38;2;56;189;248m+    let prefer_raw = self.peer_lacks_zstd || req_id.starts_with(\"swift-\");\u{1B}[0m\n-    let old = true;\n1. Yes, approve cargo test\n"
+        let coverStyled = GhosttyReflowEngine.renderStyledLines(rawOutput: duoSample, targetColumns: 40)
+        let panoStyled = GhosttyReflowEngine.renderStyledLines(rawOutput: duoSample, targetColumns: 98)
+        let splitStyled = GhosttyReflowEngine.renderStyledLines(rawOutput: duoSample, targetColumns: 48)
+        precondition(coverStyled.lines.count > panoStyled.lines.count)
+        precondition(splitStyled.lines.count >= panoStyled.lines.count)
+        precondition(coverStyled.latestStatus?.state == .needsYou && panoStyled.latestStatus?.state == .needsYou)
+        precondition(panoStyled.lines.contains(where: { $0.kind == .diffAdded }) && panoStyled.lines.contains(where: { $0.kind == .diffRemoved }))
+        precondition(panoStyled.lines.contains(where: { $0.kind == .promptChoice }))
+        precondition(GhosttyReflowEngine.encodeKey(.backspace) == Data([0x7F]))
+        precondition(HerdrQuickKey.backspace.herdrKeyNames == ["BSpace"])
+        precondition(GhosttyReflowEngine.encodeKey(.slash) == Data("/".utf8))
+
+        // 7. Auto-LAN UDP Discovery + Direct P2P TCP Handshake + One-Way PtyResize + E2EE RPCs
         try await runAutoLanSmartPathLoopbackTest()
 
         print("[OK] ALL CODA APPLE NATIVE SELF-TESTS PASSED!")
@@ -252,6 +281,15 @@ struct CodaSelfTest {
         precondition(terms.count == 1 && terms.first?.address == "t1")
         precondition(terms.first?.status?.state == "blocked")
 
+        try await net.resizeTerminalPty(
+            on: targetDevice,
+            clientIdentity: clientIdentity,
+            clientDeviceId: clientId,
+            terminal: "t1",
+            cols: 98,
+            rows: 34
+        )
+
         try await net.sendTerminalText(
             on: targetDevice,
             clientIdentity: clientIdentity,
@@ -306,9 +344,20 @@ struct CodaSelfTest {
                   let enc = try? JSONDecoder().decode(CodaEncryptedPayload.self, from: e2eeData),
                   let pt = try? nextSess.openJSON(enc),
                   let req = try? JSONSerialization.jsonObject(with: pt) as? [String: Any],
-                  let op = req["op"] as? String,
-                  let reqId = req["req_id"] as? String
+                  let op = req["op"] as? String
             else {
+                conn.cancel()
+                return
+            }
+
+            if op == "pty_resize" {
+                precondition((req["cols"] as? Int) == 98 && (req["rows"] as? Int) == 34)
+                let updatedSess = nextSess
+                servePacketLoop(conn: conn, daemonId: daemonId, sess: updatedSess)
+                return
+            }
+
+            guard let reqId = req["req_id"] as? String else {
                 conn.cancel()
                 return
             }

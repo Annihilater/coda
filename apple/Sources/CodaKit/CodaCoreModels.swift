@@ -1,3 +1,4 @@
+import CoreGraphics
 import CryptoKit
 import Darwin
 import Foundation
@@ -640,5 +641,62 @@ public struct CodaDeviceAuthPollResult: Codable, Sendable, Equatable {
         case device
         case daemonRelayTicket = "daemon_relay_ticket"
         case relays
+    }
+}
+
+// MARK: - Responsive Apple Device Form Factors (iPhone, iPhone Duo Cover/Unfolded, iPadOS, Mac)
+
+public enum CodaFormFactor: String, Codable, Sendable, CaseIterable, Equatable {
+    case iphoneCover
+    case iphoneStandard
+    case iphoneDuoUnfolded
+    case ipadOrDesktop
+
+    public var isCompact: Bool {
+        self == .iphoneCover || self == .iphoneStandard
+    }
+
+    public var isIPhoneDuo: Bool {
+        self == .iphoneCover || self == .iphoneDuoUnfolded
+    }
+
+    public var platformIdentifier: String {
+        #if os(macOS)
+        return platformIdentifier(forMacOS: true)
+        #else
+        return platformIdentifier(forMacOS: false)
+        #endif
+    }
+
+    public func platformIdentifier(forMacOS: Bool) -> String {
+        if forMacOS {
+            return "macos"
+        }
+        switch self {
+        case .iphoneCover, .iphoneDuoUnfolded:
+            return "iphone_duo"
+        case .iphoneStandard:
+            return "ios"
+        case .ipadOrDesktop:
+            return "ipados"
+        }
+    }
+
+    public static func detect(width: CGFloat, height: CGFloat) -> CodaFormFactor {
+        let safeW = max(1, width)
+        let safeH = max(1, height)
+        if safeW < 380 {
+            return .iphoneCover
+        }
+        let minDim = min(safeW, safeH)
+        let maxDim = max(safeW, safeH)
+        let ratio = safeW / safeH
+        if safeW < 580 {
+            return .iphoneStandard
+        }
+        if (safeW >= 580 && safeW < 920) || (minDim >= 560 && maxDim <= 960 && ratio >= 0.75 && ratio <= 1.35) {
+            return .iphoneDuoUnfolded
+        }
+        return .ipadOrDesktop
     }
 }
