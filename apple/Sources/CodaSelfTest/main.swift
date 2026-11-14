@@ -117,29 +117,76 @@ struct CodaSelfTest {
         let authStart = try JSONDecoder().decode(CodaDeviceAuthStart.self, from: startJSON)
         precondition(authStart.userCode == "ABCD-2345")
 
-        // 6. iPhone Duo Form-Factor Detection, 2-Row Keypad & Instant Fold/Unfold Reflow
-        precondition(CodaFormFactor.detect(width: 360, height: 780) == .iphoneCover)
-        precondition(CodaFormFactor.iphoneCover.isCompact && CodaFormFactor.iphoneCover.isIPhoneDuo)
-        precondition(CodaFormFactor.iphoneCover.platformIdentifier(forMacOS: false) == "iphone_duo")
+        // 6. iPhone Duo (466x678, 890x626 / 626x890) & Mainstream iPhone 14-18 Form-Factor Matrix + Fold Reflow
+        precondition(CodaIPhoneDeviceSpec.mainstreamCatalog.count == 23)
+        for spec in CodaIPhoneDeviceSpec.mainstreamCatalog {
+            let portrait = CodaFormFactor.detect(
+                width: spec.logicalSize.width,
+                height: spec.logicalSize.height,
+                isHorizontalRegular: spec.isHorizontalRegularInPortrait,
+                isVerticalRegular: spec.isVerticalRegularInPortrait
+            )
+            precondition(
+                portrait == spec.expectedPortraitFormFactor,
+                "Portrait form factor mismatch for \(spec.name): got \(portrait)"
+            )
+            precondition(!portrait.usesVerticalSideRail)
 
-        precondition(CodaFormFactor.detect(width: 393, height: 852) == .iphoneStandard)
-        precondition(CodaFormFactor.iphoneStandard.platformIdentifier(forMacOS: false) == "ios")
+            let landscape = CodaFormFactor.detect(
+                width: spec.logicalSize.height,
+                height: spec.logicalSize.width,
+                isHorizontalRegular: spec.isHorizontalRegularInLandscape,
+                isVerticalRegular: spec.isVerticalRegularInLandscape
+            )
+            precondition(
+                landscape == spec.expectedLandscapeFormFactor,
+                "Landscape form factor mismatch for \(spec.name): got \(landscape)"
+            )
+            precondition(landscape.usesVerticalSideRail)
 
-        precondition(CodaFormFactor.detect(width: 768, height: 832) == .iphoneDuoUnfolded)
-        precondition(CodaFormFactor.detect(width: 832, height: 768) == .iphoneDuoUnfolded)
-        precondition(!CodaFormFactor.iphoneDuoUnfolded.isCompact && CodaFormFactor.iphoneDuoUnfolded.isIPhoneDuo)
-        precondition(CodaFormFactor.iphoneDuoUnfolded.platformIdentifier(forMacOS: false) == "iphone_duo")
+            let expectedPlatform = (portrait.isIPhoneDuo || landscape.isIPhoneDuo) ? "iphone_duo" : "ios"
+            precondition(portrait.platformIdentifier(forMacOS: false) == expectedPlatform)
+            precondition(landscape.platformIdentifier(forMacOS: false) == expectedPlatform)
+        }
 
-        precondition(CodaFormFactor.detect(width: 1194, height: 834) == .ipadOrDesktop)
+        precondition(CodaFormFactor.detect(width: 466, height: 678) == .iphoneDuoCoverPortrait)
+        precondition(CodaFormFactor.detect(width: 678, height: 466) == .iphoneDuoCoverLandscape)
+        precondition(CodaFormFactor.detect(width: 890, height: 626, isHorizontalRegular: true, isVerticalRegular: true) == .iphoneDuoInnerLandscape)
+        precondition(CodaFormFactor.detect(width: 626, height: 890, isHorizontalRegular: true, isVerticalRegular: true) == .iphoneDuoInnerPortrait)
+        precondition(CodaFormFactor.detect(width: 951, height: 669, isHorizontalRegular: true, isVerticalRegular: true) == .iphoneDuoInnerLandscape)
+        precondition(CodaFormFactor.detect(width: 669, height: 951, isHorizontalRegular: true, isVerticalRegular: true) == .iphoneDuoInnerPortrait)
+        precondition(!CodaFormFactor.iphoneDuoInnerLandscape.isCompact && CodaFormFactor.iphoneDuoInnerLandscape.isIPhoneDuo)
+        precondition(CodaFormFactor.detect(width: 1194, height: 834, isHorizontalRegular: true, isVerticalRegular: true) == .ipadOrDesktop)
         precondition(CodaFormFactor.ipadOrDesktop.platformIdentifier(forMacOS: false) == "ipados")
 
+        if let landscapeCrease = CodaReservedRegion.duoFoldDivision(in: CGSize(width: 890, height: 626), posture: .bookHalfOpen) {
+            precondition(landscapeCrease.kind == .division)
+            precondition(landscapeCrease.rect == CGRect(x: 433, y: 0, width: 24, height: 626))
+        } else {
+            preconditionFailure("Expected vertical fold crease division for Duo inner landscape")
+        }
+        precondition(CodaReservedRegion.duoFoldDivision(in: CGSize(width: 626, height: 890), posture: .flat) == nil)
+        if let tabletopCrease = CodaReservedRegion.duoFoldDivision(in: CGSize(width: 626, height: 890), posture: .tabletopLaptop) {
+            precondition(tabletopCrease.kind == .division)
+            precondition(tabletopCrease.rect == CGRect(x: 0, y: 433, width: 626, height: 24))
+        } else {
+            preconditionFailure("Expected horizontal fold crease division for Duo tabletop pose")
+        }
+        precondition(CodaEdgeSafeAreas(top: 0, leading: 62, bottom: 20, trailing: 0).isHorizontallyAsymmetric)
+        precondition(!CodaEdgeSafeAreas(top: 0, leading: 59, bottom: 21, trailing: 59).isHorizontallyAsymmetric)
+
         let duoSample = "\u{1B}]7501:blocked:Run suite\u{07}\u{1B}[38;2;56;189;248m+    let prefer_raw = self.peer_lacks_zstd || req_id.starts_with(\"swift-\");\u{1B}[0m\n-    let old = true;\n1. Yes, approve cargo test\n"
-        let coverStyled = GhosttyReflowEngine.renderStyledLines(rawOutput: duoSample, targetColumns: 40)
+        let cols48Styled = GhosttyReflowEngine.renderStyledLines(rawOutput: duoSample, targetColumns: 48)
+        let cols56Styled = GhosttyReflowEngine.renderStyledLines(rawOutput: duoSample, targetColumns: 56)
+        let cols58Styled = GhosttyReflowEngine.renderStyledLines(rawOutput: duoSample, targetColumns: 58)
+        let cols80Styled = GhosttyReflowEngine.renderStyledLines(rawOutput: duoSample, targetColumns: 80)
         let panoStyled = GhosttyReflowEngine.renderStyledLines(rawOutput: duoSample, targetColumns: 98)
-        let splitStyled = GhosttyReflowEngine.renderStyledLines(rawOutput: duoSample, targetColumns: 48)
-        precondition(coverStyled.lines.count > panoStyled.lines.count)
-        precondition(splitStyled.lines.count >= panoStyled.lines.count)
-        precondition(coverStyled.latestStatus?.state == .needsYou && panoStyled.latestStatus?.state == .needsYou)
+        precondition(cols48Styled.lines.count >= cols56Styled.lines.count)
+        precondition(cols56Styled.lines.count >= cols58Styled.lines.count)
+        precondition(cols58Styled.lines.count >= cols80Styled.lines.count)
+        precondition(cols80Styled.lines.count >= panoStyled.lines.count)
+        precondition(cols48Styled.lines.count > panoStyled.lines.count)
+        precondition(cols48Styled.latestStatus?.state == .needsYou && panoStyled.latestStatus?.state == .needsYou)
         precondition(panoStyled.lines.contains(where: { $0.kind == .diffAdded }) && panoStyled.lines.contains(where: { $0.kind == .diffRemoved }))
         precondition(panoStyled.lines.contains(where: { $0.kind == .promptChoice }))
         precondition(GhosttyReflowEngine.encodeKey(.backspace) == Data([0x7F]))

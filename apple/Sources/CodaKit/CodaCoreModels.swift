@@ -644,20 +644,114 @@ public struct CodaDeviceAuthPollResult: Codable, Sendable, Equatable {
     }
 }
 
-// MARK: - Responsive Apple Device Form Factors (iPhone, iPhone Duo Cover/Unfolded, iPadOS, Mac)
+// MARK: - Responsive Apple Device Form Factors, Fold Postures & Safe Area Specs
+
+public enum CodaFoldPosture: String, Codable, Sendable, CaseIterable, Equatable {
+    case flat
+    case bookHalfOpen
+    case tabletopLaptop
+}
+
+public struct CodaReservedRegion: Sendable, Equatable {
+    public enum Kind: String, Codable, Sendable, Equatable {
+        case division
+        case occlusion
+    }
+
+    public let kind: Kind
+    public let rect: CGRect
+
+    public init(kind: Kind, rect: CGRect) {
+        self.kind = kind
+        self.rect = rect
+    }
+
+    public static func duoFoldDivision(
+        in size: CGSize,
+        posture: CodaFoldPosture,
+        thickness: CGFloat = 24
+    ) -> CodaReservedRegion? {
+        guard size.width > 0 && size.height > 0 else { return nil }
+        if size.width > size.height {
+            let x = max(0, (size.width - thickness) * 0.5)
+            return CodaReservedRegion(
+                kind: .division,
+                rect: CGRect(x: x, y: 0, width: thickness, height: size.height)
+            )
+        }
+        if posture == .tabletopLaptop {
+            let y = max(0, (size.height - thickness) * 0.5)
+            return CodaReservedRegion(
+                kind: .division,
+                rect: CGRect(x: 0, y: y, width: size.width, height: thickness)
+            )
+        }
+        return nil
+    }
+}
+
+public struct CodaEdgeSafeAreas: Sendable, Equatable {
+    public var top: CGFloat
+    public var leading: CGFloat
+    public var bottom: CGFloat
+    public var trailing: CGFloat
+
+    public static let zero = CodaEdgeSafeAreas(top: 0, leading: 0, bottom: 0, trailing: 0)
+    public static let duoSideRailWidth: CGFloat = 84
+
+    public init(top: CGFloat, leading: CGFloat, bottom: CGFloat, trailing: CGFloat) {
+        self.top = top
+        self.leading = leading
+        self.bottom = bottom
+        self.trailing = trailing
+    }
+
+    public var isHorizontallyAsymmetric: Bool {
+        abs(leading - trailing) > 1.0
+    }
+}
 
 public enum CodaFormFactor: String, Codable, Sendable, CaseIterable, Equatable {
-    case iphoneCover
-    case iphoneStandard
-    case iphoneDuoUnfolded
+    case iphonePortrait
+    case iphoneLandscape
+    case iphoneDuoCoverPortrait
+    case iphoneDuoCoverLandscape
+    case iphoneDuoInnerLandscape
+    case iphoneDuoInnerPortrait
     case ipadOrDesktop
 
     public var isCompact: Bool {
-        self == .iphoneCover || self == .iphoneStandard
+        switch self {
+        case .iphonePortrait, .iphoneLandscape, .iphoneDuoCoverPortrait, .iphoneDuoCoverLandscape:
+            return true
+        case .iphoneDuoInnerLandscape, .iphoneDuoInnerPortrait, .ipadOrDesktop:
+            return false
+        }
     }
 
     public var isIPhoneDuo: Bool {
-        self == .iphoneCover || self == .iphoneDuoUnfolded
+        switch self {
+        case .iphoneDuoCoverPortrait, .iphoneDuoCoverLandscape, .iphoneDuoInnerLandscape, .iphoneDuoInnerPortrait:
+            return true
+        case .iphonePortrait, .iphoneLandscape, .ipadOrDesktop:
+            return false
+        }
+    }
+
+    public var usesVerticalSideRail: Bool {
+        switch self {
+        case .iphoneLandscape, .iphoneDuoCoverLandscape, .iphoneDuoInnerLandscape:
+            return true
+        case .iphonePortrait, .iphoneDuoCoverPortrait, .iphoneDuoInnerPortrait, .ipadOrDesktop:
+            return false
+        }
+    }
+
+    public func fluidHorizontalMargin(for width: CGFloat) -> CGFloat {
+        if width <= 395 { return 14 }
+        if width <= 425 { return 16 }
+        if width <= 448 { return 18 }
+        return 20
     }
 
     public var platformIdentifier: String {
@@ -672,31 +766,351 @@ public enum CodaFormFactor: String, Codable, Sendable, CaseIterable, Equatable {
         if forMacOS {
             return "macos"
         }
-        switch self {
-        case .iphoneCover, .iphoneDuoUnfolded:
+        if isIPhoneDuo {
             return "iphone_duo"
-        case .iphoneStandard:
+        }
+        switch self {
+        case .iphonePortrait, .iphoneLandscape:
             return "ios"
+        case .iphoneDuoCoverPortrait, .iphoneDuoCoverLandscape, .iphoneDuoInnerLandscape, .iphoneDuoInnerPortrait:
+            return "iphone_duo"
         case .ipadOrDesktop:
             return "ipados"
         }
     }
 
-    public static func detect(width: CGFloat, height: CGFloat) -> CodaFormFactor {
-        let safeW = max(1, width)
-        let safeH = max(1, height)
-        if safeW < 380 {
-            return .iphoneCover
+    public static func detect(
+        width: CGFloat,
+        height: CGFloat,
+        isHorizontalRegular: Bool? = nil,
+        isVerticalRegular: Bool? = nil
+    ) -> CodaFormFactor {
+        let w = max(1, width)
+        let h = max(1, height)
+        let minDim = min(w, h)
+        let maxDim = max(w, h)
+        let aspect = maxDim / minDim
+
+        // Mainstream slab iPhones (iPhone 14 .. 18 Pro Max, 375..440pt short edge, ~2.16 aspect)
+        if (minDim <= 448 && aspect >= 1.70) || (isVerticalRegular == false && minDim <= 448 && maxDim >= 650) {
+            return w > h ? .iphoneLandscape : .iphonePortrait
         }
-        let minDim = min(safeW, safeH)
-        let maxDim = max(safeW, safeH)
-        let ratio = safeW / safeH
-        if safeW < 580 {
-            return .iphoneStandard
+
+        // iPhone Duo 5.4" Cover Display (466x678 Portrait, 678x466 Landscape, ~1.455 aspect)
+        if minDim >= 449 && minDim <= 540 && maxDim >= 600 && maxDim <= 755 && aspect < 1.70
+            && (isHorizontalRegular != true || isVerticalRegular == false)
+        {
+            return w > h ? .iphoneDuoCoverLandscape : .iphoneDuoCoverPortrait
         }
-        if (safeW >= 580 && safeW < 920) || (minDim >= 560 && maxDim <= 960 && ratio >= 0.75 && ratio <= 1.35) {
-            return .iphoneDuoUnfolded
+
+        // iPhone Duo 7.6" Unfolded Inner Display (890x626 / 626x890, Zoomed 951x669 / 669x951)
+        if minDim >= 560 && minDim <= 712 && maxDim >= 780 && maxDim <= 975 && aspect >= 1.25 && aspect <= 1.65 {
+            return w > h ? .iphoneDuoInnerLandscape : .iphoneDuoInnerPortrait
         }
+
+        if minDim < 540 {
+            return w > h ? .iphoneLandscape : .iphonePortrait
+        }
+
         return .ipadOrDesktop
     }
+}
+
+public struct CodaIPhoneDeviceSpec: Sendable, Equatable, Identifiable {
+    public var id: String { name }
+    public let name: String
+    public let generation: String
+    public let logicalSize: CGSize
+    public let scaleFactor: Int
+    public let portraitSafeArea: CodaEdgeSafeAreas
+    public let landscapeSafeArea: CodaEdgeSafeAreas
+    public let isHorizontalRegularInPortrait: Bool?
+    public let isVerticalRegularInPortrait: Bool?
+    public let isHorizontalRegularInLandscape: Bool?
+    public let isVerticalRegularInLandscape: Bool?
+    public let expectedPortraitFormFactor: CodaFormFactor
+    public let expectedLandscapeFormFactor: CodaFormFactor
+
+    public init(
+        name: String,
+        generation: String,
+        logicalSize: CGSize,
+        scaleFactor: Int,
+        portraitSafeArea: CodaEdgeSafeAreas,
+        landscapeSafeArea: CodaEdgeSafeAreas,
+        isHorizontalRegularInPortrait: Bool? = false,
+        isVerticalRegularInPortrait: Bool? = true,
+        isHorizontalRegularInLandscape: Bool? = false,
+        isVerticalRegularInLandscape: Bool? = false,
+        expectedPortraitFormFactor: CodaFormFactor,
+        expectedLandscapeFormFactor: CodaFormFactor
+    ) {
+        self.name = name
+        self.generation = generation
+        self.logicalSize = logicalSize
+        self.scaleFactor = scaleFactor
+        self.portraitSafeArea = portraitSafeArea
+        self.landscapeSafeArea = landscapeSafeArea
+        self.isHorizontalRegularInPortrait = isHorizontalRegularInPortrait
+        self.isVerticalRegularInPortrait = isVerticalRegularInPortrait
+        self.isHorizontalRegularInLandscape = isHorizontalRegularInLandscape
+        self.isVerticalRegularInLandscape = isVerticalRegularInLandscape
+        self.expectedPortraitFormFactor = expectedPortraitFormFactor
+        self.expectedLandscapeFormFactor = expectedLandscapeFormFactor
+    }
+
+    public static let mainstreamCatalog: [CodaIPhoneDeviceSpec] = [
+        // iPhone 14 Series
+        CodaIPhoneDeviceSpec(
+            name: "iPhone 14",
+            generation: "14",
+            logicalSize: CGSize(width: 390, height: 844),
+            scaleFactor: 3,
+            portraitSafeArea: CodaEdgeSafeAreas(top: 47, leading: 0, bottom: 34, trailing: 0),
+            landscapeSafeArea: CodaEdgeSafeAreas(top: 0, leading: 47, bottom: 21, trailing: 47),
+            expectedPortraitFormFactor: .iphonePortrait,
+            expectedLandscapeFormFactor: .iphoneLandscape
+        ),
+        CodaIPhoneDeviceSpec(
+            name: "iPhone 14 Plus",
+            generation: "14",
+            logicalSize: CGSize(width: 428, height: 926),
+            scaleFactor: 3,
+            portraitSafeArea: CodaEdgeSafeAreas(top: 47, leading: 0, bottom: 34, trailing: 0),
+            landscapeSafeArea: CodaEdgeSafeAreas(top: 0, leading: 47, bottom: 21, trailing: 47),
+            isHorizontalRegularInLandscape: true,
+            expectedPortraitFormFactor: .iphonePortrait,
+            expectedLandscapeFormFactor: .iphoneLandscape
+        ),
+        CodaIPhoneDeviceSpec(
+            name: "iPhone 14 Pro",
+            generation: "14",
+            logicalSize: CGSize(width: 393, height: 852),
+            scaleFactor: 3,
+            portraitSafeArea: CodaEdgeSafeAreas(top: 59, leading: 0, bottom: 34, trailing: 0),
+            landscapeSafeArea: CodaEdgeSafeAreas(top: 0, leading: 59, bottom: 21, trailing: 59),
+            expectedPortraitFormFactor: .iphonePortrait,
+            expectedLandscapeFormFactor: .iphoneLandscape
+        ),
+        CodaIPhoneDeviceSpec(
+            name: "iPhone 14 Pro Max",
+            generation: "14",
+            logicalSize: CGSize(width: 430, height: 932),
+            scaleFactor: 3,
+            portraitSafeArea: CodaEdgeSafeAreas(top: 59, leading: 0, bottom: 34, trailing: 0),
+            landscapeSafeArea: CodaEdgeSafeAreas(top: 0, leading: 59, bottom: 21, trailing: 59),
+            isHorizontalRegularInLandscape: true,
+            expectedPortraitFormFactor: .iphonePortrait,
+            expectedLandscapeFormFactor: .iphoneLandscape
+        ),
+        // iPhone 15 Series
+        CodaIPhoneDeviceSpec(
+            name: "iPhone 15",
+            generation: "15",
+            logicalSize: CGSize(width: 393, height: 852),
+            scaleFactor: 3,
+            portraitSafeArea: CodaEdgeSafeAreas(top: 59, leading: 0, bottom: 34, trailing: 0),
+            landscapeSafeArea: CodaEdgeSafeAreas(top: 0, leading: 59, bottom: 21, trailing: 59),
+            expectedPortraitFormFactor: .iphonePortrait,
+            expectedLandscapeFormFactor: .iphoneLandscape
+        ),
+        CodaIPhoneDeviceSpec(
+            name: "iPhone 15 Plus",
+            generation: "15",
+            logicalSize: CGSize(width: 430, height: 932),
+            scaleFactor: 3,
+            portraitSafeArea: CodaEdgeSafeAreas(top: 59, leading: 0, bottom: 34, trailing: 0),
+            landscapeSafeArea: CodaEdgeSafeAreas(top: 0, leading: 59, bottom: 21, trailing: 59),
+            isHorizontalRegularInLandscape: true,
+            expectedPortraitFormFactor: .iphonePortrait,
+            expectedLandscapeFormFactor: .iphoneLandscape
+        ),
+        CodaIPhoneDeviceSpec(
+            name: "iPhone 15 Pro",
+            generation: "15",
+            logicalSize: CGSize(width: 393, height: 852),
+            scaleFactor: 3,
+            portraitSafeArea: CodaEdgeSafeAreas(top: 59, leading: 0, bottom: 34, trailing: 0),
+            landscapeSafeArea: CodaEdgeSafeAreas(top: 0, leading: 59, bottom: 21, trailing: 59),
+            expectedPortraitFormFactor: .iphonePortrait,
+            expectedLandscapeFormFactor: .iphoneLandscape
+        ),
+        CodaIPhoneDeviceSpec(
+            name: "iPhone 15 Pro Max",
+            generation: "15",
+            logicalSize: CGSize(width: 430, height: 932),
+            scaleFactor: 3,
+            portraitSafeArea: CodaEdgeSafeAreas(top: 59, leading: 0, bottom: 34, trailing: 0),
+            landscapeSafeArea: CodaEdgeSafeAreas(top: 0, leading: 59, bottom: 21, trailing: 59),
+            isHorizontalRegularInLandscape: true,
+            expectedPortraitFormFactor: .iphonePortrait,
+            expectedLandscapeFormFactor: .iphoneLandscape
+        ),
+        // iPhone 16 Series
+        CodaIPhoneDeviceSpec(
+            name: "iPhone 16e",
+            generation: "16",
+            logicalSize: CGSize(width: 390, height: 844),
+            scaleFactor: 3,
+            portraitSafeArea: CodaEdgeSafeAreas(top: 59, leading: 0, bottom: 34, trailing: 0),
+            landscapeSafeArea: CodaEdgeSafeAreas(top: 0, leading: 59, bottom: 20, trailing: 59),
+            expectedPortraitFormFactor: .iphonePortrait,
+            expectedLandscapeFormFactor: .iphoneLandscape
+        ),
+        CodaIPhoneDeviceSpec(
+            name: "iPhone 16",
+            generation: "16",
+            logicalSize: CGSize(width: 393, height: 852),
+            scaleFactor: 3,
+            portraitSafeArea: CodaEdgeSafeAreas(top: 59, leading: 0, bottom: 34, trailing: 0),
+            landscapeSafeArea: CodaEdgeSafeAreas(top: 0, leading: 59, bottom: 20, trailing: 59),
+            expectedPortraitFormFactor: .iphonePortrait,
+            expectedLandscapeFormFactor: .iphoneLandscape
+        ),
+        CodaIPhoneDeviceSpec(
+            name: "iPhone 16 Plus",
+            generation: "16",
+            logicalSize: CGSize(width: 430, height: 932),
+            scaleFactor: 3,
+            portraitSafeArea: CodaEdgeSafeAreas(top: 59, leading: 0, bottom: 34, trailing: 0),
+            landscapeSafeArea: CodaEdgeSafeAreas(top: 0, leading: 59, bottom: 20, trailing: 59),
+            isHorizontalRegularInLandscape: true,
+            expectedPortraitFormFactor: .iphonePortrait,
+            expectedLandscapeFormFactor: .iphoneLandscape
+        ),
+        CodaIPhoneDeviceSpec(
+            name: "iPhone 16 Pro",
+            generation: "16",
+            logicalSize: CGSize(width: 402, height: 874),
+            scaleFactor: 3,
+            portraitSafeArea: CodaEdgeSafeAreas(top: 62, leading: 0, bottom: 34, trailing: 0),
+            landscapeSafeArea: CodaEdgeSafeAreas(top: 0, leading: 62, bottom: 20, trailing: 62),
+            expectedPortraitFormFactor: .iphonePortrait,
+            expectedLandscapeFormFactor: .iphoneLandscape
+        ),
+        CodaIPhoneDeviceSpec(
+            name: "iPhone 16 Pro Max",
+            generation: "16",
+            logicalSize: CGSize(width: 440, height: 956),
+            scaleFactor: 3,
+            portraitSafeArea: CodaEdgeSafeAreas(top: 62, leading: 0, bottom: 34, trailing: 0),
+            landscapeSafeArea: CodaEdgeSafeAreas(top: 0, leading: 62, bottom: 20, trailing: 62),
+            isHorizontalRegularInLandscape: true,
+            expectedPortraitFormFactor: .iphonePortrait,
+            expectedLandscapeFormFactor: .iphoneLandscape
+        ),
+        // iPhone 17 Series
+        CodaIPhoneDeviceSpec(
+            name: "iPhone 17e",
+            generation: "17",
+            logicalSize: CGSize(width: 390, height: 844),
+            scaleFactor: 3,
+            portraitSafeArea: CodaEdgeSafeAreas(top: 59, leading: 0, bottom: 34, trailing: 0),
+            landscapeSafeArea: CodaEdgeSafeAreas(top: 0, leading: 59, bottom: 20, trailing: 59),
+            expectedPortraitFormFactor: .iphonePortrait,
+            expectedLandscapeFormFactor: .iphoneLandscape
+        ),
+        CodaIPhoneDeviceSpec(
+            name: "iPhone 17",
+            generation: "17",
+            logicalSize: CGSize(width: 402, height: 874),
+            scaleFactor: 3,
+            portraitSafeArea: CodaEdgeSafeAreas(top: 62, leading: 0, bottom: 34, trailing: 0),
+            landscapeSafeArea: CodaEdgeSafeAreas(top: 0, leading: 62, bottom: 20, trailing: 62),
+            expectedPortraitFormFactor: .iphonePortrait,
+            expectedLandscapeFormFactor: .iphoneLandscape
+        ),
+        CodaIPhoneDeviceSpec(
+            name: "iPhone 17 Air",
+            generation: "17",
+            logicalSize: CGSize(width: 420, height: 912),
+            scaleFactor: 3,
+            portraitSafeArea: CodaEdgeSafeAreas(top: 68, leading: 0, bottom: 34, trailing: 0),
+            landscapeSafeArea: CodaEdgeSafeAreas(top: 0, leading: 68, bottom: 20, trailing: 68),
+            expectedPortraitFormFactor: .iphonePortrait,
+            expectedLandscapeFormFactor: .iphoneLandscape
+        ),
+        CodaIPhoneDeviceSpec(
+            name: "iPhone 17 Pro",
+            generation: "17",
+            logicalSize: CGSize(width: 402, height: 874),
+            scaleFactor: 3,
+            portraitSafeArea: CodaEdgeSafeAreas(top: 62, leading: 0, bottom: 34, trailing: 0),
+            landscapeSafeArea: CodaEdgeSafeAreas(top: 0, leading: 62, bottom: 20, trailing: 62),
+            expectedPortraitFormFactor: .iphonePortrait,
+            expectedLandscapeFormFactor: .iphoneLandscape
+        ),
+        CodaIPhoneDeviceSpec(
+            name: "iPhone 17 Pro Max",
+            generation: "17",
+            logicalSize: CGSize(width: 440, height: 956),
+            scaleFactor: 3,
+            portraitSafeArea: CodaEdgeSafeAreas(top: 62, leading: 0, bottom: 34, trailing: 0),
+            landscapeSafeArea: CodaEdgeSafeAreas(top: 0, leading: 62, bottom: 20, trailing: 62),
+            isHorizontalRegularInLandscape: true,
+            expectedPortraitFormFactor: .iphonePortrait,
+            expectedLandscapeFormFactor: .iphoneLandscape
+        ),
+        // iPhone 18 Series
+        CodaIPhoneDeviceSpec(
+            name: "iPhone 18",
+            generation: "18",
+            logicalSize: CGSize(width: 402, height: 874),
+            scaleFactor: 3,
+            portraitSafeArea: CodaEdgeSafeAreas(top: 62, leading: 0, bottom: 34, trailing: 0),
+            landscapeSafeArea: CodaEdgeSafeAreas(top: 0, leading: 62, bottom: 20, trailing: 62),
+            expectedPortraitFormFactor: .iphonePortrait,
+            expectedLandscapeFormFactor: .iphoneLandscape
+        ),
+        CodaIPhoneDeviceSpec(
+            name: "iPhone 18 Pro",
+            generation: "18",
+            logicalSize: CGSize(width: 402, height: 874),
+            scaleFactor: 3,
+            portraitSafeArea: CodaEdgeSafeAreas(top: 62, leading: 0, bottom: 34, trailing: 0),
+            landscapeSafeArea: CodaEdgeSafeAreas(top: 0, leading: 62, bottom: 20, trailing: 62),
+            expectedPortraitFormFactor: .iphonePortrait,
+            expectedLandscapeFormFactor: .iphoneLandscape
+        ),
+        CodaIPhoneDeviceSpec(
+            name: "iPhone 18 Pro Max",
+            generation: "18",
+            logicalSize: CGSize(width: 440, height: 956),
+            scaleFactor: 3,
+            portraitSafeArea: CodaEdgeSafeAreas(top: 62, leading: 0, bottom: 34, trailing: 0),
+            landscapeSafeArea: CodaEdgeSafeAreas(top: 0, leading: 62, bottom: 20, trailing: 62),
+            isHorizontalRegularInLandscape: true,
+            expectedPortraitFormFactor: .iphonePortrait,
+            expectedLandscapeFormFactor: .iphoneLandscape
+        ),
+        // iPhone Duo (Foldable 5.4" Cover & 7.6" Inner)
+        CodaIPhoneDeviceSpec(
+            name: "iPhone Duo Cover (5.4\")",
+            generation: "Duo",
+            logicalSize: CGSize(width: 466, height: 678),
+            scaleFactor: 3,
+            portraitSafeArea: CodaEdgeSafeAreas(top: 54, leading: 0, bottom: 34, trailing: 0),
+            landscapeSafeArea: CodaEdgeSafeAreas(top: 0, leading: 84, bottom: 20, trailing: 54),
+            isHorizontalRegularInPortrait: false,
+            isVerticalRegularInPortrait: true,
+            isHorizontalRegularInLandscape: false,
+            isVerticalRegularInLandscape: false,
+            expectedPortraitFormFactor: .iphoneDuoCoverPortrait,
+            expectedLandscapeFormFactor: .iphoneDuoCoverLandscape
+        ),
+        CodaIPhoneDeviceSpec(
+            name: "iPhone Duo Inner (7.6\")",
+            generation: "Duo",
+            logicalSize: CGSize(width: 626, height: 890),
+            scaleFactor: 3,
+            portraitSafeArea: CodaEdgeSafeAreas(top: 44, leading: 0, bottom: 34, trailing: 0),
+            landscapeSafeArea: CodaEdgeSafeAreas(top: 24, leading: 84, bottom: 20, trailing: 16),
+            isHorizontalRegularInPortrait: true,
+            isVerticalRegularInPortrait: true,
+            isHorizontalRegularInLandscape: true,
+            isVerticalRegularInLandscape: true,
+            expectedPortraitFormFactor: .iphoneDuoInnerPortrait,
+            expectedLandscapeFormFactor: .iphoneDuoInnerLandscape
+        ),
+    ]
 }
