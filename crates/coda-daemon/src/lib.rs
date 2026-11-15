@@ -10,7 +10,10 @@ use std::{
     collections::HashMap,
     net::{SocketAddr, UdpSocket},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex as StdMutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex as StdMutex, OnceLock,
+    },
 };
 
 use anyhow::{anyhow, Context, Result};
@@ -20,8 +23,11 @@ use coda_herdr::{
     PtyBridgeHandle, PtyOutputEvent,
 };
 use coda_protocol::{
-    AccountLiveEvent, E2eeSession, HerdrTerminalSummary, NetworkEndpointCandidate, PeerMessage,
-    RelayWireFrame, RemoteFileItem, StoredDeviceIdentity, TrafficLane, MAX_WIRE_FRAME_BYTES,
+    current_unix_ms, is_timestamp_fresh, p2p_ack_v2_signing_bytes, p2p_hello_v2_signing_bytes,
+    validate_ed25519_pub_b64, validate_x25519_pub_b64, AccountLiveEvent, E2eeSession,
+    HerdrTerminalSummary, NetworkEndpointCandidate, PeerMessage, RelaySessionAuth, RelayWireFrame,
+    RemoteFileItem, StoredDeviceIdentity, TrafficLane, TrustedPeerEntry, HANDSHAKE_MAX_SKEW_MS,
+    MAX_WIRE_FRAME_BYTES,
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -33,20 +39,82 @@ use tokio::{
         TcpListener, TcpStream, UdpSocket as TokioUdpSocket,
     },
     process::Command,
-    sync::{broadcast, mpsc, oneshot, Mutex},
+    sync::{broadcast, mpsc, oneshot, Mutex, RwLock, Semaphore},
 };
-use tokio_tungstenite::{accept_async, connect_async, tungstenite::Message as WsMsg};
+use tokio_tungstenite::{
+    accept_async_with_config, connect_async_with_config,
+    tungstenite::{protocol::WebSocketConfig, Message as WsMsg},
+};
 use tracing::{info, warn};
 use uuid::Uuid;
 
 /// Default Direct P2P port for LAN IPv4 & Mainland China Public IPv6 zero-relay hole-punching.
 pub const DEFAULT_DIRECT_P2P_PORT: u16 = 24444;
 
+const MAX_CONCURRENT_PEER_RPCS: usize = 32;
+const MAX_HTTP_PREVIEW_BYTES: usize = 4 * 1024 * 1024;
+const WS_KEEPALIVE_SECS: u64 = 25;
+const HANDSHAKE_REPLAY_MAX_ENTRIES: usize = 4096;
+
+static LAST_RELAY_GEN: AtomicU64 = AtomicU64::new(0);
+static ATOMIC_SAVE_COUNTER: AtomicU64 = AtomicU64::new(0);
+static PREVIEW_HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+static DAEMON_HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+
+fn next_monotonic_generation() -> u64 {
+    let now = current_unix_ms().max(1);
+    let mut prev = LAST_RELAY_GEN.load(Ordering::Relaxed);
+    loop {
+        let next = now.max(prev.saturating_add(1)).max(1);
+        match LAST_RELAY_GEN.compare_exchange_weak(
+            prev,
+            next,
+            Ordering::SeqCst,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return next,
+            Err(actual) => prev = actual,
+        }
+    }
+}
+
+fn daemon_http_client() -> &'static reqwest::Client {
+    DAEMON_HTTP_CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    })
+}
+
+fn preview_http_client() -> &'static reqwest::Client {
+    PREVIEW_HTTP_CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(10))
+            .no_proxy()
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    })
+}
+
+fn bounded_ws_config() -> WebSocketConfig {
+    WebSocketConfig::default()
+        .max_message_size(Some(MAX_WIRE_FRAME_BYTES))
+        .max_frame_size(Some(MAX_WIRE_FRAME_BYTES))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DaemonRelayEntry {
     pub id: String,
     pub mode: String,
     pub endpoint: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerIdentityPin {
+    pub ed25519_pub_b64: String,
+    pub x25519_pub_b64: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,10 +137,21 @@ pub struct RemoteHostSummary {
     pub name: String,
     pub role: String,
     pub platform: String,
+    #[serde(default)]
+    pub ed25519_pubkey: String,
     pub x25519_pubkey: String,
     #[serde(default)]
     pub endpoints: Vec<NetworkEndpointCandidate>,
     pub is_online: bool,
+}
+
+impl RemoteHostSummary {
+    pub fn identity_pin(&self) -> PeerIdentityPin {
+        PeerIdentityPin {
+            ed25519_pub_b64: self.ed25519_pubkey.clone(),
+            x25519_pub_b64: self.x25519_pubkey.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -87,6 +166,94 @@ pub struct DeviceAuthStartResult {
     pub identity: StoredDeviceIdentity,
 }
 
+fn atomic_write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+    }
+
+    let seq = ATOMIC_SAVE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let fname = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("coda.tmp");
+    let tmp_path = parent.join(format!(".{fname}.tmp.{}.{seq}", std::process::id()));
+
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp_path)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(&tmp_path, bytes)?;
+    }
+
+    if let Err(e) = std::fs::rename(&tmp_path, path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e.into());
+    }
+    Ok(())
+}
+
+/// Exclusive non-blocking OS file lock preventing concurrent `coda-daemon` and embedded desktop host startup.
+pub struct DaemonProcessLock {
+    #[cfg(unix)]
+    _file: std::fs::File,
+    #[cfg(not(unix))]
+    _marker: (),
+}
+
+/// Attempts to acquire the exclusive daemon lock next to `cfg_path`.
+/// Returns `Ok(None)` if another process already holds the lock.
+pub fn try_acquire_daemon_lock(cfg_path: &Path) -> Result<Option<DaemonProcessLock>> {
+    let lock_path = DaemonConfig::lock_path(cfg_path);
+    let parent = lock_path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .open(&lock_path)?;
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc != 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EWOULDBLOCK)
+                || err.raw_os_error() == Some(libc::EAGAIN)
+            {
+                return Ok(None);
+            }
+            return Err(err.into());
+        }
+        let _ = file.set_len(0);
+        let _ = writeln!(file, "{}", std::process::id());
+        let _ = file.sync_all();
+        Ok(Some(DaemonProcessLock { _file: file }))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = lock_path;
+        Ok(Some(DaemonProcessLock { _marker: () }))
+    }
+}
+
 impl DaemonConfig {
     pub fn default_path() -> PathBuf {
         if let Ok(custom) = std::env::var("CODA_DAEMON_CONFIG") {
@@ -99,24 +266,240 @@ impl DaemonConfig {
         PathBuf::from(home).join(".config/coda/daemon.json")
     }
 
+    pub fn lock_path(cfg_path: &Path) -> PathBuf {
+        cfg_path.with_file_name("coda-daemon.lock")
+    }
+
+    pub fn trusted_peers_path(cfg_path: &Path) -> PathBuf {
+        cfg_path.with_file_name("trusted_peers.json")
+    }
+
     pub fn save(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
         let body = serde_json::to_string_pretty(self)?;
-        std::fs::write(path, body)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-        }
-        Ok(())
+        atomic_write_private_file(path, body.as_bytes())
     }
 
     pub fn load(path: &Path) -> Result<Self> {
         let txt = std::fs::read_to_string(path)
             .with_context(|| format!("daemon config not found at {}", path.display()))?;
         Ok(serde_json::from_str(&txt)?)
+    }
+}
+
+#[derive(Default)]
+struct TimedReplayCache {
+    seen: HashMap<String, tokio::time::Instant>,
+}
+
+impl TimedReplayCache {
+    fn contains_fresh(&mut self, key: &str, ttl: std::time::Duration) -> bool {
+        let now = tokio::time::Instant::now();
+        self.seen.retain(|_, ts| now.duration_since(*ts) <= ttl);
+        self.seen.contains_key(key)
+    }
+
+    fn insert(&mut self, key: String, ttl: std::time::Duration) {
+        let now = tokio::time::Instant::now();
+        self.seen.retain(|_, ts| now.duration_since(*ts) <= ttl);
+        if self.seen.len() >= HANDSHAKE_REPLAY_MAX_ENTRIES {
+            let remove_count = HANDSHAKE_REPLAY_MAX_ENTRIES / 8;
+            let keys: Vec<String> = self.seen.keys().take(remove_count).cloned().collect();
+            for k in keys {
+                self.seen.remove(&k);
+            }
+        }
+        self.seen.insert(key, now);
+    }
+
+    fn check_and_insert(&mut self, key: String, ttl: std::time::Duration) -> bool {
+        if self.contains_fresh(&key, ttl) {
+            return false;
+        }
+        self.insert(key, ttl);
+        true
+    }
+}
+
+#[derive(Clone)]
+struct ServerPeerSyncConfig {
+    server_url: String,
+    session_token: Option<String>,
+    relay_ticket: String,
+}
+
+/// Thread-safe, disk-cached store of same-account trusted peer identities (`Ed25519` + `X25519`).
+pub struct TrustedPeersStore {
+    peers: RwLock<HashMap<Uuid, TrustedPeerEntry>>,
+    disk_path: Option<PathBuf>,
+    server: Option<ServerPeerSyncConfig>,
+    refresh_state: Mutex<(f64, tokio::time::Instant)>,
+    miss_cache: Mutex<HashMap<Uuid, tokio::time::Instant>>,
+}
+
+impl TrustedPeersStore {
+    pub fn new_with_peers(entries: Vec<TrustedPeerEntry>) -> Arc<Self> {
+        let map = entries
+            .into_iter()
+            .filter(|e| {
+                validate_ed25519_pub_b64(&e.ed25519_pub_b64).is_ok()
+                    && validate_x25519_pub_b64(&e.x25519_pub_b64).is_ok()
+            })
+            .map(|e| (e.device_id, e))
+            .collect();
+        Arc::new(Self {
+            peers: RwLock::new(map),
+            disk_path: None,
+            server: None,
+            refresh_state: Mutex::new((4.0, tokio::time::Instant::now())),
+            miss_cache: Mutex::new(HashMap::new()),
+        })
+    }
+
+    pub fn from_daemon_config(cfg: &DaemonConfig, disk_path: Option<PathBuf>) -> Arc<Self> {
+        let mut map = HashMap::new();
+        if let Some(ref p) = disk_path {
+            if let Ok(raw) = std::fs::read_to_string(p) {
+                if let Ok(list) = serde_json::from_str::<Vec<TrustedPeerEntry>>(&raw) {
+                    for entry in list {
+                        if validate_ed25519_pub_b64(&entry.ed25519_pub_b64).is_ok()
+                            && validate_x25519_pub_b64(&entry.x25519_pub_b64).is_ok()
+                        {
+                            map.insert(entry.device_id, entry);
+                        }
+                    }
+                }
+            }
+        }
+        let server_url = cfg.server_url.trim().trim_end_matches('/').to_string();
+        let server = if !server_url.is_empty() {
+            Some(ServerPeerSyncConfig {
+                server_url,
+                session_token: cfg.session_token.clone(),
+                relay_ticket: cfg.daemon_relay_ticket.clone(),
+            })
+        } else {
+            None
+        };
+        Arc::new(Self {
+            peers: RwLock::new(map),
+            disk_path,
+            server,
+            refresh_state: Mutex::new((4.0, tokio::time::Instant::now())),
+            miss_cache: Mutex::new(HashMap::new()),
+        })
+    }
+
+    pub async fn replace_all(&self, entries: Vec<TrustedPeerEntry>) {
+        let valid: Vec<TrustedPeerEntry> = entries
+            .into_iter()
+            .filter(|e| {
+                validate_ed25519_pub_b64(&e.ed25519_pub_b64).is_ok()
+                    && validate_x25519_pub_b64(&e.x25519_pub_b64).is_ok()
+            })
+            .collect();
+        if let Some(ref p) = self.disk_path {
+            if let Ok(json_bytes) = serde_json::to_vec_pretty(&valid) {
+                let _ = atomic_write_private_file(p, &json_bytes);
+            }
+        }
+        let map: HashMap<Uuid, TrustedPeerEntry> =
+            valid.into_iter().map(|e| (e.device_id, e)).collect();
+        *self.peers.write().await = map;
+        self.miss_cache.lock().await.clear();
+    }
+
+    pub async fn get(&self, device_id: &Uuid) -> Option<TrustedPeerEntry> {
+        self.peers.read().await.get(device_id).cloned()
+    }
+
+    pub async fn contains(&self, device_id: &Uuid) -> bool {
+        self.peers.read().await.contains_key(device_id)
+    }
+
+    pub async fn refresh_from_server(&self, force: bool) -> Result<bool> {
+        let Some(ref srv) = self.server else {
+            return Ok(false);
+        };
+        {
+            let mut bucket = self.refresh_state.lock().await;
+            let now = tokio::time::Instant::now();
+            let elapsed = now.duration_since(bucket.1).as_secs_f64();
+            bucket.0 = (bucket.0 + elapsed * 2.0).min(4.0);
+            bucket.1 = now;
+            if !force {
+                if bucket.0 < 1.0 {
+                    return Ok(false);
+                }
+                bucket.0 -= 1.0;
+            }
+        }
+
+        let url = format!("{}/api/v1/relay/trusted-peers", srv.server_url);
+        let mut req = daemon_http_client().get(&url);
+        if let Some(ref tok) = srv.session_token {
+            req = req.bearer_auth(tok);
+        } else {
+            req = req.header("X-Coda-Relay-Ticket", &srv.relay_ticket);
+        }
+        let resp = req
+            .send()
+            .await?
+            .error_for_status()
+            .context("GET /api/v1/relay/trusted-peers rejected")?
+            .json::<Vec<TrustedPeerEntry>>()
+            .await?;
+        self.replace_all(resp).await;
+        Ok(true)
+    }
+
+    pub async fn resolve_verified_peer(
+        &self,
+        device_id: Uuid,
+        claimed_ed25519: &str,
+        claimed_x25519: &str,
+    ) -> Result<TrustedPeerEntry> {
+        if let Some(existing) = self.get(&device_id).await {
+            if existing.ed25519_pub_b64 == claimed_ed25519
+                && existing.x25519_pub_b64 == claimed_x25519
+            {
+                return Ok(existing);
+            }
+        }
+
+        let miss_recent = {
+            let mut misses = self.miss_cache.lock().await;
+            let now = tokio::time::Instant::now();
+            misses.retain(|_, ts| now.duration_since(*ts) < std::time::Duration::from_secs(2));
+            misses.contains_key(&device_id)
+        };
+        let mut refreshed = false;
+        if !miss_recent && self.server.is_some() {
+            refreshed = self.refresh_from_server(false).await.unwrap_or(false);
+        }
+
+        if let Some(found) = self.get(&device_id).await {
+            if found.ed25519_pub_b64 != claimed_ed25519 {
+                anyhow::bail!(
+                    "untrusted Ed25519 key for device {device_id} (expected {}, got {claimed_ed25519})",
+                    found.ed25519_pub_b64
+                );
+            }
+            if found.x25519_pub_b64 != claimed_x25519 {
+                anyhow::bail!(
+                    "untrusted X25519 key for device {device_id} (expected {}, got {claimed_x25519})",
+                    found.x25519_pub_b64
+                );
+            }
+            return Ok(found);
+        }
+
+        if refreshed {
+            let mut misses = self.miss_cache.lock().await;
+            if misses.len() < 1024 {
+                misses.insert(device_id, tokio::time::Instant::now());
+            }
+        }
+        anyhow::bail!("peer device {device_id} is not in account TrustedPeersStore")
     }
 }
 
@@ -515,8 +898,7 @@ pub async fn register_client_identity(
     } else {
         platform.trim()
     };
-    let http = reqwest::Client::new();
-    let resp = http
+    let resp = daemon_http_client()
         .post(format!("{clean_server}/api/v1/devices/register-client"))
         .bearer_auth(session_token)
         .json(&json!({
@@ -539,14 +921,29 @@ pub async fn register_client_identity(
     Ok((dev_id, identity))
 }
 
+/// Revokes the active account session on `coda-server` (`POST /api/v1/auth/logout`).
+pub async fn logout_account_session(server_url: &str, session_token: &str) -> Result<()> {
+    let clean_server = server_url.trim().trim_end_matches('/');
+    if clean_server.is_empty() || session_token.trim().is_empty() {
+        return Ok(());
+    }
+    daemon_http_client()
+        .post(format!("{clean_server}/api/v1/auth/logout"))
+        .bearer_auth(session_token)
+        .send()
+        .await?
+        .error_for_status()
+        .context("logout failed")?;
+    Ok(())
+}
+
 /// Fetches all remote controllable hosts (`daemon` and `hybrid`) under this account.
 pub async fn list_account_hosts(
     server_url: &str,
     session_token: &str,
 ) -> Result<Vec<RemoteHostSummary>> {
     let clean_server = server_url.trim().trim_end_matches('/');
-    let http = reqwest::Client::new();
-    let raw = http
+    let raw = daemon_http_client()
         .get(format!("{clean_server}/api/v1/devices"))
         .bearer_auth(session_token)
         .send()
@@ -572,6 +969,7 @@ pub async fn list_account_hosts(
             name: item["name"].as_str().unwrap_or("coda-host").to_string(),
             role: role.to_string(),
             platform: item["platform"].as_str().unwrap_or("linux").to_string(),
+            ed25519_pubkey: item["ed25519_pubkey"].as_str().unwrap_or("").to_string(),
             x25519_pubkey: item["x25519_pubkey"].as_str().unwrap_or("").to_string(),
             endpoints,
             is_online: item["is_online"].as_bool().unwrap_or(false),
@@ -581,13 +979,12 @@ pub async fn list_account_hosts(
 }
 
 /// Connects to `coda-server` `/api/v1/events/ws` for real-time same-account device & presence pushes.
+/// Authenticates strictly via `Authorization: Bearer` header (never URL query parameter).
 pub async fn subscribe_account_events_ws(
     server_url: &str,
     session_token: &str,
 ) -> Result<mpsc::Receiver<AccountLiveEvent>> {
-    use tokio_tungstenite::tungstenite::{
-        client::IntoClientRequest, http::HeaderValue,
-    };
+    use tokio_tungstenite::tungstenite::{client::IntoClientRequest, http::HeaderValue};
 
     let clean = server_url.trim().trim_end_matches('/');
     let ws_base = if let Some(rest) = clean.strip_prefix("https://") {
@@ -599,54 +996,64 @@ pub async fn subscribe_account_events_ws(
     } else {
         format!("ws://{clean}")
     };
-    let encoded_tok: String = session_token
-        .trim()
-        .bytes()
-        .map(|b| match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                (b as char).to_string()
-            }
-            _ => format!("%{b:02X}"),
-        })
-        .collect();
-    let url = format!("{ws_base}/api/v1/events/ws?token={encoded_tok}");
+    let url = format!("{ws_base}/api/v1/events/ws");
     let mut req = url
         .into_client_request()
         .context("invalid /api/v1/events/ws request URL")?;
-    if let Ok(hdr) = HeaderValue::from_str(&format!("Bearer {}", session_token.trim())) {
-        req.headers_mut().insert("Authorization", hdr);
-    }
+    let hdr = HeaderValue::from_str(&format!("Bearer {}", session_token.trim()))
+        .context("invalid session token header value")?;
+    req.headers_mut().insert("Authorization", hdr);
 
-    let (ws_stream, _) = connect_async(req)
+    let (ws_stream, _) = connect_async_with_config(req, Some(bounded_ws_config()), false)
         .await
         .context("failed connecting to /api/v1/events/ws")?;
     let (mut sink, mut stream) = ws_stream.split();
     let (tx, rx) = mpsc::channel::<AccountLiveEvent>(128);
 
     tokio::spawn(async move {
-        while let Some(Ok(msg)) = stream.next().await {
-            match msg {
-                WsMsg::Text(txt) => {
-                    if let Ok(ev) = serde_json::from_str::<AccountLiveEvent>(&txt) {
-                        if tx.send(ev).await.is_err() {
-                            break;
-                        }
-                    }
-                }
-                WsMsg::Binary(bin) => {
-                    if let Ok(ev) = serde_json::from_slice::<AccountLiveEvent>(&bin) {
-                        if tx.send(ev).await.is_err() {
-                            break;
-                        }
-                    }
-                }
-                WsMsg::Ping(payload) => {
-                    if sink.send(WsMsg::Pong(payload)).await.is_err() {
+        let mut ping_tick =
+            tokio::time::interval(std::time::Duration::from_secs(WS_KEEPALIVE_SECS));
+        ping_tick.tick().await;
+        loop {
+            tokio::select! {
+                _ = ping_tick.tick() => {
+                    if sink.send(WsMsg::Ping(Vec::new().into())).await.is_err()
+                        || sink.flush().await.is_err()
+                    {
                         break;
                     }
                 }
-                WsMsg::Close(_) => break,
-                _ => {}
+                next_msg = stream.next() => {
+                    let Some(Ok(msg)) = next_msg else {
+                        break;
+                    };
+                    match msg {
+                        WsMsg::Text(txt) => {
+                            if let Ok(ev) = serde_json::from_str::<AccountLiveEvent>(&txt) {
+                                if tx.send(ev).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                        WsMsg::Binary(bin) => {
+                            if let Ok(ev) = serde_json::from_slice::<AccountLiveEvent>(&bin) {
+                                if tx.send(ev).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                        WsMsg::Ping(payload) => {
+                            if sink.send(WsMsg::Pong(payload)).await.is_err()
+                                || sink.flush().await.is_err()
+                            {
+                                break;
+                            }
+                        }
+                        WsMsg::Pong(_) => {}
+                        WsMsg::Close(_) => break,
+                        _ => {}
+                    }
+                }
             }
         }
     });
@@ -660,12 +1067,13 @@ pub async fn mint_peer_relay_config(
     session_token: &str,
     src_device_id: Uuid,
     target_device_id: Uuid,
+    peer_ed25519_pub_b64: &str,
     peer_x25519_pub_b64: &str,
 ) -> Result<SmartRelayFallbackConfig> {
     let clean_server = server_url.trim().trim_end_matches('/');
-    let remote_server = clean_server.starts_with("https://") || !is_loopback_endpoint(clean_server.trim_start_matches("http://"));
-    let http = reqwest::Client::new();
-    let resp = http
+    let remote_server = clean_server.starts_with("https://")
+        || !is_loopback_endpoint(clean_server.trim_start_matches("http://"));
+    let resp = daemon_http_client()
         .post(format!("{clean_server}/api/v1/relay/ticket"))
         .bearer_auth(session_token)
         .json(&json!({
@@ -697,6 +1105,7 @@ pub async fn mint_peer_relay_config(
         raw_tcp_addr,
         wss_url,
         relay_ticket,
+        peer_ed25519_pub_b64: peer_ed25519_pub_b64.to_string(),
         peer_x25519_pub_b64: peer_x25519_pub_b64.to_string(),
     })
 }
@@ -726,13 +1135,17 @@ async fn connect_herdr_with_install() -> Option<Arc<HerdrClient>> {
     }
 }
 
+struct PeerCryptoSession {
+    active_session_nonce: Option<String>,
+    e2ee: E2eeSession,
+}
+
 /// Seals and enqueues an outbound peer message while preserving exact monotonic E2EE sequence order.
 async fn send_e2ee_peer_message(
-    sessions: &Arc<Mutex<HashMap<Uuid, E2eeSession>>>,
+    sessions: &Arc<Mutex<HashMap<Uuid, PeerCryptoSession>>>,
     out_tx: &mpsc::Sender<RelayWireFrame>,
     my_device_id: Uuid,
     dst_device_id: Uuid,
-    my_dh_pub_b64: &str,
     msg: &PeerMessage,
     lane: TrafficLane,
 ) -> bool {
@@ -743,7 +1156,7 @@ async fn send_e2ee_peer_message(
     let Some(sess) = map.get_mut(&dst_device_id) else {
         return false;
     };
-    let Ok(sealed) = sess.seal_message(msg) else {
+    let Ok(sealed) = sess.e2ee.seal_message(msg) else {
         return false;
     };
     permit.send(RelayWireFrame::RoutePacket {
@@ -751,17 +1164,17 @@ async fn send_e2ee_peer_message(
         dst_device_id,
         lane,
         e2ee: sealed,
-        sender_x25519_pub_b64: Some(my_dh_pub_b64.to_string()),
+        sender_x25519_pub_b64: None,
+        session_auth: None,
     });
     true
 }
 
 fn spawn_herdr_event_forwarder(
     herdr: Arc<HerdrClient>,
-    sessions: Arc<Mutex<HashMap<Uuid, E2eeSession>>>,
+    sessions: Arc<Mutex<HashMap<Uuid, PeerCryptoSession>>>,
     out_tx: mpsc::Sender<RelayWireFrame>,
     my_device_id: Uuid,
-    my_dh_pub_b64: String,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let Ok(mut ev_rx) = herdr.subscribe_live_events().await else {
@@ -803,7 +1216,6 @@ fn spawn_herdr_event_forwarder(
                     &out_tx,
                     my_device_id,
                     peer_id,
-                    &my_dh_pub_b64,
                     &msg,
                     TrafficLane::ControlP0,
                 )
@@ -823,6 +1235,259 @@ impl Drop for TaskAbortGuard {
     }
 }
 
+/// Spawns a background synchronizer keeping `TrustedPeersStore` updated and evicting revoked peers.
+fn spawn_trusted_peers_sync_task(
+    cfg: &DaemonConfig,
+    peers_store: Arc<TrustedPeersStore>,
+    sessions: Arc<Mutex<HashMap<Uuid, PeerCryptoSession>>>,
+    active_ptys: Arc<Mutex<HashMap<(Uuid, String), PtyBridgeHandle>>>,
+) -> tokio::task::AbortHandle {
+    let server_url = cfg.server_url.clone();
+    let session_token = cfg.session_token.clone();
+    let handle = tokio::spawn(async move {
+        let prune_revoked = || async {
+            let live_ids: Vec<Uuid> = {
+                let map = sessions.lock().await;
+                map.keys().copied().collect()
+            };
+            for peer_id in live_ids {
+                if !peers_store.contains(&peer_id).await {
+                    sessions.lock().await.remove(&peer_id);
+                    active_ptys.lock().await.retain(|(dev, _), _| *dev != peer_id);
+                }
+            }
+        };
+
+        let mut ws_rx = match session_token.as_deref() {
+            Some(tok) if !tok.trim().is_empty() => {
+                subscribe_account_events_ws(&server_url, tok).await.ok()
+            }
+            _ => None,
+        };
+        let mut periodic = tokio::time::interval(std::time::Duration::from_secs(30));
+        periodic.tick().await;
+        loop {
+            tokio::select! {
+                _ = periodic.tick() => {
+                    if peers_store.refresh_from_server(true).await.is_ok() {
+                        prune_revoked().await;
+                    }
+                    if ws_rx.is_none() {
+                        if let Some(tok) = session_token.as_deref().filter(|s| !s.trim().is_empty()) {
+                            ws_rx = subscribe_account_events_ws(&server_url, tok).await.ok();
+                        }
+                    }
+                }
+                maybe_ev = async {
+                    match ws_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending::<Option<AccountLiveEvent>>().await,
+                    }
+                } => {
+                    match maybe_ev {
+                        Some(ev) => {
+                            if ev.kind != "connected" && peers_store.refresh_from_server(true).await.is_ok() {
+                                prune_revoked().await;
+                            }
+                        }
+                        None => {
+                            ws_rx = None;
+                        }
+                    }
+                }
+            }
+        }
+    });
+    handle.abort_handle()
+}
+
+/// Dispatches an authenticated/decrypted `PeerMessage`, isolating slow RPCs from the control loop.
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_decrypted_peer_message(
+    src_device_id: Uuid,
+    req_msg: PeerMessage,
+    herdr: &Option<Arc<HerdrClient>>,
+    hostname: &str,
+    active_ptys: &Arc<Mutex<HashMap<(Uuid, String), PtyBridgeHandle>>>,
+    sessions: &Arc<Mutex<HashMap<Uuid, PeerCryptoSession>>>,
+    out_tx: &mpsc::Sender<RelayWireFrame>,
+    my_device_id: Uuid,
+    rpc_semaphore: &Arc<Semaphore>,
+) {
+    if matches!(
+        req_msg,
+        PeerMessage::PtyInput { .. } | PeerMessage::PtyResize { .. }
+    ) {
+        let _ = handle_peer_request_full(
+            src_device_id,
+            req_msg,
+            herdr.as_deref(),
+            hostname,
+            active_ptys,
+            sessions,
+            out_tx,
+            my_device_id,
+        )
+        .await;
+        return;
+    }
+
+    let req_id_fallback = req_msg.request_id().unwrap_or("busy").to_string();
+    let Ok(permit) = Arc::clone(rpc_semaphore).try_acquire_owned() else {
+        let _ = send_e2ee_peer_message(
+            sessions,
+            out_tx,
+            my_device_id,
+            src_device_id,
+            &PeerMessage::ActionAck {
+                req_id: req_id_fallback,
+                ok: false,
+                detail: "daemon busy: concurrent RPC limit reached".into(),
+            },
+            TrafficLane::ControlP0,
+        )
+        .await;
+        return;
+    };
+
+    let herdr_c = herdr.clone();
+    let hostname_c = hostname.to_string();
+    let active_ptys_c = Arc::clone(active_ptys);
+    let sessions_c = Arc::clone(sessions);
+    let out_tx_c = out_tx.clone();
+    tokio::spawn(async move {
+        let _permit = permit;
+        if let Some((reply_msg, reply_lane)) = handle_peer_request_full(
+            src_device_id,
+            req_msg,
+            herdr_c.as_deref(),
+            &hostname_c,
+            &active_ptys_c,
+            &sessions_c,
+            &out_tx_c,
+            my_device_id,
+        )
+        .await
+        {
+            let _ = send_e2ee_peer_message(
+                &sessions_c,
+                &out_tx_c,
+                my_device_id,
+                src_device_id,
+                &reply_msg,
+                reply_lane,
+            )
+            .await;
+        }
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn open_and_verify_relay_route_packet(
+    src_device_id: Uuid,
+    dst_device_id: Uuid,
+    my_device_id: Uuid,
+    my_identity: &StoredDeviceIdentity,
+    e2ee: &coda_protocol::EncryptedPayload,
+    session_auth: &Option<RelaySessionAuth>,
+    peers_store: &TrustedPeersStore,
+    sessions: &Arc<Mutex<HashMap<Uuid, PeerCryptoSession>>>,
+    used_nonces: &Arc<Mutex<TimedReplayCache>>,
+    active_ptys: &Arc<Mutex<HashMap<(Uuid, String), PtyBridgeHandle>>>,
+) -> Result<PeerMessage> {
+    if dst_device_id != my_device_id {
+        anyhow::bail!("relay packet destination mismatch ({dst_device_id} != {my_device_id})");
+    }
+
+    // Fast path: packet belongs to the already authenticated active Relay v2 session nonce.
+    {
+        let mut map = sessions.lock().await;
+        if let Some(existing) = map.get_mut(&src_device_id) {
+            let matches_active = existing.active_session_nonce.is_some()
+                && existing.active_session_nonce.as_deref() == e2ee.session_nonce_b64.as_deref()
+                && match session_auth {
+                    Some(auth) => Some(auth.session_nonce_b64.as_str())
+                        == existing.active_session_nonce.as_deref(),
+                    None => true,
+                };
+            if matches_active {
+                return existing.e2ee.open_message(e2ee);
+            }
+        }
+    }
+
+    // New or replaced Relay session: strictly require signed RelaySessionAuth v2 (zero seq==1 bypass).
+    let auth = session_auth
+        .as_ref()
+        .ok_or_else(|| anyhow!("missing signed RelaySessionAuth from {src_device_id}"))?;
+    if e2ee.session_nonce_b64.as_deref() != Some(auth.session_nonce_b64.as_str()) {
+        anyhow::bail!("encrypted payload session_nonce_b64 mismatch");
+    }
+
+    let peer_entry = peers_store
+        .resolve_verified_peer(
+            src_device_id,
+            &auth.sender_ed25519_pub_b64,
+            &auth.sender_x25519_pub_b64,
+        )
+        .await?;
+
+    let now_ms = current_unix_ms();
+    auth.verify(
+        src_device_id,
+        my_device_id,
+        &peer_entry.ed25519_pub_b64,
+        &peer_entry.x25519_pub_b64,
+        now_ms,
+        HANDSHAKE_MAX_SKEW_MS,
+    )?;
+
+    let replay_key = format!("relay:{src_device_id}:{}", auth.session_nonce_b64);
+    let replay_ttl = std::time::Duration::from_millis(HANDSHAKE_MAX_SKEW_MS * 2);
+    if used_nonces.lock().await.contains_fresh(&replay_key, replay_ttl) {
+        anyhow::bail!("replayed RelaySessionAuth nonce from {src_device_id}");
+    }
+
+    let my_dh_secret = my_identity.x25519_secret()?;
+    let mut fresh = E2eeSession::derive_relay_session(
+        &my_dh_secret,
+        &peer_entry.x25519_pub_b64,
+        &auth.session_nonce_b64,
+        src_device_id,
+        my_device_id,
+        false,
+        auth.supports_zstd,
+    )?;
+
+    let opened = fresh.open_message(e2ee)?;
+
+    // Commit anti-replay state and replace active session ONLY AFTER AEAD verification succeeds.
+    used_nonces.lock().await.insert(replay_key, replay_ttl);
+    let old_nonce = {
+        let mut map = sessions.lock().await;
+        let prev = map
+            .insert(
+                src_device_id,
+                PeerCryptoSession {
+                    active_session_nonce: Some(auth.session_nonce_b64.clone()),
+                    e2ee: fresh,
+                },
+            )
+            .and_then(|s| s.active_session_nonce);
+        prev
+    };
+    if let Some(prev_nonce) = old_nonce {
+        let old_key = format!("relay:{src_device_id}:{prev_nonce}");
+        used_nonces.lock().await.insert(old_key, replay_ttl);
+        active_ptys
+            .lock()
+            .await
+            .retain(|(dev, _), _| *dev != src_device_id);
+    }
+
+    Ok(opened)
+}
+
 /// Runs a single connected Daemon session over either Raw TCP No-SNI or CDN WebSocket.
 pub async fn run_daemon_once(cfg: &DaemonConfig, prefer_mode: Option<&str>) -> Result<()> {
     run_daemon_once_with_p2p(cfg, prefer_mode, Some(DEFAULT_DIRECT_P2P_PORT)).await
@@ -833,6 +1498,18 @@ pub async fn run_daemon_once_with_p2p(
     cfg: &DaemonConfig,
     prefer_mode: Option<&str>,
     p2p_port: Option<u16>,
+) -> Result<()> {
+    let peers_store = TrustedPeersStore::from_daemon_config(cfg, None);
+    let _ = peers_store.refresh_from_server(true).await;
+    run_daemon_once_with_p2p_and_peers(cfg, prefer_mode, p2p_port, peers_store).await
+}
+
+/// Runs a connected Daemon Relay session using a shared `TrustedPeersStore`.
+pub async fn run_daemon_once_with_p2p_and_peers(
+    cfg: &DaemonConfig,
+    prefer_mode: Option<&str>,
+    p2p_port: Option<u16>,
+    peers_store: Arc<TrustedPeersStore>,
 ) -> Result<()> {
     let remote_server = cfg.server_url.starts_with("https://")
         || !is_loopback_endpoint(cfg.server_url.trim_start_matches("http://"));
@@ -853,6 +1530,8 @@ pub async fn run_daemon_once_with_p2p(
         anyhow::bail!("no relay nodes configured");
     }
 
+    let _ = peers_store.refresh_from_server(true).await;
+
     let (out_tx, mut out_rx) = mpsc::channel::<RelayWireFrame>(256);
     let (in_tx, mut in_rx) = mpsc::channel::<RelayWireFrame>(256);
     let mut _task_guard = TaskAbortGuard(Vec::new());
@@ -860,7 +1539,7 @@ pub async fn run_daemon_once_with_p2p(
     let bind_frame = RelayWireFrame::AuthBind {
         ticket: cfg.daemon_relay_ticket.clone(),
         lane: TrafficLane::ControlP0,
-        generation: 1,
+        generation: next_monotonic_generation(),
     };
 
     let mut connected = false;
@@ -897,7 +1576,12 @@ pub async fn run_daemon_once_with_p2p(
                 .write_all(&bind_frame.encode_length_delimited()?)
                 .await?;
 
-            let ack = read_raw_frame(&mut reader).await?;
+            let ack = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                read_raw_frame(&mut reader),
+            )
+            .await
+            .map_err(|_| anyhow!("raw TCP relay timed out waiting for AuthAck"))??;
             match ack {
                 RelayWireFrame::AuthAck { ok: true, .. } => {}
                 other => {
@@ -908,10 +1592,26 @@ pub async fn run_daemon_once_with_p2p(
 
             let in_tx_c = in_tx.clone();
             let tcp_writer = tokio::spawn(async move {
-                while let Some(f) = out_rx.recv().await {
-                    if let Ok(bytes) = f.encode_length_delimited() {
-                        if writer.write_all(&bytes).await.is_err() {
-                            break;
+                let mut keepalive =
+                    tokio::time::interval(std::time::Duration::from_secs(WS_KEEPALIVE_SECS));
+                keepalive.tick().await;
+                loop {
+                    tokio::select! {
+                        maybe_f = out_rx.recv() => {
+                            let Some(f) = maybe_f else { break; };
+                            if let Ok(bytes) = f.encode_length_delimited() {
+                                if writer.write_all(&bytes).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                        _ = keepalive.tick() => {
+                            let ka = RelayWireFrame::KeepAlive { ts_ms: current_unix_ms() };
+                            if let Ok(bytes) = ka.encode_length_delimited() {
+                                if writer.write_all(&bytes).await.is_err() {
+                                    break;
+                                }
+                            }
                         }
                     }
                 }
@@ -931,7 +1631,7 @@ pub async fn run_daemon_once_with_p2p(
         } else {
             let ws_res = tokio::time::timeout(
                 std::time::Duration::from_secs(6),
-                connect_async(&chosen.endpoint),
+                connect_async_with_config(&chosen.endpoint, Some(bounded_ws_config()), false),
             )
             .await;
             let (ws_stream, _) = match ws_res {
@@ -950,24 +1650,52 @@ pub async fn run_daemon_once_with_p2p(
             let (mut sink, mut stream) = ws_stream.split();
             sink.send(WsMsg::Text(serde_json::to_string(&bind_frame)?.into()))
                 .await?;
+            sink.flush().await?;
 
-            if let Some(Ok(WsMsg::Text(txt))) = stream.next().await {
+            if let Ok(Some(Ok(WsMsg::Text(txt)))) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), stream.next()).await
+            {
                 let ack: RelayWireFrame = serde_json::from_str(&txt)?;
                 if !matches!(ack, RelayWireFrame::AuthAck { ok: true, .. }) {
                     last_err = Some(anyhow!("unexpected WSS relay auth response: {ack:?}"));
                     continue;
                 }
             } else {
-                last_err = Some(anyhow!("WSS relay closed before AuthAck"));
+                last_err = Some(anyhow!("WSS relay closed or timed out before AuthAck"));
                 continue;
             }
 
             let in_tx_c = in_tx.clone();
+            let (pong_tx, mut pong_rx) = mpsc::channel::<Vec<u8>>(16);
             let wss_writer = tokio::spawn(async move {
-                while let Some(f) = out_rx.recv().await {
-                    if let Ok(txt) = serde_json::to_string(&f) {
-                        if sink.send(WsMsg::Text(txt.into())).await.is_err() {
-                            break;
+                let mut keepalive =
+                    tokio::time::interval(std::time::Duration::from_secs(WS_KEEPALIVE_SECS));
+                keepalive.tick().await;
+                loop {
+                    tokio::select! {
+                        Some(payload) = pong_rx.recv() => {
+                            if sink.send(WsMsg::Pong(payload.into())).await.is_err()
+                                || sink.flush().await.is_err()
+                            {
+                                break;
+                            }
+                        }
+                        maybe_f = out_rx.recv() => {
+                            let Some(f) = maybe_f else { break; };
+                            if let Ok(txt) = serde_json::to_string(&f) {
+                                if sink.send(WsMsg::Text(txt.into())).await.is_err()
+                                    || sink.flush().await.is_err()
+                                {
+                                    break;
+                                }
+                            }
+                        }
+                        _ = keepalive.tick() => {
+                            if sink.send(WsMsg::Ping(Vec::new().into())).await.is_err()
+                                || sink.flush().await.is_err()
+                            {
+                                break;
+                            }
                         }
                     }
                 }
@@ -976,12 +1704,27 @@ pub async fn run_daemon_once_with_p2p(
 
             let wss_reader = tokio::spawn(async move {
                 while let Some(Ok(msg)) = stream.next().await {
-                    if let WsMsg::Text(t) = msg {
-                        if let Ok(f) = serde_json::from_str::<RelayWireFrame>(&t) {
-                            if in_tx_c.send(f).await.is_err() {
-                                break;
+                    match msg {
+                        WsMsg::Text(t) => {
+                            if let Ok(f) = serde_json::from_str::<RelayWireFrame>(&t) {
+                                if in_tx_c.send(f).await.is_err() {
+                                    break;
+                                }
                             }
                         }
+                        WsMsg::Binary(b) => {
+                            if let Ok(f) = serde_json::from_slice::<RelayWireFrame>(&b) {
+                                if in_tx_c.send(f).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                        WsMsg::Ping(p) => {
+                            let _ = pong_tx.try_send(p.to_vec());
+                        }
+                        WsMsg::Pong(_) => {}
+                        WsMsg::Close(_) => break,
+                        _ => {}
                     }
                 }
             });
@@ -1040,13 +1783,24 @@ pub async fn run_daemon_once_with_p2p(
         warn!("herdr-core not active yet; daemon running in degraded diagnostics mode");
     }
 
-    let sessions: Arc<Mutex<HashMap<Uuid, E2eeSession>>> = Arc::new(Mutex::new(HashMap::new()));
+    let sessions: Arc<Mutex<HashMap<Uuid, PeerCryptoSession>>> =
+        Arc::new(Mutex::new(HashMap::new()));
     let active_ptys: Arc<Mutex<HashMap<(Uuid, String), PtyBridgeHandle>>> =
         Arc::new(Mutex::new(HashMap::new()));
-    let my_dh_secret = cfg.identity.x25519_secret()?;
-    let my_dh_pub_b64 = cfg.identity.x25519_public_b64.clone();
+    let used_relay_nonces: Arc<Mutex<TimedReplayCache>> =
+        Arc::new(Mutex::new(TimedReplayCache::default()));
+    let rpc_semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_PEER_RPCS));
+    let _ = cfg.identity.x25519_secret()?;
     let my_device_id = cfg.device_id;
     let hostname = cfg.identity.name.clone();
+
+    let peers_sync_abort = spawn_trusted_peers_sync_task(
+        cfg,
+        Arc::clone(&peers_store),
+        Arc::clone(&sessions),
+        Arc::clone(&active_ptys),
+    );
+    _task_guard.0.push(peers_sync_abort);
 
     let event_forwarder = herdr.as_ref().map(|hc| {
         let h = spawn_herdr_event_forwarder(
@@ -1054,88 +1808,56 @@ pub async fn run_daemon_once_with_p2p(
             Arc::clone(&sessions),
             out_tx.clone(),
             my_device_id,
-            my_dh_pub_b64.clone(),
         );
         _task_guard.0.push(h.abort_handle());
         h
     });
 
     while let Some(frame) = in_rx.recv().await {
-        if let RelayWireFrame::RoutePacket {
-            src_device_id,
-            e2ee,
-            sender_x25519_pub_b64,
-            ..
-        } = frame
-        {
-            let req_msg = {
-                let mut map = sessions.lock().await;
-                if !map.contains_key(&src_device_id) {
-                    if let Some(ref peer_pub) = sender_x25519_pub_b64 {
-                        if let Ok(sess) = E2eeSession::derive(&my_dh_secret, peer_pub, false) {
-                            map.insert(src_device_id, sess);
-                        }
-                    }
-                }
-                let Some(sess) = map.get_mut(&src_device_id) else {
-                    warn!("cannot decrypt packet from {src_device_id}: missing peer X25519 pubkey");
-                    continue;
-                };
-
-                match sess.open_message(&e2ee) {
+        match frame {
+            RelayWireFrame::KeepAlive { .. } => {}
+            RelayWireFrame::RoutePacket {
+                src_device_id,
+                dst_device_id,
+                e2ee,
+                session_auth,
+                ..
+            } => {
+                let req_msg = match open_and_verify_relay_route_packet(
+                    src_device_id,
+                    dst_device_id,
+                    my_device_id,
+                    &cfg.identity,
+                    &e2ee,
+                    &session_auth,
+                    &peers_store,
+                    &sessions,
+                    &used_relay_nonces,
+                    &active_ptys,
+                )
+                .await
+                {
                     Ok(m) => m,
                     Err(e) => {
-                        if e2ee.seq == 1 {
-                            if let Some(ref peer_pub) = sender_x25519_pub_b64 {
-                                if let Ok(mut fresh) =
-                                    E2eeSession::derive(&my_dh_secret, peer_pub, false)
-                                {
-                                    if let Ok(m) = fresh.open_message(&e2ee) {
-                                        *sess = fresh;
-                                        m
-                                    } else {
-                                        warn!("E2EE open failed after re-derive: {e}");
-                                        continue;
-                                    }
-                                } else {
-                                    continue;
-                                }
-                            } else {
-                                continue;
-                            }
-                        } else {
-                            warn!("E2EE open error from {src_device_id}: {e}");
-                            continue;
-                        }
+                        warn!("rejected relay packet from {src_device_id}: {e}");
+                        continue;
                     }
-                }
-            };
+                };
 
-            let maybe_reply = handle_peer_request_full(
-                src_device_id,
-                req_msg,
-                herdr.as_deref(),
-                &hostname,
-                &active_ptys,
-                &sessions,
-                &out_tx,
-                my_device_id,
-                &my_dh_pub_b64,
-            )
-            .await;
-
-            if let Some((reply_msg, reply_lane)) = maybe_reply {
-                let _ = send_e2ee_peer_message(
+                dispatch_decrypted_peer_message(
+                    src_device_id,
+                    req_msg,
+                    &herdr,
+                    &hostname,
+                    &active_ptys,
                     &sessions,
                     &out_tx,
                     my_device_id,
-                    src_device_id,
-                    &my_dh_pub_b64,
-                    &reply_msg,
-                    reply_lane,
+                    &rpc_semaphore,
                 )
                 .await;
             }
+            _ => {}
         }
     }
 
@@ -1158,6 +1880,27 @@ pub async fn spawn_direct_p2p_listener(
     cfg: DaemonConfig,
     bind_addr: SocketAddr,
 ) -> Result<SocketAddr> {
+    let peers_store = TrustedPeersStore::from_daemon_config(&cfg, None);
+    let _ = peers_store.refresh_from_server(true).await;
+    spawn_direct_p2p_listener_with_peers(cfg, bind_addr, peers_store).await
+}
+
+/// Spawns Direct P2P TCP/WS listener sharing a caller-provided `TrustedPeersStore`.
+pub async fn spawn_direct_p2p_listener_with_peers(
+    cfg: DaemonConfig,
+    bind_addr: SocketAddr,
+    peers_store: Arc<TrustedPeersStore>,
+) -> Result<SocketAddr> {
+    spawn_direct_p2p_listener_with_abort(cfg, bind_addr, peers_store)
+        .await
+        .map(|(addr, _)| addr)
+}
+
+async fn spawn_direct_p2p_listener_with_abort(
+    cfg: DaemonConfig,
+    bind_addr: SocketAddr,
+    peers_store: Arc<TrustedPeersStore>,
+) -> Result<(SocketAddr, tokio::task::AbortHandle)> {
     let listener = TcpListener::bind(bind_addr).await?;
     let local_addr = listener.local_addr()?;
     info!(
@@ -1166,11 +1909,14 @@ pub async fn spawn_direct_p2p_listener(
     );
 
     let herdr = connect_herdr_with_install().await;
+    let p2p_replay = Arc::new(Mutex::new(TimedReplayCache::default()));
 
-    tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         while let Ok((stream, peer_addr)) = listener.accept().await {
             let cfg_clone = cfg.clone();
             let herdr_clone = herdr.clone();
+            let peers_clone = Arc::clone(&peers_store);
+            let replay_clone = Arc::clone(&p2p_replay);
             tokio::spawn(async move {
                 let _ = stream.set_nodelay(true);
                 let mut peek4 = [0u8; 4];
@@ -1183,9 +1929,25 @@ pub async fn spawn_direct_p2p_listener(
                     Ok(Ok(n)) if n >= 4 && &peek4 == b"GET "
                 );
                 let res = if is_ws {
-                    handle_direct_p2p_ws_socket(stream, peer_addr, cfg_clone, herdr_clone).await
+                    handle_direct_p2p_ws_socket(
+                        stream,
+                        peer_addr,
+                        cfg_clone,
+                        herdr_clone,
+                        peers_clone,
+                        replay_clone,
+                    )
+                    .await
                 } else {
-                    handle_direct_p2p_socket(stream, peer_addr, cfg_clone, herdr_clone).await
+                    handle_direct_p2p_socket(
+                        stream,
+                        peer_addr,
+                        cfg_clone,
+                        herdr_clone,
+                        peers_clone,
+                        replay_clone,
+                    )
+                    .await
                 };
                 if let Err(e) = res {
                     warn!("direct P2P session from {peer_addr} ended: {e}");
@@ -1194,29 +1956,82 @@ pub async fn spawn_direct_p2p_listener(
         }
     });
 
-    Ok(local_addr)
+    Ok((local_addr, handle.abort_handle()))
 }
 
-fn verify_direct_p2p_hello(cfg: &DaemonConfig, hello: RelayWireFrame) -> Result<(Uuid, String)> {
+struct VerifiedP2pHello {
+    client_device_id: Uuid,
+    client_static_x25519_pub_b64: String,
+    client_ephemeral_x25519_pub_b64: String,
+    supports_zstd: bool,
+}
+
+async fn verify_direct_p2p_hello(
+    cfg: &DaemonConfig,
+    peers_store: &TrustedPeersStore,
+    replay_cache: &Arc<Mutex<TimedReplayCache>>,
+    hello: RelayWireFrame,
+) -> Result<VerifiedP2pHello> {
     match hello {
         RelayWireFrame::DirectP2pHello {
             client_device_id,
             target_device_id,
             client_ed25519_pub_b64,
             client_x25519_pub_b64,
+            client_ephemeral_x25519_pub_b64,
             timestamp_ms,
             signature_b64,
+            supports_zstd,
         } => {
             if target_device_id != cfg.device_id {
                 anyhow::bail!("P2P target device mismatch");
             }
-            let signed_msg = format!("p2p:{client_device_id}:{target_device_id}:{timestamp_ms}");
+            let now_ms = current_unix_ms();
+            if !is_timestamp_fresh(timestamp_ms, now_ms, HANDSHAKE_MAX_SKEW_MS) {
+                anyhow::bail!("P2P handshake timestamp expired or skewed");
+            }
+            validate_ed25519_pub_b64(&client_ed25519_pub_b64)?;
+            validate_x25519_pub_b64(&client_x25519_pub_b64)?;
+            if client_ephemeral_x25519_pub_b64.trim().is_empty() {
+                anyhow::bail!("P2P v2 requires non-empty client_ephemeral_x25519_pub_b64");
+            }
+            validate_x25519_pub_b64(&client_ephemeral_x25519_pub_b64)?;
+
+            let peer_entry = peers_store
+                .resolve_verified_peer(
+                    client_device_id,
+                    &client_ed25519_pub_b64,
+                    &client_x25519_pub_b64,
+                )
+                .await?;
+
+            let signed = p2p_hello_v2_signing_bytes(
+                client_device_id,
+                target_device_id,
+                &peer_entry.x25519_pub_b64,
+                &client_ephemeral_x25519_pub_b64,
+                timestamp_ms,
+            );
             StoredDeviceIdentity::verify_signature(
-                &client_ed25519_pub_b64,
-                signed_msg.as_bytes(),
+                &peer_entry.ed25519_pub_b64,
+                &signed,
                 &signature_b64,
             )?;
-            Ok((client_device_id, client_x25519_pub_b64))
+
+            let replay_key = format!(
+                "p2p:{client_device_id}:{timestamp_ms}:{client_ephemeral_x25519_pub_b64}:{signature_b64}"
+            );
+            let ttl = std::time::Duration::from_millis(HANDSHAKE_MAX_SKEW_MS * 2);
+            if !replay_cache.lock().await.check_and_insert(replay_key, ttl) {
+                anyhow::bail!("replayed DirectP2pHello rejected");
+            }
+
+            Ok(VerifiedP2pHello {
+                client_device_id,
+                client_static_x25519_pub_b64: peer_entry.x25519_pub_b64,
+                client_ephemeral_x25519_pub_b64,
+                supports_zstd,
+            })
         }
         other => anyhow::bail!("expected DirectP2pHello, got {other:?}"),
     }
@@ -1227,25 +2042,30 @@ async fn dispatch_direct_p2p_frame(
     frame: RelayWireFrame,
     cfg: &DaemonConfig,
     herdr: &Option<Arc<HerdrClient>>,
-    sessions: &Arc<Mutex<HashMap<Uuid, E2eeSession>>>,
+    sessions: &Arc<Mutex<HashMap<Uuid, PeerCryptoSession>>>,
     active_ptys: &Arc<Mutex<HashMap<(Uuid, String), PtyBridgeHandle>>>,
     out_tx: &mpsc::Sender<RelayWireFrame>,
+    rpc_semaphore: &Arc<Semaphore>,
 ) {
     match frame {
         RelayWireFrame::KeepAlive { ts_ms } => {
-            let _ = out_tx.send(RelayWireFrame::KeepAlive { ts_ms }).await;
+            let _ = out_tx.try_send(RelayWireFrame::KeepAlive { ts_ms });
         }
         RelayWireFrame::RoutePacket {
             src_device_id,
+            dst_device_id,
             e2ee,
             ..
         } => {
+            if dst_device_id != cfg.device_id {
+                return;
+            }
             let req_msg = {
                 let mut map = sessions.lock().await;
                 let Some(s) = map.get_mut(&src_device_id) else {
                     return;
                 };
-                match s.open_message(&e2ee) {
+                match s.e2ee.open_message(&e2ee) {
                     Ok(m) => m,
                     Err(e) => {
                         warn!("P2P E2EE open error: {e}");
@@ -1254,50 +2074,67 @@ async fn dispatch_direct_p2p_frame(
                 }
             };
 
-            let my_dh_pub_b64 = &cfg.identity.x25519_public_b64;
-            if let Some((reply_msg, reply_lane)) = handle_peer_request_full(
+            dispatch_decrypted_peer_message(
                 src_device_id,
                 req_msg,
-                herdr.as_deref(),
+                herdr,
                 &cfg.identity.name,
                 active_ptys,
                 sessions,
                 out_tx,
                 cfg.device_id,
-                my_dh_pub_b64,
+                rpc_semaphore,
             )
-            .await
-            {
-                let _ = send_e2ee_peer_message(
-                    sessions,
-                    out_tx,
-                    cfg.device_id,
-                    src_device_id,
-                    my_dh_pub_b64,
-                    &reply_msg,
-                    reply_lane,
-                )
-                .await;
-            }
+            .await;
         }
         _ => {}
     }
 }
 
-async fn init_p2p_session_state(
+fn build_signed_p2p_ack_and_session(
     cfg: &DaemonConfig,
-    client_device_id: Uuid,
-    client_x25519_pub_b64: &str,
-) -> Result<(
-    Arc<Mutex<HashMap<Uuid, E2eeSession>>>,
-    Arc<Mutex<HashMap<(Uuid, String), PtyBridgeHandle>>>,
-)> {
+    verified: &VerifiedP2pHello,
+    path_kind: &str,
+) -> Result<(RelayWireFrame, PeerCryptoSession)> {
     let my_dh_secret = cfg.identity.x25519_secret()?;
-    let sess = E2eeSession::derive(&my_dh_secret, client_x25519_pub_b64, false)?;
-    let sessions = Arc::new(Mutex::new(HashMap::new()));
-    sessions.lock().await.insert(client_device_id, sess);
-    let active_ptys = Arc::new(Mutex::new(HashMap::new()));
-    Ok((sessions, active_ptys))
+    let (daemon_eph_secret, daemon_eph_pub_b64) = StoredDeviceIdentity::generate_ephemeral_x25519();
+    let ack_ts = current_unix_ms();
+    let ack_signing = p2p_ack_v2_signing_bytes(
+        verified.client_device_id,
+        cfg.device_id,
+        &verified.client_ephemeral_x25519_pub_b64,
+        &daemon_eph_pub_b64,
+        ack_ts,
+    );
+    let signature_b64 = cfg.identity.sign(&ack_signing)?;
+    let sess = E2eeSession::derive_ephemeral_p2p(
+        &my_dh_secret,
+        &verified.client_static_x25519_pub_b64,
+        &daemon_eph_secret,
+        &verified.client_ephemeral_x25519_pub_b64,
+        verified.client_device_id,
+        cfg.device_id,
+        false,
+        verified.supports_zstd,
+    )?;
+    let ack = RelayWireFrame::DirectP2pAck {
+        ok: true,
+        daemon_device_id: cfg.device_id,
+        daemon_ed25519_pub_b64: cfg.identity.ed25519_public_b64.clone(),
+        daemon_x25519_pub_b64: cfg.identity.x25519_public_b64.clone(),
+        daemon_ephemeral_x25519_pub_b64: daemon_eph_pub_b64,
+        timestamp_ms: ack_ts,
+        signature_b64,
+        path_kind: path_kind.into(),
+        error: None,
+    };
+    Ok((
+        ack,
+        PeerCryptoSession {
+            active_session_nonce: None,
+            e2ee: sess,
+        },
+    ))
 }
 
 async fn handle_direct_p2p_socket(
@@ -1305,50 +2142,101 @@ async fn handle_direct_p2p_socket(
     peer_addr: SocketAddr,
     cfg: DaemonConfig,
     herdr: Option<Arc<HerdrClient>>,
+    peers_store: Arc<TrustedPeersStore>,
+    replay_cache: Arc<Mutex<TimedReplayCache>>,
 ) -> Result<()> {
     let (mut reader, mut writer) = stream.into_split();
 
-    let hello = read_raw_frame(&mut reader).await?;
-    let (client_device_id, client_x25519_pub_b64) = verify_direct_p2p_hello(&cfg, hello)?;
+    let hello = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        read_raw_frame(&mut reader),
+    )
+    .await
+    .map_err(|_| anyhow!("direct P2P hello read timed out"))??;
 
     let path_kind = if peer_addr.is_ipv6() {
         "cn_public_ipv6"
     } else {
         "lan_ipv4"
     };
-    let ack = RelayWireFrame::DirectP2pAck {
-        ok: true,
-        daemon_device_id: cfg.device_id,
-        daemon_x25519_pub_b64: cfg.identity.x25519_public_b64.clone(),
-        path_kind: path_kind.into(),
+
+    let verified = match verify_direct_p2p_hello(&cfg, &peers_store, &replay_cache, hello).await {
+        Ok(v) => v,
+        Err(e) => {
+            let reject = RelayWireFrame::DirectP2pAck {
+                ok: false,
+                daemon_device_id: cfg.device_id,
+                daemon_ed25519_pub_b64: cfg.identity.ed25519_public_b64.clone(),
+                daemon_x25519_pub_b64: cfg.identity.x25519_public_b64.clone(),
+                daemon_ephemeral_x25519_pub_b64: String::new(),
+                timestamp_ms: current_unix_ms(),
+                signature_b64: String::new(),
+                path_kind: path_kind.into(),
+                error: Some(e.to_string()),
+            };
+            if let Ok(bytes) = reject.encode_length_delimited() {
+                let _ = writer.write_all(&bytes).await;
+            }
+            return Err(e);
+        }
     };
+
+    let (ack, p2p_sess) = build_signed_p2p_ack_and_session(&cfg, &verified, path_kind)?;
     writer.write_all(&ack.encode_length_delimited()?).await?;
 
     let (out_tx, mut out_rx) = mpsc::channel::<RelayWireFrame>(256);
     let write_task = tokio::spawn(async move {
-        while let Some(f) = out_rx.recv().await {
-            if let Ok(bytes) = f.encode_length_delimited() {
-                if writer.write_all(&bytes).await.is_err() {
-                    break;
+        let mut keepalive = tokio::time::interval(std::time::Duration::from_secs(WS_KEEPALIVE_SECS));
+        keepalive.tick().await;
+        loop {
+            tokio::select! {
+                maybe_f = out_rx.recv() => {
+                    let Some(f) = maybe_f else { break; };
+                    if let Ok(bytes) = f.encode_length_delimited() {
+                        if writer.write_all(&bytes).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+                _ = keepalive.tick() => {
+                    let ka = RelayWireFrame::KeepAlive { ts_ms: current_unix_ms() };
+                    if let Ok(bytes) = ka.encode_length_delimited() {
+                        if writer.write_all(&bytes).await.is_err() {
+                            break;
+                        }
+                    }
                 }
             }
         }
     });
 
-    let (sessions, active_ptys) =
-        init_p2p_session_state(&cfg, client_device_id, &client_x25519_pub_b64).await?;
+    let sessions = Arc::new(Mutex::new(HashMap::new()));
+    sessions
+        .lock()
+        .await
+        .insert(verified.client_device_id, p2p_sess);
+    let active_ptys = Arc::new(Mutex::new(HashMap::new()));
+    let rpc_semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_PEER_RPCS));
     let event_forwarder = herdr.as_ref().map(|hc| {
         spawn_herdr_event_forwarder(
             Arc::clone(hc),
             Arc::clone(&sessions),
             out_tx.clone(),
             cfg.device_id,
-            cfg.identity.x25519_public_b64.clone(),
         )
     });
 
     while let Ok(frame) = read_raw_frame(&mut reader).await {
-        dispatch_direct_p2p_frame(frame, &cfg, &herdr, &sessions, &active_ptys, &out_tx).await;
+        dispatch_direct_p2p_frame(
+            frame,
+            &cfg,
+            &herdr,
+            &sessions,
+            &active_ptys,
+            &out_tx,
+            &rpc_semaphore,
+        )
+        .await;
     }
 
     if let Some(f) = event_forwarder {
@@ -1364,67 +2252,142 @@ async fn handle_direct_p2p_ws_socket(
     peer_addr: SocketAddr,
     cfg: DaemonConfig,
     herdr: Option<Arc<HerdrClient>>,
+    peers_store: Arc<TrustedPeersStore>,
+    replay_cache: Arc<Mutex<TimedReplayCache>>,
 ) -> Result<()> {
-    let ws_stream = accept_async(stream)
+    let ws_stream = accept_async_with_config(stream, Some(bounded_ws_config()))
         .await
         .with_context(|| format!("direct P2P WebSocket upgrade failed for {peer_addr}"))?;
     let (mut sink, mut rx) = ws_stream.split();
 
-    let Some(first_msg) = rx.next().await else {
-        anyhow::bail!("direct P2P WebSocket closed before hello");
-    };
+    let first_msg = tokio::time::timeout(std::time::Duration::from_secs(10), rx.next())
+        .await
+        .map_err(|_| anyhow!("direct P2P WebSocket hello read timed out"))?
+        .ok_or_else(|| anyhow!("direct P2P WebSocket closed before hello"))?;
     let hello: RelayWireFrame = match first_msg? {
         WsMsg::Text(t) => serde_json::from_str(&t)?,
         WsMsg::Binary(b) => serde_json::from_slice(&b)?,
         other => anyhow::bail!("unexpected initial WS message: {other:?}"),
     };
-    let (client_device_id, client_x25519_pub_b64) = verify_direct_p2p_hello(&cfg, hello)?;
 
     let path_kind = if peer_addr.is_ipv6() {
         "ipv6_ws"
     } else {
         "lan_ws"
     };
-    let ack = RelayWireFrame::DirectP2pAck {
-        ok: true,
-        daemon_device_id: cfg.device_id,
-        daemon_x25519_pub_b64: cfg.identity.x25519_public_b64.clone(),
-        path_kind: path_kind.into(),
+    let verified = match verify_direct_p2p_hello(&cfg, &peers_store, &replay_cache, hello).await {
+        Ok(v) => v,
+        Err(e) => {
+            let reject = RelayWireFrame::DirectP2pAck {
+                ok: false,
+                daemon_device_id: cfg.device_id,
+                daemon_ed25519_pub_b64: cfg.identity.ed25519_public_b64.clone(),
+                daemon_x25519_pub_b64: cfg.identity.x25519_public_b64.clone(),
+                daemon_ephemeral_x25519_pub_b64: String::new(),
+                timestamp_ms: current_unix_ms(),
+                signature_b64: String::new(),
+                path_kind: path_kind.into(),
+                error: Some(e.to_string()),
+            };
+            if let Ok(txt) = serde_json::to_string(&reject) {
+                let _ = sink.send(WsMsg::Text(txt.into())).await;
+                let _ = sink.flush().await;
+            }
+            return Err(e);
+        }
     };
+
+    let (ack, p2p_sess) = build_signed_p2p_ack_and_session(&cfg, &verified, path_kind)?;
     sink.send(WsMsg::Text(serde_json::to_string(&ack)?.into()))
         .await?;
+    sink.flush().await?;
 
     let (out_tx, mut out_rx) = mpsc::channel::<RelayWireFrame>(256);
+    let (pong_tx, mut pong_rx) = mpsc::channel::<Vec<u8>>(16);
     let write_task = tokio::spawn(async move {
-        while let Some(f) = out_rx.recv().await {
-            if let Ok(txt) = serde_json::to_string(&f) {
-                if sink.send(WsMsg::Text(txt.into())).await.is_err() {
-                    break;
+        let mut keepalive = tokio::time::interval(std::time::Duration::from_secs(WS_KEEPALIVE_SECS));
+        keepalive.tick().await;
+        loop {
+            tokio::select! {
+                Some(p) = pong_rx.recv() => {
+                    if sink.send(WsMsg::Pong(p.into())).await.is_err()
+                        || sink.flush().await.is_err()
+                    {
+                        break;
+                    }
+                }
+                maybe_f = out_rx.recv() => {
+                    let Some(f) = maybe_f else { break; };
+                    if let Ok(txt) = serde_json::to_string(&f) {
+                        if sink.send(WsMsg::Text(txt.into())).await.is_err()
+                            || sink.flush().await.is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
+                _ = keepalive.tick() => {
+                    if sink.send(WsMsg::Ping(Vec::new().into())).await.is_err()
+                        || sink.flush().await.is_err()
+                    {
+                        break;
+                    }
                 }
             }
         }
     });
 
-    let (sessions, active_ptys) =
-        init_p2p_session_state(&cfg, client_device_id, &client_x25519_pub_b64).await?;
+    let sessions = Arc::new(Mutex::new(HashMap::new()));
+    sessions
+        .lock()
+        .await
+        .insert(verified.client_device_id, p2p_sess);
+    let active_ptys = Arc::new(Mutex::new(HashMap::new()));
+    let rpc_semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_PEER_RPCS));
     let event_forwarder = herdr.as_ref().map(|hc| {
         spawn_herdr_event_forwarder(
             Arc::clone(hc),
             Arc::clone(&sessions),
             out_tx.clone(),
             cfg.device_id,
-            cfg.identity.x25519_public_b64.clone(),
         )
     });
 
     while let Some(Ok(msg)) = rx.next().await {
-        let frame_opt: Option<RelayWireFrame> = match msg {
-            WsMsg::Text(t) => serde_json::from_str(&t).ok(),
-            WsMsg::Binary(b) => serde_json::from_slice(&b).ok(),
-            _ => None,
-        };
-        if let Some(frame) = frame_opt {
-            dispatch_direct_p2p_frame(frame, &cfg, &herdr, &sessions, &active_ptys, &out_tx).await;
+        match msg {
+            WsMsg::Text(t) => {
+                if let Ok(frame) = serde_json::from_str::<RelayWireFrame>(&t) {
+                    dispatch_direct_p2p_frame(
+                        frame,
+                        &cfg,
+                        &herdr,
+                        &sessions,
+                        &active_ptys,
+                        &out_tx,
+                        &rpc_semaphore,
+                    )
+                    .await;
+                }
+            }
+            WsMsg::Binary(b) => {
+                if let Ok(frame) = serde_json::from_slice::<RelayWireFrame>(&b) {
+                    dispatch_direct_p2p_frame(
+                        frame,
+                        &cfg,
+                        &herdr,
+                        &sessions,
+                        &active_ptys,
+                        &out_tx,
+                        &rpc_semaphore,
+                    )
+                    .await;
+                }
+            }
+            WsMsg::Ping(p) => {
+                let _ = pong_tx.try_send(p.to_vec());
+            }
+            WsMsg::Close(_) => break,
+            _ => {}
         }
     }
 
@@ -1443,6 +2406,16 @@ pub async fn spawn_lan_udp_beacon(
     tcp_p2p_port: u16,
     bind_addr: SocketAddr,
 ) -> Result<SocketAddr> {
+    spawn_lan_udp_beacon_with_abort(device_id, tcp_p2p_port, bind_addr)
+        .await
+        .map(|(addr, _)| addr)
+}
+
+async fn spawn_lan_udp_beacon_with_abort(
+    device_id: Uuid,
+    tcp_p2p_port: u16,
+    bind_addr: SocketAddr,
+) -> Result<(SocketAddr, tokio::task::AbortHandle)> {
     let sock = TokioUdpSocket::bind(bind_addr).await?;
     let local_addr = sock.local_addr()?;
     info!(
@@ -1450,7 +2423,7 @@ pub async fn spawn_lan_udp_beacon(
         local_addr, tcp_p2p_port
     );
 
-    tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         let mut buf = [0u8; 512];
         loop {
             let Ok((len, src_addr)) = sock.recv_from(&mut buf).await else {
@@ -1481,7 +2454,7 @@ pub async fn spawn_lan_udp_beacon(
         }
     });
 
-    Ok(local_addr)
+    Ok((local_addr, handle.abort_handle()))
 }
 
 /// Sends a zero-config Wi-Fi UDP discovery probe (NEVER `connect()`s the UDP socket so unicast
@@ -1536,51 +2509,87 @@ pub async fn probe_lan_udp_peer(
     None
 }
 
-/// Starts embedded host P2P + UDP LAN beacon + Relay uplink inside desktop apps (e.g. `coda-desktop`)
-/// if `cfg_path` exists and port `24444` is not already owned by a standalone `coda-daemon` process.
-pub async fn start_embedded_host_if_configured(cfg_path: &Path) -> Option<SocketAddr> {
-    if let Some(parent) = cfg_path.parent() {
-        let pid_file = parent.join("coda-daemon.pid");
-        if let Ok(raw) = std::fs::read_to_string(&pid_file) {
-            if let Ok(pid) = raw.trim().parse::<u32>() {
-                if pid > 0 {
-                    let alive = std::process::Command::new("kill")
-                        .args(["-0", &pid.to_string()])
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .status()
-                        .map(|s| s.success())
-                        .unwrap_or(false);
-                    if alive {
-                        return None;
-                    }
-                }
-            }
+/// Shutdown handle for an embedded desktop host P2P/UDP/relay runtime.
+#[derive(Debug, Clone)]
+pub struct EmbeddedHostHandle {
+    pub local_addr: SocketAddr,
+    abort_handles: Arc<Vec<tokio::task::AbortHandle>>,
+}
+
+impl EmbeddedHostHandle {
+    /// Terminates the embedded relay loop, P2P listener, and UDP beacon and releases the daemon lock.
+    pub fn stop(&self) {
+        for handle in self.abort_handles.iter() {
+            handle.abort();
         }
     }
+}
 
+/// Starts embedded host P2P + UDP LAN beacon + Relay uplink inside desktop apps (e.g. `coda-desktop`)
+/// if `cfg_path` exists and no external `coda-daemon` holds `coda-daemon.lock`.
+pub async fn start_embedded_host_if_configured(cfg_path: &Path) -> Option<SocketAddr> {
+    start_embedded_host_with_handle(cfg_path)
+        .await
+        .map(|h| h.local_addr)
+}
+
+/// Starts the embedded desktop host and returns a handle that cleanly aborts its tasks on sign-out.
+pub async fn start_embedded_host_with_handle(cfg_path: &Path) -> Option<EmbeddedHostHandle> {
+    let lock = try_acquire_daemon_lock(cfg_path).ok().flatten()?;
     let cfg = DaemonConfig::load(cfg_path).ok()?;
+    let peers_store = TrustedPeersStore::from_daemon_config(
+        &cfg,
+        Some(DaemonConfig::trusted_peers_path(cfg_path)),
+    );
+    let _ = peers_store.refresh_from_server(true).await;
+
+    let mut abort_handles = Vec::new();
     let p2p_bind = SocketAddr::from(([0, 0, 0, 0], DEFAULT_DIRECT_P2P_PORT));
-    let p2p_addr = match spawn_direct_p2p_listener(cfg.clone(), p2p_bind).await {
-        Ok(addr) => addr,
+    let (p2p_addr, p2p_abort) = match spawn_direct_p2p_listener_with_abort(
+        cfg.clone(),
+        p2p_bind,
+        Arc::clone(&peers_store),
+    )
+    .await
+    {
+        Ok(res) => res,
         Err(_) => {
             let fallback = SocketAddr::from(([0, 0, 0, 0], 0));
-            spawn_direct_p2p_listener(cfg.clone(), fallback).await.ok()?
+            spawn_direct_p2p_listener_with_abort(cfg.clone(), fallback, Arc::clone(&peers_store))
+                .await
+                .ok()?
         }
     };
-    let _ = spawn_lan_udp_beacon(cfg.device_id, p2p_addr.port(), p2p_bind).await;
+    abort_handles.push(p2p_abort);
+    if let Ok((_, udp_abort)) =
+        spawn_lan_udp_beacon_with_abort(cfg.device_id, p2p_addr.port(), p2p_bind).await
+    {
+        abort_handles.push(udp_abort);
+    }
 
     let port = p2p_addr.port();
-    tokio::spawn(async move {
+    let relay_task = tokio::spawn(async move {
+        let _held_lock = lock;
         loop {
-            if let Err(e) = run_daemon_once_with_p2p(&cfg, None, Some(port)).await {
+            if let Err(e) = run_daemon_once_with_p2p_and_peers(
+                &cfg,
+                None,
+                Some(port),
+                Arc::clone(&peers_store),
+            )
+            .await
+            {
                 warn!("embedded Mac host relay disconnected ({e}); reconnecting in 2s...");
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             }
         }
     });
+    abort_handles.push(relay_task.abort_handle());
 
-    Some(p2p_addr)
+    Some(EmbeddedHostHandle {
+        local_addr: p2p_addr,
+        abort_handles: Arc::new(abort_handles),
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1590,10 +2599,9 @@ async fn handle_peer_request_full(
     herdr: Option<&HerdrClient>,
     hostname: &str,
     active_ptys: &Arc<Mutex<HashMap<(Uuid, String), PtyBridgeHandle>>>,
-    sessions: &Arc<Mutex<HashMap<Uuid, E2eeSession>>>,
+    sessions: &Arc<Mutex<HashMap<Uuid, PeerCryptoSession>>>,
     out_tx: &mpsc::Sender<RelayWireFrame>,
     my_device_id: Uuid,
-    my_dh_pub_b64: &str,
 ) -> Option<(PeerMessage, TrafficLane)> {
     match msg {
         PeerMessage::ListWorkspaces { req_id, root_dirs } => {
@@ -1644,7 +2652,6 @@ async fn handle_peer_request_full(
 
                     let sessions_clone = Arc::clone(sessions);
                     let out_tx_clone = out_tx.clone();
-                    let dh_pub = my_dh_pub_b64.to_string();
                     tokio::spawn(async move {
                         while let Some(ev) = pty_rx.recv().await {
                             let chunk_msg = PeerMessage::PtyOutputChunk {
@@ -1657,7 +2664,6 @@ async fn handle_peer_request_full(
                                 &out_tx_clone,
                                 my_device_id,
                                 src_device_id,
-                                &dh_pub,
                                 &chunk_msg,
                                 TrafficLane::ControlP0,
                             )
@@ -1809,6 +2815,129 @@ async fn handle_peer_request_full(
         }
         other => Some(handle_peer_request(other, herdr, hostname).await),
     }
+}
+
+pub fn is_sensitive_path(path: &Path) -> bool {
+    let lower_full = path.to_string_lossy().to_ascii_lowercase();
+    for sys_prefix in [
+        "/etc/shadow",
+        "/etc/gshadow",
+        "/etc/sudoers",
+        "/private/etc/shadow",
+        "/private/etc/master.passwd",
+        "/private/etc/sudoers",
+        "/proc/",
+        "/sys/",
+        "/dev/",
+        "/boot/",
+    ] {
+        if lower_full == sys_prefix.trim_end_matches('/') || lower_full.starts_with(sys_prefix) {
+            return true;
+        }
+    }
+
+    let comps: Vec<String> = path
+        .components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(s) => Some(s.to_string_lossy().to_ascii_lowercase()),
+            _ => None,
+        })
+        .collect();
+
+    for c in &comps {
+        if matches!(
+            c.as_str(),
+            ".ssh" | ".gnupg" | ".aws" | ".kube" | ".azure" | "keychains" | ".docker"
+        ) {
+            return true;
+        }
+    }
+    for win in comps.windows(2) {
+        if (win[0] == ".config" && (win[1] == "coda" || win[1] == "gcloud"))
+            || (win[0] == "library" && win[1] == "keychains")
+        {
+            return true;
+        }
+    }
+
+    if let Some(fname) = comps.last() {
+        if (fname == ".env"
+            || (fname.starts_with(".env.")
+                && !matches!(
+                    fname.as_str(),
+                    ".env.example" | ".env.sample" | ".env.template"
+                )))
+            || matches!(
+                fname.as_str(),
+                "id_rsa"
+                    | "id_ed25519"
+                    | "id_ecdsa"
+                    | "id_dsa"
+                    | "id_ed25519_sk"
+                    | "id_ecdsa_sk"
+                    | "authorized_keys"
+                    | "known_hosts"
+                    | "credentials"
+                    | "daemon.json"
+                    | "desktop-session.json"
+                    | "trusted_peers.json"
+                    | "coda-daemon.lock"
+                    | ".netrc"
+                    | ".npmrc"
+                    | ".pypirc"
+                    | ".pgpass"
+                    | ".git-credentials"
+                    | "shadow"
+                    | "gshadow"
+                    | "master.passwd"
+                    | "sudoers"
+            )
+        {
+            return true;
+        }
+        if fname.ends_with(".pem")
+            || fname.ends_with(".p12")
+            || fname.ends_with(".pfx")
+            || fname.ends_with(".kdbx")
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn validate_local_preview_target(port: u16, path: &str) -> Result<reqwest::Url, String> {
+    if port < 1024 {
+        return Err(format!(
+            "Local preview port {port} blocked (privileged ports < 1024 are disallowed)"
+        ));
+    }
+    if path.starts_with('@') || path.contains("://") {
+        return Err("Invalid local preview path".into());
+    }
+    let clean_path = if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("/{path}")
+    };
+    if clean_path.chars().any(|c| c.is_control())
+        || clean_path.contains('\\')
+        || clean_path.starts_with("//")
+    {
+        return Err("Invalid local preview path".into());
+    }
+    let raw_url = format!("http://127.0.0.1:{port}{clean_path}");
+    let parsed = reqwest::Url::parse(&raw_url).map_err(|e| format!("Invalid preview URL: {e}"))?;
+    if parsed.scheme() != "http"
+        || parsed.host_str() != Some("127.0.0.1")
+        || parsed.port() != Some(port)
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
+        return Err("Local preview target must remain strictly http://127.0.0.1".into());
+    }
+    Ok(parsed)
 }
 
 async fn handle_peer_request(
@@ -2003,15 +3132,62 @@ async fn handle_peer_request(
             )
         }
         PeerMessage::GitDiffRequest { req_id, cwd } => {
-            let branch = run_cmd_capture("git", &["-C", &cwd, "rev-parse", "--abbrev-ref", "HEAD"])
+            let safe_cwd = tokio::fs::canonicalize(&cwd)
                 .await
-                .unwrap_or_else(|| "main".into());
-            let status_short = run_cmd_capture("git", &["-C", &cwd, "status", "--short"])
-                .await
-                .unwrap_or_default();
-            let diff_unified = run_cmd_capture("git", &["-C", &cwd, "diff", "--no-color"])
-                .await
-                .unwrap_or_default();
+                .ok()
+                .filter(|p| !is_sensitive_path(p));
+            let Some(canon_cwd) = safe_cwd else {
+                return (
+                    PeerMessage::GitDiffResponse {
+                        req_id,
+                        branch: String::new(),
+                        status_short: String::new(),
+                        diff_unified: String::new(),
+                    },
+                    TrafficLane::BulkP1,
+                );
+            };
+            let cwd_str = canon_cwd.to_string_lossy().to_string();
+            let branch = run_cmd_capture(
+                "git",
+                &[
+                    "-C",
+                    &cwd_str,
+                    "-c",
+                    "core.quotePath=false",
+                    "rev-parse",
+                    "--abbrev-ref",
+                    "HEAD",
+                ],
+            )
+            .await
+            .unwrap_or_else(|| "main".into());
+            let status_short = run_cmd_capture(
+                "git",
+                &[
+                    "-C",
+                    &cwd_str,
+                    "-c",
+                    "core.quotePath=false",
+                    "status",
+                    "--short",
+                ],
+            )
+            .await
+            .unwrap_or_default();
+            let diff_unified = run_cmd_capture(
+                "git",
+                &[
+                    "-C",
+                    &cwd_str,
+                    "-c",
+                    "core.quotePath=false",
+                    "diff",
+                    "--no-color",
+                ],
+            )
+            .await
+            .unwrap_or_default();
             (
                 PeerMessage::GitDiffResponse {
                     req_id,
@@ -2023,14 +3199,22 @@ async fn handle_peer_request(
             )
         }
         PeerMessage::HttpLocalPreviewRequest { req_id, port, path } => {
-            let clean_path = if path.starts_with('/') {
-                path
-            } else {
-                format!("/{path}")
+            let target_url = match validate_local_preview_target(port, &path) {
+                Ok(u) => u,
+                Err(msg) => {
+                    return (
+                        PeerMessage::HttpLocalPreviewResponse {
+                            req_id,
+                            status_code: 403,
+                            content_type: "text/plain".into(),
+                            body_b64: B64.encode(msg),
+                        },
+                        TrafficLane::BulkP1,
+                    );
+                }
             };
-            let url = format!("http://127.0.0.1:{port}{clean_path}");
-            match reqwest::get(&url).await {
-                Ok(resp) => {
+            match preview_http_client().get(target_url).send().await {
+                Ok(mut resp) => {
                     let status_code = resp.status().as_u16();
                     let content_type = resp
                         .headers()
@@ -2038,13 +3222,41 @@ async fn handle_peer_request(
                         .and_then(|v| v.to_str().ok())
                         .unwrap_or("text/html; charset=utf-8")
                         .to_string();
-                    let bytes = resp.bytes().await.unwrap_or_default();
+                    if resp
+                        .content_length()
+                        .is_some_and(|n| n > MAX_HTTP_PREVIEW_BYTES as u64)
+                    {
+                        return (
+                            PeerMessage::HttpLocalPreviewResponse {
+                                req_id,
+                                status_code: 413,
+                                content_type: "text/plain".into(),
+                                body_b64: B64.encode("Local preview response exceeds 4 MiB limit"),
+                            },
+                            TrafficLane::BulkP1,
+                        );
+                    }
+                    let mut body = Vec::new();
+                    while let Ok(Some(chunk)) = resp.chunk().await {
+                        if body.len().saturating_add(chunk.len()) > MAX_HTTP_PREVIEW_BYTES {
+                            return (
+                                PeerMessage::HttpLocalPreviewResponse {
+                                    req_id,
+                                    status_code: 413,
+                                    content_type: "text/plain".into(),
+                                    body_b64: B64.encode("Local preview body exceeded 4 MiB limit"),
+                                },
+                                TrafficLane::BulkP1,
+                            );
+                        }
+                        body.extend_from_slice(&chunk);
+                    }
                     (
                         PeerMessage::HttpLocalPreviewResponse {
                             req_id,
                             status_code,
                             content_type,
-                            body_b64: B64.encode(&bytes),
+                            body_b64: B64.encode(&body),
                         },
                         TrafficLane::BulkP1,
                     )
@@ -2066,19 +3278,86 @@ async fn handle_peer_request(
             sub_path,
         } => {
             let clean_sub = sub_path.trim_matches('/');
-            let base = std::path::PathBuf::from(&root_path);
-            let target = if clean_sub.is_empty() {
-                base
-            } else {
-                let mut p = base;
+            let bad_sub = std::path::Path::new(clean_sub).components().any(|c| {
+                matches!(
+                    c,
+                    std::path::Component::ParentDir
+                        | std::path::Component::RootDir
+                        | std::path::Component::Prefix(_)
+                )
+            });
+            if bad_sub {
+                return (
+                    PeerMessage::DirectoryListing {
+                        req_id,
+                        root_path,
+                        sub_path: clean_sub.to_string(),
+                        entries: Vec::new(),
+                        error: Some("access denied: invalid sub_path traversal".into()),
+                    },
+                    TrafficLane::BulkP1,
+                );
+            }
+
+            let Ok(canon_base) = tokio::fs::canonicalize(&root_path).await else {
+                return (
+                    PeerMessage::DirectoryListing {
+                        req_id,
+                        root_path: root_path.clone(),
+                        sub_path: clean_sub.to_string(),
+                        entries: Vec::new(),
+                        error: Some(format!("root_path not found: {root_path}")),
+                    },
+                    TrafficLane::BulkP1,
+                );
+            };
+            if is_sensitive_path(&canon_base) {
+                return (
+                    PeerMessage::DirectoryListing {
+                        req_id,
+                        root_path,
+                        sub_path: clean_sub.to_string(),
+                        entries: Vec::new(),
+                        error: Some("access denied: restricted path".into()),
+                    },
+                    TrafficLane::BulkP1,
+                );
+            }
+
+            let mut candidate = canon_base.clone();
+            if !clean_sub.is_empty() {
                 for comp in std::path::Path::new(clean_sub).components() {
                     if let std::path::Component::Normal(c) = comp {
-                        p.push(c);
+                        candidate.push(c);
                     }
                 }
-                p
+            }
+            let Ok(canon_target) = tokio::fs::canonicalize(&candidate).await else {
+                return (
+                    PeerMessage::DirectoryListing {
+                        req_id,
+                        root_path,
+                        sub_path: clean_sub.to_string(),
+                        entries: Vec::new(),
+                        error: Some(format!("directory not found: {}", candidate.display())),
+                    },
+                    TrafficLane::BulkP1,
+                );
             };
-            match tokio::fs::read_dir(&target).await {
+            if !canon_target.starts_with(&canon_base) || is_sensitive_path(&canon_target) {
+                return (
+                    PeerMessage::DirectoryListing {
+                        req_id,
+                        root_path,
+                        sub_path: clean_sub.to_string(),
+                        entries: Vec::new(),
+                        error: Some("access denied: path escapes workspace or is sensitive".into()),
+                    },
+                    TrafficLane::BulkP1,
+                );
+            }
+
+            match tokio::fs::read_dir(&canon_target).await {
                 Ok(mut rd) => {
                     let mut entries = Vec::new();
                     while let Ok(Some(ent)) = rd.next_entry().await {
@@ -2089,7 +3368,18 @@ async fn handle_peer_request(
                         ) {
                             continue;
                         }
-                        let meta = ent.metadata().await.ok();
+                        let ent_path = ent.path();
+                        if is_sensitive_path(&ent_path) {
+                            continue;
+                        }
+                        if let Ok(ent_canon) = tokio::fs::canonicalize(&ent_path).await {
+                            if !ent_canon.starts_with(&canon_base) || is_sensitive_path(&ent_canon) {
+                                continue;
+                            }
+                        } else {
+                            continue;
+                        }
+                        let meta = tokio::fs::metadata(&ent_path).await.ok();
                         let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
                         let size_bytes = if is_dir {
                             0
@@ -2131,7 +3421,7 @@ async fn handle_peer_request(
                         root_path,
                         sub_path: clean_sub.to_string(),
                         entries: Vec::new(),
-                        error: Some(format!("{}: {e}", target.display())),
+                        error: Some(format!("{}: {e}", canon_target.display())),
                     },
                     TrafficLane::BulkP1,
                 ),
@@ -2143,9 +3433,73 @@ async fn handle_peer_request(
             max_bytes,
         } => {
             let cap = max_bytes.clamp(1024, 256_000);
-            match tokio::fs::read(&path).await {
-                Ok(bytes) => {
-                    let slice = &bytes[..bytes.len().min(cap)];
+            let canon = match tokio::fs::canonicalize(&path).await {
+                Ok(p) => p,
+                Err(e) => {
+                    return (
+                        PeerMessage::FilePreviewResponse {
+                            req_id,
+                            path,
+                            content: String::new(),
+                            error: Some(e.to_string()),
+                        },
+                        TrafficLane::BulkP1,
+                    );
+                }
+            };
+            if is_sensitive_path(&canon) {
+                return (
+                    PeerMessage::FilePreviewResponse {
+                        req_id,
+                        path,
+                        content: String::new(),
+                        error: Some("access denied: sensitive file path blocked".into()),
+                    },
+                    TrafficLane::BulkP1,
+                );
+            }
+            match tokio::fs::File::open(&canon).await {
+                Ok(file) => {
+                    let meta = match file.metadata().await {
+                        Ok(m) => m,
+                        Err(e) => {
+                            return (
+                                PeerMessage::FilePreviewResponse {
+                                    req_id,
+                                    path,
+                                    content: String::new(),
+                                    error: Some(e.to_string()),
+                                },
+                                TrafficLane::BulkP1,
+                            );
+                        }
+                    };
+                    if !meta.is_file() {
+                        return (
+                            PeerMessage::FilePreviewResponse {
+                                req_id,
+                                path,
+                                content: String::new(),
+                                error: Some("not a regular file".into()),
+                            },
+                            TrafficLane::BulkP1,
+                        );
+                    }
+                    let total_bytes = meta.len();
+                    let mut buf = Vec::with_capacity(cap.min(65_536));
+                    if let Err(e) = file.take((cap + 1) as u64).read_to_end(&mut buf).await {
+                        return (
+                            PeerMessage::FilePreviewResponse {
+                                req_id,
+                                path,
+                                content: String::new(),
+                                error: Some(e.to_string()),
+                            },
+                            TrafficLane::BulkP1,
+                        );
+                    }
+                    let was_truncated = buf.len() > cap || total_bytes > cap as u64;
+                    let slice = &buf[..buf.len().min(cap)];
                     if slice.contains(&0u8) {
                         (
                             PeerMessage::FilePreviewResponse {
@@ -2153,7 +3507,7 @@ async fn handle_peer_request(
                                 path,
                                 content: format!(
                                     "[Binary file · {} bytes — preview skipped]",
-                                    bytes.len()
+                                    total_bytes
                                 ),
                                 error: None,
                             },
@@ -2161,7 +3515,7 @@ async fn handle_peer_request(
                         )
                     } else {
                         let mut text = String::from_utf8_lossy(slice).to_string();
-                        if bytes.len() > cap {
+                        if was_truncated {
                             text.push_str("\n\n... [truncated] ...");
                         }
                         (
@@ -2198,8 +3552,20 @@ async fn handle_peer_request(
 }
 
 async fn run_cmd_capture(bin: &str, args: &[&str]) -> Option<String> {
-    let out = Command::new(bin).args(args).output().await.ok()?;
-    Some(String::from_utf8_lossy(&out.stdout).to_string())
+    const MAX_CAPTURE_BYTES: usize = 2 * 1024 * 1024;
+    let out = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        Command::new(bin).args(args).output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    let slice = if out.stdout.len() > MAX_CAPTURE_BYTES {
+        &out.stdout[..MAX_CAPTURE_BYTES]
+    } else {
+        &out.stdout
+    };
+    Some(String::from_utf8_lossy(slice).to_string())
 }
 
 async fn read_raw_frame<R: AsyncReadExt + Unpin>(reader: &mut R) -> Result<RelayWireFrame> {
@@ -2235,17 +3601,21 @@ pub struct DirectP2pClient {
     writer: tokio::net::tcp::OwnedWriteHalf,
     reader: tokio::net::tcp::OwnedReadHalf,
     e2ee: E2eeSession,
-    client_x25519_pub_b64: String,
 }
 
 impl DirectP2pClient {
-    /// Races a 250ms Happy Eyeballs probe against a direct P2P endpoint (`lan_ipv4` or `cn_public_ipv6`).
+    /// Races a 250ms Happy Eyeballs probe against a direct P2P endpoint (`lan_ipv4` or `cn_public_ipv6`),
+    /// verifying both peers' static Ed25519 signatures and deriving forward-secret ephemeral X25519 keys.
     pub async fn connect_direct(
         endpoint: &str,
         client_id: &StoredDeviceIdentity,
         client_device_id: Uuid,
         target_device_id: Uuid,
+        expected_peer: &PeerIdentityPin,
     ) -> Result<Self> {
+        validate_ed25519_pub_b64(&expected_peer.ed25519_pub_b64)?;
+        validate_x25519_pub_b64(&expected_peer.x25519_pub_b64)?;
+
         let stream = tokio::time::timeout(
             std::time::Duration::from_millis(250),
             TcpStream::connect(endpoint),
@@ -2255,35 +3625,100 @@ impl DirectP2pClient {
         let _ = stream.set_nodelay(true);
         let (mut reader, mut writer) = stream.into_split();
 
-        let timestamp_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-        let signed_msg = format!("p2p:{client_device_id}:{target_device_id}:{timestamp_ms}");
-        let signature_b64 = client_id.sign(signed_msg.as_bytes())?;
+        let (client_eph_secret, client_eph_pub_b64) =
+            StoredDeviceIdentity::generate_ephemeral_x25519();
+        let timestamp_ms = current_unix_ms();
+        let signing = p2p_hello_v2_signing_bytes(
+            client_device_id,
+            target_device_id,
+            &client_id.x25519_public_b64,
+            &client_eph_pub_b64,
+            timestamp_ms,
+        );
+        let signature_b64 = client_id.sign(&signing)?;
 
         let hello = RelayWireFrame::DirectP2pHello {
             client_device_id,
             target_device_id,
             client_ed25519_pub_b64: client_id.ed25519_public_b64.clone(),
             client_x25519_pub_b64: client_id.x25519_public_b64.clone(),
+            client_ephemeral_x25519_pub_b64: client_eph_pub_b64.clone(),
             timestamp_ms,
             signature_b64,
+            supports_zstd: true,
         };
         writer.write_all(&hello.encode_length_delimited()?).await?;
 
-        let ack = read_raw_frame(&mut reader).await?;
-        let (daemon_pub_b64, path_kind) = match ack {
+        let ack = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            read_raw_frame(&mut reader),
+        )
+        .await
+        .map_err(|_| anyhow!("direct P2P handshake timed out waiting for DirectP2pAck"))??;
+
+        let (daemon_eph_pub_b64, path_kind) = match ack {
             RelayWireFrame::DirectP2pAck {
                 ok: true,
                 daemon_device_id,
+                daemon_ed25519_pub_b64,
                 daemon_x25519_pub_b64,
+                daemon_ephemeral_x25519_pub_b64,
+                timestamp_ms: ack_ts_ms,
+                signature_b64: ack_sig_b64,
                 path_kind,
-            } if daemon_device_id == target_device_id => (daemon_x25519_pub_b64, path_kind),
+                ..
+            } => {
+                if daemon_device_id != target_device_id {
+                    anyhow::bail!("direct P2P daemon_device_id mismatch");
+                }
+                if daemon_ed25519_pub_b64 != expected_peer.ed25519_pub_b64 {
+                    anyhow::bail!("direct P2P daemon Ed25519 key mismatch against account pin");
+                }
+                if daemon_x25519_pub_b64 != expected_peer.x25519_pub_b64 {
+                    anyhow::bail!("direct P25519 key mismatch against account pin");
+                }
+                if daemon_ephemeral_x25519_pub_b64.trim().is_empty() {
+                    anyhow::bail!("direct P2P v2 requires non-empty daemon_ephemeral_x25519_pub_b64");
+                }
+                validate_x25519_pub_b64(&daemon_ephemeral_x25519_pub_b64)?;
+                if !is_timestamp_fresh(ack_ts_ms, current_unix_ms(), HANDSHAKE_MAX_SKEW_MS) {
+                    anyhow::bail!("direct P2P DirectP2pAck timestamp skewed or expired");
+                }
+                let ack_signed = p2p_ack_v2_signing_bytes(
+                    client_device_id,
+                    daemon_device_id,
+                    &client_eph_pub_b64,
+                    &daemon_ephemeral_x25519_pub_b64,
+                    ack_ts_ms,
+                );
+                StoredDeviceIdentity::verify_signature(
+                    &expected_peer.ed25519_pub_b64,
+                    &ack_signed,
+                    &ack_sig_b64,
+                )?;
+                (daemon_ephemeral_x25519_pub_b64, path_kind)
+            }
+            RelayWireFrame::DirectP2pAck {
+                ok: false, error, ..
+            } => {
+                anyhow::bail!(
+                    "direct P2P handshake rejected: {}",
+                    error.unwrap_or_else(|| "unauthorized".into())
+                );
+            }
             other => anyhow::bail!("direct P2P handshake rejected: {other:?}"),
         };
 
-        let e2ee = E2eeSession::derive(&client_id.x25519_secret()?, &daemon_pub_b64, true)?;
+        let e2ee = E2eeSession::derive_ephemeral_p2p(
+            &client_id.x25519_secret()?,
+            &expected_peer.x25519_pub_b64,
+            &client_eph_secret,
+            &daemon_eph_pub_b64,
+            client_device_id,
+            target_device_id,
+            true,
+            true,
+        )?;
 
         Ok(Self {
             client_device_id,
@@ -2292,7 +3727,6 @@ impl DirectP2pClient {
             writer,
             reader,
             e2ee,
-            client_x25519_pub_b64: client_id.x25519_public_b64.clone(),
         })
     }
 
@@ -2303,7 +3737,8 @@ impl DirectP2pClient {
             dst_device_id: self.target_device_id,
             lane,
             e2ee: sealed,
-            sender_x25519_pub_b64: Some(self.client_x25519_pub_b64.clone()),
+            sender_x25519_pub_b64: None,
+            session_auth: None,
         };
         self.writer
             .write_all(&pkt.encode_length_delimited()?)
@@ -2314,7 +3749,18 @@ impl DirectP2pClient {
     pub async fn recv_message(&mut self) -> Result<PeerMessage> {
         loop {
             let frame = read_raw_frame(&mut self.reader).await?;
-            if let RelayWireFrame::RoutePacket { e2ee, .. } = frame {
+            if let RelayWireFrame::RoutePacket {
+                src_device_id,
+                dst_device_id,
+                e2ee,
+                ..
+            } = frame
+            {
+                if src_device_id != self.target_device_id
+                    || dst_device_id != self.client_device_id
+                {
+                    continue;
+                }
                 let msg = self.e2ee.open_message(&e2ee)?;
                 if matches!(msg, PeerMessage::HerdrLiveEvent { .. }) {
                     continue;
@@ -2334,6 +3780,7 @@ pub struct SmartRelayFallbackConfig {
     pub raw_tcp_addr: Option<String>,
     pub wss_url: Option<String>,
     pub relay_ticket: String,
+    pub peer_ed25519_pub_b64: String,
     pub peer_x25519_pub_b64: String,
 }
 
@@ -2361,9 +3808,9 @@ struct RelayClientConn {
     route_label: String,
     transport: RelaySocketTransport,
     e2ee: E2eeSession,
+    session_auth: RelaySessionAuth,
     client_device_id: Uuid,
     target_device_id: Uuid,
-    client_x25519_pub_b64: String,
 }
 
 impl RelayClientConn {
@@ -2373,19 +3820,28 @@ impl RelayClientConn {
         target_device_id: Uuid,
         cfg: &SmartRelayFallbackConfig,
     ) -> Result<Self> {
-        let e2ee = E2eeSession::derive(
+        validate_ed25519_pub_b64(&cfg.peer_ed25519_pub_b64)?;
+        validate_x25519_pub_b64(&cfg.peer_x25519_pub_b64)?;
+
+        let session_auth = RelaySessionAuth::create(
+            client_id,
+            target_device_id,
+            true,
+            current_unix_ms(),
+        )?;
+        let e2ee = E2eeSession::derive_relay_session(
             &client_id.x25519_secret()?,
             &cfg.peer_x25519_pub_b64,
+            &session_auth.session_nonce_b64,
+            client_device_id,
+            target_device_id,
+            true,
             true,
         )?;
-        let gen = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
         let bind = RelayWireFrame::AuthBind {
             ticket: cfg.relay_ticket.clone(),
             lane: TrafficLane::ControlP0,
-            generation: gen.max(1),
+            generation: next_monotonic_generation(),
         };
 
         if let Some(ref raw_addr) = cfg.raw_tcp_addr {
@@ -2398,35 +3854,44 @@ impl RelayClientConn {
                 let _ = stream.set_nodelay(true);
                 let (mut reader, mut writer) = stream.into_split();
                 writer.write_all(&bind.encode_length_delimited()?).await?;
-                let ack = read_raw_frame(&mut reader).await?;
+                let ack = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    read_raw_frame(&mut reader),
+                )
+                .await
+                .map_err(|_| anyhow!("raw TCP relay timed out waiting for AuthAck"))??;
                 if matches!(ack, RelayWireFrame::AuthAck { ok: true, .. }) {
                     return Ok(Self {
                         route_label: "relay_raw_tcp".into(),
                         transport: RelaySocketTransport::RawTcp { reader, writer },
                         e2ee,
+                        session_auth,
                         client_device_id,
                         target_device_id,
-                        client_x25519_pub_b64: client_id.x25519_public_b64.clone(),
                     });
                 }
             }
         }
 
         if let Some(ref wss_url) = cfg.wss_url {
-            let (ws_stream, _) = connect_async(wss_url).await?;
+            let (ws_stream, _) =
+                connect_async_with_config(wss_url, Some(bounded_ws_config()), false).await?;
             let (mut sink, mut stream) = ws_stream.split();
             sink.send(WsMsg::Text(serde_json::to_string(&bind)?.into()))
                 .await?;
-            if let Some(Ok(WsMsg::Text(txt))) = stream.next().await {
+            sink.flush().await?;
+            if let Ok(Some(Ok(WsMsg::Text(txt)))) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), stream.next()).await
+            {
                 let ack: RelayWireFrame = serde_json::from_str(&txt)?;
                 if matches!(ack, RelayWireFrame::AuthAck { ok: true, .. }) {
                     return Ok(Self {
                         route_label: "relay_wss".into(),
                         transport: RelaySocketTransport::Wss { sink, stream },
                         e2ee,
+                        session_auth,
                         client_device_id,
                         target_device_id,
-                        client_x25519_pub_b64: client_id.x25519_public_b64.clone(),
                     });
                 }
             }
@@ -2443,7 +3908,8 @@ impl RelayClientConn {
             dst_device_id: self.target_device_id,
             lane,
             e2ee: sealed,
-            sender_x25519_pub_b64: Some(self.client_x25519_pub_b64.clone()),
+            sender_x25519_pub_b64: None,
+            session_auth: Some(self.session_auth.clone()),
         };
 
         match &mut self.transport {
@@ -2452,7 +3918,17 @@ impl RelayClientConn {
                 loop {
                     let frame = read_raw_frame(reader).await?;
                     match frame {
-                        RelayWireFrame::RoutePacket { e2ee, .. } => {
+                        RelayWireFrame::RoutePacket {
+                            src_device_id,
+                            dst_device_id,
+                            e2ee,
+                            ..
+                        } => {
+                            if src_device_id != self.target_device_id
+                                || dst_device_id != self.client_device_id
+                            {
+                                continue;
+                            }
                             let opened = self.e2ee.open_message(&e2ee)?;
                             if matches!(
                                 opened,
@@ -2478,32 +3954,51 @@ impl RelayClientConn {
             RelaySocketTransport::Wss { sink, stream } => {
                 sink.send(WsMsg::Text(serde_json::to_string(&pkt)?.into()))
                     .await?;
+                sink.flush().await?;
                 while let Some(Ok(msg)) = stream.next().await {
-                    if let WsMsg::Text(t) = msg {
-                        if let Ok(frame) = serde_json::from_str::<RelayWireFrame>(&t) {
-                            match frame {
-                                RelayWireFrame::RoutePacket { e2ee, .. } => {
-                                    let opened = self.e2ee.open_message(&e2ee)?;
-                                    if matches!(
-                                        opened,
-                                        PeerMessage::HerdrLiveEvent { .. }
-                                            | PeerMessage::PtyOutputChunk { .. }
-                                    ) {
-                                        continue;
-                                    }
-                                    if let Some(ref want) = expected_req_id {
-                                        if opened.response_req_id() != Some(want.as_str()) {
+                    match msg {
+                        WsMsg::Ping(p) => {
+                            let _ = sink.send(WsMsg::Pong(p)).await;
+                            let _ = sink.flush().await;
+                        }
+                        WsMsg::Close(_) => break,
+                        WsMsg::Text(t) => {
+                            if let Ok(frame) = serde_json::from_str::<RelayWireFrame>(&t) {
+                                match frame {
+                                    RelayWireFrame::RoutePacket {
+                                        src_device_id,
+                                        dst_device_id,
+                                        e2ee,
+                                        ..
+                                    } => {
+                                        if src_device_id != self.target_device_id
+                                            || dst_device_id != self.client_device_id
+                                        {
                                             continue;
                                         }
+                                        let opened = self.e2ee.open_message(&e2ee)?;
+                                        if matches!(
+                                            opened,
+                                            PeerMessage::HerdrLiveEvent { .. }
+                                                | PeerMessage::PtyOutputChunk { .. }
+                                        ) {
+                                            continue;
+                                        }
+                                        if let Some(ref want) = expected_req_id {
+                                            if opened.response_req_id() != Some(want.as_str()) {
+                                                continue;
+                                            }
+                                        }
+                                        return Ok(opened);
                                     }
-                                    return Ok(opened);
+                                    RelayWireFrame::Error { code, message } => {
+                                        anyhow::bail!("relay error ({code}): {message}");
+                                    }
+                                    _ => {}
                                 }
-                                RelayWireFrame::Error { code, message } => {
-                                    anyhow::bail!("relay error ({code}): {message}");
-                                }
-                                _ => {}
                             }
                         }
+                        _ => {}
                     }
                 }
                 anyhow::bail!("relay WSS stream closed before reply")
@@ -2518,6 +4013,7 @@ pub struct SmartPeerClient {
     client_id: StoredDeviceIdentity,
     client_device_id: Uuid,
     target_device_id: Uuid,
+    expected_peer: PeerIdentityPin,
     endpoints: Vec<NetworkEndpointCandidate>,
     udp_probe_addr: Option<SocketAddr>,
     relay_cfg: Option<SmartRelayFallbackConfig>,
@@ -2526,18 +4022,24 @@ pub struct SmartPeerClient {
 }
 
 impl SmartPeerClient {
+    #[allow(clippy::too_many_arguments)]
     pub async fn connect_auto(
         client_id: StoredDeviceIdentity,
         client_device_id: Uuid,
         target_device_id: Uuid,
+        expected_peer: PeerIdentityPin,
         endpoints: Vec<NetworkEndpointCandidate>,
         udp_probe_addr: Option<SocketAddr>,
         relay_cfg: Option<SmartRelayFallbackConfig>,
     ) -> Result<Self> {
+        validate_ed25519_pub_b64(&expected_peer.ed25519_pub_b64)?;
+        validate_x25519_pub_b64(&expected_peer.x25519_pub_b64)?;
+
         let mut me = Self {
             client_id,
             client_device_id,
             target_device_id,
+            expected_peer,
             endpoints,
             udp_probe_addr,
             relay_cfg,
@@ -2597,6 +4099,7 @@ impl SmartPeerClient {
                 &self.client_id,
                 self.client_device_id,
                 self.target_device_id,
+                &self.expected_peer,
             )
             .await
             {
@@ -2657,6 +4160,7 @@ async fn try_connect_direct_auto(
     client_id: &StoredDeviceIdentity,
     client_device_id: Uuid,
     target_device_id: Uuid,
+    expected_peer: &PeerIdentityPin,
     endpoints: &[NetworkEndpointCandidate],
     udp_probe_addr: Option<SocketAddr>,
 ) -> Option<DirectP2pClient> {
@@ -2674,9 +4178,14 @@ async fn try_connect_direct_auto(
         }
     }
     for addr in candidates {
-        if let Ok(p2p) =
-            DirectP2pClient::connect_direct(&addr, client_id, client_device_id, target_device_id)
-                .await
+        if let Ok(p2p) = DirectP2pClient::connect_direct(
+            &addr,
+            client_id,
+            client_device_id,
+            target_device_id,
+            expected_peer,
+        )
+        .await
         {
             return Some(p2p);
         }
@@ -2743,20 +4252,25 @@ impl Drop for LivePeerSession {
 }
 
 impl LivePeerSession {
+    #[allow(clippy::too_many_arguments)]
     pub async fn connect_auto(
         client_id: StoredDeviceIdentity,
         client_device_id: Uuid,
         target_device_id: Uuid,
+        expected_peer: PeerIdentityPin,
         endpoints: Vec<NetworkEndpointCandidate>,
         udp_probe_addr: Option<SocketAddr>,
         relay_cfg: Option<SmartRelayFallbackConfig>,
     ) -> Result<Self> {
-        let client_x25519_pub_b64 = client_id.x25519_public_b64.clone();
-        let (reader_half, writer_half, e2ee, route_label, is_direct) =
+        validate_ed25519_pub_b64(&expected_peer.ed25519_pub_b64)?;
+        validate_x25519_pub_b64(&expected_peer.x25519_pub_b64)?;
+
+        let (reader_half, writer_half, e2ee, relay_session_auth, route_label, is_direct) =
             if let Some(p2p) = try_connect_direct_auto(
                 &client_id,
                 client_device_id,
                 target_device_id,
+                &expected_peer,
                 &endpoints,
                 udp_probe_addr,
             )
@@ -2766,6 +4280,7 @@ impl LivePeerSession {
                     PeerReaderHalf::RawTcp(p2p.reader),
                     PeerWriterHalf::RawTcp(p2p.writer),
                     p2p.e2ee,
+                    None,
                     p2p.path_kind,
                     true,
                 )
@@ -2785,7 +4300,14 @@ impl LivePeerSession {
                         (PeerReaderHalf::Wss(stream), PeerWriterHalf::Wss(sink))
                     }
                 };
-                (r, w, relay.e2ee, relay.route_label, false)
+                (
+                    r,
+                    w,
+                    relay.e2ee,
+                    Some(relay.session_auth),
+                    relay.route_label,
+                    false,
+                )
             } else {
                 anyhow::bail!(
                     "neither Direct LAN/IPv6 P2P nor Relay could connect to {target_device_id}"
@@ -2796,39 +4318,76 @@ impl LivePeerSession {
         let pending: Arc<StdMutex<HashMap<String, oneshot::Sender<PeerMessage>>>> =
             Arc::new(StdMutex::new(HashMap::new()));
         let (outbound_tx, mut outbound_rx) = mpsc::channel::<(PeerMessage, TrafficLane)>(512);
+        let (pong_tx, mut pong_rx) = mpsc::channel::<Vec<u8>>(16);
         let (events_tx, _) = broadcast::channel::<PeerAsyncEvent>(1024);
 
         let e2ee_w = Arc::clone(&e2ee_state);
         let mut writer = writer_half;
-        let dh_pub_w = client_x25519_pub_b64;
         let writer_handle = tokio::spawn(async move {
-            while let Some((msg, lane)) = outbound_rx.recv().await {
-                let sealed = {
-                    let mut guard = e2ee_w.lock().expect("e2ee mutex poisoned");
-                    guard.seal_message(&msg)
-                };
-                let Ok(e2ee) = sealed else {
-                    break;
-                };
-                let frame = RelayWireFrame::RoutePacket {
-                    src_device_id: client_device_id,
-                    dst_device_id: target_device_id,
-                    lane,
-                    e2ee,
-                    sender_x25519_pub_b64: Some(dh_pub_w.clone()),
-                };
-                let send_ok = match &mut writer {
-                    PeerWriterHalf::RawTcp(w) => match frame.encode_length_delimited() {
-                        Ok(bytes) => w.write_all(&bytes).await.is_ok(),
-                        Err(_) => false,
-                    },
-                    PeerWriterHalf::Wss(sink) => match serde_json::to_string(&frame) {
-                        Ok(txt) => sink.send(WsMsg::Text(txt.into())).await.is_ok(),
-                        Err(_) => false,
-                    },
-                };
-                if !send_ok {
-                    break;
+            let mut keepalive =
+                tokio::time::interval(std::time::Duration::from_secs(WS_KEEPALIVE_SECS));
+            keepalive.tick().await;
+            loop {
+                tokio::select! {
+                    Some(p) = pong_rx.recv() => {
+                        if let PeerWriterHalf::Wss(sink) = &mut writer {
+                            if sink.send(WsMsg::Pong(p.into())).await.is_err()
+                                || sink.flush().await.is_err()
+                            {
+                                break;
+                            }
+                        }
+                    }
+                    maybe_item = outbound_rx.recv() => {
+                        let Some((msg, lane)) = maybe_item else { break; };
+                        let sealed = {
+                            let mut guard = e2ee_w.lock().expect("e2ee mutex poisoned");
+                            guard.seal_message(&msg)
+                        };
+                        let Ok(e2ee) = sealed else {
+                            break;
+                        };
+                        let frame = RelayWireFrame::RoutePacket {
+                            src_device_id: client_device_id,
+                            dst_device_id: target_device_id,
+                            lane,
+                            e2ee,
+                            sender_x25519_pub_b64: None,
+                            session_auth: relay_session_auth.clone(),
+                        };
+                        let send_ok = match &mut writer {
+                            PeerWriterHalf::RawTcp(w) => match frame.encode_length_delimited() {
+                                Ok(bytes) => w.write_all(&bytes).await.is_ok(),
+                                Err(_) => false,
+                            },
+                            PeerWriterHalf::Wss(sink) => match serde_json::to_string(&frame) {
+                                Ok(txt) => sink.send(WsMsg::Text(txt.into())).await.is_ok()
+                                    && sink.flush().await.is_ok(),
+                                Err(_) => false,
+                            },
+                        };
+                        if !send_ok {
+                            break;
+                        }
+                    }
+                    _ = keepalive.tick() => {
+                        let send_ok = match &mut writer {
+                            PeerWriterHalf::RawTcp(w) => {
+                                let ka = RelayWireFrame::KeepAlive { ts_ms: current_unix_ms() };
+                                match ka.encode_length_delimited() {
+                                    Ok(bytes) => w.write_all(&bytes).await.is_ok(),
+                                    Err(_) => false,
+                                }
+                            }
+                            PeerWriterHalf::Wss(sink) => {
+                                sink.send(WsMsg::Ping(Vec::new().into())).await.is_ok()
+                                    && sink.flush().await.is_ok()
+                            }
+                        };
+                        if !send_ok {
+                            break;
+                        }
+                    }
                 }
             }
         });
@@ -2856,7 +4415,11 @@ impl LivePeerSession {
                                     break Some(f);
                                 }
                             }
-                            Some(Ok(WsMsg::Ping(_))) | Some(Ok(WsMsg::Pong(_))) => continue,
+                            Some(Ok(WsMsg::Ping(p))) => {
+                                let _ = pong_tx.try_send(p.to_vec());
+                                continue;
+                            }
+                            Some(Ok(WsMsg::Pong(_))) => continue,
                             Some(Ok(WsMsg::Close(_))) | Some(Err(_)) | None => break None,
                             _ => continue,
                         }
@@ -2868,7 +4431,17 @@ impl LivePeerSession {
                 };
 
                 match frame {
-                    RelayWireFrame::RoutePacket { e2ee, .. } => {
+                    RelayWireFrame::RoutePacket {
+                        src_device_id,
+                        dst_device_id,
+                        e2ee,
+                        ..
+                    } => {
+                        if src_device_id != target_device_id
+                            || dst_device_id != client_device_id
+                        {
+                            continue;
+                        }
                         let opened = {
                             let mut guard = e2ee_r.lock().expect("e2ee mutex poisoned");
                             guard.open_message(&e2ee)
@@ -2999,5 +4572,55 @@ impl LivePeerSession {
     pub fn close(&self) {
         self.reader_abort.abort();
         self.writer_abort.abort();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sensitive_path_blocks_credentials_and_allows_code() {
+        assert!(is_sensitive_path(Path::new("/home/alice/.ssh/id_ed25519")));
+        assert!(is_sensitive_path(Path::new("/Users/alice/.config/coda/daemon.json")));
+        assert!(is_sensitive_path(Path::new("/Users/alice/project/.env")));
+        assert!(is_sensitive_path(Path::new("/etc/shadow")));
+        assert!(!is_sensitive_path(Path::new("/Users/alice/project/.env.example")));
+        assert!(!is_sensitive_path(Path::new("/Users/alice/project/src/main.rs")));
+    }
+
+    #[test]
+    fn test_validate_local_preview_target_blocks_privileged_and_host_escape() {
+        assert!(validate_local_preview_target(22, "/").is_err());
+        assert!(validate_local_preview_target(80, "/").is_err());
+        assert!(validate_local_preview_target(3000, "@evil.com/").is_err());
+        assert!(validate_local_preview_target(3000, "//evil.com/").is_err());
+        let ok = validate_local_preview_target(3000, "api/health").expect("valid");
+        assert_eq!(ok.as_str(), "http://127.0.0.1:3000/api/health");
+    }
+
+    #[test]
+    fn test_atomic_save_and_exclusive_daemon_lock() {
+        let dir = std::env::temp_dir().join(format!("coda-daemon-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg_path = dir.join("daemon.json");
+
+        atomic_write_private_file(&cfg_path, b"{\"ok\":true}").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&cfg_path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+
+        let lock1 = try_acquire_daemon_lock(&cfg_path).unwrap();
+        assert!(lock1.is_some());
+        let lock2 = try_acquire_daemon_lock(&cfg_path).unwrap();
+        assert!(lock2.is_none());
+        drop(lock1);
+        let lock3 = try_acquire_daemon_lock(&cfg_path).unwrap();
+        assert!(lock3.is_some());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

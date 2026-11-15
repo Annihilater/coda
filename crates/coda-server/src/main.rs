@@ -28,8 +28,12 @@ struct Args {
     raw_tcp_bind: SocketAddr,
 
     /// Shared HMAC secret between `coda-coord` and stateless `coda-relay` edge nodes
-    #[arg(long, env = "CODA_RELAY_SECRET", default_value = "coda-dev-hmac-secret-change-in-prod")]
-    relay_secret: String,
+    #[arg(long, env = "CODA_RELAY_SECRET")]
+    relay_secret: Option<String>,
+
+    /// Development-only escape hatch: allow ephemeral loopback relay secret if CODA_RELAY_SECRET is omitted
+    #[arg(long, env = "CODA_ALLOW_INSECURE_DEV_SECRET", default_value_t = false)]
+    allow_insecure_dev_secret: bool,
 
     /// Public region label advertised by stateless `--relay-only` node
     #[arg(long, env = "CODA_REGION_LABEL", default_value = "CN-BGP-NoICP")]
@@ -137,6 +141,59 @@ fn main() -> Result<()> {
     rt.block_on(async_main(args))
 }
 
+fn resolve_relay_secret(
+    configured: Option<&str>,
+    relay_only: bool,
+    allow_insecure_dev_secret: bool,
+    http_bind: SocketAddr,
+    raw_tcp_bind: SocketAddr,
+) -> Result<Vec<u8>> {
+    const INSECURE_DEFAULTS: &[&str] = &[
+        "coda-dev-hmac-secret-change-in-prod",
+        "change-me-shared-hmac-relay-secret-2026",
+        "changeme",
+        "secret",
+        "default",
+    ];
+    if let Some(raw) = configured.map(str::trim).filter(|s| !s.is_empty()) {
+        if INSECURE_DEFAULTS
+            .iter()
+            .any(|d| d.eq_ignore_ascii_case(raw))
+        {
+            anyhow::bail!(
+                "refusing to start with insecure placeholder CODA_RELAY_SECRET; generate a random secret with `openssl rand -hex 32`"
+            );
+        }
+        if raw.len() < 24 {
+            anyhow::bail!(
+                "CODA_RELAY_SECRET is too short ({} bytes); must be at least 24 bytes (generate with `openssl rand -hex 32`)",
+                raw.len()
+            );
+        }
+        return Ok(raw.as_bytes().to_vec());
+    }
+
+    if !relay_only
+        && allow_insecure_dev_secret
+        && http_bind.ip().is_loopback()
+        && raw_tcp_bind.ip().is_loopback()
+    {
+        let ephemeral = format!(
+            "{}{}",
+            uuid::Uuid::new_v4().simple(),
+            uuid::Uuid::new_v4().simple()
+        );
+        tracing::warn!(
+            "CODA_RELAY_SECRET omitted with --allow-insecure-dev-secret on loopback; generated ephemeral secret for this run"
+        );
+        return Ok(ephemeral.into_bytes());
+    }
+
+    anyhow::bail!(
+        "CODA_RELAY_SECRET is required; generate a shared secret with `openssl rand -hex 32`"
+    )
+}
+
 async fn async_main(args: Args) -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -146,9 +203,16 @@ async fn async_main(args: Args) -> Result<()> {
         .init();
 
     let _ = &args.env_file;
+    let relay_secret = resolve_relay_secret(
+        args.relay_secret.as_deref(),
+        args.relay_only,
+        args.allow_insecure_dev_secret,
+        args.http_bind,
+        args.raw_tcp_bind,
+    )?;
 
     if args.relay_only {
-        let hub = RelayHub::new(args.relay_secret.into_bytes(), &args.region_label, None);
+        let hub = RelayHub::new(relay_secret, &args.region_label, None);
         let addr = hub.spawn_raw_tcp_listener(args.raw_tcp_bind).await?;
         info!(
             "Stateless Relay-Only mode active on {addr} (region={}, no database required)",
@@ -162,7 +226,7 @@ async fn async_main(args: Args) -> Result<()> {
         &args.database_url,
         args.http_bind,
         args.raw_tcp_bind,
-        args.relay_secret.into_bytes(),
+        relay_secret,
         args.public_url,
         Some(args.web_dist),
         ServerOptions {
@@ -185,7 +249,45 @@ async fn async_main(args: Args) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_dotenv_line;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    use super::{parse_dotenv_line, resolve_relay_secret};
+
+    #[test]
+    fn test_relay_secret_policy() {
+        let loopback = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
+        let public = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 8080);
+
+        assert!(resolve_relay_secret(None, false, false, loopback, loopback).is_err());
+        assert!(resolve_relay_secret(
+            Some("coda-dev-hmac-secret-change-in-prod"),
+            false,
+            true,
+            loopback,
+            loopback
+        )
+        .is_err());
+        assert!(resolve_relay_secret(
+            Some("change-me-shared-hmac-relay-secret-2026"),
+            false,
+            false,
+            public,
+            public
+        )
+        .is_err());
+        assert!(resolve_relay_secret(Some("too-short"), false, false, loopback, loopback).is_err());
+        assert!(resolve_relay_secret(None, false, true, public, public).is_err());
+        assert!(resolve_relay_secret(None, true, true, loopback, loopback).is_err());
+
+        let ephem = resolve_relay_secret(None, false, true, loopback, loopback).unwrap();
+        assert!(ephem.len() >= 32);
+
+        let strong = "0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            resolve_relay_secret(Some(strong), false, false, public, public).unwrap(),
+            strong.as_bytes()
+        );
+    }
 
     #[test]
     fn test_parse_dotenv_line_variants() {

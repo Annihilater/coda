@@ -1,4 +1,10 @@
-use std::{net::SocketAddr, path::PathBuf, time::Duration};
+use std::{
+    io::BufRead,
+    net::SocketAddr,
+    path::PathBuf,
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
@@ -6,8 +12,9 @@ use clap::{Parser, Subcommand};
 use coda_daemon::{
     list_account_hosts, login_with_password_and_enroll, mint_peer_relay_config,
     pair_daemon_with_code, poll_device_login_until_approved, register_client_identity,
-    spawn_direct_p2p_listener, start_device_login_flow, subscribe_account_events_ws,
-    DaemonConfig, LivePeerSession, PeerAsyncEvent,
+    run_daemon_once_with_p2p_and_peers, spawn_direct_p2p_listener_with_peers,
+    start_device_login_flow, subscribe_account_events_ws, try_acquire_daemon_lock, DaemonConfig,
+    LivePeerSession, PeerAsyncEvent, TrustedPeersStore,
 };
 use coda_protocol::{PeerMessage, TrafficLane};
 use tracing::{error, info, warn};
@@ -37,6 +44,9 @@ enum Commands {
         email: Option<String>,
         #[arg(long, env = "CODA_LOGIN_PASSWORD")]
         password: Option<String>,
+        /// Read password from standard input (avoids exposing secrets in process arguments)
+        #[arg(long, default_value_t = false)]
+        password_stdin: bool,
     },
     /// Verify real-time account push (`/api/v1/events/ws`) and E2EE `herdr-core` mesh RPCs across online hosts
     VerifyMesh {
@@ -44,8 +54,10 @@ enum Commands {
         server: String,
         #[arg(long)]
         email: String,
-        #[arg(long)]
-        password: String,
+        #[arg(long, env = "CODA_LOGIN_PASSWORD")]
+        password: Option<String>,
+        #[arg(long, default_value_t = false)]
+        password_stdin: bool,
         #[arg(long, default_value_t = 1)]
         expect_hosts: usize,
     },
@@ -71,6 +83,20 @@ enum Commands {
     },
 }
 
+fn read_password_from_stdin() -> Result<String> {
+    let stdin = std::io::stdin();
+    let mut line = String::new();
+    stdin
+        .lock()
+        .read_line(&mut line)
+        .context("failed reading password from stdin")?;
+    let trimmed = line.trim_end_matches(&['\r', '\n'][..]).to_string();
+    if trimmed.is_empty() {
+        anyhow::bail!("empty password received on stdin");
+    }
+    Ok(trimmed)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -90,8 +116,14 @@ async fn main() -> Result<()> {
             role,
             email,
             password,
+            password_stdin,
         } => {
-            if let (Some(email_val), Some(pass_val)) = (email, password) {
+            let resolved_password = if password_stdin {
+                Some(read_password_from_stdin()?)
+            } else {
+                password
+            };
+            if let (Some(email_val), Some(pass_val)) = (email, resolved_password) {
                 let cfg = login_with_password_and_enroll(&server, &email_val, &pass_val, &role, name)
                     .await?;
                 cfg.save(&cfg_path)?;
@@ -131,15 +163,21 @@ async fn main() -> Result<()> {
             server,
             email,
             password,
+            password_stdin,
             expect_hosts,
         } => {
+            let resolved_password = if password_stdin {
+                read_password_from_stdin()?
+            } else {
+                password.context("verify-mesh requires --password, CODA_LOGIN_PASSWORD, or --password-stdin")?
+            };
             let clean_server = server.trim().trim_end_matches('/').to_string();
             let http = reqwest::Client::new();
             let login_resp = http
                 .post(format!("{clean_server}/api/v1/auth/login"))
                 .json(&serde_json::json!({
                     "email_or_handle": email,
-                    "password": password,
+                    "password": resolved_password,
                     "client_label": "coda-mesh-verifier",
                 }))
                 .send()
@@ -197,6 +235,7 @@ async fn main() -> Result<()> {
                     &token,
                     client_dev_id,
                     host.id,
+                    &host.ed25519_pubkey,
                     &host.x25519_pubkey,
                 )
                 .await
@@ -205,6 +244,7 @@ async fn main() -> Result<()> {
                     client_id,
                     client_dev_id,
                     host.id,
+                    host.identity_pin(),
                     host.endpoints.clone(),
                     None,
                     relay_cfg,
@@ -381,12 +421,32 @@ async fn main() -> Result<()> {
             }
         }
         Commands::Run { mode, p2p_bind } => {
+            let _daemon_lock = try_acquire_daemon_lock(&cfg_path)?
+                .context("another coda-daemon or embedded Coda host already holds the lock")?;
             let cfg = DaemonConfig::load(&cfg_path)?;
-            let bound_p2p = match spawn_direct_p2p_listener(cfg.clone(), p2p_bind).await {
+            let peers_store = TrustedPeersStore::from_daemon_config(
+                &cfg,
+                Some(DaemonConfig::trusted_peers_path(&cfg_path)),
+            );
+            let _ = peers_store.refresh_from_server(true).await;
+
+            let bound_p2p = match spawn_direct_p2p_listener_with_peers(
+                cfg.clone(),
+                p2p_bind,
+                Arc::clone(&peers_store),
+            )
+            .await
+            {
                 Ok(addr) => Some(addr),
                 Err(e) => {
                     let fallback = SocketAddr::new(p2p_bind.ip(), 0);
-                    match spawn_direct_p2p_listener(cfg.clone(), fallback).await {
+                    match spawn_direct_p2p_listener_with_peers(
+                        cfg.clone(),
+                        fallback,
+                        Arc::clone(&peers_store),
+                    )
+                    .await
+                    {
                         Ok(addr) => Some(addr),
                         Err(_) => {
                             warn!("Direct P2P listener on {p2p_bind} not bound ({e}); continuing with Relay tunnel");
@@ -403,8 +463,13 @@ async fn main() -> Result<()> {
                 }
             }
             loop {
-                if let Err(e) =
-                    coda_daemon::run_daemon_once_with_p2p(&cfg, mode.as_deref(), bound_port).await
+                if let Err(e) = run_daemon_once_with_p2p_and_peers(
+                    &cfg,
+                    mode.as_deref(),
+                    bound_port,
+                    Arc::clone(&peers_store),
+                )
+                .await
                 {
                     error!("tunnel disconnected ({e}); reconnecting in 2s...");
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;

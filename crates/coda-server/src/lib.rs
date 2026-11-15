@@ -2,6 +2,7 @@ pub mod db;
 pub mod relay;
 
 use std::{
+    collections::HashMap,
     net::SocketAddr,
     path::PathBuf,
     sync::Arc,
@@ -10,26 +11,57 @@ use std::{
 
 use anyhow::Result;
 use axum::{
-    extract::{Path, Query, Request, State, WebSocketUpgrade},
+    extract::{ConnectInfo, Extension, Path, Query, RawQuery, Request, State, WebSocketUpgrade},
     http::{
         header::{self, HeaderName, HeaderValue},
-        HeaderMap, StatusCode,
+        HeaderMap, Method, StatusCode,
     },
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
     Json, Router,
 };
 use chrono::Utc;
-use coda_protocol::{RelayTicketClaims, StoredDeviceIdentity};
+use coda_protocol::{
+    validate_ed25519_pub_b64, validate_x25519_pub_b64, RelayTicketClaims, StoredDeviceIdentity,
+    TrustedPeerEntry, MAX_WIRE_FRAME_BYTES,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tower_http::{
     cors::{Any, CorsLayer},
     services::{ServeDir, ServeFile},
 };
 use uuid::Uuid;
+
+#[derive(Default)]
+pub struct RateLimiter {
+    buckets: Mutex<HashMap<String, (u32, Instant)>>,
+}
+
+impl RateLimiter {
+    async fn check(&self, key: &str, max_requests: u32, window: Duration) -> Result<(), ApiError> {
+        let now = Instant::now();
+        let mut map = self.buckets.lock().await;
+        if map.len() > 2048 {
+            map.retain(|_, (_, started)| now.duration_since(*started) < window * 2);
+        }
+        let entry = map.entry(key.to_string()).or_insert((0, now));
+        if now.duration_since(entry.1) >= window {
+            *entry = (1, now);
+            return Ok(());
+        }
+        if entry.0 >= max_requests {
+            return Err(ApiError {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                message: "rate limit exceeded; please retry shortly".into(),
+            });
+        }
+        entry.0 += 1;
+        Ok(())
+    }
+}
 
 use crate::{
     db::{
@@ -76,6 +108,7 @@ pub struct AppState {
     pub ios_beta_url: Option<String>,
     pub http_no_redirect: reqwest::Client,
     pub latest_release_cache: Arc<RwLock<Option<(String, Instant)>>>,
+    pub rate_limiter: Arc<RateLimiter>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -256,17 +289,29 @@ pub struct EnrollHostDeviceRequest {
 
 async fn cache_control_middleware(req: Request, next: Next) -> Response {
     let path = req.uri().path().to_string();
-    let is_hashed_bundle = path.starts_with("/app.") && path.ends_with(".js") && path.len() > 8;
+    let is_hashed_bundle = path.starts_with("/app.")
+        && path.ends_with(".js")
+        && path.len() > 8
+        && path[5..path.len() - 3]
+            .chars()
+            .all(|c| c.is_ascii_hexdigit());
+    let is_static_asset = path.starts_with("/assets/") && !path.contains("..");
     let mut resp = next.run(req).await;
     if resp.status() == StatusCode::SWITCHING_PROTOCOLS {
         return resp;
     }
     let is_ok_hashed = is_hashed_bundle && resp.status() == StatusCode::OK;
+    let is_ok_asset = is_static_asset && resp.status() == StatusCode::OK;
     let headers = resp.headers_mut();
     if is_ok_hashed {
         headers.insert(
             header::CACHE_CONTROL,
             HeaderValue::from_static("public, max-age=31536000, immutable"),
+        );
+    } else if is_ok_asset {
+        headers.insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("public, max-age=86400"),
         );
     } else {
         headers.insert(
@@ -284,14 +329,19 @@ async fn cache_control_middleware(req: Request, next: Next) -> Response {
 pub fn build_router(state: AppState, web_dist_dir: Option<PathBuf>) -> Router {
     let cors = CorsLayer::new()
         .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
+        .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
+        .allow_headers([
+            header::AUTHORIZATION,
+            header::CONTENT_TYPE,
+            header::ACCEPT,
+        ]);
 
     let api = Router::new()
         .route("/api/v1/health", get(health_handler))
         .route("/api/v1/public/site-info", get(public_site_info_handler))
         .route("/api/v1/auth/register", post(register_handler))
         .route("/api/v1/auth/login", post(login_handler))
+        .route("/api/v1/auth/logout", post(logout_handler))
         .route("/api/v1/auth/me", get(me_handler))
         .route("/api/v1/auth/device/start", post(start_device_auth_handler))
         .route("/api/v1/auth/device/info", get(device_auth_info_handler))
@@ -305,6 +355,7 @@ pub fn build_router(state: AppState, web_dist_dir: Option<PathBuf>) -> Router {
             get(list_invites_handler).post(create_invite_handler),
         )
         .route("/api/v1/devices", get(list_devices_handler))
+        .route("/api/v1/devices/{id}", delete(delete_device_handler))
         .route("/api/v1/devices/pair-token", post(create_pair_token_handler))
         .route("/api/v1/devices/claim-pair", post(claim_pair_handler))
         .route(
@@ -316,6 +367,7 @@ pub fn build_router(state: AppState, web_dist_dir: Option<PathBuf>) -> Router {
             post(enroll_host_device_handler),
         )
         .route("/api/v1/relay/ticket", post(mint_relay_ticket_handler))
+        .route("/api/v1/relay/trusted-peers", get(trusted_peers_handler))
         .route("/download/{artifact}", get(download_latest_artifact_handler))
         .route("/install.sh", get(install_script_handler))
         .route("/v1/tunnel/ws", get(ws_tunnel_upgrade_handler))
@@ -373,7 +425,7 @@ pub async fn start_full_server_with_options(
     web_dist_dir: Option<PathBuf>,
     options: ServerOptions,
 ) -> Result<RunningServer> {
-    let db = Db::connect_and_migrate(database_url).await?;
+    let db = Db::connect_and_migrate_with_secret(database_url, &relay_secret).await?;
     let relay_hub = RelayHub::new(
         relay_secret.clone(),
         "Coda-Hybrid-Edge",
@@ -434,11 +486,16 @@ pub async fn start_full_server_with_options(
         ios_beta_url: options.ios_beta_url.filter(|s| !s.trim().is_empty()),
         http_no_redirect,
         latest_release_cache: Arc::new(RwLock::new(None)),
+        rate_limiter: Arc::new(RateLimiter::default()),
     };
 
     let router = build_router(state.clone(), web_dist_dir);
     tokio::spawn(async move {
-        let _ = axum::serve(http_listener, router).await;
+        let _ = axum::serve(
+            http_listener,
+            router.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await;
     });
 
     Ok(RunningServer {
@@ -484,17 +541,87 @@ fn is_remote_public_url(base_url: &str) -> bool {
     base_url.starts_with("https://") || !is_loopback_host_or_endpoint(base_url)
 }
 
+fn is_valid_http_host_authority(host: &str) -> bool {
+    let h = host.trim();
+    if h.is_empty() || h.len() > 253 {
+        return false;
+    }
+    if h.bytes().any(|b| {
+        b.is_ascii_control()
+            || matches!(
+                b,
+                b' ' | b'\t'
+                    | b'/'
+                    | b'\\'
+                    | b'\''
+                    | b'"'
+                    | b'`'
+                    | b'$'
+                    | b';'
+                    | b'?'
+                    | b'#'
+                    | b'@'
+                    | b'%'
+                    | b'<'
+                    | b'>'
+            )
+    }) {
+        return false;
+    }
+    if let Some(rest) = h.strip_prefix('[') {
+        let Some((ipv6, tail)) = rest.split_once(']') else {
+            return false;
+        };
+        if ipv6.parse::<std::net::Ipv6Addr>().is_err() {
+            return false;
+        }
+        if tail.is_empty() {
+            return true;
+        }
+        if let Some(port) = tail.strip_prefix(':') {
+            return !port.is_empty() && port.parse::<u16>().is_ok();
+        }
+        return false;
+    }
+    let (hostname, port_opt) = match h.rsplit_once(':') {
+        Some((name, port)) if !name.contains(':') => (name, Some(port)),
+        _ => (h, None),
+    };
+    if let Some(port) = port_opt {
+        if port.is_empty() || port.parse::<u16>().is_err() {
+            return false;
+        }
+    }
+    !hostname.is_empty()
+        && !hostname.starts_with('.')
+        && !hostname.ends_with('.')
+        && hostname
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+}
+
+fn is_shell_safe_base_url(url: &str) -> bool {
+    let Some(rest) = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+    else {
+        return false;
+    };
+    !rest.contains('/') && is_valid_http_host_authority(rest)
+}
+
 fn effective_public_base_url(st: &AppState, headers: &HeaderMap) -> String {
     if st.has_explicit_public_url {
         return st.public_base_url.clone();
     }
-    let host = headers
+    let host_raw = headers
         .get("x-forwarded-host")
-        .or_else(|| headers.get(axum::http::header::HOST))
         .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .or_else(|| headers.get(axum::http::header::HOST).and_then(|v| v.to_str().ok()))
         .map(str::trim)
         .filter(|s| !s.is_empty());
-    let Some(host) = host else {
+    let Some(host) = host_raw.filter(|h| is_valid_http_host_authority(h)) else {
         return st.public_base_url.clone();
     };
 
@@ -506,9 +633,9 @@ fn effective_public_base_url(st: &AppState, headers: &HeaderMap) -> String {
     let proto = headers
         .get("x-forwarded-proto")
         .and_then(|v| v.to_str().ok())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_ascii_lowercase)
+        .and_then(|v| v.split(',').next())
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| s == "http" || s == "https")
         .unwrap_or_else(|| {
             if cf_https || (!is_loopback_host_or_endpoint(host) && !host.contains(':')) {
                 "https".to_string()
@@ -516,7 +643,28 @@ fn effective_public_base_url(st: &AppState, headers: &HeaderMap) -> String {
                 "http".to_string()
             }
         });
-    format!("{proto}://{host}")
+    let candidate = format!("{proto}://{host}");
+    if is_shell_safe_base_url(&candidate) {
+        candidate
+    } else {
+        st.public_base_url.clone()
+    }
+}
+
+fn client_rate_key(
+    conn: Option<Extension<ConnectInfo<SocketAddr>>>,
+    headers: &HeaderMap,
+) -> String {
+    if let Some(Extension(ConnectInfo(addr))) = conn {
+        return addr.ip().to_string();
+    }
+    headers
+        .get("cf-connecting-ip")
+        .or_else(|| headers.get("x-real-ip"))
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "local".to_string())
 }
 
 async fn effective_relays_for_request(
@@ -549,17 +697,33 @@ async fn effective_relays_for_request(
 // HTTP Handlers
 // ============================================================================
 
-async fn health_handler(State(st): State<AppState>) -> Json<Value> {
-    Json(json!({
-        "ok": true,
-        "service": "coda-server",
-        "version": st.release_version,
-        "open_registration": st.open_registration,
-        "zero_knowledge_e2ee": true,
-        "raw_tcp_active": st.raw_tcp_active,
-        "raw_tcp_no_sni_endpoint": st.raw_tcp_public_endpoint,
-        "server_pubkey": st.server_pubkey_b64,
-    }))
+async fn health_handler(State(st): State<AppState>) -> Response {
+    if let Err(e) = st.db.ping().await {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "ok": false,
+                "service": "coda-server",
+                "version": st.release_version,
+                "error": format!("database_unreachable: {e}"),
+            })),
+        )
+            .into_response();
+    }
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "service": "coda-server",
+            "version": st.release_version,
+            "open_registration": st.open_registration,
+            "zero_knowledge_e2ee": true,
+            "raw_tcp_active": st.raw_tcp_active,
+            "raw_tcp_no_sni_endpoint": st.raw_tcp_public_endpoint,
+            "server_pubkey": st.server_pubkey_b64,
+        })),
+    )
+        .into_response()
 }
 
 const LATEST_RELEASE_CACHE_TTL: Duration = Duration::from_secs(300);
@@ -655,17 +819,17 @@ async fn download_latest_artifact_handler(
             .into_response();
     }
 
-    let target_url = match resolve_latest_github_tag(&st).await {
-        Some(latest_tag) => {
-            let filename = release_asset_filename(&artifact, &latest_tag)
-                .expect("validated artifact key");
-            format!(
-                "https://github.com/{}/releases/download/{latest_tag}/{filename}",
-                st.github_repo
-            )
-        }
-        None => format!("https://github.com/{}/releases/latest", st.github_repo),
+    let fallback_tag = if st.release_version.starts_with('v') {
+        st.release_version.clone()
+    } else {
+        format!("v{}", st.release_version)
     };
+    let tag = resolve_latest_github_tag(&st).await.unwrap_or(fallback_tag);
+    let filename = release_asset_filename(&artifact, &tag).expect("validated artifact key");
+    let target_url = format!(
+        "https://github.com/{}/releases/download/{tag}/{filename}",
+        st.github_repo
+    );
 
     (StatusCode::FOUND, [(header::LOCATION, target_url)]).into_response()
 }
@@ -712,8 +876,14 @@ async fn public_site_info_handler(
 
 async fn register_handler(
     State(st): State<AppState>,
+    conn: Option<Extension<ConnectInfo<SocketAddr>>>,
+    headers: HeaderMap,
     Json(req): Json<RegisterRequest>,
 ) -> Result<Json<AuthResponse>, ApiError> {
+    let ip = client_rate_key(conn, &headers);
+    st.rate_limiter
+        .check(&format!("register:{ip}"), 20, Duration::from_secs(60))
+        .await?;
     let (user, token) = st
         .db
         .register_user_with_policy(
@@ -731,14 +901,34 @@ async fn register_handler(
 
 async fn login_handler(
     State(st): State<AppState>,
+    conn: Option<Extension<ConnectInfo<SocketAddr>>>,
+    headers: HeaderMap,
     Json(req): Json<LoginRequest>,
 ) -> Result<Json<AuthResponse>, ApiError> {
+    let ip = client_rate_key(conn, &headers);
+    st.rate_limiter
+        .check(&format!("login:{ip}"), 30, Duration::from_secs(60))
+        .await?;
     let (user, token) = st
         .db
         .login_user(&req.email_or_handle, &req.password, &req.client_label)
         .await
         .map_err(ApiError::unauthorized)?;
     Ok(Json(AuthResponse { user, token }))
+}
+
+async fn logout_handler(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    if let Some(auth_hdr) = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+    {
+        let token = auth_hdr.strip_prefix("Bearer ").unwrap_or(auth_hdr);
+        let _ = st.db.delete_session(token).await;
+    }
+    Ok(Json(json!({ "ok": true })))
 }
 
 async fn me_handler(
@@ -789,6 +979,69 @@ async fn list_devices_handler(
     Ok(Json(devices))
 }
 
+async fn delete_device_handler(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path(device_id): Path<Uuid>,
+) -> Result<Json<Value>, ApiError> {
+    let user = require_auth(&st, &headers).await?;
+    let deleted = st
+        .db
+        .delete_device(user.id, device_id)
+        .await
+        .map_err(ApiError::internal)?;
+    if !deleted {
+        return Err(ApiError {
+            status: StatusCode::NOT_FOUND,
+            message: "device not found".into(),
+        });
+    }
+    st.relay_hub.disconnect_device(user.id, device_id).await;
+    st.relay_hub
+        .notify_device_enrolled(user.id, device_id, "", "device", Some(false))
+        .await;
+    Ok(Json(json!({ "ok": true, "deleted": true, "device_id": device_id })))
+}
+
+async fn trusted_peers_handler(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<TrustedPeerEntry>>, ApiError> {
+    let user_id = if headers.contains_key(axum::http::header::AUTHORIZATION) {
+        require_auth(&st, &headers).await?.id
+    } else if let Some(ticket) = headers
+        .get("x-coda-relay-ticket")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let claims = RelayTicketClaims::verify(ticket, &st.relay_secret, Utc::now().timestamp())
+            .map_err(ApiError::unauthorized)?;
+        let dev = st
+            .db
+            .get_device_by_id(claims.device_id)
+            .await
+            .map_err(ApiError::internal)?
+            .ok_or_else(|| ApiError::unauthorized(anyhow::anyhow!("device revoked")))?;
+        if dev.user_id != claims.user_id {
+            return Err(ApiError::unauthorized(anyhow::anyhow!(
+                "device tenant mismatch"
+            )));
+        }
+        claims.user_id
+    } else {
+        return Err(ApiError::unauthorized(anyhow::anyhow!(
+            "missing Authorization header or X-Coda-Relay-Ticket"
+        )));
+    };
+    let peers = st
+        .db
+        .list_trusted_peers(user_id)
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(Json(peers))
+}
+
 async fn create_pair_token_handler(
     State(st): State<AppState>,
     headers: HeaderMap,
@@ -830,9 +1083,14 @@ async fn install_script_handler(
 
 async fn start_device_auth_handler(
     State(st): State<AppState>,
+    conn: Option<Extension<ConnectInfo<SocketAddr>>>,
     headers: HeaderMap,
     Json(req): Json<StartDeviceAuthRequest>,
 ) -> Result<Json<StartDeviceAuthResponse>, ApiError> {
+    let ip = client_rate_key(conn, &headers);
+    st.rate_limiter
+        .check(&format!("dev_start:{ip}"), 30, Duration::from_secs(60))
+        .await?;
     let role = match req.role.as_str() {
         "daemon" | "client" | "hybrid" => req.role.as_str(),
         _ => {
@@ -841,6 +1099,8 @@ async fn start_device_auth_handler(
             )))
         }
     };
+    validate_ed25519_pub_b64(&req.ed25519_pubkey).map_err(ApiError::bad_request)?;
+    validate_x25519_pub_b64(&req.x25519_pubkey).map_err(ApiError::bad_request)?;
     let endpoints = if req.endpoints.is_null() {
         json!([])
     } else {
@@ -891,9 +1151,14 @@ async fn device_auth_info_handler(
 
 async fn approve_device_auth_handler(
     State(st): State<AppState>,
+    conn: Option<Extension<ConnectInfo<SocketAddr>>>,
     headers: HeaderMap,
     Json(req): Json<ApproveDeviceAuthRequest>,
 ) -> Result<Json<DeviceRecord>, ApiError> {
+    let ip = client_rate_key(conn, &headers);
+    st.rate_limiter
+        .check(&format!("dev_approve:{ip}"), 30, Duration::from_secs(60))
+        .await?;
     let user = require_auth(&st, &headers).await?;
     let device = st
         .db
@@ -914,9 +1179,14 @@ async fn approve_device_auth_handler(
 
 async fn poll_device_auth_handler(
     State(st): State<AppState>,
+    conn: Option<Extension<ConnectInfo<SocketAddr>>>,
     headers: HeaderMap,
     Json(req): Json<PollDeviceAuthRequest>,
 ) -> Result<Json<PollDeviceAuthResponse>, ApiError> {
+    let ip = client_rate_key(conn, &headers);
+    st.rate_limiter
+        .check(&format!("dev_poll:{ip}"), 90, Duration::from_secs(60))
+        .await?;
     let poll = st
         .db
         .poll_device_auth(&req.device_code)
@@ -1055,9 +1325,16 @@ async fn enroll_host_device_handler(
 
 async fn claim_pair_handler(
     State(st): State<AppState>,
+    conn: Option<Extension<ConnectInfo<SocketAddr>>>,
     headers: HeaderMap,
     Json(req): Json<ClaimPairRequest>,
 ) -> Result<Json<ClaimPairResponse>, ApiError> {
+    let ip = client_rate_key(conn, &headers);
+    st.rate_limiter
+        .check(&format!("claim_pair:{ip}"), 20, Duration::from_secs(60))
+        .await?;
+    validate_ed25519_pub_b64(&req.ed25519_pubkey).map_err(ApiError::bad_request)?;
+    validate_x25519_pub_b64(&req.x25519_pubkey).map_err(ApiError::bad_request)?;
     StoredDeviceIdentity::verify_signature(
         &req.ed25519_pubkey,
         req.code.trim().as_bytes(),
@@ -1210,44 +1487,77 @@ async fn ws_tunnel_upgrade_handler(
     State(st): State<AppState>,
 ) -> impl IntoResponse {
     let hub = Arc::clone(&st.relay_hub);
-    ws.on_upgrade(move |socket| hub.handle_ws_socket(socket))
-}
-
-#[derive(Debug, Deserialize)]
-struct EventsWsQuery {
-    #[serde(default)]
-    token: Option<String>,
+    ws.max_message_size(MAX_WIRE_FRAME_BYTES)
+        .max_frame_size(MAX_WIRE_FRAME_BYTES)
+        .on_upgrade(move |socket| hub.handle_ws_socket(socket))
 }
 
 async fn ws_account_events_handler(
     ws: WebSocketUpgrade,
     State(st): State<AppState>,
     headers: HeaderMap,
-    Query(query): Query<EventsWsQuery>,
+    RawQuery(raw_query): RawQuery,
 ) -> Result<Response, ApiError> {
-    let token = headers
+    if let Some(q) = raw_query.as_deref() {
+        let has_query_token = q.split('&').any(|pair| {
+            pair.split_once('=')
+                .map(|(k, v)| k == "token" && !v.is_empty())
+                .unwrap_or(false)
+        });
+        if has_query_token {
+            return Err(ApiError::unauthorized(anyhow::anyhow!(
+                "query parameter token auth is disabled; use Authorization header or WebSocket auth"
+            )));
+        }
+    }
+
+    let header_token = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.strip_prefix("Bearer ").or(Some(s)))
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .or_else(|| {
-            query
-                .token
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-        })
-        .ok_or_else(|| ApiError::unauthorized(anyhow::anyhow!("missing session token")))?;
-    let user = st
-        .db
-        .authenticate_token(&token)
-        .await
-        .map_err(ApiError::unauthorized)?;
+        .map(str::to_string);
+
+    let subproto_hdr = headers
+        .get(header::SEC_WEBSOCKET_PROTOCOL)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let subproto_token = subproto_hdr
+        .split(',')
+        .map(str::trim)
+        .find_map(|p| p.strip_prefix("coda-bearer."))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+
+    let ws = ws
+        .max_message_size(MAX_WIRE_FRAME_BYTES)
+        .max_frame_size(MAX_WIRE_FRAME_BYTES);
+    let ws = if subproto_hdr.split(',').any(|p| p.trim() == "coda-auth") {
+        ws.protocols(["coda-auth"])
+    } else {
+        ws
+    };
+
+    if let Some(token) = header_token.or(subproto_token) {
+        let user = st
+            .db
+            .authenticate_token(&token)
+            .await
+            .map_err(ApiError::unauthorized)?;
+        let hub = Arc::clone(&st.relay_hub);
+        return Ok(ws.on_upgrade(move |socket| async move {
+            hub.handle_account_events_ws(socket, user.id).await
+        }));
+    }
+
+    // Browser WebSocket without custom headers: authenticate via first JSON frame `{"type":"auth","token":"..."}`
     let hub = Arc::clone(&st.relay_hub);
-    Ok(ws.on_upgrade(move |socket| async move { hub.handle_account_events_ws(socket, user.id).await }))
+    let db = st.db.clone();
+    Ok(ws.on_upgrade(move |socket| async move {
+        hub.handle_account_events_ws_unauthenticated(socket, db).await
+    }))
 }
 
 async fn require_auth(st: &AppState, headers: &HeaderMap) -> Result<UserRecord, ApiError> {
@@ -1348,5 +1658,23 @@ mod tests {
             Some("coda-deploy-bundle-v0.3.5.tar.gz")
         );
         assert_eq!(release_asset_filename("unknown.bin", "v0.3.5"), None);
+    }
+
+    #[test]
+    fn host_authority_sanitizer_rejects_injection() {
+        assert!(is_valid_http_host_authority("coda.example.com"));
+        assert!(is_valid_http_host_authority("coda.example.com:8443"));
+        assert!(is_valid_http_host_authority("[::1]:8080"));
+        assert!(is_valid_http_host_authority("127.0.0.1:8080"));
+
+        assert!(!is_valid_http_host_authority("evil.com'; rm -rf / #"));
+        assert!(!is_valid_http_host_authority("evil.com/path"));
+        assert!(!is_valid_http_host_authority("evil.com?x=1"));
+        assert!(!is_valid_http_host_authority("user@evil.com"));
+        assert!(!is_valid_http_host_authority("$(whoami).evil.com"));
+        assert!(!is_valid_http_host_authority(""));
+        assert!(!is_shell_safe_base_url("javascript://evil.com"));
+        assert!(!is_shell_safe_base_url("https://evil.com/foo"));
+        assert!(is_shell_safe_base_url("https://coda.example.com:8443"));
     }
 }

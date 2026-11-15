@@ -41,6 +41,7 @@ CREATE TABLE IF NOT EXISTS auth_sessions (
 );
 
 CREATE INDEX IF NOT EXISTS idx_auth_sessions_user ON auth_sessions (user_id);
+CREATE INDEX IF NOT EXISTS idx_auth_sessions_expires ON auth_sessions (expires_at);
 
 -- 4. Devices (Isolated per user_id; stores Ed25519 identity & X25519 E2EE public keys)
 CREATE TABLE IF NOT EXISTS devices (
@@ -48,15 +49,16 @@ CREATE TABLE IF NOT EXISTS devices (
     user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     name TEXT NOT NULL,
     role TEXT NOT NULL CHECK (role IN ('daemon', 'client', 'hybrid')),
-    platform TEXT NOT NULL CHECK (platform IN ('macos', 'ios', 'ipados', 'iphone_duo', 'linux', 'web')),
-    ed25519_pubkey TEXT NOT NULL UNIQUE,
+    platform TEXT NOT NULL CHECK (platform IN ('macos', 'ios', 'ipados', 'iphone_duo', 'linux', 'windows', 'web')),
+    ed25519_pubkey TEXT NOT NULL,
     x25519_pubkey TEXT NOT NULL,
     endpoints_json JSONB NOT NULL DEFAULT '[]'::jsonb,
     herdr_core_id TEXT,
     herdr_version TEXT,
     is_online BOOLEAN NOT NULL DEFAULT FALSE,
     last_seen_at TIMESTAMPTZ,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_devices_user_ed25519 UNIQUE (user_id, ed25519_pubkey)
 );
 
 CREATE INDEX IF NOT EXISTS idx_devices_user_online ON devices (user_id, is_online);
@@ -91,7 +93,7 @@ CREATE TABLE IF NOT EXISTS device_auth_requests (
     user_code TEXT NOT NULL UNIQUE,
     device_name TEXT NOT NULL,
     role TEXT NOT NULL DEFAULT 'daemon' CHECK (role IN ('daemon', 'client', 'hybrid')),
-    platform TEXT NOT NULL DEFAULT 'linux',
+    platform TEXT NOT NULL DEFAULT 'linux' CHECK (platform IN ('macos', 'ios', 'ipados', 'iphone_duo', 'linux', 'windows', 'web')),
     ed25519_pubkey TEXT NOT NULL DEFAULT '',
     x25519_pubkey TEXT NOT NULL DEFAULT '',
     endpoints_json JSONB NOT NULL DEFAULT '[]'::jsonb,
@@ -106,3 +108,28 @@ CREATE TABLE IF NOT EXISTS device_auth_requests (
 );
 
 CREATE INDEX IF NOT EXISTS idx_device_auth_user_code ON device_auth_requests (user_code, expires_at);
+CREATE INDEX IF NOT EXISTS idx_device_auth_expires ON device_auth_requests (expires_at);
+
+-- Idempotent schema hardening for databases created before these constraints existed.
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'devices_ed25519_pubkey_key') THEN
+        ALTER TABLE devices DROP CONSTRAINT devices_ed25519_pubkey_key;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'uq_devices_user_ed25519') THEN
+        ALTER TABLE devices ADD CONSTRAINT uq_devices_user_ed25519 UNIQUE (user_id, ed25519_pubkey);
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'devices_platform_check') THEN
+        ALTER TABLE devices DROP CONSTRAINT devices_platform_check;
+    END IF;
+    ALTER TABLE devices
+        ADD CONSTRAINT devices_platform_check
+        CHECK (platform IN ('macos', 'ios', 'ipados', 'iphone_duo', 'linux', 'windows', 'web'));
+
+    IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'device_auth_requests_platform_check') THEN
+        ALTER TABLE device_auth_requests DROP CONSTRAINT device_auth_requests_platform_check;
+    END IF;
+    ALTER TABLE device_auth_requests
+        ADD CONSTRAINT device_auth_requests_platform_check
+        CHECK (platform IN ('macos', 'ios', 'ipados', 'iphone_duo', 'linux', 'windows', 'web'));
+END $$;

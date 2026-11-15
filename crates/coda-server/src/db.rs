@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use anyhow::{anyhow, bail, Context, Result};
 use argon2::{
@@ -6,10 +6,15 @@ use argon2::{
     Argon2,
 };
 use chrono::{DateTime, Duration, Utc};
-use rand::Rng;
+use coda_protocol::{
+    open_opaque_secret, seal_opaque_secret, validate_ed25519_pub_b64, validate_x25519_pub_b64,
+    TrustedPeerEntry,
+};
+use rand::{Rng, RngCore};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use tokio::sync::{Mutex, RwLock};
 use tokio_postgres::{Client, NoTls};
 use tracing::{error, info};
 use uuid::Uuid;
@@ -87,13 +92,25 @@ pub enum DeviceAuthPollState {
     Expired,
 }
 
-#[derive(Clone)]
-pub struct Db {
-    client: Arc<Client>,
+struct DbInner {
+    database_url: String,
+    token_wrap_key: Vec<u8>,
+    client: RwLock<Arc<Client>>,
+    reconnect_lock: Mutex<()>,
+    tx_client: Mutex<Option<Client>>,
+    dummy_password_hash: String,
 }
 
+#[derive(Clone)]
+pub struct Db {
+    inner: Arc<DbInner>,
+}
+
+const ADMIN_BOOTSTRAP_ADVISORY_LOCK_KEY: i64 = 7_240_991;
+const MAX_PASSWORD_BYTES: usize = 1024;
+
 impl Db {
-    pub async fn connect_and_migrate(database_url: &str) -> Result<Self> {
+    async fn connect_raw(database_url: &str) -> Result<Client> {
         let (client, connection) = tokio_postgres::connect(database_url, NoTls)
             .await
             .with_context(|| format!("failed connecting to PostgreSQL: {database_url}"))?;
@@ -103,6 +120,27 @@ impl Db {
                 error!("PostgreSQL connection error: {e}");
             }
         });
+        Ok(client)
+    }
+
+    pub async fn connect_and_migrate(database_url: &str) -> Result<Self> {
+        let default_secret = std::env::var("CODA_RELAY_SECRET")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.into_bytes())
+            .unwrap_or_else(|| {
+                let mut key = vec![0u8; 32];
+                OsRng.fill_bytes(&mut key);
+                key
+            });
+        Self::connect_and_migrate_with_secret(database_url, &default_secret).await
+    }
+
+    pub async fn connect_and_migrate_with_secret(
+        database_url: &str,
+        token_wrap_secret: &[u8],
+    ) -> Result<Self> {
+        let client = Self::connect_raw(database_url).await?;
 
         client
             .batch_execute(INIT_SQL)
@@ -114,10 +152,73 @@ impl Db {
             .execute("UPDATE devices SET is_online = FALSE WHERE is_online = TRUE", &[])
             .await?;
 
-        info!("PostgreSQL connected and migrations verified");
-        Ok(Self {
-            client: Arc::new(client),
+        let dummy_password_hash = tokio::task::spawn_blocking(|| {
+            let salt = SaltString::generate(&mut OsRng);
+            Argon2::default()
+                .hash_password(b"coda-timing-equalizer-dummy", &salt)
+                .map(|h| h.to_string())
+                .map_err(|e| anyhow!("dummy argon2 hash error: {e}"))
         })
+        .await??;
+
+        let inner = Arc::new(DbInner {
+            database_url: database_url.to_string(),
+            token_wrap_key: token_wrap_secret.to_vec(),
+            client: RwLock::new(Arc::new(client)),
+            reconnect_lock: Mutex::new(()),
+            tx_client: Mutex::new(None),
+            dummy_password_hash,
+        });
+
+        spawn_expiry_cleanup_task(Arc::downgrade(&inner));
+
+        info!("PostgreSQL connected and migrations verified");
+        Ok(Self { inner })
+    }
+
+    async fn client(&self) -> Result<Arc<Client>> {
+        {
+            let guard = self.inner.client.read().await;
+            if !guard.is_closed() {
+                return Ok(Arc::clone(&guard));
+            }
+        }
+        let _reconn = self.inner.reconnect_lock.lock().await;
+        {
+            let guard = self.inner.client.read().await;
+            if !guard.is_closed() {
+                return Ok(Arc::clone(&guard));
+            }
+        }
+        let fresh = Arc::new(Self::connect_raw(&self.inner.database_url).await?);
+        let mut guard = self.inner.client.write().await;
+        *guard = Arc::clone(&fresh);
+        Ok(fresh)
+    }
+
+    async fn acquire_tx_client(&self) -> Result<tokio::sync::MutexGuard<'_, Option<Client>>> {
+        let mut guard = self.inner.tx_client.lock().await;
+        let need_new = guard.as_ref().map_or(true, |c| c.is_closed());
+        if need_new {
+            *guard = Some(Self::connect_raw(&self.inner.database_url).await?);
+        }
+        Ok(guard)
+    }
+
+    /// Executes a lightweight query verifying live database reachability.
+    pub async fn ping(&self) -> Result<()> {
+        let client = self.client().await?;
+        client
+            .simple_query("SELECT 1")
+            .await
+            .context("database health check failed")?;
+        Ok(())
+    }
+
+    /// Deletes expired auth sessions, pairing tokens, and device auth codes.
+    pub async fn purge_expired_records(&self) -> Result<()> {
+        let client = self.client().await?;
+        purge_expired_with_client(&client).await
     }
 
     pub async fn seed_default_relays(
@@ -137,8 +238,9 @@ impl Db {
         cdn_wss_endpoint: &str,
         server_pubkey: &str,
     ) -> Result<()> {
+        let client = self.client().await?;
         let wss_priority: i32 = if raw_tcp_active { 20 } else { 5 };
-        self.client
+        client
             .execute(
                 r#"
                 INSERT INTO relay_nodes (id, region, mode, endpoint, node_pubkey, priority, is_active)
@@ -153,7 +255,7 @@ impl Db {
             )
             .await?;
 
-        self.client
+        client
             .execute(
                 r#"
                 INSERT INTO relay_nodes (id, region, mode, endpoint, node_pubkey, priority, is_active)
@@ -173,8 +275,8 @@ impl Db {
     }
 
     pub async fn has_any_users(&self) -> Result<bool> {
-        let row = self
-            .client
+        let client = self.client().await?;
+        let row = client
             .query_one("SELECT EXISTS(SELECT 1 FROM users)", &[])
             .await?;
         Ok(row.get(0))
@@ -206,18 +308,40 @@ impl Db {
     ) -> Result<(UserRecord, String)> {
         let email = email.trim().to_lowercase();
         let handle = handle.trim().to_lowercase();
-        if email.is_empty() || handle.is_empty() || password.len() < 6 {
-            bail!("email, handle, and password (>= 6 chars) are required");
+        let display_name = display_name.trim().to_string();
+        validate_email(&email)?;
+        validate_handle(&handle)?;
+        if display_name.is_empty() || display_name.len() > 128 {
+            bail!("display_name must be 1..=128 characters");
+        }
+        if password.len() < 6 || password.len() > MAX_PASSWORD_BYTES {
+            bail!("password must be 6..={MAX_PASSWORD_BYTES} bytes");
         }
 
-        let salt = SaltString::generate(&mut OsRng);
-        let password_hash = Argon2::default()
-            .hash_password(password.as_bytes(), &salt)
-            .map_err(|e| anyhow!("password hash error: {e}"))?
-            .to_string();
+        let pw_owned = password.to_string();
+        let password_hash = tokio::task::spawn_blocking(move || {
+            let salt = SaltString::generate(&mut OsRng);
+            Argon2::default()
+                .hash_password(pw_owned.as_bytes(), &salt)
+                .map(|h| h.to_string())
+                .map_err(|e| anyhow!("password hash error: {e}"))
+        })
+        .await??;
 
-        let count_row = self
-            .client
+        let mut tx_guard = self.acquire_tx_client().await?;
+        let tx_conn = tx_guard
+            .as_mut()
+            .ok_or_else(|| anyhow!("tx postgres client unavailable"))?;
+        let tx = tx_conn.transaction().await?;
+
+        // Serialize bootstrap count check so concurrent initial registrations cannot both become admin.
+        tx.execute(
+            "SELECT pg_advisory_xact_lock($1)",
+            &[&ADMIN_BOOTSTRAP_ADVISORY_LOCK_KEY],
+        )
+        .await?;
+
+        let count_row = tx
             .query_one("SELECT COUNT(*)::BIGINT FROM users", &[])
             .await?;
         let user_count: i64 = count_row.get(0);
@@ -226,8 +350,7 @@ impl Db {
         let trimmed_invite = invite_code.map(str::trim).filter(|s| !s.is_empty());
         if !is_first_admin {
             if let Some(code) = trimmed_invite {
-                let updated = self
-                    .client
+                let updated = tx
                     .execute(
                         r#"
                         UPDATE invite_codes
@@ -248,15 +371,21 @@ impl Db {
         }
 
         let quota_mbps: i32 = if is_first_admin { 100 } else { 25 };
-        let row = self
-            .client
+        let row = tx
             .query_one(
                 r#"
                 INSERT INTO users (email, handle, display_name, password_hash, is_admin, bandwidth_quota_mbps, last_login_at)
                 VALUES ($1, $2, $3, $4, $5, $6, NOW())
                 RETURNING id, email, handle, display_name, is_admin, bandwidth_quota_mbps, created_at
                 "#,
-                &[&email, &handle, &display_name, &password_hash, &is_first_admin, &quota_mbps],
+                &[
+                    &email,
+                    &handle,
+                    &display_name,
+                    &password_hash,
+                    &is_first_admin,
+                    &quota_mbps,
+                ],
             )
             .await
             .context("email or handle already registered")?;
@@ -271,8 +400,20 @@ impl Db {
             created_at: row.get(6),
         };
 
-        let token = self.issue_session_token(user.id, "register").await?;
-        Ok((user, token))
+        let raw_token = generate_raw_session_token();
+        let token_sha256 = sha256_hex(&raw_token);
+        let expires_at = Utc::now() + Duration::days(30);
+        tx.execute(
+            r#"
+            INSERT INTO auth_sessions (token_sha256, user_id, client_label, expires_at)
+            VALUES ($1, $2, 'register', $3)
+            "#,
+            &[&token_sha256, &user.id, &expires_at],
+        )
+        .await?;
+
+        tx.commit().await?;
+        Ok((user, raw_token))
     }
 
     pub async fn login_user(
@@ -281,9 +422,12 @@ impl Db {
         password: &str,
         client_label: &str,
     ) -> Result<(UserRecord, String)> {
+        if password.is_empty() || password.len() > MAX_PASSWORD_BYTES {
+            bail!("invalid credentials");
+        }
+        let client = self.client().await?;
         let key = email_or_handle.trim().to_lowercase();
-        let row = self
-            .client
+        let row = client
             .query_opt(
                 r#"
                 SELECT id, email, handle, display_name, password_hash, is_admin, bandwidth_quota_mbps, created_at
@@ -292,15 +436,31 @@ impl Db {
                 "#,
                 &[&key],
             )
-            .await?
-            .ok_or_else(|| anyhow!("invalid credentials"))?;
+            .await?;
+
+        let Some(row) = row else {
+            let dummy = self.inner.dummy_password_hash.clone();
+            let pw = password.to_string();
+            let _ = tokio::task::spawn_blocking(move || {
+                if let Ok(parsed) = PasswordHash::new(&dummy) {
+                    let _ = Argon2::default().verify_password(pw.as_bytes(), &parsed);
+                }
+            })
+            .await;
+            bail!("invalid credentials");
+        };
 
         let pw_hash_str: String = row.get(4);
-        let parsed_hash =
-            PasswordHash::new(&pw_hash_str).map_err(|_| anyhow!("corrupted password hash"))?;
-        Argon2::default()
-            .verify_password(password.as_bytes(), &parsed_hash)
-            .map_err(|_| anyhow!("invalid credentials"))?;
+        let pw_owned = password.to_string();
+        let verified = tokio::task::spawn_blocking(move || -> Result<()> {
+            let parsed_hash =
+                PasswordHash::new(&pw_hash_str).map_err(|_| anyhow!("corrupted password hash"))?;
+            Argon2::default()
+                .verify_password(pw_owned.as_bytes(), &parsed_hash)
+                .map_err(|_| anyhow!("invalid credentials"))
+        })
+        .await??;
+        let _ = verified;
 
         let user = UserRecord {
             id: row.get(0),
@@ -312,7 +472,7 @@ impl Db {
             created_at: row.get(7),
         };
 
-        self.client
+        client
             .execute("UPDATE users SET last_login_at = NOW() WHERE id = $1", &[&user.id])
             .await?;
 
@@ -321,29 +481,41 @@ impl Db {
     }
 
     async fn issue_session_token(&self, user_id: Uuid, client_label: &str) -> Result<String> {
-        let mut raw_bytes = [0u8; 32];
-        rand::thread_rng().fill(&mut raw_bytes);
-        let raw_token = format!("coda_pat_{}", hex::encode(raw_bytes));
+        let client = self.client().await?;
+        let raw_token = generate_raw_session_token();
         let token_sha256 = sha256_hex(&raw_token);
         let expires_at = Utc::now() + Duration::days(30);
+        let label: String = client_label.chars().take(64).collect();
 
-        self.client
+        client
             .execute(
                 r#"
                 INSERT INTO auth_sessions (token_sha256, user_id, client_label, expires_at)
                 VALUES ($1, $2, $3, $4)
                 "#,
-                &[&token_sha256, &user_id, &client_label, &expires_at],
+                &[&token_sha256, &user_id, &label, &expires_at],
             )
             .await?;
 
         Ok(raw_token)
     }
 
-    pub async fn authenticate_token(&self, raw_token: &str) -> Result<UserRecord> {
+    pub async fn delete_session(&self, raw_token: &str) -> Result<()> {
+        let client = self.client().await?;
         let token_sha256 = sha256_hex(raw_token.trim());
-        let row = self
-            .client
+        client
+            .execute(
+                "DELETE FROM auth_sessions WHERE token_sha256 = $1",
+                &[&token_sha256],
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn authenticate_token(&self, raw_token: &str) -> Result<UserRecord> {
+        let client = self.client().await?;
+        let token_sha256 = sha256_hex(raw_token.trim());
+        let row = client
             .query_opt(
                 r#"
                 SELECT u.id, u.email, u.handle, u.display_name, u.is_admin, u.bandwidth_quota_mbps, u.created_at
@@ -377,13 +549,13 @@ impl Db {
         if !creator.is_admin {
             bail!("only admin accounts can generate new friend invite codes");
         }
-        let suffix: u32 = rand::thread_rng().gen_range(100_000..999_999);
+        let client = self.client().await?;
+        let suffix: u32 = rand::thread_rng().gen_range(100_000..=999_999);
         let code = format!("CODA-{suffix}");
         let expires_at = Some(Utc::now() + Duration::days(valid_days.max(1)));
         let max_uses = max_uses.clamp(1, 500);
 
-        let row = self
-            .client
+        let row = client
             .query_one(
                 r#"
                 INSERT INTO invite_codes (code, created_by, note, max_uses, expires_at)
@@ -408,8 +580,8 @@ impl Db {
         if !user.is_admin {
             return Ok(vec![]);
         }
-        let rows = self
-            .client
+        let client = self.client().await?;
+        let rows = client
             .query(
                 "SELECT code, note, max_uses, used_count, expires_at, created_at FROM invite_codes ORDER BY created_at DESC LIMIT 50",
                 &[],
@@ -434,25 +606,31 @@ impl Db {
         user_id: Uuid,
         suggested_name: Option<&str>,
     ) -> Result<(String, DateTime<Utc>)> {
-        let a: u16 = rand::thread_rng().gen_range(100..999);
-        let b: u16 = rand::thread_rng().gen_range(100..999);
-        let code = format!("{a}-{b}");
+        let client = self.client().await?;
         let expires_at = Utc::now() + Duration::minutes(10);
-
-        self.client
-            .execute(
-                r#"
-                INSERT INTO pairing_tokens (code, user_id, suggested_name, expires_at)
-                VALUES ($1, $2, $3, $4)
-                "#,
-                &[&code, &user_id, &suggested_name, &expires_at],
-            )
-            .await?;
-
-        Ok((code, expires_at))
+        for _ in 0..10 {
+            let a: u16 = rand::thread_rng().gen_range(100..=999);
+            let b: u16 = rand::thread_rng().gen_range(100..=999);
+            let code = format!("{a}-{b}");
+            let res = client
+                .execute(
+                    r#"
+                    INSERT INTO pairing_tokens (code, user_id, suggested_name, expires_at)
+                    VALUES ($1, $2, $3, $4)
+                    ON CONFLICT (code) DO NOTHING
+                    "#,
+                    &[&code, &user_id, &suggested_name, &expires_at],
+                )
+                .await?;
+            if res > 0 {
+                return Ok((code, expires_at));
+            }
+        }
+        bail!("failed allocating unique pairing token after retries")
     }
 
-    /// Daemon claims a 6-digit pairing code and registers its Ed25519 + X25519 public keys.
+    /// Daemon claims a 6-digit pairing code and registers its Ed25519 + X25519 public keys atomically.
+    #[allow(clippy::too_many_arguments)]
     pub async fn claim_pairing_token(
         &self,
         code: &str,
@@ -464,14 +642,22 @@ impl Db {
         herdr_core_id: Option<&str>,
         herdr_version: Option<&str>,
     ) -> Result<(DeviceRecord, UserRecord)> {
+        validate_device_inputs(name, "daemon", platform, ed25519_pubkey, x25519_pubkey)?;
         let normalized = code.trim();
-        let token_row = self
-            .client
+
+        let mut tx_guard = self.acquire_tx_client().await?;
+        let tx_conn = tx_guard
+            .as_mut()
+            .ok_or_else(|| anyhow!("tx postgres client unavailable"))?;
+        let tx = tx_conn.transaction().await?;
+
+        let token_row = tx
             .query_opt(
                 r#"
                 SELECT user_id, suggested_name
                 FROM pairing_tokens
                 WHERE code = $1 AND claimed_device_id IS NULL AND expires_at > NOW()
+                FOR UPDATE
                 "#,
                 &[&normalized],
             )
@@ -482,31 +668,53 @@ impl Db {
         let suggested: Option<String> = token_row.get(1);
         let final_name = suggested
             .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| name.to_string());
+            .unwrap_or_else(|| name.trim().to_string());
 
-        let dev = self
-            .upsert_device(
-                user_id,
-                &final_name,
-                "daemon",
-                platform,
-                ed25519_pubkey,
-                x25519_pubkey,
-                endpoints_json,
-                herdr_core_id,
-                herdr_version,
+        let dev_row = tx
+            .query_one(
+                r#"
+                INSERT INTO devices (
+                    user_id, name, role, platform, ed25519_pubkey, x25519_pubkey,
+                    endpoints_json, herdr_core_id, herdr_version, is_online, last_seen_at
+                )
+                VALUES ($1, $2, 'daemon', $3, $4, $5, $6, $7, $8, FALSE, NOW())
+                ON CONFLICT (user_id, ed25519_pubkey) DO UPDATE
+                SET name = EXCLUDED.name,
+                    role = EXCLUDED.role,
+                    platform = EXCLUDED.platform,
+                    x25519_pubkey = EXCLUDED.x25519_pubkey,
+                    endpoints_json = EXCLUDED.endpoints_json,
+                    herdr_core_id = EXCLUDED.herdr_core_id,
+                    herdr_version = EXCLUDED.herdr_version,
+                    last_seen_at = NOW()
+                RETURNING id, user_id, name, role, platform, ed25519_pubkey, x25519_pubkey,
+                          endpoints_json, herdr_core_id, herdr_version, is_online, last_seen_at
+                "#,
+                &[
+                    &user_id,
+                    &final_name,
+                    &platform,
+                    &ed25519_pubkey,
+                    &x25519_pubkey,
+                    endpoints_json,
+                    &herdr_core_id,
+                    &herdr_version,
+                ],
             )
             .await?;
+        let dev = map_device_row(&dev_row);
 
-        self.client
+        let updated = tx
             .execute(
-                "UPDATE pairing_tokens SET claimed_device_id = $1 WHERE code = $2",
+                "UPDATE pairing_tokens SET claimed_device_id = $1 WHERE code = $2 AND claimed_device_id IS NULL",
                 &[&dev.id, &normalized],
             )
             .await?;
+        if updated == 0 {
+            bail!("pairing token already claimed");
+        }
 
-        let urow = self
-            .client
+        let urow = tx
             .query_one(
                 "SELECT id, email, handle, display_name, is_admin, bandwidth_quota_mbps, created_at FROM users WHERE id = $1",
                 &[&user_id],
@@ -522,6 +730,7 @@ impl Db {
             created_at: urow.get(6),
         };
 
+        tx.commit().await?;
         Ok((dev, user))
     }
 
@@ -538,8 +747,10 @@ impl Db {
         herdr_core_id: Option<&str>,
         herdr_version: Option<&str>,
     ) -> Result<DeviceRecord> {
-        let row = self
-            .client
+        validate_device_inputs(name, role, platform, ed25519_pubkey, x25519_pubkey)?;
+        let client = self.client().await?;
+        let trimmed_name = name.trim();
+        let row = client
             .query_one(
                 r#"
                 INSERT INTO devices (
@@ -547,7 +758,7 @@ impl Db {
                     endpoints_json, herdr_core_id, herdr_version, is_online, last_seen_at
                 )
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, FALSE, NOW())
-                ON CONFLICT (ed25519_pubkey) DO UPDATE
+                ON CONFLICT (user_id, ed25519_pubkey) DO UPDATE
                 SET name = EXCLUDED.name,
                     role = EXCLUDED.role,
                     platform = EXCLUDED.platform,
@@ -556,13 +767,12 @@ impl Db {
                     herdr_core_id = EXCLUDED.herdr_core_id,
                     herdr_version = EXCLUDED.herdr_version,
                     last_seen_at = NOW()
-                WHERE devices.user_id = EXCLUDED.user_id
                 RETURNING id, user_id, name, role, platform, ed25519_pubkey, x25519_pubkey,
                           endpoints_json, herdr_core_id, herdr_version, is_online, last_seen_at
                 "#,
                 &[
                     &user_id,
-                    &name,
+                    &trimmed_name,
                     &role,
                     &platform,
                     &ed25519_pubkey,
@@ -573,15 +783,15 @@ impl Db {
                 ],
             )
             .await
-            .context("device registration failed or public key belongs to another user")?;
+            .context("device registration failed")?;
 
         Ok(map_device_row(&row))
     }
 
     /// Strict tenant-isolated device listing (`WHERE user_id = $1`).
     pub async fn list_user_devices(&self, user_id: Uuid) -> Result<Vec<DeviceRecord>> {
-        let rows = self
-            .client
+        let client = self.client().await?;
+        let rows = client
             .query(
                 r#"
                 SELECT id, user_id, name, role, platform, ed25519_pubkey, x25519_pubkey,
@@ -596,9 +806,46 @@ impl Db {
         Ok(rows.iter().map(map_device_row).collect())
     }
 
+    /// Strict tenant-isolated trusted peer directory for cryptographic pinning on daemons & clients.
+    pub async fn list_trusted_peers(&self, user_id: Uuid) -> Result<Vec<TrustedPeerEntry>> {
+        let client = self.client().await?;
+        let rows = client
+            .query(
+                r#"
+                SELECT id, name, role, ed25519_pubkey, x25519_pubkey
+                FROM devices
+                WHERE user_id = $1
+                ORDER BY created_at ASC
+                "#,
+                &[&user_id],
+            )
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| TrustedPeerEntry {
+                device_id: r.get(0),
+                name: r.get(1),
+                role: r.get(2),
+                ed25519_pub_b64: r.get(3),
+                x25519_pub_b64: r.get(4),
+            })
+            .collect())
+    }
+
+    pub async fn delete_device(&self, user_id: Uuid, device_id: Uuid) -> Result<bool> {
+        let client = self.client().await?;
+        let deleted = client
+            .execute(
+                "DELETE FROM devices WHERE id = $1 AND user_id = $2",
+                &[&device_id, &user_id],
+            )
+            .await?;
+        Ok(deleted > 0)
+    }
+
     pub async fn get_device_by_id(&self, device_id: Uuid) -> Result<Option<DeviceRecord>> {
-        let row = self
-            .client
+        let client = self.client().await?;
+        let row = client
             .query_opt(
                 r#"
                 SELECT id, user_id, name, role, platform, ed25519_pubkey, x25519_pubkey,
@@ -613,8 +860,8 @@ impl Db {
     }
 
     pub async fn get_user_quota_mbps(&self, user_id: Uuid) -> Result<u32> {
-        let row = self
-            .client
+        let client = self.client().await?;
+        let row = client
             .query_one(
                 "SELECT bandwidth_quota_mbps FROM users WHERE id = $1",
                 &[&user_id],
@@ -625,7 +872,8 @@ impl Db {
     }
 
     pub async fn set_device_online(&self, device_id: Uuid, is_online: bool) -> Result<()> {
-        self.client
+        let client = self.client().await?;
+        client
             .execute(
                 "UPDATE devices SET is_online = $2, last_seen_at = NOW() WHERE id = $1",
                 &[&device_id, &is_online],
@@ -635,7 +883,8 @@ impl Db {
     }
 
     pub async fn update_device_endpoints(&self, device_id: Uuid, endpoints: &Value) -> Result<()> {
-        self.client
+        let client = self.client().await?;
+        client
             .execute(
                 "UPDATE devices SET endpoints_json = $2, last_seen_at = NOW() WHERE id = $1",
                 &[&device_id, endpoints],
@@ -645,8 +894,8 @@ impl Db {
     }
 
     pub async fn list_active_relays(&self) -> Result<Vec<RelayNodeRecord>> {
-        let rows = self
-            .client
+        let client = self.client().await?;
+        let rows = client
             .query(
                 r#"
                 SELECT id, region, mode, endpoint, node_pubkey, priority
@@ -670,6 +919,7 @@ impl Db {
             .collect())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_device_auth_request(
         &self,
         device_name: &str,
@@ -682,10 +932,13 @@ impl Db {
         herdr_version: &str,
         ttl_secs: i64,
     ) -> Result<(String, String, DateTime<Utc>)> {
+        validate_device_inputs(device_name, role, platform, ed25519_pubkey, x25519_pubkey)?;
+        let client = self.client().await?;
         let device_code = format!("dev_{}_{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
         let user_code = generate_user_code();
         let expires_at = Utc::now() + Duration::seconds(ttl_secs.max(60));
-        self.client
+        let trimmed_name = device_name.trim();
+        client
             .execute(
                 r#"
                 INSERT INTO device_auth_requests (
@@ -698,7 +951,7 @@ impl Db {
                 &[
                     &device_code,
                     &user_code,
-                    &device_name,
+                    &trimmed_name,
                     &role,
                     &platform,
                     &ed25519_pubkey,
@@ -717,12 +970,12 @@ impl Db {
         &self,
         user_code: &str,
     ) -> Result<Option<DeviceAuthPublicInfo>> {
+        let client = self.client().await?;
         let normalized = normalize_user_code(user_code);
         if normalized.is_empty() {
             return Ok(None);
         }
-        let row = self
-            .client
+        let row = client
             .query_opt(
                 r#"
                 SELECT user_code, device_name, role, platform, status, expires_at
@@ -758,8 +1011,13 @@ impl Db {
         device_name_override: Option<&str>,
     ) -> Result<DeviceRecord> {
         let normalized = normalize_user_code(user_code);
-        let row = self
-            .client
+        let mut tx_guard = self.acquire_tx_client().await?;
+        let tx_conn = tx_guard
+            .as_mut()
+            .ok_or_else(|| anyhow!("tx postgres client unavailable"))?;
+        let tx = tx_conn.transaction().await?;
+
+        let row = tx
             .query_opt(
                 r#"
                 SELECT device_code, device_name, role, platform,
@@ -767,6 +1025,7 @@ impl Db {
                        herdr_core_id, herdr_version, status, expires_at
                 FROM device_auth_requests
                 WHERE user_code = $1
+                FOR UPDATE
                 "#,
                 &[&normalized],
             )
@@ -789,68 +1048,159 @@ impl Db {
             bail!("device authorization code is already {status}");
         }
         if expires_at < Utc::now() {
-            let _ = self
-                .client
+            let _ = tx
                 .execute(
                     "UPDATE device_auth_requests SET status = 'expired' WHERE device_code = $1",
                     &[&device_code],
                 )
                 .await;
+            let _ = tx.commit().await;
             bail!("device authorization code expired");
         }
 
         if let Some(override_name) = device_name_override.map(str::trim).filter(|s| !s.is_empty()) {
             device_name = override_name.to_string();
         }
+        validate_device_inputs(&device_name, &role, &platform, &ed25519_pubkey, &x25519_pubkey)?;
 
-        let device = self
-            .upsert_device(
-                user_id,
-                &device_name,
-                &role,
-                &platform,
-                &ed25519_pubkey,
-                &x25519_pubkey,
-                &endpoints_json,
-                Some(herdr_core_id.as_str()).filter(|s| !s.is_empty()),
-                Some(herdr_version.as_str()).filter(|s| !s.is_empty()),
-            )
-            .await?;
-
-        let token = self
-            .issue_session_token(user_id, &format!("device:{}", device.name))
-            .await?;
-
-        self.client
-            .execute(
+        let core_opt = Some(herdr_core_id.as_str()).filter(|s| !s.is_empty());
+        let ver_opt = Some(herdr_version.as_str()).filter(|s| !s.is_empty());
+        let dev_row = tx
+            .query_one(
                 r#"
-                UPDATE device_auth_requests
-                SET status = 'approved',
-                    approved_user_id = $2,
-                    issued_session_token = $3,
-                    issued_device_id = $4,
-                    device_name = $5
-                WHERE device_code = $1
+                INSERT INTO devices (
+                    user_id, name, role, platform, ed25519_pubkey, x25519_pubkey,
+                    endpoints_json, herdr_core_id, herdr_version, is_online, last_seen_at
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, FALSE, NOW())
+                ON CONFLICT (user_id, ed25519_pubkey) DO UPDATE
+                SET name = EXCLUDED.name,
+                    role = EXCLUDED.role,
+                    platform = EXCLUDED.platform,
+                    x25519_pubkey = EXCLUDED.x25519_pubkey,
+                    endpoints_json = EXCLUDED.endpoints_json,
+                    herdr_core_id = EXCLUDED.herdr_core_id,
+                    herdr_version = EXCLUDED.herdr_version,
+                    last_seen_at = NOW()
+                RETURNING id, user_id, name, role, platform, ed25519_pubkey, x25519_pubkey,
+                          endpoints_json, herdr_core_id, herdr_version, is_online, last_seen_at
                 "#,
                 &[
-                    &device_code,
                     &user_id,
-                    &token,
-                    &device.id,
-                    &device.name,
+                    &device_name,
+                    &role,
+                    &platform,
+                    &ed25519_pubkey,
+                    &x25519_pubkey,
+                    &endpoints_json,
+                    &core_opt,
+                    &ver_opt,
                 ],
             )
             .await?;
+        let device = map_device_row(&dev_row);
 
+        let token = generate_raw_session_token();
+        let token_sha256 = sha256_hex(&token);
+        let session_exp = Utc::now() + Duration::days(30);
+        let label: String = format!("device:{}", device.name).chars().take(64).collect();
+        tx.execute(
+            r#"
+            INSERT INTO auth_sessions (token_sha256, user_id, client_label, expires_at)
+            VALUES ($1, $2, $3, $4)
+            "#,
+            &[&token_sha256, &user_id, &label, &session_exp],
+        )
+        .await?;
+
+        let sealed_token = seal_opaque_secret(&self.inner.token_wrap_key, &token)?;
+        tx.execute(
+            r#"
+            UPDATE device_auth_requests
+            SET status = 'approved',
+                approved_user_id = $2,
+                issued_session_token = $3,
+                issued_device_id = $4,
+                device_name = $5
+            WHERE device_code = $1
+            "#,
+            &[
+                &device_code,
+                &user_id,
+                &sealed_token,
+                &device.id,
+                &device.name,
+            ],
+        )
+        .await?;
+
+        tx.commit().await?;
         Ok(device)
     }
 
     pub async fn poll_device_auth(&self, device_code: &str) -> Result<DeviceAuthPollState> {
-        let row = self
-            .client
+        let client = self.client().await?;
+
+        // Atomically consume an approved & unexpired token first so concurrent polls cannot double-read it.
+        if let Some(consumed_row) = client
             .query_opt(
                 r#"
-                SELECT status, approved_user_id, issued_session_token, issued_device_id, expires_at
+                WITH prev AS (
+                    SELECT device_code, approved_user_id, issued_session_token, issued_device_id
+                    FROM device_auth_requests
+                    WHERE device_code = $1
+                      AND status = 'approved'
+                      AND expires_at > NOW()
+                      AND issued_session_token <> ''
+                    FOR UPDATE
+                )
+                UPDATE device_auth_requests d
+                SET status = 'consumed',
+                    issued_session_token = ''
+                FROM prev
+                WHERE d.device_code = prev.device_code
+                RETURNING prev.approved_user_id, prev.issued_session_token, prev.issued_device_id
+                "#,
+                &[&device_code],
+            )
+            .await?
+        {
+            let approved_user_id: Option<Uuid> = consumed_row.get(0);
+            let sealed_token: String = consumed_row.get(1);
+            let issued_device_id: Option<Uuid> = consumed_row.get(2);
+            if let (Some(user_id), Some(device_id)) = (approved_user_id, issued_device_id) {
+                let session_token = open_opaque_secret(&self.inner.token_wrap_key, &sealed_token)?;
+                let user_row = client
+                    .query_one(
+                        "SELECT id, email, handle, display_name, is_admin, bandwidth_quota_mbps, created_at FROM users WHERE id = $1",
+                        &[&user_id],
+                    )
+                    .await?;
+                let user = UserRecord {
+                    id: user_row.get(0),
+                    email: user_row.get(1),
+                    handle: user_row.get(2),
+                    display_name: user_row.get(3),
+                    is_admin: user_row.get(4),
+                    bandwidth_quota_mbps: user_row.get(5),
+                    created_at: user_row.get(6),
+                };
+                let device = self
+                    .get_device_by_id(device_id)
+                    .await?
+                    .ok_or_else(|| anyhow!("issued device not found"))?;
+                return Ok(DeviceAuthPollState::Approved {
+                    session_token,
+                    user,
+                    device,
+                });
+            }
+        }
+
+        let row = client
+            .query_opt(
+                r#"
+                SELECT status, expires_at
                 FROM device_auth_requests
                 WHERE device_code = $1
                 "#,
@@ -863,16 +1213,12 @@ impl Db {
         };
 
         let status: String = row.get(0);
-        let approved_user_id: Option<Uuid> = row.get(1);
-        let session_token: String = row.get(2);
-        let issued_device_id: Option<Uuid> = row.get(3);
-        let expires_at: DateTime<Utc> = row.get(4);
+        let expires_at: DateTime<Utc> = row.get(1);
 
         if status == "pending" {
             let remaining = (expires_at - Utc::now()).num_seconds();
             if remaining <= 0 {
-                let _ = self
-                    .client
+                let _ = client
                     .execute(
                         "UPDATE device_auth_requests SET status = 'expired' WHERE device_code = $1",
                         &[&device_code],
@@ -885,46 +1231,103 @@ impl Db {
             });
         }
 
-        if status == "approved" {
-            if let (Some(user_id), Some(device_id)) = (approved_user_id, issued_device_id) {
-                if !session_token.is_empty() {
-                    let user_row = self
-                        .client
-                        .query_one(
-                            "SELECT id, email, handle, display_name, is_admin, bandwidth_quota_mbps, created_at FROM users WHERE id = $1",
-                            &[&user_id],
-                        )
-                        .await?;
-                    let user = UserRecord {
-                        id: user_row.get(0),
-                        email: user_row.get(1),
-                        handle: user_row.get(2),
-                        display_name: user_row.get(3),
-                        is_admin: user_row.get(4),
-                        bandwidth_quota_mbps: user_row.get(5),
-                        created_at: user_row.get(6),
-                    };
-                    let device = self
-                        .get_device_by_id(device_id)
-                        .await?
-                        .ok_or_else(|| anyhow!("issued device not found"))?;
-                    self.client
-                        .execute(
-                            "UPDATE device_auth_requests SET status = 'consumed', issued_session_token = '' WHERE device_code = $1",
-                            &[&device_code],
-                        )
-                        .await?;
-                    return Ok(DeviceAuthPollState::Approved {
-                        session_token,
-                        user,
-                        device,
-                    });
-                }
-            }
-        }
-
         Ok(DeviceAuthPollState::Expired)
     }
+}
+
+fn validate_email(email: &str) -> Result<()> {
+    let Some((local, domain)) = email.split_once('@') else {
+        bail!("invalid email address");
+    };
+    if local.is_empty()
+        || domain.is_empty()
+        || !domain.contains('.')
+        || email.len() > 254
+        || email.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        bail!("invalid email address");
+    }
+    Ok(())
+}
+
+fn validate_handle(handle: &str) -> Result<()> {
+    if handle.len() < 2
+        || handle.len() > 64
+        || handle.contains('@')
+        || !handle
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        bail!("handle must be 2..=64 ASCII characters ([a-z0-9._-]) without '@'");
+    }
+    Ok(())
+}
+
+fn validate_device_inputs(
+    name: &str,
+    role: &str,
+    platform: &str,
+    ed25519_pubkey: &str,
+    x25519_pubkey: &str,
+) -> Result<()> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() || trimmed.len() > 128 {
+        bail!("device name must be 1..=128 characters");
+    }
+    if !matches!(role, "daemon" | "client" | "hybrid") {
+        bail!("invalid device role: {role}");
+    }
+    if !matches!(
+        platform,
+        "macos" | "ios" | "ipados" | "iphone_duo" | "linux" | "windows" | "web"
+    ) {
+        bail!("invalid device platform: {platform}");
+    }
+    validate_ed25519_pub_b64(ed25519_pubkey)?;
+    validate_x25519_pub_b64(x25519_pubkey)?;
+    Ok(())
+}
+
+fn generate_raw_session_token() -> String {
+    let mut raw_bytes = [0u8; 32];
+    rand::thread_rng().fill(&mut raw_bytes);
+    format!("coda_pat_{}", hex::encode(raw_bytes))
+}
+
+async fn purge_expired_with_client(client: &Client) -> Result<()> {
+    let _ = client
+        .execute("DELETE FROM auth_sessions WHERE expires_at < NOW()", &[])
+        .await?;
+    let _ = client
+        .execute(
+            "DELETE FROM pairing_tokens WHERE expires_at < NOW() - INTERVAL '1 hour'",
+            &[],
+        )
+        .await?;
+    let _ = client
+        .execute(
+            "DELETE FROM device_auth_requests WHERE expires_at < NOW() - INTERVAL '1 hour'",
+            &[],
+        )
+        .await?;
+    Ok(())
+}
+
+fn spawn_expiry_cleanup_task(weak_inner: Weak<DbInner>) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(900));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            let Some(inner) = weak_inner.upgrade() else {
+                break;
+            };
+            let db = Db { inner };
+            if let Ok(client) = db.client().await {
+                let _ = purge_expired_with_client(&client).await;
+            }
+        }
+    });
 }
 
 pub fn normalize_user_code(raw: &str) -> String {
