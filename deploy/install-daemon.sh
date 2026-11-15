@@ -160,15 +160,77 @@ else
   curl -fsSL https://releases.herdr.dev/core/install.sh | sh
 fi
 
+compute_sha256() {
+  target_file="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "${target_file}" | awk '{print tolower($1)}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "${target_file}" | awk '{print tolower($1)}'
+  elif command -v openssl >/dev/null 2>&1; then
+    openssl dgst -sha256 "${target_file}" | awk '{print tolower($NF)}'
+  else
+    echo "error: missing sha256sum / shasum / openssl for checksum verification" >&2
+    return 1
+  fi
+}
+
+verify_release_sha256() {
+  base_url="$1"
+  ver_tag="$2"
+  asset_name="$3"
+  local_file="$4"
+  if [ "${CODA_SKIP_CHECKSUM:-0}" = "1" ]; then
+    return 0
+  fi
+  sums_file="$(mktemp)"
+  if ! curl -fsSL "${base_url}/SHA256SUMS-${ver_tag}.txt" -o "${sums_file}" 2>/dev/null \
+    && ! curl -fsSL "${base_url}/SHA256SUMS.txt" -o "${sums_file}" 2>/dev/null; then
+    rm -f "${sums_file}"
+    echo "error: failed downloading SHA256SUMS-${ver_tag}.txt (or SHA256SUMS.txt)" >&2
+    return 1
+  fi
+  expected_hash="$(awk -v target="${asset_name}" '{
+    fname = $2;
+    sub(/^\*/, "", fname);
+    sub(/^.*\//, "", fname);
+    if (fname == target) { print tolower($1); exit; }
+  }' "${sums_file}")"
+  rm -f "${sums_file}"
+  if [ -z "${expected_hash}" ]; then
+    echo "error: SHA256SUMS missing entry for ${asset_name}" >&2
+    return 1
+  fi
+  actual_hash="$(compute_sha256 "${local_file}")" || return 1
+  if [ "${actual_hash}" != "${expected_hash}" ]; then
+    echo "error: SHA256 mismatch for ${asset_name} (expected=${expected_hash}, actual=${actual_hash})" >&2
+    return 1
+  fi
+  echo "    [OK] SHA256 verified (${asset_name}: ${actual_hash})"
+}
+
+xml_escape() {
+  printf '%s' "${1:-}" | sed \
+    -e 's/&/\&amp;/g' \
+    -e 's/</\&lt;/g' \
+    -e 's/>/\&gt;/g' \
+    -e 's/"/\&quot;/g' \
+    -e "s/'/\&apos;/g"
+}
+
+systemd_quote() {
+  esc="$(printf '%s' "${1:-}" | tr -d '\r\n' | sed 's/\\/\\\\/g; s/"/\\"/g')"
+  printf '"%s"' "${esc}"
+}
+
 echo "==> [2/4] Checking coda-daemon binary..."
 if [ -n "${LOCAL_BIN}" ] && [ -x "${LOCAL_BIN}" ]; then
   cp "${LOCAL_BIN}" "${INSTALL_DIR}/coda-daemon"
   chmod +x "${INSTALL_DIR}/coda-daemon"
   echo "    Installed local coda-daemon binary to ${INSTALL_DIR}/coda-daemon"
 elif ! command -v coda-daemon >/dev/null 2>&1; then
-  if [ -x "./target/release/coda-daemon" ]; then
+  if [ "${CODA_ALLOW_LOCAL_TARGET:-0}" = "1" ] && [ -x "./target/release/coda-daemon" ]; then
     cp "./target/release/coda-daemon" "${INSTALL_DIR}/coda-daemon"
-  elif [ -x "./target/debug/coda-daemon" ]; then
+  elif [ "${CODA_ALLOW_LOCAL_TARGET:-0}" = "1" ] && [ -x "./target/debug/coda-daemon" ]; then
     cp "./target/debug/coda-daemon" "${INSTALL_DIR}/coda-daemon"
   else
     ARCH_NAME="$(uname -m)"
@@ -191,20 +253,34 @@ elif ! command -v coda-daemon >/dev/null 2>&1; then
         fi
       fi
       PKG_NAME="${DIR_NAME}-${VERSION}.tar.gz"
-      echo "    Downloading prebuilt ${PKG_NAME} from GitHub Releases..."
+      REL_BASE="https://github.com/${REPO}/releases/download/${VERSION}"
+      echo "    Downloading & verifying prebuilt ${PKG_NAME} from GitHub Releases..."
       TMP_D="$(mktemp -d)"
-      if [ "${VERSION}" != "latest" ] && curl -fsSL "https://github.com/${REPO}/releases/download/${VERSION}/${PKG_NAME}" -o "${TMP_D}/${PKG_NAME}"; then
+      if [ "${VERSION}" != "latest" ] && curl -fsSL "${REL_BASE}/${PKG_NAME}" -o "${TMP_D}/${PKG_NAME}"; then
+        if ! verify_release_sha256 "${REL_BASE}" "${VERSION}" "${PKG_NAME}" "${TMP_D}/${PKG_NAME}"; then
+          rm -rf "${TMP_D}"
+          exit 1
+        fi
         tar -C "${TMP_D}" -xzf "${TMP_D}/${PKG_NAME}"
         cp "${TMP_D}/${DIR_NAME}/coda-daemon" "${INSTALL_DIR}/coda-daemon"
-      else
+      elif [ "${CODA_ALLOW_SOURCE_BUILD:-0}" = "1" ] && [ -f "./Cargo.toml" ]; then
         echo "    Release download unavailable; building coda-daemon from source via cargo..."
         cargo build --release -p coda-daemon
         cp "./target/release/coda-daemon" "${INSTALL_DIR}/coda-daemon"
+      else
+        rm -rf "${TMP_D}"
+        echo "error: failed downloading ${PKG_NAME} from ${REL_BASE}" >&2
+        exit 1
       fi
       rm -rf "${TMP_D}"
     else
-      cargo build --release -p coda-daemon
-      cp "./target/release/coda-daemon" "${INSTALL_DIR}/coda-daemon"
+      if [ "${CODA_ALLOW_SOURCE_BUILD:-0}" = "1" ] && [ -f "./Cargo.toml" ]; then
+        cargo build --release -p coda-daemon
+        cp "./target/release/coda-daemon" "${INSTALL_DIR}/coda-daemon"
+      else
+        echo "error: unsupported OS/architecture (${OS_NAME}/${ARCH_NAME})" >&2
+        exit 1
+      fi
     fi
   fi
   chmod +x "${INSTALL_DIR}/coda-daemon"
@@ -220,9 +296,9 @@ if [ -n "${PAIR_CODE}" ]; then
 elif [ -n "${LOGIN_EMAIL}" ] && [ -n "${LOGIN_PASSWORD}" ]; then
   echo "==> [3/4] Enrolling host non-interactively with Coda Coordinator (${SERVER_URL})..."
   if [ -n "${DEVICE_NAME}" ]; then
-    coda-daemon login --server "${SERVER_URL}" --email "${LOGIN_EMAIL}" --password "${LOGIN_PASSWORD}" --role "${DEVICE_ROLE}" --name "${DEVICE_NAME}"
+    printf '%s\n' "${LOGIN_PASSWORD}" | env -u CODA_LOGIN_PASSWORD coda-daemon login --server "${SERVER_URL}" --email "${LOGIN_EMAIL}" --password-stdin --role "${DEVICE_ROLE}" --name "${DEVICE_NAME}"
   else
-    coda-daemon login --server "${SERVER_URL}" --email "${LOGIN_EMAIL}" --password "${LOGIN_PASSWORD}" --role "${DEVICE_ROLE}"
+    printf '%s\n' "${LOGIN_PASSWORD}" | env -u CODA_LOGIN_PASSWORD coda-daemon login --server "${SERVER_URL}" --email "${LOGIN_EMAIL}" --password-stdin --role "${DEVICE_ROLE}"
   fi
 elif [ ! -f "${CFG_PATH}" ]; then
   if [ "${NON_INTERACTIVE}" -eq 1 ]; then
@@ -273,6 +349,11 @@ if [ "${OS_NAME}" = "Darwin" ]; then
     PLIST_DIR="${HOME}/Library/LaunchAgents"
     PLIST_PATH="${PLIST_DIR}/dev.coda.daemon.plist"
     mkdir -p "${PLIST_DIR}"
+    PLIST_P2P_XML=""
+    if [ -n "${P2P_BIND}" ]; then
+      PLIST_P2P_XML="    <string>--p2p-bind</string>
+    <string>$(xml_escape "${P2P_BIND}")</string>"
+    fi
     cat > "${PLIST_PATH}" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -282,17 +363,18 @@ if [ "${OS_NAME}" = "Darwin" ]; then
   <string>dev.coda.daemon</string>
   <key>ProgramArguments</key>
   <array>
-    <string>${INSTALL_DIR}/coda-daemon</string>
+    <string>$(xml_escape "${INSTALL_DIR}/coda-daemon")</string>
     <string>--config</string>
-    <string>${CFG_PATH}</string>
+    <string>$(xml_escape "${CFG_PATH}")</string>
     <string>run</string>
+${PLIST_P2P_XML}
   </array>
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key>
-    <string>${INSTALL_DIR}:${HOME}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <string>$(xml_escape "${INSTALL_DIR}:${HOME}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")</string>
     <key>CODA_DAEMON_CONFIG</key>
-    <string>${CFG_PATH}</string>
+    <string>$(xml_escape "${CFG_PATH}")</string>
   </dict>
   <key>KeepAlive</key>
   <true/>
@@ -307,9 +389,20 @@ EOF
   fi
 elif [ "${OS_NAME}" = "Linux" ]; then
   SERVICE_STARTED=0
-  EXEC_CMD="${INSTALL_DIR}/coda-daemon --config ${CFG_PATH} run"
+  SAFE_WORK_DIR="${LAUNCH_PWD}"
+  case "${SAFE_WORK_DIR}" in
+    ""|/tmp|/tmp/*|/var/tmp|/var/tmp/*) SAFE_WORK_DIR="${HOME:-/}" ;;
+  esac
+  if [ ! -d "${SAFE_WORK_DIR}" ]; then
+    SAFE_WORK_DIR="${HOME:-/}"
+  fi
+  if [ ! -d "${SAFE_WORK_DIR}" ]; then
+    SAFE_WORK_DIR="/"
+  fi
+
+  EXEC_CMD="$(systemd_quote "${INSTALL_DIR}/coda-daemon") --config $(systemd_quote "${CFG_PATH}") run"
   if [ -n "${P2P_BIND}" ]; then
-    EXEC_CMD="${EXEC_CMD} --p2p-bind ${P2P_BIND}"
+    EXEC_CMD="${EXEC_CMD} --p2p-bind $(systemd_quote "${P2P_BIND}")"
   fi
 
   if [ "$(id -u)" -eq 0 ] && [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
@@ -322,10 +415,10 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=${LAUNCH_PWD}
-Environment="HOME=${HOME}"
-Environment="PATH=${INSTALL_DIR}:/usr/local/bin:/usr/bin:/bin"
-Environment="CODA_DAEMON_CONFIG=${CFG_PATH}"
+WorkingDirectory=$(systemd_quote "${SAFE_WORK_DIR}")
+Environment=$(systemd_quote "HOME=${HOME}")
+Environment=$(systemd_quote "PATH=${INSTALL_DIR}:/usr/local/bin:/usr/bin:/bin")
+Environment=$(systemd_quote "CODA_DAEMON_CONFIG=${CFG_PATH}")
 ExecStart=${EXEC_CMD}
 Restart=always
 RestartSec=2
@@ -351,9 +444,9 @@ After=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=${LAUNCH_PWD}
-Environment="PATH=${INSTALL_DIR}:/usr/local/bin:/usr/bin:/bin"
-Environment="CODA_DAEMON_CONFIG=${CFG_PATH}"
+WorkingDirectory=$(systemd_quote "${SAFE_WORK_DIR}")
+Environment=$(systemd_quote "PATH=${INSTALL_DIR}:/usr/local/bin:/usr/bin:/bin")
+Environment=$(systemd_quote "CODA_DAEMON_CONFIG=${CFG_PATH}")
 ExecStart=${EXEC_CMD}
 Restart=always
 RestartSec=2

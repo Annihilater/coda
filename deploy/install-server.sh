@@ -2,8 +2,9 @@
 # Coda Coordinator & Web Console One-Click Production Installer (Linux x86_64 / ARM64)
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/Annihilater/coda/main/deploy/install-server.sh | sudo sh -s -- \
-#     --public-url http://YOUR_SERVER_IP:8080 \
-#     --relay-secret YOUR_SHARED_SECRET
+#     --public-url https://codahub.dev \
+#     --relay-secret YOUR_SHARED_SECRET \
+#     --database-url postgres://coda:YOUR_STRONG_PASSWORD@127.0.0.1:5432/coda_prod
 
 set -eu
 
@@ -16,6 +17,97 @@ ARG_DB_URL=""
 ARG_HTTP_BIND=""
 ARG_RAW_TCP_BIND=""
 ARG_OPEN_REG=""
+
+load_env_file() {
+  env_path="${1:-}"
+  [ -n "${env_path}" ] && [ -f "${env_path}" ] || return 0
+  while IFS= read -r raw_line || [ -n "${raw_line}" ]; do
+    line="$(printf '%s' "${raw_line}" | tr -d '\r')"
+    line="${line#"${line%%[![:space:]]*}"}"
+    case "${line}" in
+      ""|\#*) continue ;;
+      export[[:space:]]*)
+        line="${line#export}"
+        line="${line#"${line%%[![:space:]]*}"}"
+        ;;
+    esac
+    case "${line}" in
+      *=*) ;;
+      *) continue ;;
+    esac
+    env_key="${line%%=*}"
+    env_val="${line#*=}"
+    env_key="${env_key%"${env_key##*[![:space:]]}"}"
+    case "${env_key}" in
+      ''|[0-9]*|*[!A-Za-z0-9_]*) continue ;;
+    esac
+    case "${env_val}" in
+      \'*\')
+        env_val="${env_val#\'}"
+        env_val="${env_val%\'}"
+        ;;
+      \"*\")
+        env_val="${env_val#\"}"
+        env_val="${env_val%\"}"
+        env_val="$(printf '%s' "${env_val}" | sed 's/\\"/"/g; s/\\\\/\\/g')"
+        ;;
+    esac
+    export "${env_key}=${env_val}"
+  done < "${env_path}"
+}
+
+quote_env_val() {
+  esc="$(printf '%s' "${1:-}" | tr -d '\r\n' | sed 's/\\/\\\\/g; s/"/\\"/g')"
+  printf '"%s"' "${esc}"
+}
+
+compute_sha256() {
+  target_file="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "${target_file}" | awk '{print tolower($1)}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "${target_file}" | awk '{print tolower($1)}'
+  elif command -v openssl >/dev/null 2>&1; then
+    openssl dgst -sha256 "${target_file}" | awk '{print tolower($NF)}'
+  else
+    echo "[ERROR] Missing sha256sum / shasum / openssl for checksum verification" >&2
+    return 1
+  fi
+}
+
+verify_release_sha256() {
+  base_url="$1"
+  ver_tag="$2"
+  asset_name="$3"
+  local_file="$4"
+  if [ "${CODA_SKIP_CHECKSUM:-0}" = "1" ]; then
+    return 0
+  fi
+  sums_file="$(mktemp)"
+  if ! curl -fsSL "${base_url}/SHA256SUMS-${ver_tag}.txt" -o "${sums_file}" 2>/dev/null \
+    && ! curl -fsSL "${base_url}/SHA256SUMS.txt" -o "${sums_file}" 2>/dev/null; then
+    rm -f "${sums_file}"
+    echo "[ERROR] Failed downloading SHA256SUMS-${ver_tag}.txt (or SHA256SUMS.txt); aborting unverified install." >&2
+    return 1
+  fi
+  expected_hash="$(awk -v target="${asset_name}" '{
+    fname = $2;
+    sub(/^\*/, "", fname);
+    sub(/^.*\//, "", fname);
+    if (fname == target) { print tolower($1); exit; }
+  }' "${sums_file}")"
+  rm -f "${sums_file}"
+  if [ -z "${expected_hash}" ]; then
+    echo "[ERROR] SHA256SUMS does not contain an entry for ${asset_name}." >&2
+    return 1
+  fi
+  actual_hash="$(compute_sha256 "${local_file}")" || return 1
+  if [ "${actual_hash}" != "${expected_hash}" ]; then
+    echo "[ERROR] SHA256 mismatch for ${asset_name}: expected=${expected_hash} actual=${actual_hash}" >&2
+    return 1
+  fi
+  echo "    [OK] SHA256 verified (${asset_name}: ${actual_hash})"
+}
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -38,23 +130,33 @@ elif [ -z "${ENV_SRC}" ] && [ -f "/etc/coda/.env" ]; then
 fi
 
 if [ -n "${ENV_SRC}" ] && [ -f "${ENV_SRC}" ]; then
-  echo "==> Loading base configuration from ${ENV_SRC}..."
-  set -a
-  # shellcheck disable=SC1090
-  . "${ENV_SRC}"
-  set +a
+  echo "==> Loading base configuration safely from ${ENV_SRC}..."
+  load_env_file "${ENV_SRC}"
 fi
 
 PUBLIC_URL="${ARG_PUBLIC_URL:-${CODA_PUBLIC_URL:-http://127.0.0.1:8080}}"
-RELAY_SECRET="${ARG_RELAY_SECRET:-${CODA_RELAY_SECRET:-coda-default-relay-secret-change-me}}"
-DB_URL="${ARG_DB_URL:-${DATABASE_URL:-postgres://coda:coda_prod_pass@127.0.0.1:5432/coda_prod}}"
+RELAY_SECRET="${ARG_RELAY_SECRET:-${CODA_RELAY_SECRET:-}}"
+DB_URL="${ARG_DB_URL:-${DATABASE_URL:-}}"
 HTTP_BIND="${ARG_HTTP_BIND:-${CODA_HTTP_BIND:-0.0.0.0:${CODA_HTTP_PORT:-8080}}}"
 RAW_TCP_BIND="${ARG_RAW_TCP_BIND:-${CODA_RAW_TCP_BIND:-0.0.0.0:${CODA_RAW_TCP_PORT:-24443}}}"
 REGION_LABEL="${CODA_REGION_LABEL:-CN-BGP-NoICP}"
-OPEN_REGISTRATION="${ARG_OPEN_REG:-${CODA_OPEN_REGISTRATION:-true}}"
+OPEN_REGISTRATION="${ARG_OPEN_REG:-${CODA_OPEN_REGISTRATION:-false}}"
 GITHUB_REPO="${CODA_GITHUB_REPO:-Annihilater/coda}"
 IOS_BETA_URL="${CODA_IOS_BETA_URL:-}"
 RAW_TCP_PUBLIC_ENDPOINT="${CODA_RAW_TCP_PUBLIC_ENDPOINT:-}"
+
+case "${RELAY_SECRET}" in
+  ""|*change-me*|*change_me*)
+    echo "[ERROR] Refusing to install without a real --relay-secret / CODA_RELAY_SECRET." >&2
+    exit 1
+    ;;
+esac
+case "${DB_URL}" in
+  ""|*coda_prod_pass*|*change-me*|*change_me*)
+    echo "[ERROR] Refusing to install without a real --database-url / DATABASE_URL." >&2
+    exit 1
+    ;;
+esac
 
 if [ "${VERSION}" = "latest" ]; then
   EFFECTIVE_URL="$(curl -fsSLI -o /dev/null -w '%{url_effective}' "https://github.com/${REPO}/releases/latest")"
@@ -65,36 +167,45 @@ ARCH="$(uname -m)"
 case "${ARCH}" in
   x86_64|amd64) DIR="coda-server-linux-x86_64" ;;
   aarch64|arm64) DIR="coda-server-linux-aarch64" ;;
-  *) echo "Unsupported architecture: ${ARCH}"; exit 1 ;;
+  *) echo "Unsupported architecture: ${ARCH}" >&2; exit 1 ;;
 esac
 PKG="${DIR}-${VERSION}.tar.gz"
+REL_BASE="https://github.com/${REPO}/releases/download/${VERSION}"
 
-echo "==> [1/3] Downloading Coda Server ${VERSION} (${PKG})..."
+echo "==> [1/3] Downloading & verifying Coda Server ${VERSION} (${PKG})..."
 TMP_DIR="$(mktemp -d)"
-curl -fsSL "https://github.com/${REPO}/releases/download/${VERSION}/${PKG}" -o "${TMP_DIR}/${PKG}"
+trap 'rm -rf "${TMP_DIR}"' EXIT HUP INT TERM
+curl -fsSL "${REL_BASE}/${PKG}" -o "${TMP_DIR}/${PKG}"
+verify_release_sha256 "${REL_BASE}" "${VERSION}" "${PKG}" "${TMP_DIR}/${PKG}"
 tar -C "${TMP_DIR}" -xzf "${TMP_DIR}/${PKG}"
 
 mkdir -p /opt/coda /etc/coda
+chmod 700 /etc/coda
 cp "${TMP_DIR}/${DIR}/coda-server" /usr/local/bin/coda-server
 chmod +x /usr/local/bin/coda-server
-rm -rf /opt/coda/web-dist
+rm -rf /opt/coda/web-dist /opt/coda/migrations
 cp -r "${TMP_DIR}/${DIR}/web-dist" /opt/coda/web-dist
-rm -rf "${TMP_DIR}"
+if [ -d "${TMP_DIR}/${DIR}/migrations" ]; then
+  cp -r "${TMP_DIR}/${DIR}/migrations" /opt/coda/migrations
+fi
 
 echo "==> [2/3] Writing unified /etc/coda/.env (0600) & systemd unit /etc/systemd/system/coda-server.service..."
-cat > /etc/coda/.env <<EOF
-CODA_RELAY_SECRET=${RELAY_SECRET}
-CODA_PUBLIC_URL=${PUBLIC_URL}
-CODA_HTTP_BIND=${HTTP_BIND}
-CODA_RAW_TCP_BIND=${RAW_TCP_BIND}
-CODA_REGION_LABEL=${REGION_LABEL}
-CODA_OPEN_REGISTRATION=${OPEN_REGISTRATION}
-CODA_GITHUB_REPO=${GITHUB_REPO}
-CODA_IOS_BETA_URL=${IOS_BETA_URL}
-CODA_RAW_TCP_PUBLIC_ENDPOINT=${RAW_TCP_PUBLIC_ENDPOINT}
-DATABASE_URL=${DB_URL}
+(
+  umask 077
+  cat > /etc/coda/.env <<EOF
+CODA_RELAY_SECRET=$(quote_env_val "${RELAY_SECRET}")
+CODA_PUBLIC_URL=$(quote_env_val "${PUBLIC_URL}")
+CODA_HTTP_BIND=$(quote_env_val "${HTTP_BIND}")
+CODA_RAW_TCP_BIND=$(quote_env_val "${RAW_TCP_BIND}")
+CODA_REGION_LABEL=$(quote_env_val "${REGION_LABEL}")
+CODA_OPEN_REGISTRATION=$(quote_env_val "${OPEN_REGISTRATION}")
+CODA_GITHUB_REPO=$(quote_env_val "${GITHUB_REPO}")
+CODA_IOS_BETA_URL=$(quote_env_val "${IOS_BETA_URL}")
+CODA_RAW_TCP_PUBLIC_ENDPOINT=$(quote_env_val "${RAW_TCP_PUBLIC_ENDPOINT}")
+DATABASE_URL=$(quote_env_val "${DB_URL}")
 EOF
-chmod 600 /etc/coda/.env
+  chmod 600 /etc/coda/.env
+)
 
 cat > /etc/systemd/system/coda-server.service <<'EOF'
 [Unit]

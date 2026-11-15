@@ -6,15 +6,16 @@ Coda 每次发布 Tag (`v*`) 时，GitHub Actions 流水线会自动构建并发
 > - **产物命名**：所有发布压缩包文件名均携带版本号（例如 `-v0.2.3.tar.gz`），而 **解压后顶层目录名称均不带版本号**（例如 `coda-deploy-bundle/`、`coda-macos-aarch64/`），方便脚本与升级复用。
 > - **预构建镜像（部署包无需 Dockerfile）**：`coda-deploy-bundle/` 直接引用公网镜像仓库 `ghcr.io/annihilater/coda:<version>`；同时 `start.sh` / `update.sh` 内置自动回落逻辑——若服务器无法访问 GHCR，会自动从 GitHub Releases 下载离线镜像包 `coda-image-linux-{amd64,arm64}-<version>.tar.gz` 并 `docker load` 导入。
 > - **统一 `.env` 密钥管理**：`./start.sh`、`docker-compose.yml`、`coda-server.service`、`coda-relay-cn.service` 与直接运行 `coda-server` 二进制均**统一从 `.env`（或 `/etc/coda/.env`，`0600` 权限）读取 `CODA_RELAY_SECRET` 等环境变量**，`.service` 单元文件中不存放任何明文密钥。
+> - **完整变量与安全规范**：有关 `.env` 全部配置项、必填密钥校验、`SHA256SUMS` 完整性校验、E2EE v2 前向安全及滚动升级说明，请查阅同目录下的 `CONFIG_AND_SECURITY.md`。
 
 | 制品 / 镜像名称 | 解压后目录 / 平台 | 说明 |
 | :--- | :--- | :--- |
 | **`ghcr.io/annihilater/coda:<version>`** | `linux/amd64` / `linux/arm64` | **预构建多架构服务端容器镜像**（内置 `coda-server`、`coda-daemon` 与前端资源） |
-| **`coda-deploy-bundle-<version>.tar.gz`** | `coda-deploy-bundle/` | **极简部署运维包**（含 `pull.sh`/`start.sh`/`stop.sh`/`restart.sh`/`status.sh`/`logs.sh`/`update.sh`、`docker-compose.yml`、`env.example`/`.env.example`、`*.service`、安装脚本与本指南，**无 `Dockerfile`**） |
+| **`coda-deploy-bundle-<version>.tar.gz`** | `coda-deploy-bundle/` | **极简部署运维包**（含 `pull.sh`/`start.sh`/`stop.sh`/`restart.sh`/`status.sh`/`logs.sh`/`update.sh`、`docker-compose.yml`、`env.example`/`.env.example`、`*.service`、安装脚本、`DEPLOY.md` 与 `CONFIG_AND_SECURITY.md`，**无 `Dockerfile`**） |
 | **`coda-image-linux-{amd64,arm64}-<version>.tar.gz`** | 离线容器镜像包 | 供内网或 GHCR 不可达环境执行 `docker load` 离线导入使用 |
 | **`coda-server-linux-{x86_64,aarch64}-<version>.tar.gz`** | `coda-server-linux-*/` | Linux 服务端裸机包（含 `coda-server` + `web-dist` + `migrations` + `deploy`） |
 | **`coda-daemon-linux-{x86_64,aarch64}-<version>.tar.gz`** | `coda-daemon-linux-*/` | Linux 受控开发机守护进程 (`coda-daemon`) |
-| **`coda-macos-aarch64-<version>.tar.gz`** | `coda-macos-aarch64/` | macOS Apple Silicon 全家桶（含 **`coda-desktop` [Rust+GPUI 120Hz 桌面端]**、`CodaMacApp` [SwiftUI]、`coda-daemon`、`coda-server`） |
+| **`coda-macos-aarch64-<version>.tar.gz`** | `coda-macos-aarch64/` | macOS Apple Silicon 全家桶（含 **`coda-desktop` [Rust+GPUI 120Hz 桌面端]**、`CodaMacApp` [SwiftUI]、`libcoda_apple_ffi.dylib`、`coda-daemon`、`coda-server`） |
 | **`Coda-Desktop-macos-aarch64-<version>.dmg`** | macOS App 安装镜像 | 拖入 `Applications` 即可运行的 `Coda.app`（内置 `coda-desktop` + `coda-daemon`） |
 | **`coda-daemon-macos-aarch64-<version>.tar.gz`** | `coda-daemon-macos-aarch64/` | macOS Apple Silicon 受控开发机守护进程 (`coda-daemon`) |
 
@@ -33,7 +34,7 @@ Coda 每次发布 Tag (`v*`) 时，GitHub Actions 流水线会自动构建并发
 2. 检查服务端 `.env`（默认模板 `.env.example` 已预设好）：
    ```dotenv
    CODA_PUBLIC_URL=https://codahub.dev
-   CODA_OPEN_REGISTRATION=true
+   CODA_OPEN_REGISTRATION=false   # 如需向公网开放免邀请码自助注册可设为 true
    ```
    > 只要 `CODA_PUBLIC_URL` 是 `https://` 域名且未配置 `CODA_RAW_TCP_PUBLIC_ENDPOINT`，控制面会自动将 `global-cdn-wss`（`wss://codahub.dev/v1/tunnel/ws`）设为首选，并屏蔽不可达的内网 `127.0.0.1:24443` 地址。
 3. 修改配置后执行 **`./restart.sh`** 让 `.env` 生效。

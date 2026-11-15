@@ -46,9 +46,11 @@ jobs:
           filters: |
             deploy:
               - 'deploy/**'
+              - '.dockerignore'
               - '.github/workflows/ci.yml'
             web:
               - 'web/**'
+              - 'assets/**'
               - '.github/workflows/ci.yml'
             rust_core:
               - 'Cargo.toml'
@@ -58,6 +60,7 @@ jobs:
               - 'crates/coda-herdr/**'
               - 'crates/coda-daemon/**'
               - 'crates/coda-server/**'
+              - 'crates/coda-apple-ffi/**'
               - '.github/workflows/ci.yml'
             apple_desktop:
               - 'Cargo.toml'
@@ -69,30 +72,38 @@ jobs:
               - '.github/workflows/ci.yml'
 
   deploy-lint:
-    name: Deploy Scripts & Compose Check
+    name: Deploy Scripts, Compose & Docker Build Check
     needs: changes
     if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.deploy == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Lint shell scripts & Docker Compose config
+      - name: Lint shell scripts & fail-closed Docker Compose config
         run: |
           for f in deploy/*.sh; do
             sh -n "$f"
           done
-          docker compose -f deploy/docker-compose.yml config >/dev/null
-          docker compose --profile relay-cn -f deploy/docker-compose.yml config >/dev/null
+          if env -u POSTGRES_PASSWORD -u CODA_RELAY_SECRET docker compose -f deploy/docker-compose.yml config >/dev/null 2>&1; then
+            echo "error: docker compose config must fail when secrets are unset" >&2
+            exit 1
+          fi
+          POSTGRES_PASSWORD=ci_pg_secret CODA_RELAY_SECRET=ci_relay_secret docker compose -f deploy/docker-compose.yml config >/dev/null
+          POSTGRES_PASSWORD=ci_pg_secret CODA_RELAY_SECRET=ci_relay_secret docker compose --profile relay-cn -f deploy/docker-compose.yml config >/dev/null
+      - name: Build multi-stage Docker image & verify non-root runtime user
+        run: |
+          docker build -f deploy/Dockerfile -t coda-ci:verify .
+          test "$(docker run --rm --entrypoint id coda-ci:verify -u)" != "0"
 
   web-console:
-    name: Web Console Build
+    name: Web Console Test & Build
     needs: changes
     if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.web == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
-      - name: Install & Build Web Console
-        run: cd web && bun install --frozen-lockfile && bun run build
+      - name: Install, Test & Build Web Console
+        run: cd web && bun install --frozen-lockfile && bun test && bun run build && test ! -e dist/app.js
 
   rust-core:
     name: Rust Core (Linux x86_64 Release Cache & Tests)
@@ -123,12 +134,12 @@ jobs:
           cache-on-failure: true
       - name: Install system dependencies
         run: dpkg -s pkg-config libzstd-dev >/dev/null 2>&1 || (sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libzstd-dev)
-      - name: Build & test protocol, herdr, daemon, and server (release)
+      - name: Build & test protocol, herdr, daemon, server & Apple FFI (release)
         env:
           TEST_DATABASE_URL: postgres://vampire@localhost:5432/coda_test
         run: |
-          cargo test --release -p coda-protocol -p coda-herdr -p coda-daemon -p coda-server -- --nocapture
-          cargo build --release -p coda-server -p coda-daemon
+          cargo test --release -p coda-protocol -p coda-herdr -p coda-daemon -p coda-server -p coda-apple-ffi -- --nocapture
+          cargo build --release -p coda-server -p coda-daemon -p coda-apple-ffi
 
   rust-linux-arm64:
     name: Rust Release Cache Warm (Linux ARM64)
@@ -168,10 +179,10 @@ jobs:
           key: swift-release-macos-aarch64-${{ hashFiles('apple/Package.swift', 'apple/Sources/**', 'apple/Tests/**') }}
           restore-keys: |
             swift-release-macos-aarch64-
-      - name: Test & Build GPUI Desktop + Daemon + Server (release)
+      - name: Test & Build GPUI Desktop + Apple FFI + Daemon + Server (release)
         run: |
-          cargo test --release -p coda-desktop
-          cargo build --release -p coda-server -p coda-daemon -p coda-desktop
+          cargo test --release -p coda-apple-ffi -p coda-desktop
+          cargo build --release -p coda-apple-ffi -p coda-server -p coda-daemon -p coda-desktop
           ./target/release/coda-desktop --self-test
-      - name: Build & Self-Test Apple Swift 6 Package (release)
-        run: cd apple && swift build -c release && ./.build/release/CodaSelfTest
+      - name: Test, Build & Self-Test Apple Swift 6 Package (release)
+        run: cd apple && swift test && swift build -c release && ./.build/release/CodaSelfTest

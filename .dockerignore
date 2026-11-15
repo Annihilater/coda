@@ -1,0 +1,12 @@
+.git
+.github
+.agents
+target
+apple
+web/node_modules
+web/dist
+docs
+.env
+deploy/.env
+*.log
+.DS_Store

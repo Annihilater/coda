@@ -121,6 +121,92 @@ gen_secret_hex() {
   fi
 }
 
+load_env_file() {
+  env_path="${1:-}"
+  [ -n "${env_path}" ] && [ -f "${env_path}" ] || return 0
+  while IFS= read -r raw_line || [ -n "${raw_line}" ]; do
+    line="$(printf '%s' "${raw_line}" | tr -d '\r')"
+    line="${line#"${line%%[![:space:]]*}"}"
+    case "${line}" in
+      ""|\#*) continue ;;
+      export[[:space:]]*)
+        line="${line#export}"
+        line="${line#"${line%%[![:space:]]*}"}"
+        ;;
+    esac
+    case "${line}" in
+      *=*) ;;
+      *) continue ;;
+    esac
+    env_key="${line%%=*}"
+    env_val="${line#*=}"
+    env_key="${env_key%"${env_key##*[![:space:]]}"}"
+    case "${env_key}" in
+      ''|[0-9]*|*[!A-Za-z0-9_]*) continue ;;
+    esac
+    case "${env_val}" in
+      \'*\')
+        env_val="${env_val#\'}"
+        env_val="${env_val%\'}"
+        ;;
+      \"*\")
+        env_val="${env_val#\"}"
+        env_val="${env_val%\"}"
+        env_val="$(printf '%s' "${env_val}" | sed 's/\\"/"/g; s/\\\\/\\/g')"
+        ;;
+    esac
+    export "${env_key}=${env_val}"
+  done < "${env_path}"
+}
+
+compute_sha256() {
+  target_file="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "${target_file}" | awk '{print tolower($1)}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "${target_file}" | awk '{print tolower($1)}'
+  elif command -v openssl >/dev/null 2>&1; then
+    openssl dgst -sha256 "${target_file}" | awk '{print tolower($NF)}'
+  else
+    echo "[ERROR] 缺少 sha256sum / shasum / openssl，无法校验离线包摘要。" >&2
+    return 1
+  fi
+}
+
+verify_release_sha256() {
+  base_url="$1"
+  ver_tag="$2"
+  asset_name="$3"
+  local_file="$4"
+  if [ "${CODA_SKIP_CHECKSUM:-0}" = "1" ]; then
+    return 0
+  fi
+  sums_file="$(mktemp)"
+  if ! curl -fsSL "${base_url}/SHA256SUMS-${ver_tag}.txt" -o "${sums_file}" 2>/dev/null \
+    && ! curl -fsSL "${base_url}/SHA256SUMS.txt" -o "${sums_file}" 2>/dev/null; then
+    rm -f "${sums_file}"
+    echo "[ERROR] 无法下载校验清单 SHA256SUMS-${ver_tag}.txt（或 SHA256SUMS.txt），拒绝导入未校验镜像。" >&2
+    return 1
+  fi
+  expected_hash="$(awk -v target="${asset_name}" '{
+    fname = $2;
+    sub(/^\*/, "", fname);
+    sub(/^.*\//, "", fname);
+    if (fname == target) { print tolower($1); exit; }
+  }' "${sums_file}")"
+  rm -f "${sums_file}"
+  if [ -z "${expected_hash}" ]; then
+    echo "[ERROR] 校验清单中缺少 ${asset_name} 的 SHA256 记录。" >&2
+    return 1
+  fi
+  actual_hash="$(compute_sha256 "${local_file}")" || return 1
+  if [ "${actual_hash}" != "${expected_hash}" ]; then
+    echo "[ERROR] ${asset_name} SHA256 校验失败 (expected=${expected_hash}, actual=${actual_hash})。" >&2
+    return 1
+  fi
+  echo "==> [校验] SHA256 通过: ${asset_name} (${actual_hash})"
+}
+
 load_env() {
   require_configured="${1:-0}"
 
@@ -135,13 +221,16 @@ load_env() {
     if [ "${RUNTIME}" != "systemd" ] && { [ "${require_configured}" = "1" ] || [ "${CMD}" = "pull" ]; }; then
       rand_relay_secret="$(gen_secret_hex)"
       rand_pg_pass="$(gen_secret_hex)"
-      if [ -n "${template_env}" ]; then
-        sed \
-          -e "s|coda_shared_hmac_relay_secret_change_me_2026|${rand_relay_secret}|g" \
-          -e "s|coda_prod_change_me_2026|${rand_pg_pass}|g" \
-          "${template_env}" > "${SCRIPT_DIR}/.env"
-      else
-        cat > "${SCRIPT_DIR}/.env" <<EOF
+      (
+        umask 077
+        if [ -n "${template_env}" ]; then
+          sed \
+            -e "s|coda_shared_hmac_relay_secret_change_me_2026|${rand_relay_secret}|g" \
+            -e "s|coda_prod_change_me_2026|${rand_pg_pass}|g" \
+            -e "s|^CODA_OPEN_REGISTRATION=true|CODA_OPEN_REGISTRATION=false|g" \
+            "${template_env}" > "${SCRIPT_DIR}/.env"
+        else
+          cat > "${SCRIPT_DIR}/.env" <<EOF
 DEPLOY_MODE=coordinator
 CODA_IMAGE=ghcr.io/annihilater/coda:latest
 CODA_HOST_BIND_IP=127.0.0.1
@@ -149,27 +238,22 @@ CODA_HTTP_PORT=8080
 CODA_RAW_TCP_PORT=24443
 CODA_PUBLIC_URL=https://codahub.dev
 CODA_REGION_LABEL=CN-BGP-NoICP
-CODA_OPEN_REGISTRATION=true
+CODA_OPEN_REGISTRATION=false
 CODA_GITHUB_REPO=Annihilater/coda
 CODA_RELAY_SECRET=${rand_relay_secret}
 POSTGRES_PASSWORD=${rand_pg_pass}
 EOF
-      fi
-      chmod 600 "${SCRIPT_DIR}/.env" 2>/dev/null || true
-      echo "[INFO] 已自动生成配置文件 ${SCRIPT_DIR}/.env（默认仅监听 127.0.0.1，公网入口 https://codahub.dev，已自动生成随机密码与中继密钥；如需调整可编辑 .env 后执行 ./restart.sh）。"
+        fi
+        chmod 600 "${SCRIPT_DIR}/.env" 2>/dev/null || true
+      )
+      echo "[INFO] 已安全创建配置文件 ${SCRIPT_DIR}/.env (mode 0600，默认仅监听 127.0.0.1，已生成随机密钥与密码，默认关闭开放注册 CODA_OPEN_REGISTRATION=false)。"
     elif [ -f "/etc/coda/.env" ]; then
-      set -a
-      # shellcheck disable=SC1091
-      . "/etc/coda/.env"
-      set +a
+      load_env_file "/etc/coda/.env"
     fi
   fi
 
   if [ -f "${SCRIPT_DIR}/.env" ]; then
-    set -a
-    # shellcheck disable=SC1091
-    . "${SCRIPT_DIR}/.env"
-    set +a
+    load_env_file "${SCRIPT_DIR}/.env"
   fi
 
   DEPLOY_MODE="${OVERRIDE_MODE:-${DEPLOY_MODE:-coordinator}}"
@@ -179,12 +263,28 @@ EOF
   IMAGE="${CODA_IMAGE:-ghcr.io/annihilater/coda:latest}"
   PUBLIC_URL="${CODA_PUBLIC_URL:-https://codahub.dev}"
 
+  if [ "${DEPLOY_MODE}" = "relay-cn" ] && [ -z "${POSTGRES_PASSWORD:-}" ]; then
+    export POSTGRES_PASSWORD="unused_relay_cn_placeholder"
+  fi
+
   if [ "${require_configured}" = "1" ]; then
     case "${CODA_RELAY_SECRET:-}" in
       ""|*change_me*|*change-me*)
-        echo "[WARN] 当前 CODA_RELAY_SECRET 仍为默认占位值，生产环境强烈建议修改 .env 并执行 ./restart.sh ！" >&2
+        echo "[ERROR] CODA_RELAY_SECRET 缺失或仍为示例占位值，请修改 .env 后重试！" >&2
+        exit 1
         ;;
     esac
+    if [ "${DEPLOY_MODE}" != "relay-cn" ] && [ -z "${DOCKER_DATABASE_URL:-}" ]; then
+      case "${POSTGRES_PASSWORD:-}" in
+        ""|*change_me*|*change-me*|coda_prod_secret|coda_prod_pass)
+          echo "[ERROR] POSTGRES_PASSWORD 缺失或仍为示例占位值，请修改 .env 后重试！" >&2
+          exit 1
+          ;;
+      esac
+    fi
+  else
+    export CODA_RELAY_SECRET="${CODA_RELAY_SECRET:-placeholder_not_for_runtime}"
+    export POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-placeholder_not_for_runtime}"
   fi
 }
 
@@ -227,12 +327,17 @@ ensure_image() {
   fi
 
   asset="coda-image-linux-${img_arch}-${tag}.tar.gz"
-  download_url="${proxy}https://github.com/${REPO}/releases/download/${tag}/${asset}"
+  release_base="${proxy}https://github.com/${REPO}/releases/download/${tag}"
+  download_url="${release_base}/${asset}"
   tmp_tar="$(mktemp)"
   echo "==> [镜像] 下载 ${download_url} ..."
   if ! curl -fL --retry 2 "${download_url}" -o "${tmp_tar}"; then
     rm -f "${tmp_tar}"
     echo "[ERROR] 无法下载离线镜像包 ${download_url}。请检查网络或配置 .env 中的 GITHUB_PROXY。" >&2
+    exit 1
+  fi
+  if ! verify_release_sha256 "${release_base}" "${tag}" "${asset}" "${tmp_tar}"; then
+    rm -f "${tmp_tar}"
     exit 1
   fi
 

@@ -12,8 +12,7 @@ on:
         default: "v0.3.9"
 
 permissions:
-  contents: write
-  packages: write
+  contents: read
 
 concurrency:
   group: release-${{ github.ref }}
@@ -38,10 +37,12 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install build dependencies
         run: dpkg -s pkg-config libzstd-dev >/dev/null 2>&1 || (sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libzstd-dev)
-      - name: Build Web Console
-        run: cd web && bun install --frozen-lockfile && bun run build
-      - name: Build coda-server & coda-daemon (release)
-        run: cargo build --release -p coda-server -p coda-daemon
+      - name: Test & Build Web Console
+        run: cd web && bun install --frozen-lockfile && bun test && bun run build
+      - name: Test core crates & Build coda-server, coda-daemon, coda-apple-ffi (release)
+        run: |
+          cargo test --release -p coda-protocol -p coda-herdr -p coda-daemon -p coda-apple-ffi
+          cargo build --release -p coda-server -p coda-daemon
       - name: Package Linux x86_64 Artifacts
         run: |
           mkdir -p dist/coda-server-linux-x86_64 dist/coda-daemon-linux-x86_64
@@ -80,10 +81,12 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install build dependencies
         run: dpkg -s pkg-config libzstd-dev >/dev/null 2>&1 || (sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libzstd-dev)
-      - name: Build Web Console
-        run: cd web && bun install --frozen-lockfile && bun run build
-      - name: Build coda-server & coda-daemon (release)
-        run: cargo build --release -p coda-server -p coda-daemon
+      - name: Test & Build Web Console
+        run: cd web && bun install --frozen-lockfile && bun test && bun run build
+      - name: Test core crates & Build coda-server, coda-daemon, coda-apple-ffi (release)
+        run: |
+          cargo test --release -p coda-protocol -p coda-herdr -p coda-daemon -p coda-apple-ffi
+          cargo build --release -p coda-server -p coda-daemon
       - name: Package Linux aarch64
         run: |
           mkdir -p dist/coda-server-linux-aarch64 dist/coda-daemon-linux-aarch64
@@ -127,18 +130,27 @@ jobs:
           key: swift-release-macos-aarch64-${{ hashFiles('apple/Package.swift', 'apple/Sources/**', 'apple/Tests/**') }}
           restore-keys: |
             swift-release-macos-aarch64-
-      - name: Build Web Console
-        run: cd web && bun install --frozen-lockfile && bun run build
-      - name: Build Rust Release Binaries (coda-desktop GPUI + coda-daemon + coda-server)
-        run: cargo build --release -p coda-server -p coda-daemon -p coda-desktop
-      - name: Build Apple Swift 6 Desktop Companion
-        run: cd apple && swift build -c release --product CodaMacApp
+      - name: Test & Build Web Console
+        run: cd web && bun install --frozen-lockfile && bun test && bun run build
+      - name: Test & Build Rust Release Binaries (coda-apple-ffi + coda-desktop + coda-daemon + coda-server)
+        run: |
+          cargo test --release -p coda-apple-ffi -p coda-desktop
+          cargo build --release -p coda-apple-ffi -p coda-server -p coda-daemon -p coda-desktop
+          ./target/release/coda-desktop --self-test
+      - name: Test, Verify & Build Apple Swift 6 Desktop Companion
+        run: |
+          cd apple
+          swift test
+          swift build -c release
+          ./.build/release/CodaSelfTest
+          swift build -c release --product CodaMacApp
       - name: Package macOS Apple Silicon Suite
         run: |
           mkdir -p dist/coda-macos-aarch64 dist/coda-daemon-macos-aarch64
           cp target/release/coda-desktop dist/coda-macos-aarch64/
           cp target/release/coda-daemon dist/coda-macos-aarch64/
           cp target/release/coda-server dist/coda-macos-aarch64/
+          cp target/release/libcoda_apple_ffi.dylib dist/coda-macos-aarch64/
           cp apple/.build/release/CodaMacApp dist/coda-macos-aarch64/
           cp -r web/dist dist/coda-macos-aarch64/web-dist
           cp -r deploy dist/coda-macos-aarch64/deploy
@@ -197,6 +209,9 @@ jobs:
     name: Build & Push Multi-Arch GHCR + Offline Docker Tarballs
     needs: [build-linux-x86_64, build-linux-aarch64]
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     env:
       DOCKER_BUILD_SUMMARY: "false"
       DOCKER_BUILD_RECORD_UPLOAD: "false"
@@ -231,7 +246,8 @@ jobs:
           cp dist-unpack/coda-server-linux-aarch64/coda-server docker-ctx/bin/linux-arm64/coda-server
           cp dist-unpack/coda-daemon-linux-aarch64/coda-daemon docker-ctx/bin/linux-arm64/coda-daemon
           cp -r dist-unpack/coda-server-linux-x86_64/web-dist docker-ctx/web/dist
-          cp deploy/install-daemon.sh docker-ctx/deploy/install-daemon.sh
+          cp -r dist-unpack/coda-server-linux-x86_64/migrations docker-ctx/migrations
+          cp -r deploy docker-ctx/deploy
 
           sed 's/^          //' > docker-ctx/Dockerfile <<'DOCKERFILE_EOF'
           FROM debian:bookworm-slim
@@ -239,16 +255,31 @@ jobs:
           LABEL org.opencontainers.image.source="https://github.com/Annihilater/coda"
           LABEL org.opencontainers.image.description="Coda Zero-Knowledge AI Agent Mesh Coordinator & Stateless Relay"
           LABEL org.opencontainers.image.licenses="MIT"
-          RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git libzstd1 && rm -rf /var/lib/apt/lists/*
+          RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git libzstd1 && rm -rf /var/lib/apt/lists/* \
+              && groupadd --system --gid 10001 coda \
+              && useradd --system --uid 10001 --gid coda --home-dir /opt/coda --create-home --shell /usr/sbin/nologin coda
           WORKDIR /opt/coda
           COPY bin/linux-${TARGETARCH}/coda-server /usr/local/bin/coda-server
           COPY bin/linux-${TARGETARCH}/coda-daemon /usr/local/bin/coda-daemon
           COPY web/dist /opt/coda/web/dist
-          COPY deploy/install-daemon.sh /opt/coda/deploy/install-daemon.sh
+          COPY migrations /opt/coda/migrations
+          COPY deploy /opt/coda/deploy
+          RUN chown -R coda:coda /opt/coda && chmod 0755 /opt/coda/deploy/*.sh
+          USER coda
           EXPOSE 8080 24443
           ENTRYPOINT ["coda-server"]
           CMD ["--web-dist", "/opt/coda/web/dist"]
           DOCKERFILE_EOF
+
+      - name: Compute Multi-Arch Docker Tags (skip :latest on prereleases)
+        id: dockertags
+        run: |
+          TAGS="ghcr.io/annihilater/coda:${RELEASE_TAG}"
+          case "${RELEASE_TAG}" in
+            *-*) echo "Prerelease tag (${RELEASE_TAG}); skipping :latest tag update" ;;
+            *) TAGS="${TAGS},ghcr.io/annihilater/coda:latest" ;;
+          esac
+          echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
 
       - name: Push Multi-Arch Image to ghcr.io/annihilater/coda
         uses: docker/build-push-action@v6
@@ -259,9 +290,7 @@ jobs:
           push: true
           cache-from: type=registry,ref=ghcr.io/annihilater/coda:buildcache
           cache-to: type=registry,ref=ghcr.io/annihilater/coda:buildcache,mode=max,image-manifest=true,oci-mediatypes=true
-          tags: |
-            ghcr.io/annihilater/coda:${{ env.RELEASE_TAG }}
-            ghcr.io/annihilater/coda:latest
+          tags: ${{ steps.dockertags.outputs.tags }}
 
       - name: Export Offline Container Image Tarballs in Parallel
         run: |
@@ -296,6 +325,8 @@ jobs:
     name: Assemble Deploy Bundle & Publish GitHub Release
     needs: [build-linux-x86_64, build-linux-aarch64, build-macos-aarch64, build-and-push-docker]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
       - id: dl
@@ -320,7 +351,7 @@ jobs:
           BUNDLE_DIR="dist-bundle/coda-deploy-bundle"
           mkdir -p "${BUNDLE_DIR}"
 
-          cp deploy/DEPLOY.md "${BUNDLE_DIR}/DEPLOY.md"
+          cp deploy/*.md "${BUNDLE_DIR}/"
           cp README.md "${BUNDLE_DIR}/README.md"
           cp -r migrations "${BUNDLE_DIR}/migrations"
 
@@ -340,7 +371,7 @@ jobs:
           sed "s|ghcr.io/annihilater/coda:latest|ghcr.io/annihilater/coda:${RELEASE_TAG}|g" \
             deploy/coda.sh > "${BUNDLE_DIR}/coda.sh"
           chmod 0755 "${BUNDLE_DIR}/coda.sh"
-          chmod 0644 "${BUNDLE_DIR}/.env.example" "${BUNDLE_DIR}/env.example" "${BUNDLE_DIR}/docker-compose.yml" "${BUNDLE_DIR}/coda-server.service" "${BUNDLE_DIR}/coda-relay-cn.service"
+          chmod 0644 "${BUNDLE_DIR}"/*.md "${BUNDLE_DIR}/.env.example" "${BUNDLE_DIR}/env.example" "${BUNDLE_DIR}/docker-compose.yml" "${BUNDLE_DIR}/coda-server.service" "${BUNDLE_DIR}/coda-relay-cn.service"
 
           tar --owner=0 --group=0 -C dist-bundle -czf "release-assets/coda-deploy-bundle-${RELEASE_TAG}.tar.gz" coda-deploy-bundle
 
@@ -359,14 +390,33 @@ jobs:
           cp "SHA256SUMS-${RELEASE_TAG}.txt" "SHA256SUMS.txt"
           cat "SHA256SUMS-${RELEASE_TAG}.txt"
 
+      - name: Detect Prerelease Tag
+        id: relmeta
+        run: |
+          case "${RELEASE_TAG}" in
+            *-*) echo "is_prerelease=true" >> "$GITHUB_OUTPUT" ;;
+            *) echo "is_prerelease=false" >> "$GITHUB_OUTPUT" ;;
+          esac
+
+      - name: Generate Concise Release Notes
+        run: |
+          sed 's/^          //' > release-notes.md <<EOF
+          - **macOS Desktop (Apple Silicon)**: \`Coda-Desktop-macos-aarch64-${RELEASE_TAG}.dmg\`
+          - **Production Deploy Bundle**: \`coda-deploy-bundle-${RELEASE_TAG}.tar.gz\`
+          - **Container Image**: \`ghcr.io/annihilater/coda:${RELEASE_TAG}\` (\`linux/amd64\`, \`linux/arm64\`)
+          - **Daemon Installers & Checksums**: \`coda-daemon-*-${RELEASE_TAG}.tar.gz\` · \`SHA256SUMS-${RELEASE_TAG}.txt\`
+
+          > 完整部署指南、环境变量参考与安全配置说明已内置于 \`coda-deploy-bundle-${RELEASE_TAG}.tar.gz\`（解压后查看 \`DEPLOY.md\` 与 \`CONFIG_AND_SECURITY.md\`）。
+          EOF
+
       - name: Publish Release to GitHub
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.RELEASE_TAG }}
-          name: "Coda ${{ env.RELEASE_TAG }} · Zero-Knowledge AI Agent Mesh (GPUI + SwiftUI + E2EE)"
-          body_path: deploy/DEPLOY.md
+          name: "Coda ${{ env.RELEASE_TAG }}"
+          body_path: release-notes.md
           draft: false
-          prerelease: false
+          prerelease: ${{ steps.relmeta.outputs.is_prerelease == 'true' }}
           files: |
             release-assets/*.tar.gz
             release-assets/*.dmg
