@@ -5,10 +5,11 @@
 
 use std::{
     collections::HashMap,
+    os::unix::{fs::OpenOptionsExt, process::CommandExt},
     path::{Path, PathBuf},
     process::Stdio,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
 };
@@ -138,8 +139,14 @@ fn discover_hc_binary_in(home: Option<&Path>, path_var: Option<&std::ffi::OsStr>
     None
 }
 
+static HC_INSTALL_LOCK: Mutex<()> = Mutex::const_new(());
+
 /// Ensures `herdr-core` (`hc`) is installed locally, running the official install script if missing.
 pub async fn ensure_or_install_hc_binary() -> Result<PathBuf> {
+    if let Some(existing) = discover_hc_binary() {
+        return Ok(existing);
+    }
+    let _guard = HC_INSTALL_LOCK.lock().await;
     if let Some(existing) = discover_hc_binary() {
         return Ok(existing);
     }
@@ -148,15 +155,72 @@ pub async fn ensure_or_install_hc_binary() -> Result<PathBuf> {
     }
 
     tracing::info!("`herdr-core` binary not found; installing via https://releases.herdr.dev/core/install.sh");
+    let tmp_script = std::env::temp_dir().join(format!(
+        "coda-herdr-install-{}-{}.sh",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0)
+    ));
+    {
+        std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o700)
+            .open(&tmp_script)
+            .context("failed creating temporary installer file")?;
+    }
+
+    let dl = Command::new("curl")
+        .args([
+            "--proto",
+            "=https",
+            "--tlsv1.2",
+            "-fsSL",
+            "-o",
+            tmp_script.to_str().unwrap_or("/tmp/coda-herdr-install.sh"),
+            "https://releases.herdr.dev/core/install.sh",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await;
+
+    let script_ok = match dl {
+        Ok(out) if out.status.success() => {
+            let head = std::fs::read(&tmp_script).unwrap_or_default();
+            if !head.starts_with(b"#!") {
+                let _ = std::fs::remove_file(&tmp_script);
+                bail!("herdr-core installer download did not return a shell script (#! header missing)");
+            }
+            true
+        }
+        Ok(out) => {
+            let _ = std::fs::remove_file(&tmp_script);
+            bail!(
+                "herdr-core installer download failed ({}): {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp_script);
+            return Err(e).context("failed invoking curl for herdr-core installer");
+        }
+    };
+    let _ = script_ok;
+
     let output = Command::new("sh")
-        .arg("-c")
-        .arg("curl -fsSL https://releases.herdr.dev/core/install.sh | sh")
+        .arg(&tmp_script)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
         .await
-        .context("failed to invoke shell installer for herdr-core")?;
+        .context("failed to execute installer script for herdr-core")?;
+    let _ = std::fs::remove_file(&tmp_script);
 
     if !output.status.success() {
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -169,20 +233,35 @@ pub async fn ensure_or_install_hc_binary() -> Result<PathBuf> {
         );
     }
 
-    discover_hc_binary().ok_or_else(|| {
+    let bin = discover_hc_binary().ok_or_else(|| {
         anyhow!(
             "herdr-core installer finished, but `herdr-core`/`hc` was still not found in standard paths"
         )
-    })
+    })?;
+    let _ = Command::new(&bin)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .with_context(|| format!("installed binary {} failed basic execution check", bin.display()))?;
+    Ok(bin)
+}
+
+struct HerdrTransport {
+    stdin_tx: mpsc::Sender<String>,
+    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>>,
+    alive: Arc<AtomicBool>,
+    _child: Child,
 }
 
 pub struct HerdrClient {
     hc_path: PathBuf,
-    stdin_tx: mpsc::Sender<String>,
-    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>>,
+    transport: Mutex<HerdrTransport>,
+    reconnect_lock: Mutex<()>,
     next_id: AtomicU64,
     hello_info: HerdrHelloInfo,
-    _child: Arc<Mutex<Child>>,
 }
 
 static HC_NAME_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -240,15 +319,8 @@ fn next_unique_hc_name(prefix: Option<&str>) -> String {
 }
 
 impl HerdrClient {
-    pub async fn connect_default() -> Result<Self> {
-        let hc = discover_hc_binary()
-            .ok_or_else(|| anyhow!("`hc` (herdr-core) binary not found; install from https://releases.herdr.dev/core/install.sh"))?;
-        Self::connect_with_bin(hc).await
-    }
-
-    pub async fn connect_with_bin(hc_path: impl AsRef<Path>) -> Result<Self> {
-        let hc_path = hc_path.as_ref().to_path_buf();
-        let mut child = Command::new(&hc_path)
+    async fn spawn_transport(hc_path: &Path) -> Result<HerdrTransport> {
+        let mut child = Command::new(hc_path)
             .arg("connect")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -261,22 +333,30 @@ impl HerdrClient {
         let stdout = child.stdout.take().context("missing child stdout")?;
 
         let (stdin_tx, mut stdin_rx) = mpsc::channel::<String>(256);
+        let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let alive = Arc::new(AtomicBool::new(true));
+
+        let alive_writer = Arc::clone(&alive);
+        let pending_writer = Arc::clone(&pending);
         tokio::spawn(async move {
             while let Some(mut line) = stdin_rx.recv().await {
                 if !line.ends_with('\n') {
                     line.push('\n');
                 }
-                if stdin.write_all(line.as_bytes()).await.is_err() {
+                if stdin.write_all(line.as_bytes()).await.is_err() || stdin.flush().await.is_err() {
                     break;
                 }
-                let _ = stdin.flush().await;
+            }
+            alive_writer.store(false, Ordering::SeqCst);
+            let mut map = pending_writer.lock().await;
+            for (_, waiter) in map.drain() {
+                let _ = waiter.send(Err(anyhow!("herdr-core stdin closed")));
             }
         });
 
-        let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>> =
-            Arc::new(Mutex::new(HashMap::new()));
         let pending_reader = Arc::clone(&pending);
-
+        let alive_reader = Arc::clone(&alive);
         tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = lines.next_line().await {
@@ -297,12 +377,35 @@ impl HerdrClient {
                     }
                 }
             }
+            alive_reader.store(false, Ordering::SeqCst);
+            let mut map = pending_reader.lock().await;
+            for (_, waiter) in map.drain() {
+                let _ = waiter.send(Err(anyhow!("herdr-core process disconnected")));
+            }
         });
+
+        Ok(HerdrTransport {
+            stdin_tx,
+            pending,
+            alive,
+            _child: child,
+        })
+    }
+
+    pub async fn connect_default() -> Result<Self> {
+        let hc = discover_hc_binary()
+            .ok_or_else(|| anyhow!("`hc` (herdr-core) binary not found; install from https://releases.herdr.dev/core/install.sh"))?;
+        Self::connect_with_bin(hc).await
+    }
+
+    pub async fn connect_with_bin(hc_path: impl AsRef<Path>) -> Result<Self> {
+        let hc_path = hc_path.as_ref().to_path_buf();
+        let transport = Self::spawn_transport(&hc_path).await?;
 
         let mut temp = Self {
             hc_path,
-            stdin_tx,
-            pending,
+            transport: Mutex::new(transport),
+            reconnect_lock: Mutex::new(()),
             next_id: AtomicU64::new(1),
             hello_info: HerdrHelloInfo {
                 core_id: String::new(),
@@ -310,7 +413,6 @@ impl HerdrClient {
                 version: String::new(),
                 generation: 1,
             },
-            _child: Arc::new(Mutex::new(child)),
         };
 
         let res = temp
@@ -336,10 +438,17 @@ impl HerdrClient {
         &self.hc_path
     }
 
-    pub async fn call_rpc(&self, method: &str, params: Value) -> Result<Value> {
+    async fn call_rpc_once(&self, method: &str, params: &Value) -> Result<Value> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().await.insert(id, tx);
+        let stdin_tx = {
+            let guard = self.transport.lock().await;
+            if !guard.alive.load(Ordering::SeqCst) {
+                bail!("herdr connection closed");
+            }
+            guard.pending.lock().await.insert(id, tx);
+            guard.stdin_tx.clone()
+        };
 
         let payload = serde_json::to_string(&json!({
             "jsonrpc": "2.0",
@@ -348,8 +457,9 @@ impl HerdrClient {
             "params": params,
         }))?;
 
-        if self.stdin_tx.send(payload).await.is_err() {
-            self.pending.lock().await.remove(&id);
+        if stdin_tx.send(payload).await.is_err() {
+            let guard = self.transport.lock().await;
+            guard.pending.lock().await.remove(&id);
             bail!("herdr connection closed");
         }
 
@@ -357,6 +467,35 @@ impl HerdrClient {
             .await
             .context("herdr rpc timeout")?
             .context("herdr waiter cancelled")?
+    }
+
+    async fn ensure_reconnected(&self) -> Result<()> {
+        let _guard = self.reconnect_lock.lock().await;
+        let is_alive = { self.transport.lock().await.alive.load(Ordering::SeqCst) };
+        if is_alive {
+            return Ok(());
+        }
+        let fresh = Self::spawn_transport(&self.hc_path).await?;
+        {
+            let mut tr = self.transport.lock().await;
+            *tr = fresh;
+        }
+        let _ = self.call_rpc_once("hello", &json!({ "framed": false })).await?;
+        Ok(())
+    }
+
+    pub async fn call_rpc(&self, method: &str, params: Value) -> Result<Value> {
+        match self.call_rpc_once(method, &params).await {
+            Ok(v) => Ok(v),
+            Err(err) => {
+                let msg = err.to_string();
+                let should_reconnect = msg.contains("closed") || msg.contains("disconnected");
+                if should_reconnect && method != "hello" && self.ensure_reconnected().await.is_ok() {
+                    return self.call_rpc_once(method, &params).await;
+                }
+                Err(err)
+            }
+        }
     }
 
     pub async fn list_terminals(&self, include_finished: bool) -> Result<Vec<HerdrTerminalSummary>> {
@@ -694,20 +833,39 @@ impl Drop for PtyBridgeHandle {
 }
 
 impl PtyBridgeHandle {
-    /// Writes raw bytes (keystrokes, Kitty Keyboard sequences, bracketed paste) into the attached PTY.
+    /// Writes all bytes (keystrokes, Kitty Keyboard sequences, bracketed paste) into the attached PTY,
+    /// handling partial writes and `EINTR` / `EAGAIN`.
     pub fn write_raw(&self, bytes: &[u8]) -> Result<()> {
-        if bytes.is_empty() {
-            return Ok(());
-        }
-        let n = unsafe {
-            libc::write(
-                self.master_fd,
-                bytes.as_ptr() as *const libc::c_void,
-                bytes.len(),
-            )
-        };
-        if n < 0 {
-            bail!("PTY write failed: {}", std::io::Error::last_os_error());
+        let mut offset = 0usize;
+        let mut eagain_spins = 0u32;
+        while offset < bytes.len() {
+            let chunk = &bytes[offset..];
+            let n = unsafe {
+                libc::write(
+                    self.master_fd,
+                    chunk.as_ptr() as *const libc::c_void,
+                    chunk.len(),
+                )
+            };
+            if n > 0 {
+                offset += n as usize;
+                eagain_spins = 0;
+            } else if n == 0 {
+                bail!("PTY write EOF after {offset}/{} bytes", bytes.len());
+            } else {
+                let err = std::io::Error::last_os_error();
+                match err.raw_os_error() {
+                    Some(libc::EINTR) => continue,
+                    Some(e) if e == libc::EAGAIN || e == libc::EWOULDBLOCK => {
+                        eagain_spins += 1;
+                        if eagain_spins > 1000 {
+                            bail!("PTY write timed out with EAGAIN");
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                    }
+                    _ => bail!("PTY write failed: {err}"),
+                }
+            }
         }
         Ok(())
     }
@@ -728,6 +886,15 @@ impl PtyBridgeHandle {
             );
         }
         Ok(())
+    }
+}
+
+fn set_cloexec(fd: libc::c_int) {
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFD);
+        if flags >= 0 {
+            let _ = libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+        }
     }
 }
 
@@ -763,10 +930,43 @@ pub fn spawn_pty_attach(
     if rc != 0 {
         bail!("openpty failed: {}", std::io::Error::last_os_error());
     }
+    set_cloexec(master_fd);
+
+    let slave_out_fd = unsafe { libc::dup(slave_fd) };
+    if slave_out_fd < 0 {
+        let err = std::io::Error::last_os_error();
+        unsafe {
+            libc::close(slave_fd);
+            libc::close(master_fd);
+        }
+        bail!("dup(slave_fd) failed: {err}");
+    }
+    let slave_err_fd = unsafe { libc::dup(slave_fd) };
+    if slave_err_fd < 0 {
+        let err = std::io::Error::last_os_error();
+        unsafe {
+            libc::close(slave_out_fd);
+            libc::close(slave_fd);
+            libc::close(master_fd);
+        }
+        bail!("dup(slave_fd) for stderr failed: {err}");
+    }
+    let reader_fd = unsafe { libc::dup(master_fd) };
+    if reader_fd < 0 {
+        let err = std::io::Error::last_os_error();
+        unsafe {
+            libc::close(slave_err_fd);
+            libc::close(slave_out_fd);
+            libc::close(slave_fd);
+            libc::close(master_fd);
+        }
+        bail!("dup(master_fd) for reader failed: {err}");
+    }
+    set_cloexec(reader_fd);
 
     let slave_in = unsafe { Stdio::from_raw_fd(slave_fd) };
-    let slave_out = unsafe { Stdio::from_raw_fd(libc::dup(slave_fd)) };
-    let slave_err = unsafe { Stdio::from_raw_fd(libc::dup(slave_fd)) };
+    let slave_out = unsafe { Stdio::from_raw_fd(slave_out_fd) };
+    let slave_err = unsafe { Stdio::from_raw_fd(slave_err_fd) };
 
     let mut cmd = std::process::Command::new(hc_path);
     cmd.args(["attach", terminal])
@@ -775,13 +975,25 @@ pub fn spawn_pty_attach(
         .stdin(slave_in)
         .stdout(slave_out)
         .stderr(slave_err);
+    unsafe {
+        cmd.pre_exec(|| {
+            let _ = libc::setsid();
+            let _ = libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY as _, 0);
+            Ok(())
+        });
+    }
 
-    let mut child = cmd
-        .spawn()
-        .with_context(|| format!("failed to spawn `hc attach {terminal}` in PTY"))?;
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            unsafe {
+                libc::close(reader_fd);
+                libc::close(master_fd);
+            }
+            return Err(e).with_context(|| format!("failed to spawn `hc attach {terminal}` in PTY"));
+        }
+    };
     let child_pid = child.id();
-
-    let reader_fd = unsafe { libc::dup(master_fd) };
     let term_name = terminal.to_string();
 
     std::thread::spawn(move || {
@@ -795,7 +1007,13 @@ pub fn spawn_pty_attach(
                     buf.len(),
                 )
             };
-            if n <= 0 {
+            if n == 0 {
+                break;
+            }
+            if n < 0 {
+                if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
                 break;
             }
             let chunk_b64 = B64.encode(&buf[..n as usize]);
@@ -1063,14 +1281,18 @@ fn compute_branch_status_summary(terminals: &[HerdrTerminalSummary]) -> String {
 }
 
 async fn git_capture(cwd: &Path, args: &[&str]) -> Option<String> {
-    let out = Command::new("git")
+    let mut cmd = Command::new("git");
+    cmd.arg("-c")
+        .arg("core.quotePath=false")
         .arg("-C")
         .arg(cwd)
         .args(args)
-        .output()
+        .stdin(Stdio::null());
+    let out = tokio::time::timeout(std::time::Duration::from_secs(10), cmd.output())
         .await
+        .ok()?
         .ok()?;
-    if !out.status.success() {
+    if !out.status.success() || out.stdout.len() > 4 * 1024 * 1024 {
         return None;
     }
     Some(String::from_utf8_lossy(&out.stdout).to_string())

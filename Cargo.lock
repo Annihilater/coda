@@ -1156,8 +1156,10 @@ dependencies = [
 name = "coda-apple-ffi"
 version = "0.3.9"
 dependencies = [
+ "base64 0.22.1",
  "coda-protocol",
  "serde_json",
+ "zstd",
 ]
 
 [[package]]
@@ -1170,6 +1172,7 @@ dependencies = [
  "coda-herdr",
  "coda-protocol",
  "futures-util",
+ "libc",
  "reqwest",
  "serde",
  "serde_json",
@@ -1192,9 +1195,11 @@ dependencies = [
  "coda-herdr",
  "coda-protocol",
  "gpui",
+ "hex",
  "libc",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tokio",
  "tracing",
  "tracing-subscriber",

@@ -1,7 +1,8 @@
 //! Coda Wire Protocol, Zero-Knowledge E2EE (`X25519 + HKDF-SHA256 + ChaCha20Poly1305`),
 //! `zstd` Adaptive Compression, Stateless HMAC Relay Tickets, and Dual-Lane QoS Framing.
 
-use std::io::Cursor;
+use std::io::{Cursor, Read};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
@@ -12,9 +13,9 @@ use chacha20poly1305::{
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
-use rand::rngs::OsRng;
+use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 use x25519_dalek::{PublicKey as X25519Public, StaticSecret as X25519Secret};
 
@@ -24,6 +25,63 @@ type HmacSha256 = Hmac<Sha256>;
 const ZSTD_COMPRESS_THRESHOLD: usize = 256;
 /// Maximum raw TCP frame size (8 MiB) to prevent memory exhaustion on stateless relays.
 pub const MAX_WIRE_FRAME_BYTES: usize = 8 * 1024 * 1024;
+/// Maximum permitted decompressed E2EE payload size (16 MiB) to prevent zstd zip-bombs.
+pub const MAX_DECOMPRESSED_BYTES: usize = MAX_WIRE_FRAME_BYTES * 2;
+/// Length in bytes of per-session relay AEAD/HKDF salt nonces.
+pub const RELAY_SESSION_NONCE_LEN: usize = 16;
+/// Default clock-skew / freshness tolerance for P2P and Relay session handshakes (2 minutes).
+pub const HANDSHAKE_MAX_SKEW_MS: u64 = 120_000;
+
+fn default_true() -> bool {
+    true
+}
+
+/// Returns current Unix epoch milliseconds.
+pub fn current_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+/// Checks whether a peer-supplied handshake timestamp falls within `max_skew_ms` of `now_ms`.
+pub fn is_timestamp_fresh(ts_ms: u64, now_ms: u64, max_skew_ms: u64) -> bool {
+    now_ms.abs_diff(ts_ms) <= max_skew_ms
+}
+
+/// Validates and decodes a canonical 32-byte Base64 public/secret key.
+pub fn decode_b64_key_32(b64_str: &str, label: &str) -> Result<[u8; 32]> {
+    let raw = B64
+        .decode(b64_str)
+        .with_context(|| format!("invalid base64 for {label}"))?;
+    raw.try_into()
+        .map_err(|_| anyhow!("invalid {label} length (expected 32 bytes)"))
+}
+
+/// Validates a Base64 Ed25519 verifying key.
+pub fn validate_ed25519_pub_b64(b64_str: &str) -> Result<VerifyingKey> {
+    let bytes = decode_b64_key_32(b64_str, "ed25519 public key")?;
+    VerifyingKey::from_bytes(&bytes).map_err(|_| anyhow!("invalid ed25519 public key point"))
+}
+
+/// Validates a Base64 X25519 public key (32 bytes, non-zero).
+pub fn validate_x25519_pub_b64(b64_str: &str) -> Result<X25519Public> {
+    let bytes = decode_b64_key_32(b64_str, "x25519 public key")?;
+    if bytes == [0u8; 32] {
+        bail!("all-zero x25519 public key rejected");
+    }
+    Ok(X25519Public::from(bytes))
+}
+
+/// Trusted device registry entry returned by `coda-server` for peer pinning.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrustedPeerEntry {
+    pub device_id: Uuid,
+    pub name: String,
+    pub role: String,
+    pub ed25519_pub_b64: String,
+    pub x25519_pub_b64: String,
+}
 
 // ============================================================================
 // 1. Device Cryptographic Identity & Zero-Knowledge E2EE Session
@@ -94,11 +152,217 @@ impl StoredDeviceIdentity {
     }
 
     pub fn x25519_secret(&self) -> Result<X25519Secret> {
-        let arr: [u8; 32] = B64
-            .decode(&self.x25519_secret_b64)?
-            .try_into()
-            .map_err(|_| anyhow!("invalid x25519 secret length"))?;
+        let arr = decode_b64_key_32(&self.x25519_secret_b64, "x25519 secret")?;
         Ok(X25519Secret::from(arr))
+    }
+
+    /// Generates an ephemeral X25519 secret/public pair encoded as Base64.
+    pub fn generate_ephemeral_x25519() -> (X25519Secret, String) {
+        let secret = X25519Secret::random_from_rng(OsRng);
+        let public = X25519Public::from(&secret);
+        (secret, B64.encode(public.as_bytes()))
+    }
+}
+
+/// 64-bit sliding anti-replay window.
+/// Call `check(seq)` before AEAD decryption and `commit(seq)` ONLY after AEAD succeeds.
+#[derive(Debug, Clone, Default)]
+pub struct ReplayWindow {
+    highest_seq: u64,
+    bitmap: u64,
+}
+
+impl ReplayWindow {
+    /// Checks whether `seq` is fresh without mutating window state.
+    pub fn check(&self, seq: u64) -> Result<()> {
+        if seq == 0 {
+            bail!("invalid E2EE sequence number seq=0");
+        }
+        if self.highest_seq > 0 && seq <= self.highest_seq {
+            let diff = self.highest_seq - seq;
+            if diff >= 64 {
+                bail!(
+                    "stale E2EE frame seq={} below replay window highest={}",
+                    seq,
+                    self.highest_seq
+                );
+            }
+            if (self.bitmap & (1u64 << diff)) != 0 {
+                bail!("duplicate E2EE frame seq={}", seq);
+            }
+        }
+        Ok(())
+    }
+
+    /// Records `seq` as seen after AEAD authentication succeeds.
+    pub fn commit(&mut self, seq: u64) {
+        if self.highest_seq == 0 {
+            self.highest_seq = seq;
+            self.bitmap = 1;
+        } else if seq > self.highest_seq {
+            let shift = seq - self.highest_seq;
+            self.bitmap = if shift >= 64 {
+                1
+            } else {
+                (self.bitmap << shift) | 1
+            };
+            self.highest_seq = seq;
+        } else {
+            let diff = self.highest_seq - seq;
+            if diff < 64 {
+                self.bitmap |= 1u64 << diff;
+            }
+        }
+    }
+}
+
+/// Signed relay session authentication block carried when establishing or resetting a Relay v2 session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelaySessionAuth {
+    pub session_nonce_b64: String,
+    pub init_ts_ms: u64,
+    pub sender_ed25519_pub_b64: String,
+    pub sender_x25519_pub_b64: String,
+    #[serde(default = "default_true")]
+    pub supports_zstd: bool,
+    pub signature_b64: String,
+}
+
+/// Canonical signing payload for `RelaySessionAuth` v2.
+pub fn relay_session_auth_signing_bytes(
+    client_device_id: Uuid,
+    daemon_device_id: Uuid,
+    sender_x25519_pub_b64: &str,
+    session_nonce_b64: &str,
+    init_ts_ms: u64,
+) -> Vec<u8> {
+    format!(
+        "relay-sess-v2:{}:{}:{}:{}:{}",
+        client_device_id.hyphenated(),
+        daemon_device_id.hyphenated(),
+        sender_x25519_pub_b64,
+        session_nonce_b64,
+        init_ts_ms
+    )
+    .into_bytes()
+}
+
+/// Canonical signing payload for `DirectP2pHello` v2.
+pub fn p2p_hello_v2_signing_bytes(
+    client_device_id: Uuid,
+    target_device_id: Uuid,
+    client_static_x25519_pub_b64: &str,
+    client_eph_x25519_pub_b64: &str,
+    timestamp_ms: u64,
+) -> Vec<u8> {
+    format!(
+        "p2p-hello-v2:{}:{}:{}:{}:{}",
+        client_device_id.hyphenated(),
+        target_device_id.hyphenated(),
+        client_static_x25519_pub_b64,
+        client_eph_x25519_pub_b64,
+        timestamp_ms
+    )
+    .into_bytes()
+}
+
+/// Canonical signing payload for `DirectP2pAck` v2.
+pub fn p2p_ack_v2_signing_bytes(
+    client_device_id: Uuid,
+    daemon_device_id: Uuid,
+    client_eph_x25519_pub_b64: &str,
+    daemon_eph_x25519_pub_b64: &str,
+    timestamp_ms: u64,
+) -> Vec<u8> {
+    format!(
+        "p2p-ack-v2:{}:{}:{}:{}:{}",
+        client_device_id.hyphenated(),
+        daemon_device_id.hyphenated(),
+        client_eph_x25519_pub_b64,
+        daemon_eph_x25519_pub_b64,
+        timestamp_ms
+    )
+    .into_bytes()
+}
+
+impl RelaySessionAuth {
+    /// Creates a newly signed `RelaySessionAuth` with a random 16-byte nonce.
+    pub fn create(
+        identity: &StoredDeviceIdentity,
+        dst_daemon_id: Uuid,
+        supports_zstd: bool,
+        now_ms: u64,
+    ) -> Result<Self> {
+        let client_id = identity
+            .device_id
+            .ok_or_else(|| anyhow!("StoredDeviceIdentity missing device_id"))?;
+        let mut nonce = [0u8; RELAY_SESSION_NONCE_LEN];
+        OsRng.fill_bytes(&mut nonce);
+        let session_nonce_b64 = B64.encode(nonce);
+        let payload = relay_session_auth_signing_bytes(
+            client_id,
+            dst_daemon_id,
+            &identity.x25519_public_b64,
+            &session_nonce_b64,
+            now_ms,
+        );
+        let signature_b64 = identity.sign(&payload)?;
+        Ok(Self {
+            session_nonce_b64,
+            init_ts_ms: now_ms,
+            sender_ed25519_pub_b64: identity.ed25519_public_b64.clone(),
+            sender_x25519_pub_b64: identity.x25519_public_b64.clone(),
+            supports_zstd,
+            signature_b64,
+        })
+    }
+
+    /// Verifies signature, nonce format, timestamp freshness, and pinned peer identity keys.
+    pub fn verify(
+        &self,
+        src_client_id: Uuid,
+        dst_daemon_id: Uuid,
+        expected_ed25519_pub_b64: &str,
+        expected_x25519_pub_b64: &str,
+        now_ms: u64,
+        max_skew_ms: u64,
+    ) -> Result<[u8; RELAY_SESSION_NONCE_LEN]> {
+        let actual_ed = decode_b64_key_32(&self.sender_ed25519_pub_b64, "sender ed25519")?;
+        let exp_ed = decode_b64_key_32(expected_ed25519_pub_b64, "expected ed25519")?;
+        if actual_ed != exp_ed {
+            bail!("relay session auth Ed25519 key does not match trusted device key");
+        }
+        let actual_x = decode_b64_key_32(&self.sender_x25519_pub_b64, "sender x25519")?;
+        let exp_x = decode_b64_key_32(expected_x25519_pub_b64, "expected x25519")?;
+        if actual_x != exp_x {
+            bail!("relay session auth X25519 key does not match trusted device key");
+        }
+        if !is_timestamp_fresh(self.init_ts_ms, now_ms, max_skew_ms) {
+            bail!(
+                "relay session auth timestamp out of window (init_ts_ms={}, now_ms={})",
+                self.init_ts_ms,
+                now_ms
+            );
+        }
+        let nonce_raw = B64
+            .decode(&self.session_nonce_b64)
+            .context("invalid relay session nonce base64")?;
+        let nonce_arr: [u8; RELAY_SESSION_NONCE_LEN] = nonce_raw
+            .try_into()
+            .map_err(|_| anyhow!("invalid relay session nonce length (expected 16 bytes)"))?;
+        let signing_bytes = relay_session_auth_signing_bytes(
+            src_client_id,
+            dst_daemon_id,
+            &self.sender_x25519_pub_b64,
+            &self.session_nonce_b64,
+            self.init_ts_ms,
+        );
+        StoredDeviceIdentity::verify_signature(
+            expected_ed25519_pub_b64,
+            &signing_bytes,
+            &self.signature_b64,
+        )?;
+        Ok(nonce_arr)
     }
 }
 
@@ -110,8 +374,10 @@ pub struct E2eeSession {
     tx_dir_tag: u8,
     rx_dir_tag: u8,
     next_tx_seq: u64,
-    highest_rx_seq: Option<u64>,
+    rx_window: ReplayWindow,
     peer_lacks_zstd: bool,
+    aad_binding: Option<[u8; 16]>,
+    session_nonce_b64: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -119,24 +385,35 @@ pub struct EncryptedPayload {
     pub seq: u64,
     pub compressed: bool,
     pub ciphertext_b64: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_nonce_b64: Option<String>,
+}
+
+fn x25519_dh_checked(
+    my_secret: &X25519Secret,
+    peer_public_b64: &str,
+    label: &str,
+) -> Result<([u8; 32], [u8; 32])> {
+    let peer_bytes = decode_b64_key_32(peer_public_b64, label)?;
+    let peer_pub = X25519Public::from(peer_bytes);
+    let shared = my_secret.diffie_hellman(&peer_pub);
+    if !shared.was_contributory() {
+        bail!("non-contributory (low-order) {label}");
+    }
+    Ok((*shared.as_bytes(), peer_bytes))
 }
 
 impl E2eeSession {
-    /// Derives directional keys from static/ephemeral X25519 keys.
+    /// Legacy static X25519 derivation helper (prefer `derive_ephemeral_p2p` or `derive_relay_session`).
     /// `is_client_initiator = true` on the controlling client (iPhone/Mac/Web), `false` on `coda-daemon`.
     pub fn derive(
         my_secret: &X25519Secret,
         peer_public_b64: &str,
         is_client_initiator: bool,
     ) -> Result<Self> {
-        let peer_bytes: [u8; 32] = B64
-            .decode(peer_public_b64)?
-            .try_into()
-            .map_err(|_| anyhow!("invalid peer x25519 public key"))?;
-        let peer_pub = X25519Public::from(peer_bytes);
-        let shared = my_secret.diffie_hellman(&peer_pub);
+        let (shared, _) = x25519_dh_checked(my_secret, peer_public_b64, "peer x25519 public key")?;
 
-        let hk = Hkdf::<Sha256>::new(Some(b"coda-zk-mesh-salt-v1"), shared.as_bytes());
+        let hk = Hkdf::<Sha256>::new(Some(b"coda-zk-mesh-salt-v1"), &shared);
         let mut c2d_key = [0u8; 32];
         let mut d2c_key = [0u8; 32];
         hk.expand(b"coda-client-to-daemon-aead", &mut c2d_key)
@@ -156,9 +433,146 @@ impl E2eeSession {
             tx_dir_tag,
             rx_dir_tag,
             next_tx_seq: 1,
-            highest_rx_seq: None,
+            rx_window: ReplayWindow::default(),
             peer_lacks_zstd: false,
+            aad_binding: None,
+            session_nonce_b64: None,
         })
+    }
+
+    /// Direct P2P v2 hybrid static+ephemeral X25519 derivation with forward secrecy and identity-bound HKDF info.
+    #[allow(clippy::too_many_arguments)]
+    pub fn derive_ephemeral_p2p(
+        my_static_secret: &X25519Secret,
+        peer_static_public_b64: &str,
+        my_ephemeral_secret: &X25519Secret,
+        peer_ephemeral_public_b64: &str,
+        client_device_id: Uuid,
+        daemon_device_id: Uuid,
+        is_client_initiator: bool,
+        peer_supports_zstd: bool,
+    ) -> Result<Self> {
+        let (static_shared, _) = x25519_dh_checked(
+            my_static_secret,
+            peer_static_public_b64,
+            "peer static x25519 public key",
+        )?;
+        let (eph_shared, peer_eph_raw) = x25519_dh_checked(
+            my_ephemeral_secret,
+            peer_ephemeral_public_b64,
+            "peer ephemeral x25519 public key",
+        )?;
+        let my_eph_raw = X25519Public::from(my_ephemeral_secret).to_bytes();
+
+        let (client_eph_raw, daemon_eph_raw) = if is_client_initiator {
+            (my_eph_raw, peer_eph_raw)
+        } else {
+            (peer_eph_raw, my_eph_raw)
+        };
+
+        let mut salt_hasher = Sha256::new();
+        salt_hasher.update(client_eph_raw);
+        salt_hasher.update(daemon_eph_raw);
+        let salt: [u8; 32] = salt_hasher.finalize().into();
+
+        let mut ikm = [0u8; 64];
+        ikm[..32].copy_from_slice(&static_shared);
+        ikm[32..].copy_from_slice(&eph_shared);
+
+        let hk = Hkdf::<Sha256>::new(Some(&salt), &ikm);
+        let c_str = client_device_id.hyphenated().to_string();
+        let d_str = daemon_device_id.hyphenated().to_string();
+        let info_c2d = format!("coda-p2p-v2-c2d:{c_str}:{d_str}");
+        let info_d2c = format!("coda-p2p-v2-d2c:{c_str}:{d_str}");
+        let mut c2d_key = [0u8; 32];
+        let mut d2c_key = [0u8; 32];
+        hk.expand(info_c2d.as_bytes(), &mut c2d_key)
+            .map_err(|_| anyhow!("hkdf expand failed"))?;
+        hk.expand(info_d2c.as_bytes(), &mut d2c_key)
+            .map_err(|_| anyhow!("hkdf expand failed"))?;
+
+        let (tx_raw, rx_raw, tx_dir_tag, rx_dir_tag) = if is_client_initiator {
+            (c2d_key, d2c_key, 0x01, 0x02)
+        } else {
+            (d2c_key, c2d_key, 0x02, 0x01)
+        };
+
+        let mut binding = [0u8; 16];
+        binding.copy_from_slice(&salt[..16]);
+
+        Ok(Self {
+            tx_cipher: ChaCha20Poly1305::new(Key::from_slice(&tx_raw)),
+            rx_cipher: ChaCha20Poly1305::new(Key::from_slice(&rx_raw)),
+            tx_dir_tag,
+            rx_dir_tag,
+            next_tx_seq: 1,
+            rx_window: ReplayWindow::default(),
+            peer_lacks_zstd: !peer_supports_zstd,
+            aad_binding: Some(binding),
+            session_nonce_b64: None,
+        })
+    }
+
+    /// Relay v2 salted X25519 session derivation bound to `session_nonce` and endpoint device IDs.
+    pub fn derive_relay_session(
+        my_static_secret: &X25519Secret,
+        peer_static_public_b64: &str,
+        session_nonce_b64: &str,
+        client_device_id: Uuid,
+        daemon_device_id: Uuid,
+        is_client_initiator: bool,
+        peer_supports_zstd: bool,
+    ) -> Result<Self> {
+        let nonce_raw = B64
+            .decode(session_nonce_b64)
+            .context("invalid relay session nonce base64")?;
+        let nonce_arr: [u8; RELAY_SESSION_NONCE_LEN] = nonce_raw
+            .try_into()
+            .map_err(|_| anyhow!("invalid relay session nonce length (expected 16 bytes)"))?;
+        let canonical_nonce_b64 = B64.encode(nonce_arr);
+        let (static_shared, _) = x25519_dh_checked(
+            my_static_secret,
+            peer_static_public_b64,
+            "peer static x25519 public key",
+        )?;
+
+        let hk = Hkdf::<Sha256>::new(Some(&nonce_arr), &static_shared);
+        let c_str = client_device_id.hyphenated().to_string();
+        let d_str = daemon_device_id.hyphenated().to_string();
+        let info_c2d = format!("coda-relay-v2-c2d:{c_str}:{d_str}");
+        let info_d2c = format!("coda-relay-v2-d2c:{c_str}:{d_str}");
+        let mut c2d_key = [0u8; 32];
+        let mut d2c_key = [0u8; 32];
+        hk.expand(info_c2d.as_bytes(), &mut c2d_key)
+            .map_err(|_| anyhow!("hkdf expand failed"))?;
+        hk.expand(info_d2c.as_bytes(), &mut d2c_key)
+            .map_err(|_| anyhow!("hkdf expand failed"))?;
+
+        let (tx_raw, rx_raw, tx_dir_tag, rx_dir_tag) = if is_client_initiator {
+            (c2d_key, d2c_key, 0x01, 0x02)
+        } else {
+            (d2c_key, c2d_key, 0x02, 0x01)
+        };
+
+        Ok(Self {
+            tx_cipher: ChaCha20Poly1305::new(Key::from_slice(&tx_raw)),
+            rx_cipher: ChaCha20Poly1305::new(Key::from_slice(&rx_raw)),
+            tx_dir_tag,
+            rx_dir_tag,
+            next_tx_seq: 1,
+            rx_window: ReplayWindow::default(),
+            peer_lacks_zstd: !peer_supports_zstd,
+            aad_binding: Some(nonce_arr),
+            session_nonce_b64: Some(canonical_nonce_b64),
+        })
+    }
+
+    pub fn set_peer_lacks_zstd(&mut self, lacks: bool) {
+        self.peer_lacks_zstd = lacks;
+    }
+
+    pub fn session_nonce_b64(&self) -> Option<&str> {
+        self.session_nonce_b64.as_deref()
     }
 
     fn make_nonce(dir_tag: u8, seq: u64) -> Nonce {
@@ -166,6 +580,20 @@ impl E2eeSession {
         n[0] = dir_tag;
         n[4..12].copy_from_slice(&seq.to_be_bytes());
         *Nonce::from_slice(&n)
+    }
+
+    fn make_aad(&self, compressed: bool, dir_tag: u8) -> Vec<u8> {
+        let c_byte = if compressed { 1u8 } else { 0u8 };
+        match self.aad_binding {
+            Some(binding) => {
+                let mut aad = Vec::with_capacity(18);
+                aad.push(c_byte);
+                aad.push(dir_tag);
+                aad.extend_from_slice(&binding);
+                aad
+            }
+            None => vec![c_byte],
+        }
     }
 
     pub fn seal_message(&mut self, msg: &PeerMessage) -> Result<EncryptedPayload> {
@@ -182,9 +610,12 @@ impl E2eeSession {
         };
 
         let seq = self.next_tx_seq;
-        self.next_tx_seq += 1;
+        self.next_tx_seq = self
+            .next_tx_seq
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("E2EE tx sequence exhausted"))?;
         let nonce = Self::make_nonce(self.tx_dir_tag, seq);
-        let aad = [if compressed { 1u8 } else { 0u8 }];
+        let aad = self.make_aad(compressed, self.tx_dir_tag);
         let ct = self
             .tx_cipher
             .encrypt(&nonce, Payload { msg: &body, aad: &aad })
@@ -194,30 +625,35 @@ impl E2eeSession {
             seq,
             compressed,
             ciphertext_b64: B64.encode(ct),
+            session_nonce_b64: self.session_nonce_b64.clone(),
         })
     }
 
     pub fn open_message(&mut self, payload: &EncryptedPayload) -> Result<PeerMessage> {
-        if let Some(prev) = self.highest_rx_seq {
-            if payload.seq <= prev {
-                bail!("replay or out-of-order E2EE frame seq={} <= {}", payload.seq, prev);
+        if let Some(expected_nonce) = self.session_nonce_b64.as_deref() {
+            if let Some(actual_nonce) = payload.session_nonce_b64.as_deref() {
+                if actual_nonce != expected_nonce {
+                    bail!("mismatched relay session_nonce_b64 in encrypted payload");
+                }
             }
         }
+        self.rx_window.check(payload.seq)?;
         let ct = B64.decode(&payload.ciphertext_b64)?;
         let nonce = Self::make_nonce(self.rx_dir_tag, payload.seq);
-        let aad = [if payload.compressed { 1u8 } else { 0u8 }];
+        let aad = self.make_aad(payload.compressed, self.rx_dir_tag);
         let pt = self
             .rx_cipher
             .decrypt(&nonce, Payload { msg: &ct, aad: &aad })
             .map_err(|_| anyhow!("AEAD decryption failed (wrong key or tampered frame)"))?;
 
         let json_bytes = if payload.compressed {
-            zstd::stream::decode_all(Cursor::new(&pt))?
+            zstd_decode_bounded(&pt, MAX_DECOMPRESSED_BYTES)?
         } else {
             pt
         };
-        self.highest_rx_seq = Some(payload.seq);
         let msg: PeerMessage = serde_json::from_slice(&json_bytes)?;
+        // Only commit replay window after AEAD decryption, bounded decompression, and JSON decode succeed.
+        self.rx_window.commit(payload.seq);
         if msg.request_id().is_some_and(|id| id.starts_with("swift-")) {
             self.peer_lacks_zstd = true;
         }
@@ -225,11 +661,89 @@ impl E2eeSession {
     }
 }
 
+/// Decompresses raw `zstd` bytes with a hard ceiling of `max_bytes` to defend against zip-bombs.
+pub fn zstd_decode_bounded(raw: &[u8], max_bytes: usize) -> Result<Vec<u8>> {
+    let decoder = zstd::stream::Decoder::new(Cursor::new(raw))?;
+    let mut out = Vec::new();
+    let mut limited = decoder.take((max_bytes as u64).saturating_add(1));
+    limited.read_to_end(&mut out)?;
+    if out.len() > max_bytes {
+        bail!(
+            "zstd decompressed payload exceeds limit ({} bytes)",
+            max_bytes
+        );
+    }
+    Ok(out)
+}
+
+/// Decodes base64-encoded `zstd` payload into raw bytes with zip-bomb protection.
+pub fn zstd_decompress_b64_to_bytes(compressed_b64: &str) -> Result<Vec<u8>> {
+    let raw = B64.decode(compressed_b64)?;
+    zstd_decode_bounded(&raw, MAX_DECOMPRESSED_BYTES)
+}
+
+/// Decodes base64-encoded `zstd` payload and returns base64-encoded raw bytes (binary/NUL-safe across C FFI).
+pub fn zstd_decompress_b64_to_b64(compressed_b64: &str) -> Result<String> {
+    let decompressed = zstd_decompress_b64_to_bytes(compressed_b64)?;
+    Ok(B64.encode(decompressed))
+}
+
 /// Decodes base64-encoded `zstd` payload and returns UTF-8 JSON string (used by Apple FFI).
 pub fn zstd_decompress_b64_to_utf8(compressed_b64: &str) -> Result<String> {
-    let raw = B64.decode(compressed_b64)?;
-    let decompressed = zstd::stream::decode_all(Cursor::new(&raw))?;
+    let decompressed = zstd_decompress_b64_to_bytes(compressed_b64)?;
     Ok(String::from_utf8(decompressed)?)
+}
+
+/// Encrypts a sensitive short-lived secret (such as a pending RFC 8628 session token at rest in DB)
+/// using HKDF-SHA256 + ChaCha20Poly1305 keyed from `wrapping_secret`.
+pub fn seal_opaque_secret(wrapping_secret: &[u8], plaintext: &str) -> Result<String> {
+    let hk = Hkdf::<Sha256>::new(Some(b"coda-opaque-secret-v1"), wrapping_secret);
+    let mut key_bytes = [0u8; 32];
+    hk.expand(b"coda-db-token-wrap-aead", &mut key_bytes)
+        .map_err(|_| anyhow!("hkdf expand failed"))?;
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(&key_bytes));
+    let mut nonce_bytes = [0u8; 12];
+    OsRng.fill_bytes(&mut nonce_bytes);
+    let ct = cipher
+        .encrypt(
+            Nonce::from_slice(&nonce_bytes),
+            Payload {
+                msg: plaintext.as_bytes(),
+                aad: b"coda-device-auth-token-v1",
+            },
+        )
+        .map_err(|_| anyhow!("failed sealing opaque secret"))?;
+    Ok(format!("enc:v1:{}.{}", B64.encode(nonce_bytes), B64.encode(ct)))
+}
+
+/// Decrypts an opaque secret sealed with `seal_opaque_secret`.
+pub fn open_opaque_secret(wrapping_secret: &[u8], sealed: &str) -> Result<String> {
+    let rest = sealed
+        .strip_prefix("enc:v1:")
+        .ok_or_else(|| anyhow!("unsealed or malformed opaque secret"))?;
+    let (nonce_b64, ct_b64) = rest
+        .split_once('.')
+        .ok_or_else(|| anyhow!("malformed opaque secret envelope"))?;
+    let nonce_raw = B64.decode(nonce_b64)?;
+    let nonce_arr: [u8; 12] = nonce_raw
+        .try_into()
+        .map_err(|_| anyhow!("invalid opaque secret nonce length"))?;
+    let ct = B64.decode(ct_b64)?;
+    let hk = Hkdf::<Sha256>::new(Some(b"coda-opaque-secret-v1"), wrapping_secret);
+    let mut key_bytes = [0u8; 32];
+    hk.expand(b"coda-db-token-wrap-aead", &mut key_bytes)
+        .map_err(|_| anyhow!("hkdf expand failed"))?;
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(&key_bytes));
+    let pt = cipher
+        .decrypt(
+            Nonce::from_slice(&nonce_arr),
+            Payload {
+                msg: &ct,
+                aad: b"coda-device-auth-token-v1",
+            },
+        )
+        .map_err(|_| anyhow!("failed decrypting opaque secret"))?;
+    Ok(String::from_utf8(pt)?)
 }
 
 // ============================================================================
@@ -311,11 +825,13 @@ pub enum RelayWireFrame {
         src_device_id: Uuid,
         dst_device_id: Uuid,
         lane: TrafficLane,
-        /// Optional unencrypted server-assisted dev fallback ONLY when Web UI pairs via ephemeral session;
-        /// Native clients & Daemons use `e2ee`.
         e2ee: EncryptedPayload,
-        /// Sender's ephemeral or static X25519 public key so stateless/Web clients can derive session keys on the fly.
+        /// Sender's ephemeral or static X25519 public key (legacy compatibility field).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         sender_x25519_pub_b64: Option<String>,
+        /// Signed Relay v2 session authentication envelope (nonce + Ed25519 signature over endpoints).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_auth: Option<RelaySessionAuth>,
     },
     PeerPresence {
         device_id: Uuid,
@@ -333,6 +849,10 @@ pub enum RelayWireFrame {
         target_device_id: Uuid,
         client_ed25519_pub_b64: String,
         client_x25519_pub_b64: String,
+        #[serde(default)]
+        client_ephemeral_x25519_pub_b64: String,
+        #[serde(default = "default_true")]
+        supports_zstd: bool,
         timestamp_ms: u64,
         signature_b64: String,
     },
@@ -341,7 +861,17 @@ pub enum RelayWireFrame {
         ok: bool,
         daemon_device_id: Uuid,
         daemon_x25519_pub_b64: String,
+        #[serde(default)]
+        daemon_ed25519_pub_b64: String,
+        #[serde(default)]
+        daemon_ephemeral_x25519_pub_b64: String,
+        #[serde(default)]
+        timestamp_ms: u64,
+        #[serde(default)]
+        signature_b64: String,
         path_kind: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
     },
     KeepAlive {
         ts_ms: u64,
@@ -857,5 +1387,182 @@ mod tests {
         let encoded = serde_json::to_string(&ev).unwrap();
         let decoded: AccountLiveEvent = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, ev);
+    }
+
+    #[test]
+    fn test_ephemeral_p2p_v2_relay_v2_replay_window_and_zipbomb() {
+        let mut client_id = StoredDeviceIdentity::generate("iPhone App");
+        let mut daemon_id = StoredDeviceIdentity::generate("Studio Host");
+        let cid = Uuid::new_v4();
+        let did = Uuid::new_v4();
+        client_id.device_id = Some(cid);
+        daemon_id.device_id = Some(did);
+
+        // 1. Ephemeral P2P v2 roundtrip + sliding window + forged-seq DoS resistance
+        let (c_eph_sec, c_eph_pub) = StoredDeviceIdentity::generate_ephemeral_x25519();
+        let (d_eph_sec, d_eph_pub) = StoredDeviceIdentity::generate_ephemeral_x25519();
+        let now = current_unix_ms();
+
+        let hello_bytes = p2p_hello_v2_signing_bytes(
+            cid,
+            did,
+            &client_id.x25519_public_b64,
+            &c_eph_pub,
+            now,
+        );
+        let hello_sig = client_id.sign(&hello_bytes).unwrap();
+        StoredDeviceIdentity::verify_signature(
+            &client_id.ed25519_public_b64,
+            &hello_bytes,
+            &hello_sig,
+        )
+        .unwrap();
+
+        let ack_bytes = p2p_ack_v2_signing_bytes(cid, did, &c_eph_pub, &d_eph_pub, now);
+        let ack_sig = daemon_id.sign(&ack_bytes).unwrap();
+        StoredDeviceIdentity::verify_signature(
+            &daemon_id.ed25519_public_b64,
+            &ack_bytes,
+            &ack_sig,
+        )
+        .unwrap();
+
+        let mut p2p_c = E2eeSession::derive_ephemeral_p2p(
+            &client_id.x25519_secret().unwrap(),
+            &daemon_id.x25519_public_b64,
+            &c_eph_sec,
+            &d_eph_pub,
+            cid,
+            did,
+            true,
+            true,
+        )
+        .unwrap();
+        let mut p2p_d = E2eeSession::derive_ephemeral_p2p(
+            &daemon_id.x25519_secret().unwrap(),
+            &client_id.x25519_public_b64,
+            &d_eph_sec,
+            &c_eph_pub,
+            cid,
+            did,
+            false,
+            false,
+        )
+        .unwrap();
+
+        let f1 = p2p_c
+            .seal_message(&PeerMessage::Ping {
+                req_id: "r1".into(),
+                sent_ms: 1,
+            })
+            .unwrap();
+        let f2 = p2p_c
+            .seal_message(&PeerMessage::Ping {
+                req_id: "r2".into(),
+                sent_ms: 2,
+            })
+            .unwrap();
+        let f3 = p2p_c
+            .seal_message(&PeerMessage::Ping {
+                req_id: "r3".into(),
+                sent_ms: 3,
+            })
+            .unwrap();
+
+        // Out-of-order delivery (f3 then f1 then f2) succeeds under 64-bit sliding window
+        assert_eq!(p2p_d.open_message(&f3).unwrap().request_id(), Some("r3"));
+        assert_eq!(p2p_d.open_message(&f1).unwrap().request_id(), Some("r1"));
+
+        // Attacker injects forged seq=9999999 frame: fails AEAD and MUST NOT advance replay window!
+        let mut forged = f2.clone();
+        forged.seq = 9_999_999;
+        assert!(p2p_d.open_message(&forged).is_err());
+
+        // Legitimate f2 still decrypts after forged-seq injection
+        assert_eq!(p2p_d.open_message(&f2).unwrap().request_id(), Some("r2"));
+        // Replaying f1 fails
+        assert!(p2p_d.open_message(&f1).is_err());
+
+        // Daemon honors peer_supports_zstd=false upfront
+        let big = "Line for upfront zstd negotiation\n".repeat(40);
+        let d_reply = p2p_d
+            .seal_message(&PeerMessage::TerminalScreenSnapshot {
+                req_id: "custom-1".into(),
+                terminal: "t1".into(),
+                text: big.clone(),
+                status: None,
+            })
+            .unwrap();
+        assert!(!d_reply.compressed);
+        assert!(p2p_c.open_message(&d_reply).is_ok());
+
+        // 2. Relay v2 session auth + salted session derivation
+        let auth = RelaySessionAuth::create(&client_id, did, true, now).unwrap();
+        let nonce_arr = auth
+            .verify(
+                cid,
+                did,
+                &client_id.ed25519_public_b64,
+                &client_id.x25519_public_b64,
+                now,
+                HANDSHAKE_MAX_SKEW_MS,
+            )
+            .unwrap();
+        assert_eq!(nonce_arr.len(), RELAY_SESSION_NONCE_LEN);
+
+        let mut rel_c = E2eeSession::derive_relay_session(
+            &client_id.x25519_secret().unwrap(),
+            &daemon_id.x25519_public_b64,
+            &auth.session_nonce_b64,
+            cid,
+            did,
+            true,
+            true,
+        )
+        .unwrap();
+        let mut rel_d = E2eeSession::derive_relay_session(
+            &daemon_id.x25519_secret().unwrap(),
+            &client_id.x25519_public_b64,
+            &auth.session_nonce_b64,
+            cid,
+            did,
+            false,
+            true,
+        )
+        .unwrap();
+        let rf = rel_c
+            .seal_message(&PeerMessage::Ping {
+                req_id: "rel-1".into(),
+                sent_ms: 9,
+            })
+            .unwrap();
+        assert_eq!(
+            rf.session_nonce_b64.as_deref(),
+            Some(auth.session_nonce_b64.as_str())
+        );
+        assert_eq!(rel_d.open_message(&rf).unwrap().request_id(), Some("rel-1"));
+
+        // Wrong session nonce fails AEAD
+        let bad_rel = E2eeSession::derive_relay_session(
+            &daemon_id.x25519_secret().unwrap(),
+            &client_id.x25519_public_b64,
+            &B64.encode([7u8; 16]),
+            cid,
+            did,
+            false,
+            true,
+        )
+        .unwrap();
+        let mut bad_rel = bad_rel;
+        assert!(bad_rel.open_message(&rf).is_err());
+
+        // Low-order all-zero X25519 public key rejected
+        assert!(validate_x25519_pub_b64(&B64.encode([0u8; 32])).is_err());
+
+        // Bounded zstd rejects oversized payloads
+        let zeros = vec![0u8; 2048];
+        let compressed = zstd::stream::encode_all(Cursor::new(&zeros), 3).unwrap();
+        assert!(zstd_decode_bounded(&compressed, 1024).is_err());
+        assert_eq!(zstd_decode_bounded(&compressed, 4096).unwrap().len(), 2048);
     }
 }
