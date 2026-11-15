@@ -150,37 +150,219 @@ public enum HerdrQuickKey: String, CaseIterable, Sendable {
     }
 }
 
-/// High-speed Swift VT reference engine with `OSC 7501` interception, 24-bit TrueColor ANSI parsing,
-/// Git diff classification, and responsive foldable/mobile column reflow.
+/// Stateful VT100/xterm terminal surface engine supporting streaming UTF-8 bytes,
+/// CJK wide characters, 24-bit TrueColor SGR, alternate screen (`?1049h`/`?47h`),
+/// `OSC 7501` / `OSC 0/2`, scrollback reflow, and Git diff classification.
 public struct GhosttyReflowEngine: GhosttyVTSurface {
+    private struct StyledCell: Sendable, Equatable {
+        var ch: Character
+        var fg: GhosttyRGBColor?
+        var bold: Bool
+        var dim: Bool
+        var width: UInt8 // 1 for normal, 2 for wide lead, 0 for continuation/empty
+        var isWideContinuation: Bool
+
+        static let blank = StyledCell(
+            ch: " ",
+            fg: nil,
+            bold: false,
+            dim: false,
+            width: 1,
+            isWideContinuation: false
+        )
+
+        var isDefaultBlank: Bool {
+            ch == " " && !isWideContinuation && width == 1 && fg == nil && !bold && !dim
+        }
+    }
+
+    private struct ScreenRow: Sendable, Equatable {
+        var cells: [StyledCell]
+        var softWrapped: Bool
+
+        init(columns: Int, softWrapped: Bool = false) {
+            self.cells = Array(repeating: .blank, count: max(1, columns))
+            self.softWrapped = softWrapped
+        }
+
+        mutating func clear(fg: GhosttyRGBColor? = nil, bold: Bool = false, dim: Bool = false) {
+            let fill = StyledCell(ch: " ", fg: fg, bold: bold, dim: dim, width: 1, isWideContinuation: false)
+            cells = Array(repeating: fill, count: cells.count)
+            softWrapped = false
+        }
+
+        var trimmedEndIndex: Int {
+            var end = cells.count
+            while end > 0 {
+                let c = cells[end - 1]
+                if c.ch == " " && !c.isWideContinuation && c.fg == nil && !c.bold && !c.dim {
+                    end -= 1
+                } else {
+                    break
+                }
+            }
+            return end
+        }
+
+        var plainTrimmedString: String {
+            var end = cells.count
+            while end > 0 && cells[end - 1].ch == " " && !cells[end - 1].isWideContinuation {
+                end -= 1
+            }
+            var out = ""
+            out.reserveCapacity(end)
+            for idx in 0..<end {
+                if !cells[idx].isWideContinuation {
+                    out.append(cells[idx].ch)
+                }
+            }
+            return out
+        }
+    }
+
+    private struct CursorState: Sendable {
+        var row: Int = 0
+        var col: Int = 0
+        var fg: GhosttyRGBColor? = nil
+        var bold: Bool = false
+        var dim: Bool = false
+        var pendingWrap: Bool = false
+    }
+
+    private enum VTParseState: Sendable {
+        case ground
+        case escape
+        case escapeIntermediate
+        case csi
+        case osc
+        case oscEscape
+        case stringSkip // DCS / APC / PM terminated by BEL or ST
+        case stringSkipEscape
+    }
+
     public private(set) var columns: Int
     public private(set) var rows: Int
-    private var logicalParagraphs: [String] = []
     public private(set) var visibleLines: [String] = []
+    public private(set) var styledLines: [GhosttyStyledLine] = []
+    public private(set) var plainVisibleText: String = ""
+    public private(set) var title: String = ""
+    public private(set) var inAltScreen: Bool = false
     public private(set) var latestHerdrStatus: HerdrOSC7501Status?
 
-    public init(columns: Int = 52, rows: Int = 24) {
-        self.columns = max(20, columns)
-        self.rows = max(6, rows)
+    private let maxScrollback: Int
+    private var primaryGrid: [ScreenRow]
+    private var primaryScrollback: [ScreenRow] = []
+    private var altGrid: [ScreenRow]
+
+    private var cursorRow: Int = 0
+    private var cursorCol: Int = 0
+    private var pendingWrap: Bool = false
+    private var savedPrimaryCursor = CursorState()
+    private var savedAltCursor = CursorState()
+
+    private var scrollTop: Int = 0
+    private var scrollBottom: Int
+
+    private var curFg: GhosttyRGBColor? = nil
+    private var curBold: Bool = false
+    private var curDim: Bool = false
+    private var treatLFAsCRLF: Bool
+
+    private var parseState: VTParseState = .ground
+    private var csiBuffer: [UInt8] = []
+    private var oscBuffer: [UnicodeScalar] = []
+    private var pendingUTF8: [UInt8] = []
+
+    private static let maxCSIBytes = 256
+    private static let maxOSCScalars = 4096
+
+    public init(columns: Int = 52, rows: Int = 24, maxScrollback: Int = 1500, treatLFAsCRLF: Bool = true) {
+        let cols = max(20, columns)
+        let rws = max(6, rows)
+        self.columns = cols
+        self.rows = rws
+        self.maxScrollback = max(0, maxScrollback)
+        self.treatLFAsCRLF = treatLFAsCRLF
+        self.primaryGrid = (0..<rws).map { _ in ScreenRow(columns: cols) }
+        self.altGrid = (0..<rws).map { _ in ScreenRow(columns: cols) }
+        self.scrollBottom = rws - 1
+        rebuildDerivedOutputs()
+    }
+
+    public mutating func reset() {
+        primaryGrid = (0..<rows).map { _ in ScreenRow(columns: columns) }
+        primaryScrollback = []
+        altGrid = (0..<rows).map { _ in ScreenRow(columns: columns) }
+        inAltScreen = false
+        cursorRow = 0
+        cursorCol = 0
+        pendingWrap = false
+        savedPrimaryCursor = CursorState()
+        savedAltCursor = CursorState()
+        scrollTop = 0
+        scrollBottom = rows - 1
+        curFg = nil
+        curBold = false
+        curDim = false
+        parseState = .ground
+        csiBuffer.removeAll(keepingCapacity: true)
+        oscBuffer.removeAll(keepingCapacity: true)
+        pendingUTF8.removeAll(keepingCapacity: true)
+        title = ""
+        latestHerdrStatus = nil
+        rebuildDerivedOutputs()
     }
 
     public mutating func feed(_ utf8Bytes: Data) {
-        guard let chunk = String(data: utf8Bytes, encoding: .utf8) else { return }
-        let (cleaned, parsedStatus) = Self.extractOSC7501(from: chunk, stripCSI: true)
-        if let parsedStatus {
-            latestHerdrStatus = parsedStatus
-        }
-        let incoming = cleaned.components(separatedBy: "\n")
-        for line in incoming {
-            let trimmed = line.replacingOccurrences(of: "\r", with: "").trimmingCharacters(in: .controlCharacters)
-            if !trimmed.isEmpty {
-                logicalParagraphs.append(trimmed)
+        guard !utf8Bytes.isEmpty else { return }
+        pendingUTF8.append(contentsOf: utf8Bytes)
+
+        var idx = 0
+        let total = pendingUTF8.count
+        while idx < total {
+            let b = pendingUTF8[idx]
+            if b < 0x80 {
+                processScalar(UnicodeScalar(b))
+                idx += 1
+                continue
+            }
+
+            let expectedLen: Int
+            if b >= 0xC2 && b <= 0xDF {
+                expectedLen = 2
+            } else if b >= 0xE0 && b <= 0xEF {
+                expectedLen = 3
+            } else if b >= 0xF0 && b <= 0xF4 {
+                expectedLen = 4
+            } else {
+                // Orphan continuation byte or illegal UTF-8 lead byte
+                processScalar(UnicodeScalar(0xFFFD)!)
+                idx += 1
+                continue
+            }
+
+            if idx + expectedLen > total {
+                // Incomplete multi-byte UTF-8 sequence split across chunk boundary
+                break
+            }
+
+            let slice = pendingUTF8[idx..<(idx + expectedLen)]
+            var decoder = UTF8()
+            var iter = slice.makeIterator()
+            switch decoder.decode(&iter) {
+            case .scalarValue(let scalar):
+                processScalar(scalar)
+                idx += expectedLen
+            case .emptyInput, .error:
+                processScalar(UnicodeScalar(0xFFFD)!)
+                idx += 1
             }
         }
-        if logicalParagraphs.count > 500 {
-            logicalParagraphs.removeFirst(logicalParagraphs.count - 500)
+
+        if idx > 0 {
+            pendingUTF8.removeFirst(idx)
         }
-        rebuildReflowedGrid()
+        rebuildDerivedOutputs()
     }
 
     public mutating func feedBase64PtyChunk(_ dataB64: String) {
@@ -188,10 +370,31 @@ public struct GhosttyReflowEngine: GhosttyVTSurface {
         feed(raw)
     }
 
-    public mutating func resizeReflow(columns: Int, rows: Int) {
-        self.columns = max(20, columns)
-        self.rows = max(6, rows)
-        rebuildReflowedGrid()
+    public mutating func resizeReflow(columns newColsRaw: Int, rows newRowsRaw: Int) {
+        let newCols = max(20, newColsRaw)
+        let newRows = max(6, newRowsRaw)
+        if newCols == columns && newRows == rows { return }
+
+        if inAltScreen {
+            altGrid = resizeGridWithoutReflow(altGrid, newCols: newCols, newRows: newRows)
+            primaryGrid = reflowPrimaryHistoryAndGrid(newCols: newCols, newRows: newRows).grid
+        } else {
+            let reflowed = reflowPrimaryHistoryAndGrid(newCols: newCols, newRows: newRows)
+            primaryScrollback = reflowed.scrollback
+            primaryGrid = reflowed.grid
+            altGrid = resizeGridWithoutReflow(altGrid, newCols: newCols, newRows: newRows)
+            cursorRow = min(max(0, reflowed.cursorRow), newRows - 1)
+            cursorCol = min(max(0, reflowed.cursorCol), newCols - 1)
+        }
+
+        columns = newCols
+        rows = newRows
+        cursorRow = min(max(0, cursorRow), newRows - 1)
+        cursorCol = min(max(0, cursorCol), newCols - 1)
+        pendingWrap = false
+        scrollTop = 0
+        scrollBottom = newRows - 1
+        rebuildDerivedOutputs()
     }
 
     public func encodeKeyChord(_ chord: TactileChordAction) -> Data {
@@ -247,89 +450,813 @@ public struct GhosttyReflowEngine: GhosttyVTSurface {
         return out
     }
 
-    private mutating func rebuildReflowedGrid() {
-        var wrapped: [String] = []
-        for p in logicalParagraphs {
-            if p.count <= columns {
-                wrapped.append(p)
-            } else {
-                var idx = p.startIndex
-                while idx < p.endIndex {
-                    let end = p.index(idx, offsetBy: columns, limitedBy: p.endIndex) ?? p.endIndex
-                    wrapped.append(String(p[idx..<end]))
-                    idx = end
-                }
-            }
-        }
-        if wrapped.count > rows {
-            visibleLines = Array(wrapped.suffix(rows))
-        } else {
-            visibleLines = wrapped
-        }
-    }
-
-    // MARK: - Rich ANSI / Diff Rendering for `CodaTerminalSessionView`
+    // MARK: - Rich ANSI / Diff Rendering for Snapshots & Views
 
     public static func renderStyledLines(
         rawOutput: String,
         targetColumns: Int
     ) -> (lines: [GhosttyStyledLine], latestStatus: HerdrOSC7501Status?) {
-        let cols = max(24, targetColumns)
-        let (cleanOfOSC, status) = extractOSC7501(from: rawOutput, stripCSI: false)
-        let normalized = cleanOfOSC.replacingOccurrences(of: "\r\n", with: "\n")
-            .replacingOccurrences(of: "\r", with: "\n")
+        var engine = GhosttyReflowEngine(
+            columns: max(24, targetColumns),
+            rows: 24,
+            maxScrollback: 2000,
+            treatLFAsCRLF: true
+        )
+        engine.feed(Data(rawOutput.utf8))
+        return (engine.styledLines, engine.latestHerdrStatus)
+    }
 
-        var result: [GhosttyStyledLine] = []
-        var lineID = 0
+    // MARK: - Streaming VT State Machine
 
-        let rawLines = normalized.components(separatedBy: "\n")
-        for rawLine in rawLines {
-            let cells = parseSGRCells(rawLine)
-            if cells.isEmpty {
-                result.append(GhosttyStyledLine(
-                    id: lineID,
-                    plainText: "",
-                    spans: [],
-                    kind: .normal
-                ))
-                lineID += 1
+    private mutating func processScalar(_ scalar: UnicodeScalar) {
+        switch parseState {
+        case .ground:
+            handleGroundScalar(scalar)
+
+        case .escape:
+            handleEscapeScalar(scalar)
+
+        case .escapeIntermediate:
+            if scalar.value >= 0x30 && scalar.value <= 0x7E {
+                parseState = .ground
+            } else if scalar.value == 0x1B {
+                parseState = .escape
+            } else if scalar.value < 0x20 || scalar.value >= 0x80 {
+                parseState = .ground
+            }
+
+        case .csi:
+            let v = scalar.value
+            if v == 0x1B {
+                csiBuffer.removeAll(keepingCapacity: true)
+                parseState = .escape
+            } else if v >= 0x40 && v <= 0x7E {
+                executeCSI(finalByte: UInt8(v))
+                csiBuffer.removeAll(keepingCapacity: true)
+                parseState = .ground
+            } else if v >= 0x20 && v <= 0x3F {
+                if csiBuffer.count < Self.maxCSIBytes {
+                    csiBuffer.append(UInt8(v))
+                }
+            } else if v < 0x20 {
+                handleC0InEscape(scalar)
+            }
+
+        case .osc:
+            if scalar.value == 0x07 {
+                finalizeOSC()
+                oscBuffer.removeAll(keepingCapacity: true)
+                parseState = .ground
+            } else if scalar.value == 0x1B {
+                parseState = .oscEscape
+            } else if oscBuffer.count < Self.maxOSCScalars {
+                oscBuffer.append(scalar)
+            }
+
+        case .oscEscape:
+            if scalar.value == 0x5C { // '\' -> ST
+                finalizeOSC()
+                oscBuffer.removeAll(keepingCapacity: true)
+                parseState = .ground
+            } else {
+                finalizeOSC()
+                oscBuffer.removeAll(keepingCapacity: true)
+                parseState = .escape
+                handleEscapeScalar(scalar)
+            }
+
+        case .stringSkip:
+            if scalar.value == 0x07 {
+                parseState = .ground
+            } else if scalar.value == 0x1B {
+                parseState = .stringSkipEscape
+            }
+
+        case .stringSkipEscape:
+            if scalar.value == 0x5C {
+                parseState = .ground
+            } else {
+                parseState = .escape
+                handleEscapeScalar(scalar)
+            }
+        }
+    }
+
+    private mutating func handleC0InEscape(_ scalar: UnicodeScalar) {
+        switch scalar.value {
+        case 0x08: backspace()
+        case 0x09: horizontalTab()
+        case 0x0A, 0x0B, 0x0C: lineFeed()
+        case 0x0D: carriageReturn()
+        default: break
+        }
+    }
+
+    private mutating func handleGroundScalar(_ scalar: UnicodeScalar) {
+        switch scalar.value {
+        case 0x07:
+            break
+        case 0x08:
+            backspace()
+        case 0x09:
+            horizontalTab()
+        case 0x0A, 0x0B, 0x0C:
+            lineFeed()
+        case 0x0D:
+            carriageReturn()
+        case 0x1B:
+            parseState = .escape
+        case 0x00..<0x20, 0x7F:
+            break
+        default:
+            putScalar(scalar)
+        }
+    }
+
+    private mutating func handleEscapeScalar(_ scalar: UnicodeScalar) {
+        switch scalar.value {
+        case 0x5B: // '[' CSI
+            csiBuffer.removeAll(keepingCapacity: true)
+            parseState = .csi
+        case 0x5D: // ']' OSC
+            oscBuffer.removeAll(keepingCapacity: true)
+            parseState = .osc
+        case 0x50, 0x58, 0x5E, 0x5F: // DCS, SOS, PM, APC
+            parseState = .stringSkip
+        case 0x20...0x2F: // nF / charset designation like ESC ( B, ESC ) 0
+            parseState = .escapeIntermediate
+        case 0x37: // '7' DECSC
+            saveCursor()
+            parseState = .ground
+        case 0x38: // '8' DECRC
+            restoreCursor()
+            parseState = .ground
+        case 0x44: // 'D' IND
+            lineFeedStrict()
+            parseState = .ground
+        case 0x45: // 'E' NEL
+            carriageReturn()
+            lineFeedStrict()
+            parseState = .ground
+        case 0x4D: // 'M' RI
+            reverseIndex()
+            parseState = .ground
+        case 0x63: // 'c' RIS
+            reset()
+        default:
+            parseState = .ground
+        }
+    }
+
+    // MARK: - Grid Operations
+
+    private mutating func withActiveGrid<R>(_ body: (inout [ScreenRow]) -> R) -> R {
+        if inAltScreen {
+            return body(&altGrid)
+        } else {
+            return body(&primaryGrid)
+        }
+    }
+
+    private mutating func carriageReturn() {
+        cursorCol = 0
+        pendingWrap = false
+    }
+
+    private mutating func backspace() {
+        pendingWrap = false
+        if cursorCol > 0 {
+            cursorCol -= 1
+        }
+    }
+
+    private mutating func horizontalTab() {
+        pendingWrap = false
+        let nextStop = ((cursorCol / 8) + 1) * 8
+        cursorCol = min(columns - 1, nextStop)
+    }
+
+    private mutating func lineFeed() {
+        lineFeedStrict()
+        if treatLFAsCRLF && !inAltScreen {
+            cursorCol = 0
+        }
+    }
+
+    private mutating func lineFeedStrict() {
+        pendingWrap = false
+        if cursorRow == scrollBottom {
+            scrollUp(lines: 1)
+        } else if cursorRow < rows - 1 {
+            cursorRow += 1
+        }
+    }
+
+    private mutating func reverseIndex() {
+        pendingWrap = false
+        if cursorRow == scrollTop {
+            scrollDown(lines: 1)
+        } else if cursorRow > 0 {
+            cursorRow -= 1
+        }
+    }
+
+    private mutating func scrollUp(lines: Int) {
+        let n = max(1, min(lines, scrollBottom - scrollTop + 1))
+        let captureScrollback = !inAltScreen && scrollTop == 0 && maxScrollback > 0
+        let blankRow = ScreenRow(columns: columns)
+        let top = scrollTop
+        let bottom = scrollBottom
+
+        if captureScrollback {
+            for r in top..<(top + n) where r < primaryGrid.count {
+                primaryScrollback.append(primaryGrid[r])
+            }
+            if primaryScrollback.count > maxScrollback {
+                primaryScrollback.removeFirst(primaryScrollback.count - maxScrollback)
+            }
+        }
+
+        withActiveGrid { grid in
+            for r in top...(bottom - n) {
+                grid[r] = grid[r + n]
+            }
+            for r in (bottom - n + 1)...bottom {
+                grid[r] = blankRow
+            }
+        }
+    }
+
+    private mutating func scrollDown(lines: Int) {
+        let n = max(1, min(lines, scrollBottom - scrollTop + 1))
+        let blankRow = ScreenRow(columns: columns)
+        let top = scrollTop
+        let bottom = scrollBottom
+        withActiveGrid { grid in
+            var r = bottom
+            while r >= top + n {
+                grid[r] = grid[r - n]
+                r -= 1
+            }
+            for fill in top..<(top + n) {
+                grid[fill] = blankRow
+            }
+        }
+    }
+
+    private mutating func saveCursor() {
+        let snapshot = CursorState(
+            row: cursorRow,
+            col: cursorCol,
+            fg: curFg,
+            bold: curBold,
+            dim: curDim,
+            pendingWrap: pendingWrap
+        )
+        if inAltScreen {
+            savedAltCursor = snapshot
+        } else {
+            savedPrimaryCursor = snapshot
+        }
+    }
+
+    private mutating func restoreCursor() {
+        let snapshot = inAltScreen ? savedAltCursor : savedPrimaryCursor
+        cursorRow = min(max(0, snapshot.row), rows - 1)
+        cursorCol = min(max(0, snapshot.col), columns - 1)
+        curFg = snapshot.fg
+        curBold = snapshot.bold
+        curDim = snapshot.dim
+        pendingWrap = snapshot.pendingWrap
+    }
+
+    private mutating func enterAltScreen(saveCursorFirst: Bool, clearAlt: Bool) {
+        if saveCursorFirst {
+            savedPrimaryCursor = CursorState(
+                row: cursorRow,
+                col: cursorCol,
+                fg: curFg,
+                bold: curBold,
+                dim: curDim,
+                pendingWrap: pendingWrap
+            )
+        }
+        inAltScreen = true
+        if clearAlt || altGrid.count != rows {
+            altGrid = (0..<rows).map { _ in ScreenRow(columns: columns) }
+        }
+        cursorRow = 0
+        cursorCol = 0
+        pendingWrap = false
+        scrollTop = 0
+        scrollBottom = rows - 1
+    }
+
+    private mutating func leaveAltScreen(restoreSavedCursor: Bool) {
+        inAltScreen = false
+        scrollTop = 0
+        scrollBottom = rows - 1
+        pendingWrap = false
+        if restoreSavedCursor {
+            restoreCursor()
+        } else {
+            cursorRow = min(cursorRow, rows - 1)
+            cursorCol = min(cursorCol, columns - 1)
+        }
+    }
+
+    private static func clearWideNeighbors(in row: inout ScreenRow, at col: Int) {
+        guard col >= 0 && col < row.cells.count else { return }
+        if row.cells[col].isWideContinuation && col > 0 {
+            row.cells[col - 1] = .blank
+        } else if row.cells[col].width == 2 && col + 1 < row.cells.count {
+            row.cells[col + 1] = .blank
+        }
+        row.cells[col] = .blank
+    }
+
+    private mutating func putScalar(_ scalar: UnicodeScalar) {
+        let w = Self.scalarDisplayWidth(scalar)
+        if w == 0 {
+            // Combining scalar: attach to previous printable cell if possible
+            let targetCol: Int? = if pendingWrap {
+                columns - 1
+            } else if cursorCol > 0 {
+                cursorCol - 1
+            } else {
+                nil
+            }
+            if let tc = targetCol {
+                let r = cursorRow
+                withActiveGrid { grid in
+                    var actualCol = tc
+                    if grid[r].cells[actualCol].isWideContinuation && actualCol > 0 {
+                        actualCol -= 1
+                    }
+                    let existing = String(grid[r].cells[actualCol].ch)
+                    if let combined = (existing + String(scalar)).first {
+                        grid[r].cells[actualCol].ch = combined
+                    }
+                }
+            }
+            return
+        }
+
+        if pendingWrap {
+            let r = cursorRow
+            withActiveGrid { grid in
+                grid[r].softWrapped = true
+            }
+            cursorCol = 0
+            pendingWrap = false
+            lineFeedStrict()
+        }
+
+        if w == 2 && cursorCol >= columns - 1 {
+            let r = cursorRow
+            let col = cursorCol
+            withActiveGrid { grid in
+                Self.clearWideNeighbors(in: &grid[r], at: col)
+                grid[r].softWrapped = true
+            }
+            cursorCol = 0
+            lineFeedStrict()
+        }
+
+        let ch = Character(scalar)
+        let fg = curFg
+        let bold = curBold
+        let dim = curDim
+        let r = cursorRow
+        let col = cursorCol
+        let cols = columns
+
+        withActiveGrid { grid in
+            Self.clearWideNeighbors(in: &grid[r], at: col)
+            if w == 2 && col + 1 < cols {
+                Self.clearWideNeighbors(in: &grid[r], at: col + 1)
+                grid[r].cells[col] = StyledCell(
+                    ch: ch, fg: fg, bold: bold, dim: dim, width: 2, isWideContinuation: false
+                )
+                grid[r].cells[col + 1] = StyledCell(
+                    ch: " ", fg: fg, bold: bold, dim: dim, width: 0, isWideContinuation: true
+                )
+            } else {
+                grid[r].cells[col] = StyledCell(
+                    ch: ch, fg: fg, bold: bold, dim: dim, width: 1, isWideContinuation: false
+                )
+            }
+        }
+
+        if cursorCol + w >= columns {
+            cursorCol = columns - 1
+            pendingWrap = true
+        } else {
+            cursorCol += w
+        }
+    }
+
+    // MARK: - CSI & OSC Execution
+
+    private mutating func executeCSI(finalByte: UInt8) {
+        let raw = String(decoding: csiBuffer, as: UTF8.self)
+        let isPrivate = raw.hasPrefix("?")
+        let cleanParams = isPrivate ? String(raw.dropFirst()) : raw
+
+        // Preserve colon sub-parameters for SGR (`38:2::r:g:b`)
+        if finalByte == 0x6D /* 'm' */ && !isPrivate {
+            Self.applySGR(params: cleanParams, fg: &curFg, bold: &curBold, dim: &curDim)
+            return
+        }
+
+        let ints: [Int] = cleanParams.isEmpty
+            ? []
+            : cleanParams.split(separator: ";", omittingEmptySubsequences: false).map { Int($0) ?? 0 }
+        let p1 = ints.first ?? 0
+        let count1 = max(1, p1)
+
+        if isPrivate {
+            switch finalByte {
+            case 0x68: // 'h' DECSET
+                for code in ints {
+                    if code == 1049 || code == 1047 || code == 47 {
+                        enterAltScreen(saveCursorFirst: code == 1049, clearAlt: true)
+                    }
+                }
+            case 0x6C: // 'l' DECRST
+                for code in ints {
+                    if code == 1049 || code == 1047 || code == 47 {
+                        leaveAltScreen(restoreSavedCursor: code == 1049)
+                    }
+                }
+            default:
+                break
+            }
+            return
+        }
+
+        switch finalByte {
+        case 0x41: // 'A' CUU
+            pendingWrap = false
+            cursorRow = max(0, cursorRow - count1)
+        case 0x42, 0x65: // 'B' CUD / 'e' VPR
+            pendingWrap = false
+            cursorRow = min(rows - 1, cursorRow + count1)
+        case 0x43, 0x61: // 'C' CUF / 'a' HPR
+            pendingWrap = false
+            cursorCol = min(columns - 1, cursorCol + count1)
+        case 0x44: // 'D' CUB
+            pendingWrap = false
+            cursorCol = max(0, cursorCol - count1)
+        case 0x45: // 'E' CNL
+            pendingWrap = false
+            cursorRow = min(rows - 1, cursorRow + count1)
+            cursorCol = 0
+        case 0x46: // 'F' CPL
+            pendingWrap = false
+            cursorRow = max(0, cursorRow - count1)
+            cursorCol = 0
+        case 0x47, 0x60: // 'G' CHA / '`' HPA
+            pendingWrap = false
+            cursorCol = min(columns - 1, max(0, count1 - 1))
+        case 0x48, 0x66: // 'H' CUP / 'f' HVP
+            pendingWrap = false
+            let r = max(1, ints.count >= 1 ? ints[0] : 1)
+            let c = max(1, ints.count >= 2 ? ints[1] : 1)
+            cursorRow = min(rows - 1, r - 1)
+            cursorCol = min(columns - 1, c - 1)
+        case 0x64: // 'd' VPA
+            pendingWrap = false
+            cursorRow = min(rows - 1, max(0, count1 - 1))
+        case 0x4A: // 'J' ED
+            eraseInDisplay(mode: p1)
+        case 0x4B: // 'K' EL
+            eraseInLine(mode: p1)
+        case 0x58: // 'X' ECH
+            let cols = columns
+            let r = cursorRow
+            let start = cursorCol
+            let end = min(cols, start + count1)
+            withActiveGrid { grid in
+                for c in start..<end {
+                    Self.clearWideNeighbors(in: &grid[r], at: c)
+                }
+            }
+        case 0x4C: // 'L' IL (insert lines inside scroll region)
+            if cursorRow >= scrollTop && cursorRow <= scrollBottom {
+                let savedTop = scrollTop
+                scrollTop = cursorRow
+                scrollDown(lines: count1)
+                scrollTop = savedTop
+            }
+        case 0x4D: // 'M' DL (delete lines inside scroll region)
+            if cursorRow >= scrollTop && cursorRow <= scrollBottom {
+                let savedTop = scrollTop
+                scrollTop = cursorRow
+                scrollUp(lines: count1)
+                scrollTop = savedTop
+            }
+        case 0x40: // '@' ICH (insert blank characters)
+            let cols = columns
+            let r = cursorRow
+            let col = cursorCol
+            let n = min(count1, cols - col)
+            withActiveGrid { grid in
+                Self.clearWideNeighbors(in: &grid[r], at: col)
+                var c = cols - 1
+                while c >= col + n {
+                    grid[r].cells[c] = grid[r].cells[c - n]
+                    c -= 1
+                }
+                for fill in col..<(col + n) {
+                    grid[r].cells[fill] = .blank
+                }
+                if cols > 0 && grid[r].cells[cols - 1].width == 2 {
+                    grid[r].cells[cols - 1] = .blank
+                }
+            }
+        case 0x50: // 'P' DCH (delete characters)
+            let cols = columns
+            let r = cursorRow
+            let col = cursorCol
+            let n = min(count1, cols - col)
+            withActiveGrid { grid in
+                Self.clearWideNeighbors(in: &grid[r], at: col)
+                for c in col..<(cols - n) {
+                    grid[r].cells[c] = grid[r].cells[c + n]
+                }
+                for fill in (cols - n)..<cols {
+                    grid[r].cells[fill] = .blank
+                }
+                if grid[r].cells[col].isWideContinuation {
+                    grid[r].cells[col] = .blank
+                }
+            }
+        case 0x53: // 'S' SU
+            scrollUp(lines: count1)
+        case 0x54: // 'T' SD
+            scrollDown(lines: count1)
+        case 0x72: // 'r' DECSTBM
+            let top = max(1, ints.count >= 1 && ints[0] > 0 ? ints[0] : 1)
+            let bot = min(rows, ints.count >= 2 && ints[1] > 0 ? ints[1] : rows)
+            if top < bot {
+                scrollTop = top - 1
+                scrollBottom = bot - 1
+            } else {
+                scrollTop = 0
+                scrollBottom = rows - 1
+            }
+            cursorRow = 0
+            cursorCol = 0
+            pendingWrap = false
+        case 0x73: // 's' SCOSC
+            saveCursor()
+        case 0x75: // 'u' SCORC
+            restoreCursor()
+        default:
+            break
+        }
+    }
+
+    private mutating func eraseInDisplay(mode: Int) {
+        let cols = columns
+        let rNow = cursorRow
+        let cNow = cursorCol
+        let totalRows = rows
+        withActiveGrid { grid in
+            switch mode {
+            case 0:
+                for c in cNow..<cols {
+                    Self.clearWideNeighbors(in: &grid[rNow], at: c)
+                }
+                grid[rNow].softWrapped = false
+                for r in (rNow + 1)..<totalRows {
+                    grid[r].clear()
+                }
+            case 1:
+                for r in 0..<rNow {
+                    grid[r].clear()
+                }
+                for c in 0...min(cNow, cols - 1) {
+                    Self.clearWideNeighbors(in: &grid[rNow], at: c)
+                }
+            case 2, 3:
+                for r in 0..<totalRows {
+                    grid[r].clear()
+                }
+            default:
+                break
+            }
+        }
+        if mode == 3 && !inAltScreen {
+            primaryScrollback.removeAll(keepingCapacity: true)
+        }
+    }
+
+    private mutating func eraseInLine(mode: Int) {
+        let cols = columns
+        let r = cursorRow
+        let cNow = cursorCol
+        withActiveGrid { grid in
+            switch mode {
+            case 0:
+                for c in cNow..<cols {
+                    Self.clearWideNeighbors(in: &grid[r], at: c)
+                }
+                grid[r].softWrapped = false
+            case 1:
+                for c in 0...min(cNow, cols - 1) {
+                    Self.clearWideNeighbors(in: &grid[r], at: c)
+                }
+            case 2:
+                grid[r].clear()
+            default:
+                break
+            }
+        }
+    }
+
+    private mutating func finalizeOSC() {
+        let raw = String(String.UnicodeScalarView(oscBuffer))
+        if raw.hasPrefix("7501;") {
+            let payload = String(raw.dropFirst(5))
+            if let status = Self.parseOSC7501Payload(payload, separator: ";") {
+                latestHerdrStatus = status
+            }
+        } else if raw.hasPrefix("7501:") {
+            let payload = String(raw.dropFirst(5))
+            if let status = Self.parseOSC7501Payload(payload, separator: ":") {
+                latestHerdrStatus = status
+            }
+        } else if raw.hasPrefix("0;") || raw.hasPrefix("2;") {
+            title = String(raw.dropFirst(2))
+        }
+    }
+
+    // MARK: - Resize Reflow & Output Materialization
+
+    private func resizeGridWithoutReflow(
+        _ grid: [ScreenRow],
+        newCols: Int,
+        newRows: Int
+    ) -> [ScreenRow] {
+        var out = (0..<newRows).map { _ in ScreenRow(columns: newCols) }
+        let rowCount = min(grid.count, newRows)
+        for r in 0..<rowCount {
+            let copyCols = min(grid[r].cells.count, newCols)
+            for c in 0..<copyCols {
+                out[r].cells[c] = grid[r].cells[c]
+            }
+            if newCols > 0 && copyCols < grid[r].cells.count && out[r].cells[newCols - 1].width == 2 {
+                out[r].cells[newCols - 1] = .blank
+            }
+        }
+        return out
+    }
+
+    private func reflowPrimaryHistoryAndGrid(
+        newCols: Int,
+        newRows: Int
+    ) -> (scrollback: [ScreenRow], grid: [ScreenRow], cursorRow: Int, cursorCol: Int) {
+        var combined = primaryScrollback + primaryGrid
+        // Drop trailing blank lines beyond cursor row
+        let cursorAbs = primaryScrollback.count + cursorRow
+        while combined.count > cursorAbs + 1 && combined.last?.trimmedEndIndex == 0 && !combined.last!.softWrapped {
+            combined.removeLast()
+        }
+
+        struct LogicalLine {
+            var cells: [StyledCell]
+            var containsCursor: Bool
+            var cursorOffset: Int
+        }
+
+        var logicalLines: [LogicalLine] = []
+        var idx = 0
+        while idx < combined.count {
+            var cells: [StyledCell] = []
+            var hasCursor = false
+            var curOffset = 0
+            while true {
+                let row = combined[idx]
+                let isCursorRow = (idx == cursorAbs)
+                let endIdx = row.softWrapped
+                    ? row.cells.count
+                    : max(row.trimmedEndIndex, isCursorRow ? min(cursorCol, row.cells.count) : 0)
+                if isCursorRow {
+                    hasCursor = true
+                    curOffset = cells.count + min(cursorCol, row.cells.count)
+                }
+                for c in 0..<min(endIdx, row.cells.count) {
+                    if !row.cells[c].isWideContinuation {
+                        cells.append(row.cells[c])
+                    } else if isCursorRow && c < cursorCol {
+                        curOffset = max(0, curOffset - 1)
+                    }
+                }
+                let cont = row.softWrapped && idx + 1 < combined.count
+                idx += 1
+                if !cont { break }
+            }
+            logicalLines.append(LogicalLine(cells: cells, containsCursor: hasCursor, cursorOffset: curOffset))
+        }
+
+        var wrappedRows: [ScreenRow] = []
+        var newCursorAbs = 0
+        var newCursorCol = 0
+
+        for line in logicalLines {
+            if line.cells.isEmpty {
+                if line.containsCursor {
+                    newCursorAbs = wrappedRows.count
+                    newCursorCol = 0
+                }
+                wrappedRows.append(ScreenRow(columns: newCols, softWrapped: false))
                 continue
             }
 
-            // Wrap cells at `cols` without breaking attribute runs
-            var idx = 0
-            while idx < cells.count {
-                let end = min(idx + cols, cells.count)
-                let slice = Array(cells[idx..<end])
-                let plain = String(slice.map(\.ch))
-                let spans = coalesceSpans(slice)
-                let kind = classifyLine(plain)
-                result.append(GhosttyStyledLine(
-                    id: lineID,
-                    plainText: plain,
-                    spans: spans,
-                    kind: kind
-                ))
-                lineID += 1
-                idx = end
+            var currentRow = ScreenRow(columns: newCols, softWrapped: false)
+            var col = 0
+            for (cellIdx, cell) in line.cells.enumerated() {
+                let w = cell.width == 2 ? 2 : 1
+                if col + w > newCols {
+                    currentRow.softWrapped = true
+                    wrappedRows.append(currentRow)
+                    currentRow = ScreenRow(columns: newCols, softWrapped: false)
+                    col = 0
+                }
+                if line.containsCursor && cellIdx == line.cursorOffset {
+                    newCursorAbs = wrappedRows.count
+                    newCursorCol = col
+                }
+                currentRow.cells[col] = cell
+                if w == 2 && col + 1 < newCols {
+                    currentRow.cells[col + 1] = StyledCell(
+                        ch: " ", fg: cell.fg, bold: cell.bold, dim: cell.dim, width: 0, isWideContinuation: true
+                    )
+                }
+                col += w
             }
+            if line.containsCursor && line.cursorOffset >= line.cells.count {
+                newCursorAbs = wrappedRows.count
+                newCursorCol = min(col, newCols - 1)
+            }
+            wrappedRows.append(currentRow)
         }
 
-        // Trim trailing blank lines if screen has extra trailing newlines
-        while result.count > 1, result.last?.plainText.isEmpty == true {
-            result.removeLast()
+        while wrappedRows.count < newRows {
+            wrappedRows.append(ScreenRow(columns: newCols, softWrapped: false))
         }
-        return (result, status)
+
+        let sbCount = max(0, wrappedRows.count - newRows)
+        let scrollbackSlice = sbCount > 0
+            ? Array(wrappedRows.prefix(sbCount).suffix(maxScrollback))
+            : []
+        let gridSlice = Array(wrappedRows.suffix(newRows))
+        let adjustedCursorRow = max(0, min(newRows - 1, newCursorAbs - sbCount))
+        return (scrollbackSlice, gridSlice, adjustedCursorRow, min(newCols - 1, newCursorCol))
     }
 
-    private struct StyledCell {
-        let ch: Character
-        let fg: GhosttyRGBColor?
-        let bold: Bool
-        let dim: Bool
+    private mutating func rebuildDerivedOutputs() {
+        let activeGrid = inAltScreen ? altGrid : primaryGrid
+        var vis = activeGrid.map(\.plainTrimmedString)
+        while vis.count > 1 && vis.last?.isEmpty == true {
+            vis.removeLast()
+        }
+        visibleLines = vis
+        plainVisibleText = vis.joined(separator: "\n")
+
+        let sourceRows = inAltScreen ? altGrid : (primaryScrollback + primaryGrid)
+        var nonTrailingBlankCount = sourceRows.count
+        while nonTrailingBlankCount > 1 && sourceRows[nonTrailingBlankCount - 1].trimmedEndIndex == 0 {
+            nonTrailingBlankCount -= 1
+        }
+
+        var linesOut: [GhosttyStyledLine] = []
+        linesOut.reserveCapacity(nonTrailingBlankCount)
+        for lineID in 0..<nonTrailingBlankCount {
+            let row = sourceRows[lineID]
+            let end = row.trimmedEndIndex
+            if end == 0 {
+                linesOut.append(GhosttyStyledLine(id: lineID, plainText: "", spans: [], kind: .normal))
+                continue
+            }
+            let slice = row.cells[0..<end]
+            var plain = ""
+            plain.reserveCapacity(end)
+            for cell in slice where !cell.isWideContinuation {
+                plain.append(cell.ch)
+            }
+            let spans = Self.coalesceSpans(slice)
+            let kind = Self.classifyLine(plain)
+            linesOut.append(GhosttyStyledLine(id: lineID, plainText: plain, spans: spans, kind: kind))
+        }
+        styledLines = linesOut
     }
 
-    private static func coalesceSpans(_ cells: [StyledCell]) -> [GhosttyStyledSpan] {
+    // MARK: - Helpers (Span Coalescing, SGR, Wide Widths, Diff & OSC 7501)
+
+    private static func coalesceSpans(_ cells: ArraySlice<StyledCell>) -> [GhosttyStyledSpan] {
         var spans: [GhosttyStyledSpan] = []
         var buf = ""
         var curFg: GhosttyRGBColor?
@@ -338,6 +1265,7 @@ public struct GhosttyReflowEngine: GhosttyVTSurface {
         var spanId = 0
 
         for cell in cells {
+            if cell.isWideContinuation { continue }
             if !buf.isEmpty && (cell.fg != curFg || cell.bold != curBold || cell.dim != curDim) {
                 spans.append(GhosttyStyledSpan(id: spanId, text: buf, fg: curFg, bold: curBold, dim: curDim))
                 spanId += 1
@@ -356,71 +1284,32 @@ public struct GhosttyReflowEngine: GhosttyVTSurface {
         return spans
     }
 
-    private static func parseSGRCells(_ input: String) -> [StyledCell] {
-        var cells: [StyledCell] = []
-        var curFg: GhosttyRGBColor?
-        var curBold = false
-        var curDim = false
-
-        var i = input.startIndex
-        while i < input.endIndex {
-            let ch = input[i]
-            if ch == "\u{1B}" {
-                let next = input.index(after: i)
-                if next < input.endIndex && input[next] == "[" {
-                    // CSI sequence: ESC [ <params> <final>
-                    var j = input.index(after: next)
-                    var params = ""
-                    while j < input.endIndex {
-                        let cj = input[j]
-                        if let scalar = cj.unicodeScalars.first, scalar.value >= 0x40 && scalar.value <= 0x7E {
-                            if cj == "m" {
-                                applySGR(params: params, fg: &curFg, bold: &curBold, dim: &curDim)
-                            }
-                            j = input.index(after: j)
-                            break
-                        }
-                        params.append(cj)
-                        j = input.index(after: j)
-                    }
-                    i = j
-                    continue
-                } else if next < input.endIndex && input[next] == "]" {
-                    // Any remaining OSC sequence: skip until BEL or ST
-                    var j = input.index(after: next)
-                    while j < input.endIndex {
-                        if input[j] == "\u{07}" {
-                            j = input.index(after: j)
-                            break
-                        }
-                        if input[j] == "\u{1B}" {
-                            let afterEsc = input.index(after: j)
-                            j = (afterEsc < input.endIndex && input[afterEsc] == "\\")
-                                ? input.index(after: afterEsc)
-                                : afterEsc
-                            break
-                        }
-                        j = input.index(after: j)
-                    }
-                    i = j
-                    continue
-                }
-            }
-
-            if let scalar = ch.unicodeScalars.first, scalar.value < 0x20 && ch != "\t" {
-                i = input.index(after: i)
-                continue
-            }
-            if ch == "\t" {
-                for _ in 0..<4 {
-                    cells.append(StyledCell(ch: " ", fg: curFg, bold: curBold, dim: curDim))
-                }
-            } else {
-                cells.append(StyledCell(ch: ch, fg: curFg, bold: curBold, dim: curDim))
-            }
-            i = input.index(after: i)
+    private static func scalarDisplayWidth(_ scalar: UnicodeScalar) -> Int {
+        let v = scalar.value
+        if v < 0x20 || v == 0x7F { return 0 }
+        if (0x0300...0x036F).contains(v)
+            || (0x1AB0...0x1AFF).contains(v)
+            || (0x1DC0...0x1DFF).contains(v)
+            || (0x200B...0x200D).contains(v)
+            || (0x20D0...0x20FF).contains(v)
+            || (0xFE00...0xFE0F).contains(v)
+            || (0xFE20...0xFE2F).contains(v)
+        {
+            return 0
         }
-        return cells
+        if (0x1100...0x115F).contains(v)
+            || (0x2E80...0x9FFF).contains(v)
+            || (0xAC00...0xD7AF).contains(v)
+            || (0xF900...0xFAFF).contains(v)
+            || (0xFE10...0xFE6F).contains(v)
+            || (0xFF00...0xFF60).contains(v)
+            || (0xFFE0...0xFFE6).contains(v)
+            || (0x1F300...0x1FAFF).contains(v)
+            || (0x20000...0x3FFFF).contains(v)
+        {
+            return 2
+        }
+        return 1
     }
 
     private static func applySGR(
@@ -435,10 +1324,36 @@ public struct GhosttyReflowEngine: GhosttyVTSurface {
             dim = false
             return
         }
-        let nums = params.split(separator: ";", omittingEmptySubsequences: false).compactMap { Int($0) }
+
+        // Support both `;` and `:` (ISO-8613-6 e.g. `38:2::r:g:b` or `38:5:idx`)
+        let rawTokens = params.split(separator: ";", omittingEmptySubsequences: false)
         var idx = 0
-        while idx < nums.count {
-            let code = nums[idx]
+        while idx < rawTokens.count {
+            let tok = rawTokens[idx]
+            if tok.contains(":") {
+                let sub = tok.split(separator: ":", omittingEmptySubsequences: false).compactMap { $0.isEmpty ? nil : Int($0) }
+                if let head = sub.first {
+                    if head == 38 {
+                        if sub.count >= 3 && sub[1] == 5 {
+                            fg = xterm256Color(sub[2])
+                        } else if sub.count >= 5 && sub[1] == 2 {
+                            // 38:2:cs:r:g:b or 38:2::r:g:b (sub omits empty cs -> sub.count==5)
+                            let offset = sub.count >= 6 ? 3 : 2
+                            if offset + 2 < sub.count {
+                                fg = GhosttyRGBColor(
+                                    r: UInt8(clamping: sub[offset]),
+                                    g: UInt8(clamping: sub[offset + 1]),
+                                    b: UInt8(clamping: sub[offset + 2])
+                                )
+                            }
+                        }
+                    }
+                }
+                idx += 1
+                continue
+            }
+
+            let code = tok.isEmpty ? 0 : (Int(tok) ?? -1)
             switch code {
             case 0:
                 fg = nil
@@ -458,14 +1373,28 @@ public struct GhosttyReflowEngine: GhosttyVTSurface {
             case 90...97:
                 fg = standard16Color(8 + (code - 90))
             case 38:
-                if idx + 2 < nums.count && nums[idx + 1] == 5 {
-                    fg = xterm256Color(nums[idx + 2])
+                let next1 = idx + 1 < rawTokens.count ? Int(rawTokens[idx + 1]) : nil
+                if next1 == 5, idx + 2 < rawTokens.count, let n = Int(rawTokens[idx + 2]) {
+                    fg = xterm256Color(n)
                     idx += 2
-                } else if idx + 4 < nums.count && nums[idx + 1] == 2 {
-                    let r = UInt8(clamping: nums[idx + 2])
-                    let g = UInt8(clamping: nums[idx + 3])
-                    let b = UInt8(clamping: nums[idx + 4])
-                    fg = GhosttyRGBColor(r: r, g: g, b: b)
+                } else if next1 == 2,
+                          idx + 4 < rawTokens.count,
+                          let r = Int(rawTokens[idx + 2]),
+                          let g = Int(rawTokens[idx + 3]),
+                          let b = Int(rawTokens[idx + 4])
+                {
+                    fg = GhosttyRGBColor(
+                        r: UInt8(clamping: r),
+                        g: UInt8(clamping: g),
+                        b: UInt8(clamping: b)
+                    )
+                    idx += 4
+                }
+            case 48:
+                let next1 = idx + 1 < rawTokens.count ? Int(rawTokens[idx + 1]) : nil
+                if next1 == 5 && idx + 2 < rawTokens.count {
+                    idx += 2
+                } else if next1 == 2 && idx + 4 < rawTokens.count {
                     idx += 4
                 }
             default:
@@ -525,42 +1454,6 @@ public struct GhosttyReflowEngine: GhosttyVTSurface {
         return .normal
     }
 
-    // MARK: - Flexible OSC 7501 Extractor (`;` and `:` prefixes, `msg=` and `task=`)
-
-    private static func extractOSC7501(
-        from input: String,
-        stripCSI: Bool
-    ) -> (cleaned: String, latestStatus: HerdrOSC7501Status?) {
-        var working = input
-        var lastStatus: HerdrOSC7501Status?
-
-        while let oscRange = working.range(of: "\u{1B}]7501;") ?? working.range(of: "\u{1B}]7501:") {
-            let sep = working[working.index(before: oscRange.upperBound)]
-            let afterPrefix = working[oscRange.upperBound...]
-            guard let terminator = afterPrefix.firstIndex(where: { $0 == "\u{07}" || $0 == "\u{1B}" }) else {
-                break
-            }
-            let body = String(afterPrefix[..<terminator])
-            if let parsed = parseOSC7501Payload(body, separator: sep) {
-                lastStatus = parsed
-            }
-            var endIdx = working.index(after: terminator)
-            if working[terminator] == "\u{1B}", endIdx < working.endIndex, working[endIdx] == "\\" {
-                endIdx = working.index(after: endIdx)
-            }
-            working.removeSubrange(oscRange.lowerBound..<endIdx)
-        }
-
-        if stripCSI {
-            let pattern = "\u{1B}\\[[0-9;?]*[A-Za-z]"
-            if let regex = try? NSRegularExpression(pattern: pattern) {
-                let nsRange = NSRange(working.startIndex..<working.endIndex, in: working)
-                working = regex.stringByReplacingMatches(in: working, range: nsRange, withTemplate: "")
-            }
-        }
-        return (working, lastStatus)
-    }
-
     private static func parseOSC7501Payload(_ payload: String, separator: Character) -> HerdrOSC7501Status? {
         if payload.contains("=") {
             var kv: [String: String] = [:]
@@ -581,7 +1474,6 @@ public struct GhosttyReflowEngine: GhosttyVTSurface {
                 progress: progress
             )
         } else if separator == ":" {
-            // Positional form e.g. `7501:blocked:Approve deploy`
             let parts = payload.split(separator: ":", maxSplits: 1)
             let state = HerdrLifecycleState.from(rawState: parts.first.map(String.init))
             let msg = parts.count > 1 ? String(parts[1]) : nil

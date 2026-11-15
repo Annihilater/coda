@@ -552,7 +552,9 @@ public struct CodaMobileSpacesTabView: View {
                             }
                         }
 
-                        let matching = group.sessions.filter { $0.cwd.hasPrefix(repo.rootPath) || $0.workspaceName == repo.repoName }
+                        let matching = group.sessions.filter {
+                            codaPathWithinRoot($0.cwd, root: repo.rootPath) || $0.workspaceName == repo.repoName
+                        }
                         if !matching.isEmpty {
                             paneMinimapGrid(sessions: matching)
                         }
@@ -568,7 +570,7 @@ public struct CodaMobileSpacesTabView: View {
 
             let repoRoots = Set(group.repos.map(\.rootPath))
             let orphanSessions = group.sessions.filter { s in
-                !repoRoots.contains(where: { s.cwd.hasPrefix($0) })
+                !repoRoots.contains(where: { codaPathWithinRoot(s.cwd, root: $0) })
             }
             if !orphanSessions.isEmpty {
                 paneMinimapGrid(sessions: orphanSessions)

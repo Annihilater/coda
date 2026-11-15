@@ -102,19 +102,28 @@ public final class CodaWorkspaceStore: ObservableObject {
     @Published public var duoSplitMode: CodaDuoSplitMode = .inboxAndTerminal
     @Published public var secondarySessionID: String? = nil
     @Published public var showTactileTwoRowKeypad: Bool = false
+    @Published public var voiceConfigSyncMessage: String? = nil
 
     private var networkClient: CodaNetworkClient?
     private var networkClientURL: URL?
     private var pollLoopTask: Task<Void, Never>?
+    private var accountEventsTask: Task<Void, Never>?
     private var deviceAuthTask: Task<Void, Never>?
+    private var screenRefreshTask: Task<Void, Never>?
     private var readCompletedIDs: Set<String> = []
     private var attachedSessionIDs: Set<String> = []
+    private var surfaceEngines: [String: GhosttyReflowEngine] = [:]
+    private var lastWorkspaceScanAt: [UUID: Date] = [:]
     private var accountEventsConnectedToken: String? = nil
     private var previousStates: [String: HerdrLifecycleState] = [:]
     private var lastToastAt: Date = .distantPast
     private var lastViewportSize: CGSize = .zero
     private var lastIsHorizontalRegular: Bool? = nil
     private var lastIsVerticalRegular: Bool? = nil
+
+    public var onlineMachineCount: Int {
+        remoteMachines.filter(\.isOnline).count
+    }
 
     public init() {
         let loadedSettings = CodaPersistedSettings.load()
@@ -125,7 +134,16 @@ public final class CodaWorkspaceStore: ObservableObject {
         #else
         let defaultName = "Mac-Client"
         #endif
-        self.localIdentity = CodaDeviceIdentity.loadOrCreatePersisted(defaultName: defaultName)
+        var loadedIdentity = CodaDeviceIdentity.loadOrCreatePersisted(defaultName: defaultName)
+        let regKey = CodaPersistedSettings.registrationKey(
+            serverBaseURL: loadedSettings.serverBaseURLString,
+            ownerHandle: loadedSettings.ownerHandle
+        )
+        if let savedDevStr = loadedSettings.registeredDeviceIDs[regKey],
+           let savedDevUUID = UUID(uuidString: savedDevStr) {
+            loadedIdentity.deviceId = savedDevUUID
+        }
+        self.localIdentity = loadedIdentity
 
         if let url = URL(string: loadedSettings.serverBaseURLString), !loadedSettings.sessionToken.isEmpty {
             let client = CodaNetworkClient(serverBaseURL: url)
@@ -152,16 +170,30 @@ public final class CodaWorkspaceStore: ObservableObject {
     }
 
     public func updateServerURL(_ raw: String) {
+        let oldClient = self.networkClient
         settings.serverBaseURLString = raw
         settings.save()
-        if let url = URL(string: normalizedServerURLString()) {
-            let client = CodaNetworkClient(serverBaseURL: url)
-            self.networkClient = client
-            self.networkClientURL = url
-            let tok = settings.sessionToken
-            if !tok.isEmpty {
-                Task { await client.setToken(tok) }
-            }
+        stopLiveSync()
+        if let oldClient {
+            Task { await oldClient.disconnectTransport() }
+        }
+        self.networkClient = nil
+        self.networkClientURL = nil
+        self.accountEventsConnectedToken = nil
+        self.attachedSessionIDs.removeAll()
+        self.surfaceEngines.removeAll()
+        self.lastWorkspaceScanAt.removeAll()
+        self.sessions.removeAll()
+        self.remoteMachines.removeAll()
+        self.workspacesByDevice.removeAll()
+        self.machineRouteModes.removeAll()
+        self.rawScreenTextBySession.removeAll()
+        self.terminalLinesBySession.removeAll()
+        self.selectedSessionID = nil
+        syncIdentityDeviceIdForCurrentRegistration()
+        _ = ensureClient()
+        if isSignedIn {
+            startLiveSync()
         }
     }
 
@@ -327,8 +359,9 @@ public final class CodaWorkspaceStore: ObservableObject {
         if isSignedIn {
             let token = settings.sessionToken
             if !token.isEmpty && accountEventsConnectedToken != token, let client = ensureClient() {
+                accountEventsTask?.cancel()
                 accountEventsConnectedToken = token
-                Task { [weak self] in
+                accountEventsTask = Task { [weak self] in
                     await client.setAsyncEventHandler { [weak self] event in
                         Task { @MainActor in
                             self?.handleAsyncPeerEvent(event)
@@ -359,8 +392,14 @@ public final class CodaWorkspaceStore: ObservableObject {
     public func stopLiveSync() {
         pollLoopTask?.cancel()
         pollLoopTask = nil
+        accountEventsTask?.cancel()
+        accountEventsTask = nil
+        screenRefreshTask?.cancel()
+        screenRefreshTask = nil
         accountEventsConnectedToken = nil
         attachedSessionIDs.removeAll()
+        surfaceEngines.removeAll()
+        lastWorkspaceScanAt.removeAll()
         if let client = networkClient {
             Task { await client.disconnectAccountEventsWebSocket() }
         }
@@ -376,21 +415,24 @@ public final class CodaWorkspaceStore: ObservableObject {
            let b64 = obj["data_b64"] as? String,
            let rawBytes = Data(base64Encoded: b64) {
             let sid = "\(hostPrefix)/\(terminal)"
-            let chunk = String(decoding: rawBytes, as: UTF8.self)
-            var updated = (rawScreenTextBySession[sid] ?? "") + chunk
-            if updated.count > 65_536 {
-                updated = String(updated.suffix(65_536))
-            }
-            rawScreenTextBySession[sid] = updated
-            let rendered = GhosttyReflowEngine.renderStyledLines(
-                rawOutput: updated,
-                targetColumns: terminalColumns
+            var engine = surfaceEngines[sid] ?? GhosttyReflowEngine(
+                columns: terminalColumns,
+                rows: terminalRows,
+                maxScrollback: 1500,
+                treatLFAsCRLF: true
             )
-            terminalLinesBySession[sid] = rendered.lines
+            if engine.columns != terminalColumns || engine.rows != terminalRows {
+                engine.resizeReflow(columns: terminalColumns, rows: terminalRows)
+            }
+            engine.feed(rawBytes)
+            surfaceEngines[sid] = engine
+            let visiblePlain = engine.plainVisibleText
+            rawScreenTextBySession[sid] = visiblePlain
+            terminalLinesBySession[sid] = engine.styledLines
             if let idx = sessions.firstIndex(where: { $0.id == sid }) {
                 let prevState = sessions[idx].state
-                sessions[idx].screenPreview = String(updated.suffix(420))
-                if let st = rendered.latestStatus {
+                sessions[idx].screenPreview = String(visiblePlain.suffix(420))
+                if let st = engine.latestHerdrStatus {
                     sessions[idx].state = st.state
                     if let msg = st.message { sessions[idx].statusMessage = msg }
                     if let title = st.title { sessions[idx].taskTitle = title }
@@ -463,16 +505,23 @@ public final class CodaWorkspaceStore: ObservableObject {
                         if res.state == "approved", let tok = res.sessionToken {
                             self.settings.sessionToken = tok
                             self.settings.ownerHandle = res.ownerHandle ?? ""
-                            self.settings.save()
                             if let devId = res.device?.id {
                                 self.localIdentity.deviceId = devId
                                 CodaDeviceIdentity.savePersisted(self.localIdentity)
+                                let key = CodaPersistedSettings.registrationKey(
+                                    serverBaseURL: self.settings.serverBaseURLString,
+                                    ownerHandle: self.settings.ownerHandle
+                                )
+                                self.settings.registeredDeviceIDs[key] = devId.uuidString.lowercased()
+                            } else {
+                                self.syncIdentityDeviceIdForCurrentRegistration()
                             }
+                            self.settings.save()
                             self.pendingDeviceAuth = nil
                             self.isPollingDeviceAuth = false
                             await self.ensureClientDeviceRegistered(using: client)
                             self.startLiveSync()
-                            await self.refreshMachinesAndSessions()
+                            await self.refreshMachinesAndSessions(forceWorkspaces: true)
                             return
                         } else if res.state == "expired" {
                             self.isPollingDeviceAuth = false
@@ -513,10 +562,11 @@ public final class CodaWorkspaceStore: ObservableObject {
             } else {
                 settings.ownerHandle = emailOrHandle
             }
+            syncIdentityDeviceIdForCurrentRegistration()
             settings.save()
             await ensureClientDeviceRegistered(using: client)
             startLiveSync()
-            await refreshMachinesAndSessions()
+            await refreshMachinesAndSessions(forceWorkspaces: true)
         } catch {
             authError = tr("Sign in failed. Check credentials or server URL.", "登录失败，请检查账号密码或服务器地址。", locale: locale)
         }
@@ -536,17 +586,47 @@ public final class CodaWorkspaceStore: ObservableObject {
             )
             settings.sessionToken = tok
             settings.ownerHandle = cleanHandle
+            syncIdentityDeviceIdForCurrentRegistration()
             settings.save()
             await ensureClientDeviceRegistered(using: client)
             startLiveSync()
-            await refreshMachinesAndSessions()
+            await refreshMachinesAndSessions(forceWorkspaces: true)
         } catch {
             authError = tr("Registration failed.", "注册失败，请检查输入信息。", locale: locale)
         }
     }
 
-    private func ensureClientDeviceRegistered(using client: CodaNetworkClient) async {
-        if localIdentity.deviceId != nil { return }
+    private func syncIdentityDeviceIdForCurrentRegistration() {
+        let regKey = CodaPersistedSettings.registrationKey(
+            serverBaseURL: settings.serverBaseURLString,
+            ownerHandle: settings.ownerHandle
+        )
+        if let saved = settings.registeredDeviceIDs[regKey], let uuid = UUID(uuidString: saved) {
+            localIdentity.deviceId = uuid
+        } else {
+            localIdentity.deviceId = nil
+        }
+        CodaDeviceIdentity.savePersisted(localIdentity)
+    }
+
+    private func ensureClientDeviceRegistered(using client: CodaNetworkClient, force: Bool = false) async {
+        let regKey = CodaPersistedSettings.registrationKey(
+            serverBaseURL: settings.serverBaseURLString,
+            ownerHandle: settings.ownerHandle
+        )
+        if !force {
+            if let saved = settings.registeredDeviceIDs[regKey], let uuid = UUID(uuidString: saved) {
+                if localIdentity.deviceId != uuid {
+                    localIdentity.deviceId = uuid
+                    CodaDeviceIdentity.savePersisted(localIdentity)
+                }
+                return
+            }
+            if localIdentity.deviceId != nil {
+                localIdentity.deviceId = nil
+                CodaDeviceIdentity.savePersisted(localIdentity)
+            }
+        }
         #if os(iOS)
         let platform = formFactor.platformIdentifier(forMacOS: false)
         #else
@@ -555,6 +635,8 @@ public final class CodaWorkspaceStore: ObservableObject {
         if let dev = try? await client.registerClientDevice(identity: localIdentity, platform: platform) {
             localIdentity.deviceId = dev.id
             CodaDeviceIdentity.savePersisted(localIdentity)
+            settings.registeredDeviceIDs[regKey] = dev.id.uuidString.lowercased()
+            settings.save()
         }
     }
 
@@ -572,8 +654,10 @@ public final class CodaWorkspaceStore: ObservableObject {
     }
 
     public func signOut() {
+        let oldClient = networkClient
         stopLiveSync()
         deviceAuthTask?.cancel()
+        deviceAuthTask = nil
         pendingDeviceAuth = nil
         isPollingDeviceAuth = false
         pairingCode = nil
@@ -581,19 +665,32 @@ public final class CodaWorkspaceStore: ObservableObject {
         settings.sessionToken = ""
         settings.ownerHandle = ""
         settings.save()
+        localIdentity.deviceId = nil
+        CodaDeviceIdentity.savePersisted(localIdentity)
         sessions = []
         remoteMachines = []
         workspacesByDevice = [:]
         machineRouteModes = [:]
+        rawScreenTextBySession = [:]
+        terminalLinesBySession = [:]
+        readCompletedIDs.removeAll()
+        previousStates.removeAll()
+        voiceConfigSyncMessage = nil
+        uploadStatusBanner = nil
         selectedSessionID = nil
-        if let client = networkClient {
-            Task { await client.disconnectTransport() }
+        networkClient = nil
+        networkClientURL = nil
+        if let oldClient {
+            Task {
+                await oldClient.logout()
+                await oldClient.disconnectTransport()
+            }
         }
     }
 
     // MARK: - Real Remote Synchronization
 
-    public func refreshMachinesAndSessions() async {
+    public func refreshMachinesAndSessions(forceWorkspaces: Bool = false) async {
         guard isSignedIn, let client = ensureClient() else { return }
         if isRefreshing { return }
         isRefreshing = true
@@ -602,6 +699,10 @@ public final class CodaWorkspaceStore: ObservableObject {
         do {
             await ensureClientDeviceRegistered(using: client)
             let allDevices = try await client.listDevices()
+            if let myId = localIdentity.deviceId,
+               !allDevices.contains(where: { $0.id == myId }) {
+                await ensureClientDeviceRegistered(using: client, force: true)
+            }
             let hosts = allDevices.filter { $0.role == "daemon" || $0.role == "hybrid" }
             self.remoteMachines = hosts
 
@@ -618,17 +719,27 @@ public final class CodaWorkspaceStore: ObservableObject {
                     )
                     machineRouteModes[host.id] = route
 
-                    let wsRes = try? await client.listWorkspaces(
-                        on: host,
-                        clientIdentity: localIdentity,
-                        clientDeviceId: localIdentity.deviceId ?? host.id
-                    )
-                    let repos = wsRes?.repos ?? []
-                    nextWorkspaces[host.id] = repos
-                    if let vc = wsRes?.voiceConfig, settings.voiceConfig.apiKey.isEmpty, !vc.apiKey.isEmpty {
-                        settings.voiceConfig = vc
-                        settings.save()
+                    let shouldScanWorkspaces = forceWorkspaces
+                        || lastWorkspaceScanAt[host.id].map({ Date().timeIntervalSince($0) >= 30 }) ?? true
+                    let repos: [CodaRepoWorkspaceSummary]
+                    if shouldScanWorkspaces {
+                        let wsRes = try? await client.listWorkspaces(
+                            on: host,
+                            clientIdentity: localIdentity,
+                            clientDeviceId: localIdentity.deviceId ?? host.id
+                        )
+                        repos = wsRes?.repos ?? (workspacesByDevice[host.id] ?? [])
+                        if wsRes != nil {
+                            lastWorkspaceScanAt[host.id] = Date()
+                        }
+                        if let vc = wsRes?.voiceConfig, settings.voiceConfig.apiKey.isEmpty, !vc.apiKey.isEmpty {
+                            settings.voiceConfig = vc
+                            settings.save()
+                        }
+                    } else {
+                        repos = workspacesByDevice[host.id] ?? []
                     }
+                    nextWorkspaces[host.id] = repos
 
                     let terminals = (try? await client.listTerminals(
                         on: host,
@@ -688,10 +799,10 @@ public final class CodaWorkspaceStore: ObservableObject {
         return terminals.map { term in
             let sid = "\(host.id.uuidString.lowercased())/\(term.address)"
             let matchedRepo = repos.first(where: { repo in
-                term.cwd.hasPrefix(repo.rootPath)
-                    || repo.branches.contains(where: { term.cwd.hasPrefix($0.worktreePath) })
+                codaPathWithinRoot(term.cwd, root: repo.rootPath)
+                    || repo.branches.contains(where: { codaPathWithinRoot(term.cwd, root: $0.worktreePath) })
             })
-            let matchedBranch = matchedRepo?.branches.first(where: { term.cwd.hasPrefix($0.worktreePath) })
+            let matchedBranch = matchedRepo?.branches.first(where: { codaPathWithinRoot(term.cwd, root: $0.worktreePath) })
                 ?? matchedRepo?.branches.first
 
             let workspace = matchedRepo?.repoName
@@ -783,7 +894,7 @@ public final class CodaWorkspaceStore: ObservableObject {
         }
     }
 
-    public func refreshTerminalScreen(for session: CodaAgentSession) async {
+    public func refreshTerminalScreen(for session: CodaAgentSession, forceSnapshot: Bool = false) async {
         guard let client = networkClient,
               let devId = session.deviceId,
               let dev = remoteMachines.first(where: { $0.id == devId }),
@@ -803,6 +914,13 @@ public final class CodaWorkspaceStore: ObservableObject {
                     attachedSessionIDs.insert(session.id)
                 }
             }
+
+            if !forceSnapshot && attachedSessionIDs.contains(session.id),
+               surfaceEngines[session.id] != nil,
+               !(terminalLinesBySession[session.id]?.isEmpty ?? true) {
+                return
+            }
+
             let res = try await client.readTerminalScreen(
                 on: dev,
                 clientIdentity: localIdentity,
@@ -810,16 +928,21 @@ public final class CodaWorkspaceStore: ObservableObject {
                 terminal: session.terminalAddress,
                 historyLines: 180
             )
-            rawScreenTextBySession[session.id] = res.text
-            let rendered = GhosttyReflowEngine.renderStyledLines(
-                rawOutput: res.text,
-                targetColumns: terminalColumns
+            var engine = GhosttyReflowEngine(
+                columns: terminalColumns,
+                rows: terminalRows,
+                maxScrollback: 1500,
+                treatLFAsCRLF: true
             )
-            terminalLinesBySession[session.id] = rendered.lines
+            engine.feed(Data(res.text.utf8))
+            surfaceEngines[session.id] = engine
+            let visiblePlain = engine.plainVisibleText
+            rawScreenTextBySession[session.id] = visiblePlain
+            terminalLinesBySession[session.id] = engine.styledLines
 
             if let idx = sessions.firstIndex(where: { $0.id == session.id }) {
-                sessions[idx].screenPreview = String(res.text.suffix(420))
-                if let st = rendered.latestStatus {
+                sessions[idx].screenPreview = String(visiblePlain.suffix(420))
+                if let st = engine.latestHerdrStatus {
                     sessions[idx].state = st.state
                     if let msg = st.message { sessions[idx].statusMessage = msg }
                     if let title = st.title { sessions[idx].taskTitle = title }
@@ -843,7 +966,11 @@ public final class CodaWorkspaceStore: ObservableObject {
                 readCompletedIDs.insert(session.id)
             }
         }
-        Task { await refreshTerminalScreen(for: session) }
+        screenRefreshTask?.cancel()
+        let needSnapshot = !attachedSessionIDs.contains(session.id) || surfaceEngines[session.id] == nil
+        screenRefreshTask = Task { [weak self] in
+            await self?.refreshTerminalScreen(for: session, forceSnapshot: needSnapshot)
+        }
     }
 
     public func selectSecondarySession(_ session: CodaAgentSession) {
@@ -854,7 +981,10 @@ public final class CodaWorkspaceStore: ObservableObject {
                 readCompletedIDs.insert(session.id)
             }
         }
-        Task { await refreshTerminalScreen(for: session) }
+        let needSnapshot = !attachedSessionIDs.contains(session.id) || surfaceEngines[session.id] == nil
+        Task { [weak self] in
+            await self?.refreshTerminalScreen(for: session, forceSnapshot: needSnapshot)
+        }
     }
 
     public func setDuoSplitMode(_ mode: CodaDuoSplitMode) {
@@ -970,11 +1100,23 @@ public final class CodaWorkspaceStore: ObservableObject {
         if dimsChanged {
             terminalColumns = nextCols
             terminalRows = nextRows
-            for (sid, raw) in rawScreenTextBySession {
-                terminalLinesBySession[sid] = GhosttyReflowEngine.renderStyledLines(
-                    rawOutput: raw,
-                    targetColumns: nextCols
-                ).lines
+            for sid in Set(surfaceEngines.keys).union(rawScreenTextBySession.keys) {
+                if var engine = surfaceEngines[sid] {
+                    engine.resizeReflow(columns: nextCols, rows: nextRows)
+                    surfaceEngines[sid] = engine
+                    terminalLinesBySession[sid] = engine.styledLines
+                    rawScreenTextBySession[sid] = engine.plainVisibleText
+                } else if let raw = rawScreenTextBySession[sid] {
+                    var fresh = GhosttyReflowEngine(
+                        columns: nextCols,
+                        rows: nextRows,
+                        maxScrollback: 1500,
+                        treatLFAsCRLF: true
+                    )
+                    fresh.feed(Data(raw.utf8))
+                    surfaceEngines[sid] = fresh
+                    terminalLinesBySession[sid] = fresh.styledLines
+                }
             }
             if let session = selectedSession,
                let client = networkClient,
@@ -995,11 +1137,38 @@ public final class CodaWorkspaceStore: ObservableObject {
         }
     }
 
+    public func recomputeTerminalGridForFontChange() {
+        guard lastViewportSize.width > 0 && lastViewportSize.height > 0 else { return }
+        updateViewportGeometry(
+            size: lastViewportSize,
+            safeAreas: edgeSafeAreas,
+            isHorizontalRegular: lastIsHorizontalRegular,
+            isVerticalRegular: lastIsVerticalRegular
+        )
+    }
+
     public func closeTerminalToInbox() {
+        let closing = selectedSession
         selectedSessionID = nil
         dpadVisible = false
         ctrlActive = false
         altActive = false
+        if let closing {
+            attachedSessionIDs.remove(closing.id)
+            if let client = networkClient,
+               let devId = closing.deviceId,
+               let dev = remoteMachines.first(where: { $0.id == devId }),
+               let clientDevId = localIdentity.deviceId {
+                Task {
+                    try? await client.detachTerminalPty(
+                        on: dev,
+                        clientIdentity: localIdentity,
+                        clientDeviceId: clientDevId,
+                        terminal: closing.terminalAddress
+                    )
+                }
+            }
+        }
     }
 
     public func switchSibling(delta: Int) {
@@ -1158,13 +1327,31 @@ public final class CodaWorkspaceStore: ObservableObject {
               let dev = remoteMachines.first(where: { $0.id == devId }),
               let clientDevId = localIdentity.deviceId else { return }
 
+        let maxUploadBytes = 8 * 1024 * 1024
         Task {
             let granted = fileURL.startAccessingSecurityScopedResource()
             defer {
                 if granted { fileURL.stopAccessingSecurityScopedResource() }
             }
+            if let fileSize = (try? fileURL.resourceValues(forKeys: [.fileSizeKey]).fileSize),
+               fileSize > maxUploadBytes {
+                uploadStatusBanner = tr(
+                    "File exceeds 8 MiB upload limit.",
+                    "文件超过 8 MiB 上传限制。",
+                    locale: locale
+                )
+                return
+            }
             guard let data = try? Data(contentsOf: fileURL) else {
                 uploadStatusBanner = tr("Could not read selected file.", "读取文件失败。", locale: locale)
+                return
+            }
+            guard data.count <= maxUploadBytes else {
+                uploadStatusBanner = tr(
+                    "File exceeds 8 MiB upload limit.",
+                    "文件超过 8 MiB 上传限制。",
+                    locale: locale
+                )
                 return
             }
             uploadStatusBanner = tr("Uploading \(fileURL.lastPathComponent)...", "正在上传 \(fileURL.lastPathComponent)...", locale: locale)
@@ -1187,6 +1374,40 @@ public final class CodaWorkspaceStore: ObservableObject {
             } catch {
                 uploadStatusBanner = tr("Upload failed: \(error.localizedDescription)", "上传失败：\(error.localizedDescription)", locale: locale)
             }
+        }
+    }
+
+    public func saveVoiceConfig() async {
+        settings.save()
+        voiceConfigSyncMessage = tr("Saved to secure storage.", "已保存至安全存储。", locale: locale)
+        guard isSignedIn, let client = networkClient, let clientDevId = localIdentity.deviceId else { return }
+        let onlineHosts = remoteMachines.filter(\.isOnline)
+        guard !onlineHosts.isEmpty else { return }
+        var syncedCount = 0
+        for host in onlineHosts {
+            if let synced = try? await client.setVoiceConfig(
+                on: host,
+                clientIdentity: localIdentity,
+                clientDeviceId: clientDevId,
+                config: settings.voiceConfig
+            ) {
+                settings.voiceConfig = synced
+                settings.save()
+                syncedCount += 1
+            }
+        }
+        if syncedCount > 0 {
+            voiceConfigSyncMessage = tr(
+                "Saved & synced to \(syncedCount) host(s).",
+                "已保存并同步到 \(syncedCount) 台主机。",
+                locale: locale
+            )
+        } else {
+            voiceConfigSyncMessage = tr(
+                "Saved locally (host offline).",
+                "已在本地安全保存（主机离线）。",
+                locale: locale
+            )
         }
     }
 

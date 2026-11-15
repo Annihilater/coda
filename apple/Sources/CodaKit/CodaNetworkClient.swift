@@ -1,3 +1,4 @@
+import CryptoKit
 import Darwin
 import Foundation
 import Network
@@ -32,12 +33,20 @@ public struct CodaRelayTicketResult: Sendable {
     public let rawTCPHost: String?
     public let rawTCPPort: UInt16?
     public let wssURL: URL?
+    public let relays: [CodaRelayNodeInfo]
 
-    public init(ticket: String, rawTCPHost: String?, rawTCPPort: UInt16?, wssURL: URL?) {
+    public init(
+        ticket: String,
+        rawTCPHost: String?,
+        rawTCPPort: UInt16?,
+        wssURL: URL?,
+        relays: [CodaRelayNodeInfo] = []
+    ) {
         self.ticket = ticket
         self.rawTCPHost = rawTCPHost
         self.rawTCPPort = rawTCPPort
         self.wssURL = wssURL
+        self.relays = relays
     }
 }
 
@@ -97,6 +106,14 @@ private struct DirectP2PPeerState {
     var readerTask: Task<Void, Never>?
 }
 
+private struct RelayPeerSessionState {
+    var session: CodaE2EESession
+    let sessionNonceB64: String
+    let initTsMs: UInt64
+    let signatureB64: String
+    var ackedByPeer: Bool
+}
+
 private struct PendingRequest {
     let peerDeviceId: UUID
     let transportGen: UInt64
@@ -117,7 +134,7 @@ public actor CodaNetworkClient {
     private var activeRelayRouteMode: SmartPathRouteMode?
     private var directP2PPeers: [UUID: DirectP2PPeerState] = [:]
     private var p2pPeerDeviceId: UUID?
-    private var relayPeerSessions: [UUID: CodaE2EESession] = [:]
+    private var relayPeerSessions: [UUID: RelayPeerSessionState] = [:]
     private var connectedPeerDeviceId: UUID?
     private var pendingRequests: [String: PendingRequest] = [:]
     private var asyncEvents: [CodaAsyncEvent] = []
@@ -173,9 +190,6 @@ public actor CodaNetworkClient {
         } else if comps.scheme == "http" {
             comps.scheme = "ws"
         }
-        var items = comps.queryItems ?? []
-        items.append(URLQueryItem(name: "token", value: sessionToken))
-        comps.queryItems = items
         guard let wsURL = comps.url else { return }
 
         accountEventsLoopTask = Task { [weak self] in
@@ -187,9 +201,21 @@ public actor CodaNetworkClient {
 
                 var req = URLRequest(url: wsURL)
                 req.setValue("Bearer \(sessionToken)", forHTTPHeaderField: "Authorization")
+                req.setValue("coda-auth, coda-bearer.\(sessionToken)", forHTTPHeaderField: "Sec-WebSocket-Protocol")
                 let task = URLSession.shared.webSocketTask(with: req)
                 await self.setAccountEventsTask(task, expectedGen: loopGen)
                 task.resume()
+
+                let pingTask = Task {
+                    while !Task.isCancelled {
+                        try? await Task.sleep(nanoseconds: 25_000_000_000)
+                        if Task.isCancelled { break }
+                        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                            task.sendPing { _ in cont.resume() }
+                        }
+                    }
+                }
+                defer { pingTask.cancel() }
 
                 while !Task.isCancelled {
                     do {
@@ -208,6 +234,7 @@ public actor CodaNetworkClient {
                         break
                     }
                 }
+                pingTask.cancel()
                 task.cancel(with: .normalClosure, reason: nil)
                 let stillActiveAfterDrop = await self.isAccountEventsGenCurrent(loopGen)
                 if !stillActiveAfterDrop || Task.isCancelled { return }
@@ -257,8 +284,20 @@ public actor CodaNetworkClient {
     // MARK: - Request ID Negotiation
 
     public func nextRequestID() -> String {
-        let prefix = CodaE2EESession.hasNativeZstdFFI ? "ffi" : "swift"
+        let prefix = CodaE2EESession.hasNativeZstdFFI ? "coda" : "swift"
         return "\(prefix)-\(UUID().uuidString.lowercased())"
+    }
+
+    public func logout() async {
+        let token = bearerToken
+        bearerToken = nil
+        disconnectTransport()
+        guard let token, !token.isEmpty else { return }
+        let url = serverBaseURL.appendingPathComponent("api/v1/auth/logout")
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        _ = try? await URLSession.shared.data(for: req)
     }
 
     // MARK: - Coordinator REST API
@@ -453,7 +492,8 @@ public actor CodaNetworkClient {
             ticket: wire.ticket,
             rawTCPHost: rawTCPHost,
             rawTCPPort: rawTCPPort,
-            wssURL: wssURL
+            wssURL: wssURL,
+            relays: wire.relays
         )
     }
 
@@ -563,6 +603,12 @@ public actor CodaNetworkClient {
             "generation": gen,
         ])
         try await Self.sendNW(conn, data: bindFramed)
+        let ack = try await Self.readLengthDelimitedFrame(conn)
+        guard (ack["frame_type"] as? String) == "auth_ack",
+              (ack["ok"] as? Bool) == true else {
+            conn.cancel()
+            throw URLError(.userAuthenticationRequired)
+        }
         self.relayReaderTask?.cancel()
         self.rawTCPConnection?.cancel()
         self.rawTCPConnection = conn
@@ -586,6 +632,12 @@ public actor CodaNetworkClient {
         let task = URLSession.shared.webSocketTask(with: wssURL)
         task.maximumMessageSize = 8 * 1024 * 1024
         task.resume()
+        let timeoutTask = Task {
+            try await Task.sleep(nanoseconds: 5_000_000_000)
+            task.cancel(with: .goingAway, reason: nil)
+        }
+        defer { timeoutTask.cancel() }
+
         let bindObj: [String: Any] = [
             "frame_type": "auth_bind",
             "ticket": relayTicket,
@@ -594,6 +646,22 @@ public actor CodaNetworkClient {
         ]
         let bindStr = String(data: try JSONSerialization.data(withJSONObject: bindObj), encoding: .utf8) ?? "{}"
         try await task.send(.string(bindStr))
+
+        let firstMsg = try await task.receive()
+        let firstData: Data
+        switch firstMsg {
+        case .string(let s): firstData = Data(s.utf8)
+        case .data(let d): firstData = d
+        @unknown default:
+            task.cancel(with: .protocolError, reason: nil)
+            throw URLError(.badServerResponse)
+        }
+        guard let ackObj = try JSONSerialization.jsonObject(with: firstData) as? [String: Any],
+              (ackObj["frame_type"] as? String) == "auth_ack",
+              (ackObj["ok"] as? Bool) == true else {
+            task.cancel(with: .policyViolation, reason: nil)
+            throw URLError(.userAuthenticationRequired)
+        }
 
         self.relayReaderTask?.cancel()
         self.rawTCPConnection?.cancel()
@@ -793,6 +861,8 @@ public actor CodaNetworkClient {
         clientIdentity: CodaDeviceIdentity,
         clientDeviceId: UUID,
         targetDeviceId: UUID,
+        expectedDaemonEd25519Pubkey: String = "",
+        expectedDaemonX25519Pubkey: String? = nil,
         timeoutMs: UInt64 = 350
     ) async throws -> SmartPathRouteMode {
         let tcpOptions = NWProtocolTCP.Options()
@@ -805,10 +875,12 @@ public actor CodaNetworkClient {
         }
         let conn = NWConnection(host: NWEndpoint.Host(host), port: nwPort, using: params)
 
+        let ephPrivate = Curve25519.KeyAgreement.PrivateKey()
+        let ephPubB64 = ephPrivate.publicKey.rawRepresentation.base64EncodedString()
         let tsMs = UInt64(Date().timeIntervalSince1970 * 1000)
         let clientIdLower = clientDeviceId.uuidString.lowercased()
         let targetIdLower = targetDeviceId.uuidString.lowercased()
-        let signedMsg = "p2p:\(clientIdLower):\(targetIdLower):\(tsMs)"
+        let signedMsg = "p2p-hello-v2:\(clientIdLower):\(targetIdLower):\(clientIdentity.x25519PublicB64):\(ephPubB64):\(tsMs)"
         let sigB64 = try clientIdentity.sign(message: Data(signedMsg.utf8))
 
         let helloFramed = try Self.encodeLengthDelimitedJSON([
@@ -817,6 +889,8 @@ public actor CodaNetworkClient {
             "target_device_id": targetIdLower,
             "client_ed25519_pub_b64": clientIdentity.ed25519PublicB64,
             "client_x25519_pub_b64": clientIdentity.x25519PublicB64,
+            "client_ephemeral_x25519_pub_b64": ephPubB64,
+            "supports_zstd": CodaE2EESession.hasNativeZstdFFI,
             "timestamp_ms": tsMs,
             "signature_b64": sigB64,
         ])
@@ -845,18 +919,54 @@ public actor CodaNetworkClient {
         let ack = try await Self.readLengthDelimitedFrame(conn)
         guard (ack["frame_type"] as? String) == "direct_p2p_ack",
               (ack["ok"] as? Bool) == true,
-              let daemonPubB64 = ack["daemon_x25519_pub_b64"] as? String
+              let daemonPubB64 = ack["daemon_x25519_pub_b64"] as? String,
+              let ackDaemonIdStr = ack["daemon_device_id"] as? String,
+              ackDaemonIdStr.lowercased() == targetIdLower,
+              let daemonEdPubB64 = ack["daemon_ed25519_pub_b64"] as? String,
+              let daemonEphPubB64 = ack["daemon_ephemeral_x25519_pub_b64"] as? String,
+              !daemonEphPubB64.isEmpty,
+              let ackSigB64 = ack["signature_b64"] as? String,
+              let ackTsNum = ack["timestamp_ms"] as? NSNumber
         else {
             conn.cancel()
-            throw URLError(.userAuthenticationRequired)
+            throw CodaCryptoError.invalidHandshake("malformed direct_p2p_ack")
+        }
+
+        let ackTsMs = ackTsNum.uint64Value
+        let nowMs = UInt64(Date().timeIntervalSince1970 * 1000)
+        let skewMs = ackTsMs >= nowMs ? (ackTsMs - nowMs) : (nowMs - ackTsMs)
+        guard skewMs <= 300_000 else {
+            conn.cancel()
+            throw CodaCryptoError.invalidHandshake("daemon timestamp skew \(skewMs)ms exceeds 300s")
+        }
+        if !expectedDaemonEd25519Pubkey.isEmpty && daemonEdPubB64 != expectedDaemonEd25519Pubkey {
+            conn.cancel()
+            throw CodaCryptoError.invalidHandshake("daemon ed25519_pubkey mismatch")
+        }
+        if let expectedX = expectedDaemonX25519Pubkey, !expectedX.isEmpty, daemonPubB64 != expectedX {
+            conn.cancel()
+            throw CodaCryptoError.invalidHandshake("daemon x25519_pubkey mismatch")
+        }
+        let expectedAckMsg = "p2p-ack-v2:\(clientIdLower):\(targetIdLower):\(ephPubB64):\(daemonEphPubB64):\(ackTsMs)"
+        guard CodaDeviceIdentity.verifySignature(
+            ed25519PublicB64: daemonEdPubB64,
+            message: Data(expectedAckMsg.utf8),
+            signatureB64: ackSigB64
+        ) else {
+            conn.cancel()
+            throw CodaCryptoError.invalidHandshake("invalid direct_p2p_ack Ed25519 signature")
         }
 
         let pathKind = (ack["path_kind"] as? String) ?? "lan_ipv4"
         let routeMode: SmartPathRouteMode = (pathKind == "cn_public_ipv6") ? .cnIPv6P2P : .lanDirect
         let sess = try CodaE2EESession(
-            myX25519SecretB64: clientIdentity.x25519SecretB64,
-            peerX25519PublicB64: daemonPubB64,
-            isClientInitiator: true
+            directP2Pv2Identity: clientIdentity,
+            peerStaticX25519PublicB64: daemonPubB64,
+            myEphemeralPrivateKey: ephPrivate,
+            peerEphemeralX25519PublicB64: daemonEphPubB64,
+            clientDeviceId: clientDeviceId,
+            daemonDeviceId: targetDeviceId,
+            isInitiator: true
         )
         let gen = self.currentGeneration
         self.currentGeneration &+= 1
@@ -895,6 +1005,85 @@ public actor CodaNetworkClient {
         return (host, p)
     }
 
+    private static func relaySessionSigningString(
+        clientDeviceId: UUID,
+        daemonDeviceId: UUID,
+        senderX25519PubB64: String,
+        sessionNonceB64: String,
+        initTsMs: UInt64
+    ) -> String {
+        "relay-sess-v2:\(clientDeviceId.uuidString.lowercased()):\(daemonDeviceId.uuidString.lowercased()):\(senderX25519PubB64):\(sessionNonceB64):\(initTsMs)"
+    }
+
+    private func resetRelayPeerSession(
+        for targetDevice: CodaRemoteDevice,
+        clientIdentity: CodaDeviceIdentity,
+        clientDeviceId: UUID
+    ) throws -> RelayPeerSessionState {
+        let sessionNonceB64 = CodaE2EESession.randomSessionNonceB64()
+        let session = try CodaE2EESession(
+            relayV2Identity: clientIdentity,
+            peerStaticX25519PublicB64: targetDevice.x25519Pubkey,
+            sessionNonceB64: sessionNonceB64,
+            clientDeviceId: clientDeviceId,
+            daemonDeviceId: targetDevice.id,
+            isInitiator: true
+        )
+        let nowMs = UInt64(Date().timeIntervalSince1970 * 1000)
+        let sigMsg = Self.relaySessionSigningString(
+            clientDeviceId: clientDeviceId,
+            daemonDeviceId: targetDevice.id,
+            senderX25519PubB64: clientIdentity.x25519PublicB64,
+            sessionNonceB64: sessionNonceB64,
+            initTsMs: nowMs
+        )
+        let sig = try clientIdentity.sign(message: Data(sigMsg.utf8))
+        let state = RelayPeerSessionState(
+            session: session,
+            sessionNonceB64: sessionNonceB64,
+            initTsMs: nowMs,
+            signatureB64: sig,
+            ackedByPeer: false
+        )
+        self.relayPeerSessions[targetDevice.id] = state
+        return state
+    }
+
+    private func ensureRelayPeerSession(
+        for targetDevice: CodaRemoteDevice,
+        clientIdentity: CodaDeviceIdentity,
+        clientDeviceId: UUID
+    ) throws -> RelayPeerSessionState {
+        if var existing = relayPeerSessions[targetDevice.id] {
+            let nowMs = UInt64(Date().timeIntervalSince1970 * 1000)
+            let ageMs = nowMs >= existing.initTsMs ? (nowMs - existing.initTsMs) : (existing.initTsMs - nowMs)
+            if !existing.ackedByPeer && ageMs > 60_000 {
+                let sigMsg = Self.relaySessionSigningString(
+                    clientDeviceId: clientDeviceId,
+                    daemonDeviceId: targetDevice.id,
+                    senderX25519PubB64: clientIdentity.x25519PublicB64,
+                    sessionNonceB64: existing.sessionNonceB64,
+                    initTsMs: nowMs
+                )
+                let sig = try clientIdentity.sign(message: Data(sigMsg.utf8))
+                existing = RelayPeerSessionState(
+                    session: existing.session,
+                    sessionNonceB64: existing.sessionNonceB64,
+                    initTsMs: nowMs,
+                    signatureB64: sig,
+                    ackedByPeer: false
+                )
+                relayPeerSessions[targetDevice.id] = existing
+            }
+            return existing
+        }
+        return try resetRelayPeerSession(
+            for: targetDevice,
+            clientIdentity: clientIdentity,
+            clientDeviceId: clientDeviceId
+        )
+    }
+
     public func connectAutoSmartPath(
         targetDevice: CodaRemoteDevice,
         clientIdentity: CodaDeviceIdentity,
@@ -903,7 +1092,8 @@ public actor CodaNetworkClient {
         udpProbePort: UInt16 = 24444,
         relayRawTCP: (host: String, port: UInt16)? = nil,
         relayWSS: URL? = nil,
-        relayTicket: String? = nil
+        relayTicket: String? = nil,
+        relayCandidates: [CodaRelayNodeInfo] = []
     ) async throws -> SmartPathRouteMode {
         var candidates: [(host: String, port: UInt16)] = []
         let targetId = targetDevice.id
@@ -929,7 +1119,9 @@ public actor CodaNetworkClient {
                 port: cand.port,
                 clientIdentity: clientIdentity,
                 clientDeviceId: clientDeviceId,
-                targetDeviceId: targetId
+                targetDeviceId: targetId,
+                expectedDaemonEd25519Pubkey: targetDevice.ed25519Pubkey,
+                expectedDaemonX25519Pubkey: targetDevice.x25519Pubkey
             ) {
                 startWiFiPathMonitor(
                     targetDevice: targetDevice,
@@ -942,11 +1134,11 @@ public actor CodaNetworkClient {
             }
         }
 
-        // Seamless Relay fallback with dedicated directional E2EE session per peer daemon
-        self.relayPeerSessions[targetId] = try CodaE2EESession(
-            myIdentity: clientIdentity,
-            peerX25519PublicB64: targetDevice.x25519Pubkey,
-            isInitiator: true
+        // Seamless Relay fallback with Relay v2 signed session establishment per peer daemon
+        _ = try ensureRelayPeerSession(
+            for: targetDevice,
+            clientIdentity: clientIdentity,
+            clientDeviceId: clientDeviceId
         )
         if let relayMode = self.activeRelayRouteMode, (self.wsTask != nil || self.rawTCPConnection != nil) {
             self.connectedPeerDeviceId = targetId
@@ -961,21 +1153,73 @@ public actor CodaNetworkClient {
             return relayMode
         }
 
-        let isRemoteHTTPS = serverBaseURL.scheme == "https"
-        let hasReachableRawTCP = relayRawTCP.map { !Self.isLoopbackHost($0.host) } ?? false
-        if !(isRemoteHTTPS && !hasReachableRawTCP), let raw = relayRawTCP, let ticket = relayTicket {
-            try await connectDomesticRawTCPAsync(host: raw.host, port: raw.port, relayTicket: ticket)
-            self.activeRouteMode = .domesticRawTCP
-        } else if let wss = relayWSS, let ticket = relayTicket {
-            try await connectOverseasCDNWSS(wssURL: wss, relayTicket: ticket)
-            self.activeRouteMode = .globalCDNWSS
-        } else if let raw = relayRawTCP, let ticket = relayTicket {
-            try await connectDomesticRawTCPAsync(host: raw.host, port: raw.port, relayTicket: ticket)
-            self.activeRouteMode = .domesticRawTCP
-        } else {
+        guard let ticket = relayTicket, !ticket.isEmpty else {
             throw URLError(.cannotConnectToHost)
         }
 
+        let isRemoteServer = serverBaseURL.scheme == "https" || !Self.isLoopbackHost(serverBaseURL.host ?? "")
+        enum RelayAttempt {
+            case rawTCP(String, UInt16)
+            case wss(URL)
+        }
+        var attempts: [RelayAttempt] = []
+        if !relayCandidates.isEmpty {
+            let sorted = relayCandidates.sorted { $0.priority < $1.priority }
+            for node in sorted where node.mode == "raw_tcp_no_sni" {
+                if let parsed = Self.parseHostPort(node.endpoint), !(isRemoteServer && Self.isLoopbackHost(parsed.0)) {
+                    attempts.append(.rawTCP(parsed.0, parsed.1))
+                }
+            }
+            for node in sorted where node.mode == "cdn_wss" {
+                if let url = URL(string: node.endpoint) {
+                    attempts.append(.wss(url))
+                }
+            }
+            for node in sorted where node.mode == "raw_tcp_no_sni" {
+                if let parsed = Self.parseHostPort(node.endpoint), isRemoteServer && Self.isLoopbackHost(parsed.0) {
+                    attempts.append(.rawTCP(parsed.0, parsed.1))
+                }
+            }
+        } else {
+            let hasReachableRawTCP = relayRawTCP.map { !(isRemoteServer && Self.isLoopbackHost($0.host)) } ?? false
+            if hasReachableRawTCP, let raw = relayRawTCP {
+                attempts.append(.rawTCP(raw.host, raw.port))
+            }
+            if let wss = relayWSS {
+                attempts.append(.wss(wss))
+            }
+            if !hasReachableRawTCP, let raw = relayRawTCP {
+                attempts.append(.rawTCP(raw.host, raw.port))
+            }
+        }
+
+        var connected = false
+        var lastRelayError: Error?
+        for attempt in attempts {
+            do {
+                switch attempt {
+                case .rawTCP(let h, let p):
+                    try await connectDomesticRawTCPAsync(host: h, port: p, relayTicket: ticket)
+                    self.activeRouteMode = .domesticRawTCP
+                case .wss(let url):
+                    try await connectOverseasCDNWSS(wssURL: url, relayTicket: ticket)
+                    self.activeRouteMode = .globalCDNWSS
+                }
+                connected = true
+                break
+            } catch {
+                lastRelayError = error
+            }
+        }
+        guard connected else {
+            throw lastRelayError ?? URLError(.cannotConnectToHost)
+        }
+
+        _ = try resetRelayPeerSession(
+            for: targetDevice,
+            clientIdentity: clientIdentity,
+            clientDeviceId: clientDeviceId
+        )
         self.connectedPeerDeviceId = targetId
         startWiFiPathMonitor(
             targetDevice: targetDevice,
@@ -1002,20 +1246,18 @@ public actor CodaNetworkClient {
             return peerState.routeMode
         }
         if (wsTask != nil || rawTCPConnection != nil) {
-            if relayPeerSessions[targetDevice.id] == nil {
-                self.relayPeerSessions[targetDevice.id] = try CodaE2EESession(
-                    myIdentity: clientIdentity,
-                    peerX25519PublicB64: targetDevice.x25519Pubkey,
-                    isInitiator: true
-                )
-            }
+            _ = try ensureRelayPeerSession(
+                for: targetDevice,
+                clientIdentity: clientIdentity,
+                clientDeviceId: clientDevId
+            )
             let relayMode = activeRelayRouteMode ?? activeRouteMode
             self.connectedPeerDeviceId = targetDevice.id
             self.activeRouteMode = relayMode
             return relayMode
         }
 
-        let ticketResp = try? await mintRelayTicket(deviceId: clientDevId, peerDeviceId: nil)
+        let ticketResp = try? await mintRelayTicket(deviceId: clientDevId, peerDeviceId: targetDevice.id)
         let rawTuple = ticketResp.flatMap { res -> (host: String, port: UInt16)? in
             guard let h = res.rawTCPHost, let p = res.rawTCPPort else { return nil }
             return (h, p)
@@ -1026,7 +1268,8 @@ public actor CodaNetworkClient {
             clientDeviceId: clientDevId,
             relayRawTCP: rawTuple,
             relayWSS: ticketResp?.wssURL,
-            relayTicket: ticketResp?.ticket
+            relayTicket: ticketResp?.ticket,
+            relayCandidates: ticketResp?.relays ?? []
         )
     }
 
@@ -1065,13 +1308,19 @@ public actor CodaNetworkClient {
         udpProbePort: UInt16
     ) async {
         guard directP2PPeers[targetDevice.id] == nil else { return }
-        if let found = Self.probeLanUDP(targetDeviceId: targetDevice.id, host: udpProbeHost, port: udpProbePort) {
+        let targetId = targetDevice.id
+        let udpFound = await Task.detached {
+            Self.probeLanUDP(targetDeviceId: targetId, host: udpProbeHost, port: udpProbePort)
+        }.value
+        if let found = udpFound {
             _ = try? await performDirectP2PHandshake(
                 host: found.host,
                 port: found.port,
                 clientIdentity: clientIdentity,
                 clientDeviceId: clientDeviceId,
-                targetDeviceId: targetDevice.id
+                targetDeviceId: targetId,
+                expectedDaemonEd25519Pubkey: targetDevice.ed25519Pubkey,
+                expectedDaemonX25519Pubkey: targetDevice.x25519Pubkey
             )
         }
     }
@@ -1083,20 +1332,36 @@ public actor CodaNetworkClient {
         clientIdentity: CodaDeviceIdentity,
         clientDeviceId: UUID,
         targetDeviceId: UUID,
-        lane: String
+        lane: String,
+        relayAuthState: RelayPeerSessionState? = nil
     ) -> [String: Any] {
-        [
+        var e2eeDict: [String: Any] = [
+            "seq": sealed.seq,
+            "compressed": sealed.compressed,
+            "ciphertext_b64": sealed.ciphertextB64,
+        ]
+        if let nonce = sealed.sessionNonceB64 {
+            e2eeDict["session_nonce_b64"] = nonce
+        }
+        var pkt: [String: Any] = [
             "frame_type": "route_packet",
             "src_device_id": clientDeviceId.uuidString.lowercased(),
             "dst_device_id": targetDeviceId.uuidString.lowercased(),
             "lane": lane,
-            "e2ee": [
-                "seq": sealed.seq,
-                "compressed": sealed.compressed,
-                "ciphertext_b64": sealed.ciphertextB64,
-            ],
+            "e2ee": e2eeDict,
             "sender_x25519_pub_b64": clientIdentity.x25519PublicB64,
         ]
+        if let auth = relayAuthState, !auth.ackedByPeer {
+            pkt["session_auth"] = [
+                "session_nonce_b64": auth.sessionNonceB64,
+                "init_ts_ms": auth.initTsMs,
+                "sender_ed25519_pub_b64": clientIdentity.ed25519PublicB64,
+                "sender_x25519_pub_b64": clientIdentity.x25519PublicB64,
+                "supports_zstd": CodaE2EESession.hasNativeZstdFFI,
+                "signature_b64": auth.signatureB64,
+            ]
+        }
+        return pkt
     }
 
     private func failPendingRequest(reqId: String, error: Error) {
@@ -1189,10 +1454,15 @@ public actor CodaNetworkClient {
            let e2eeDict = frame["e2ee"] as? [String: Any],
            let e2eeData = try? JSONSerialization.data(withJSONObject: e2eeDict),
            let encPayload = try? JSONDecoder().decode(CodaEncryptedPayload.self, from: e2eeData),
-           var sess = relayPeerSessions[srcUUID],
-           let pt = try? sess.openJSON(encPayload) {
-            relayPeerSessions[srcUUID] = sess
+           var state = relayPeerSessions[srcUUID],
+           let pt = try? state.session.openJSON(encPayload) {
+            state.ackedByPeer = true
+            relayPeerSessions[srcUUID] = state
             handleDecryptedPeerPayload(pt, sourceDeviceId: srcUUID)
+        } else if frameType == "auth_ack" {
+            if (frame["ok"] as? Bool) == false {
+                handleRelayDisconnect(gen: gen)
+            }
         } else if frameType == "error" {
             let msg = ((frame["message"] as? String) ?? "").lowercased()
             let matchingPeer = relayPeerSessions.keys.first { msg.contains($0.uuidString.lowercased()) }
@@ -1379,21 +1649,22 @@ public actor CodaNetworkClient {
             )
         }
 
-        // Prepare Relay E2EE session for `targetDevice.id`
-        var sess = try relayPeerSessions[targetDevice.id] ?? CodaE2EESession(
-            myIdentity: clientIdentity,
-            peerX25519PublicB64: targetDevice.x25519Pubkey,
-            isInitiator: true
+        // Prepare Relay v2 E2EE session for `targetDevice.id`
+        var relayState = try ensureRelayPeerSession(
+            for: targetDevice,
+            clientIdentity: clientIdentity,
+            clientDeviceId: clientDeviceId
         )
-        let sealed = try sess.sealJSON(finalData)
-        relayPeerSessions[targetDevice.id] = sess
+        let sealed = try relayState.session.sealJSON(finalData)
+        relayPeerSessions[targetDevice.id] = relayState
 
         let routePacket = buildRoutePacketDict(
             sealed: sealed,
             clientIdentity: clientIdentity,
             clientDeviceId: clientDeviceId,
             targetDeviceId: targetDevice.id,
-            lane: lane
+            lane: lane,
+            relayAuthState: relayState
         )
 
         // Path 2: Global CDN WebSocket Relay
@@ -1470,20 +1741,21 @@ public actor CodaNetworkClient {
             return
         }
 
-        var sess = try relayPeerSessions[targetDevice.id] ?? CodaE2EESession(
-            myIdentity: clientIdentity,
-            peerX25519PublicB64: targetDevice.x25519Pubkey,
-            isInitiator: true
+        var relayState = try ensureRelayPeerSession(
+            for: targetDevice,
+            clientIdentity: clientIdentity,
+            clientDeviceId: clientDeviceId
         )
-        let sealed = try sess.sealJSON(messageJSONData)
-        relayPeerSessions[targetDevice.id] = sess
+        let sealed = try relayState.session.sealJSON(messageJSONData)
+        relayPeerSessions[targetDevice.id] = relayState
 
         let routePacket = buildRoutePacketDict(
             sealed: sealed,
             clientIdentity: clientIdentity,
             clientDeviceId: clientDeviceId,
             targetDeviceId: targetDevice.id,
-            lane: lane
+            lane: lane,
+            relayAuthState: relayState
         )
 
         if let ws = self.wsTask {
@@ -1862,5 +2134,56 @@ public actor CodaNetworkClient {
             statusShort: decoded.statusShort,
             diffUnified: decoded.diffUnified
         )
+    }
+
+    public func detachTerminalPty(
+        on device: CodaRemoteDevice,
+        clientIdentity: CodaDeviceIdentity,
+        clientDeviceId: UUID,
+        terminal: String
+    ) async throws {
+        let reqData = try JSONSerialization.data(withJSONObject: [
+            "op": "pty_detach",
+            "req_id": nextRequestID(),
+            "terminal": terminal,
+        ])
+        _ = try await sendPeerMessageData(
+            reqData,
+            to: device,
+            clientIdentity: clientIdentity,
+            clientDeviceId: clientDeviceId,
+            lane: "control_p0"
+        )
+    }
+
+    public func setVoiceConfig(
+        on device: CodaRemoteDevice,
+        clientIdentity: CodaDeviceIdentity,
+        clientDeviceId: UUID,
+        config: CodaVoiceModelConfig
+    ) async throws -> CodaVoiceModelConfig {
+        let reqData = try JSONSerialization.data(withJSONObject: [
+            "op": "set_voice_config",
+            "req_id": nextRequestID(),
+            "config": [
+                "provider": config.provider,
+                "base_url": config.baseURL,
+                "api_key": config.apiKey,
+                "model": config.model,
+            ],
+        ])
+        let respData = try await sendPeerMessageData(
+            reqData,
+            to: device,
+            clientIdentity: clientIdentity,
+            clientDeviceId: clientDeviceId,
+            lane: "control_p0"
+        )
+        struct Resp: Decodable {
+            let ok: Bool
+            let config: CodaVoiceModelConfig
+        }
+        let decoded = try JSONDecoder().decode(Resp.self, from: respData)
+        return decoded.config
     }
 }

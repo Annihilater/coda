@@ -1,5 +1,6 @@
 import CodaGhosttyKit
 import CodaKit
+import CryptoKit
 import Darwin
 import Foundation
 import Network
@@ -227,7 +228,10 @@ struct CodaSelfTest {
         // 7. Auto-LAN UDP Discovery + Direct P2P TCP Handshake + One-Way PtyResize + E2EE RPCs
         try await runAutoLanSmartPathLoopbackTest()
 
-        // 8. Optional Live Multi-Host Mesh Test (`CODA_LIVE_MESH_TEST_URL`)
+        // 8. Security, Hybrid/Relay v2 E2EE, Rust FFI Zstd Interop, Keychain/0600 Secrets, Stateful VT & Path Guards
+        try runSecurityFFIAndVTAssertions()
+
+        // 9. Optional Live Multi-Host Mesh Test (`CODA_LIVE_MESH_TEST_URL`)
         if let liveURL = ProcessInfo.processInfo.environment["CODA_LIVE_MESH_TEST_URL"], !liveURL.isEmpty {
             try await runLiveMeshSelfTest(baseURLString: liveURL)
         }
@@ -438,6 +442,10 @@ struct CodaSelfTest {
 
         let udpFD = Darwin.socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
         precondition(udpFD >= 0, "failed creating UDP beacon socket")
+        var udpTimeout = timeval(tv_sec: 5, tv_usec: 0)
+        _ = withUnsafePointer(to: &udpTimeout) { ptr in
+            Darwin.setsockopt(udpFD, SOL_SOCKET, SO_RCVTIMEO, ptr, socklen_t(MemoryLayout<timeval>.size))
+        }
         var udpBind = sockaddr_in()
         udpBind.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
         udpBind.sin_family = sa_family_t(AF_INET)
@@ -500,6 +508,7 @@ struct CodaSelfTest {
             name: "Loopback-Host",
             role: "daemon",
             platform: "macos",
+            ed25519Pubkey: daemonIdentity.ed25519PublicB64,
             x25519Pubkey: daemonIdentity.x25519PublicB64,
             endpoints: [],
             isOnline: true
@@ -563,15 +572,40 @@ struct CodaSelfTest {
         daemonIdentity: CodaDeviceIdentity
     ) {
         readFramed(conn: conn) { hello in
+            let daemonEphPriv = Curve25519.KeyAgreement.PrivateKey()
+            let daemonEphPubB64 = daemonEphPriv.publicKey.rawRepresentation.base64EncodedString()
+
             guard let hello,
                   (hello["frame_type"] as? String) == "direct_p2p_hello",
+                  let clientIdStr = hello["client_device_id"] as? String,
+                  let clientDevUUID = UUID(uuidString: clientIdStr),
                   let clientPub = hello["client_x25519_pub_b64"] as? String,
+                  let clientEphPub = hello["client_ephemeral_x25519_pub_b64"] as? String,
+                  let clientEdPub = hello["client_ed25519_pub_b64"] as? String,
+                  let helloTs = (hello["timestamp_ms"] as? NSNumber)?.uint64Value,
+                  let helloSig = hello["signature_b64"] as? String,
+                  CodaDeviceIdentity.verifySignature(
+                      ed25519PublicB64: clientEdPub,
+                      message: Data("p2p-hello-v2:\(clientIdStr.lowercased()):\(daemonId.uuidString.lowercased()):\(clientPub):\(clientEphPub):\(helloTs)".utf8),
+                      signatureB64: helloSig
+                  ),
                   let initialSess = try? CodaE2EESession(
-                    myX25519SecretB64: daemonIdentity.x25519SecretB64,
-                    peerX25519PublicB64: clientPub,
-                    isClientInitiator: false
+                    directP2Pv2Identity: daemonIdentity,
+                    peerStaticX25519PublicB64: clientPub,
+                    myEphemeralPrivateKey: daemonEphPriv,
+                    peerEphemeralX25519PublicB64: clientEphPub,
+                    clientDeviceId: clientDevUUID,
+                    daemonDeviceId: daemonId,
+                    isInitiator: false
                   )
             else {
+                conn.cancel()
+                return
+            }
+
+            let ackTsMs = UInt64(Date().timeIntervalSince1970 * 1000)
+            let ackTranscript = "p2p-ack-v2:\(clientIdStr.lowercased()):\(daemonId.uuidString.lowercased()):\(clientEphPub):\(daemonEphPubB64):\(ackTsMs)"
+            guard let ackSigB64 = try? daemonIdentity.sign(message: Data(ackTranscript.utf8)) else {
                 conn.cancel()
                 return
             }
@@ -581,6 +615,10 @@ struct CodaSelfTest {
                 "ok": true,
                 "daemon_device_id": daemonId.uuidString.lowercased(),
                 "daemon_x25519_pub_b64": daemonIdentity.x25519PublicB64,
+                "daemon_ed25519_pub_b64": daemonIdentity.ed25519PublicB64,
+                "daemon_ephemeral_x25519_pub_b64": daemonEphPubB64,
+                "timestamp_ms": ackTsMs,
+                "signature_b64": ackSigB64,
                 "path_kind": "lan_ipv4",
             ]
             sendFramed(conn: conn, obj: ack) {
@@ -690,6 +728,217 @@ struct CodaSelfTest {
                 servePacketLoop(conn: conn, daemonId: daemonId, sess: updatedSess)
             }
         }
+    }
+
+    static func runSecurityFFIAndVTAssertions() throws {
+        // 8a. DirectP2P v2 hybrid static + ephemeral X25519 + transcript binding
+        let clientID = UUID()
+        let daemonID = UUID()
+        let clientId = CodaDeviceIdentity.generate(name: "SelfTest-Client")
+        let daemonId = CodaDeviceIdentity.generate(name: "SelfTest-Daemon")
+        let clientEph = Curve25519.KeyAgreement.PrivateKey()
+        let daemonEph = Curve25519.KeyAgreement.PrivateKey()
+
+        var p2pInitiator = try CodaE2EESession(
+            directP2Pv2Identity: clientId,
+            peerStaticX25519PublicB64: daemonId.x25519PublicB64,
+            myEphemeralPrivateKey: clientEph,
+            peerEphemeralX25519PublicB64: daemonEph.publicKey.rawRepresentation.base64EncodedString(),
+            clientDeviceId: clientID,
+            daemonDeviceId: daemonID,
+            isInitiator: true
+        )
+        var p2pResponder = try CodaE2EESession(
+            directP2Pv2Identity: daemonId,
+            peerStaticX25519PublicB64: clientId.x25519PublicB64,
+            myEphemeralPrivateKey: daemonEph,
+            peerEphemeralX25519PublicB64: clientEph.publicKey.rawRepresentation.base64EncodedString(),
+            clientDeviceId: clientID,
+            daemonDeviceId: daemonID,
+            isInitiator: false
+        )
+        let p2pSealed = try p2pInitiator.sealJSON(Data("{\"op\":\"ping\",\"seq\":1}".utf8))
+        let p2pOpened = try p2pResponder.openJSON(p2pSealed)
+        precondition(String(decoding: p2pOpened, as: UTF8.self) == "{\"op\":\"ping\",\"seq\":1}")
+
+        var wrongBoundResponder = try CodaE2EESession(
+            directP2Pv2Identity: daemonId,
+            peerStaticX25519PublicB64: clientId.x25519PublicB64,
+            myEphemeralPrivateKey: daemonEph,
+            peerEphemeralX25519PublicB64: clientEph.publicKey.rawRepresentation.base64EncodedString(),
+            clientDeviceId: clientID,
+            daemonDeviceId: UUID(),
+            isInitiator: false
+        )
+        let p2pSealedBad = try p2pInitiator.sealJSON(Data("{}".utf8))
+        var mismatchRejected = false
+        do { _ = try wrongBoundResponder.openJSON(p2pSealedBad) } catch { mismatchRejected = true }
+        precondition(mismatchRejected, "Expected DirectP2P v2 transcript mismatch to fail AEAD")
+
+        // 8b. Relay v2 Swift <-> Rust FFI interop + native zstd + binary interior NUL preservation
+        precondition(CodaE2EESession.hasNativeZstdFFI, "Expected libcoda_apple_ffi native zstd FFI")
+        precondition(CodaE2EESession.hasRelayV2FFIBridge, "Expected libcoda_apple_ffi Relay v2 FFI")
+        let nonceB64 = CodaE2EESession.randomSessionNonceB64()
+        var swiftRelay = try CodaE2EESession(
+            relayV2Identity: clientId,
+            peerStaticX25519PublicB64: daemonId.x25519PublicB64,
+            sessionNonceB64: nonceB64,
+            clientDeviceId: clientID,
+            daemonDeviceId: daemonID,
+            isInitiator: true
+        )
+        guard let rustRelay = CodaRustFFISessionBridge(
+            identity: daemonId,
+            peerX25519PublicB64: clientId.x25519PublicB64,
+            sessionNonceB64: nonceB64,
+            clientDeviceId: clientID,
+            daemonDeviceId: daemonID,
+            isInitiator: false,
+            peerSupportsZstd: true
+        ) else {
+            preconditionFailure("Failed initializing CodaRustFFISessionBridge")
+        }
+
+        let s2rPayload = try swiftRelay.sealJSON(Data("{\"op\":\"ping\",\"req_id\":\"selftest-r1\",\"sent_ms\":1234}".utf8))
+        let s2rJSON = String(decoding: try JSONEncoder().encode(s2rPayload), as: UTF8.self)
+        guard let rOpened = rustRelay.openEncryptedPayloadJSON(s2rJSON), rOpened.contains("\"selftest-r1\"") else {
+            preconditionFailure("Rust FFI failed opening Swift Relay v2 payload")
+        }
+
+        let bigText = String(repeating: "coda-zstd-ffi-line\n", count: 80)
+        let bigMsgData = try JSONSerialization.data(withJSONObject: [
+            "op": "pong",
+            "req_id": "selftest-r1",
+            "sent_ms": 9876,
+            "daemon_hostname": bigText,
+            "herdr_version": "0.1.20",
+        ])
+        guard let sealedFromRust = rustRelay.sealPeerMessageJSON(String(decoding: bigMsgData, as: UTF8.self)) else {
+            preconditionFailure("Rust FFI failed sealing PeerMessage")
+        }
+        let encFromRust = try JSONDecoder().decode(CodaEncryptedPayload.self, from: Data(sealedFromRust.utf8))
+        precondition(encFromRust.compressed, "Expected Rust FFI to zstd-compress large PeerMessage")
+        let swiftOpenedBig = try swiftRelay.openJSON(encFromRust)
+        let parsedBig = try JSONSerialization.jsonObject(with: swiftOpenedBig) as? [String: Any]
+        precondition((parsedBig?["daemon_hostname"] as? String) == bigText)
+
+        // Binary zstd frame with interior NUL bytes: "A\0B\0C" (RFC 8878 single-segment raw block)
+        let nulZstdFrame = Data([0x28, 0xB5, 0x2F, 0xFD, 0x20, 0x05, 0x29, 0x00, 0x00, 0x41, 0x00, 0x42, 0x00, 0x43])
+        let decompressedNul = try CodaE2EESession.decompressZstdB64ToData(nulZstdFrame.base64EncodedString())
+        precondition(decompressedNul == Data([0x41, 0x00, 0x42, 0x00, 0x43]), "Binary interior NUL zstd decompression truncated")
+
+        // 8c. Post-AEAD ReplayWindow resilience (forged high-seq packet must not poison window)
+        let rwNonce = CodaE2EESession.randomSessionNonceB64()
+        var rwSender = try CodaE2EESession(
+            relayV2Identity: clientId,
+            peerStaticX25519PublicB64: daemonId.x25519PublicB64,
+            sessionNonceB64: rwNonce,
+            clientDeviceId: clientID,
+            daemonDeviceId: daemonID,
+            isInitiator: true
+        )
+        var rwReceiver = try CodaE2EESession(
+            relayV2Identity: daemonId,
+            peerStaticX25519PublicB64: clientId.x25519PublicB64,
+            sessionNonceB64: rwNonce,
+            clientDeviceId: clientID,
+            daemonDeviceId: daemonID,
+            isInitiator: false
+        )
+        let rw1 = try rwSender.sealJSON(Data("{\"n\":1}".utf8))
+        let rw2 = try rwSender.sealJSON(Data("{\"n\":2}".utf8))
+        let rw3 = try rwSender.sealJSON(Data("{\"n\":3}".utf8))
+        let forgedHigh = CodaEncryptedPayload(
+            seq: 10_000,
+            compressed: false,
+            ciphertextB64: Data("forged".utf8).base64EncodedString(),
+            sessionNonceB64: rwNonce
+        )
+        var forgedFailed = false
+        do { _ = try rwReceiver.openJSON(forgedHigh) } catch { forgedFailed = true }
+        precondition(forgedFailed, "Forged high-seq packet must fail AEAD")
+        let openedRw3 = try rwReceiver.openJSON(rw3)
+        let openedRw1 = try rwReceiver.openJSON(rw1)
+        let openedRw2 = try rwReceiver.openJSON(rw2)
+        precondition(openedRw3 == Data("{\"n\":3}".utf8))
+        precondition(openedRw1 == Data("{\"n\":1}".utf8))
+        precondition(openedRw2 == Data("{\"n\":2}".utf8))
+        var replayFailed = false
+        do { _ = try rwReceiver.openJSON(rw2) } catch { replayFailed = true }
+        precondition(replayFailed, "Replayed seq=2 must fail")
+
+        // 8d. CodaSecretStore 0600 file permissions & CodaPersistedSettings UserDefaults secret scrubbing
+        let tmpDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("coda-selftest-secrets-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
+        let prevSecretsDir = ProcessInfo.processInfo.environment["CODA_APPLE_SECRETS_DIR"]
+        let defaultsKey = "dev.codahub.client.settings.v2"
+        let prevDefaultsData = UserDefaults.standard.data(forKey: defaultsKey)
+        setenv("CODA_APPLE_SECRETS_DIR", tmpDir.path, 1)
+        defer {
+            if let prevSecretsDir {
+                setenv("CODA_APPLE_SECRETS_DIR", prevSecretsDir, 1)
+            } else {
+                unsetenv("CODA_APPLE_SECRETS_DIR")
+            }
+            if let prevDefaultsData {
+                UserDefaults.standard.set(prevDefaultsData, forKey: defaultsKey)
+            } else {
+                UserDefaults.standard.removeObject(forKey: defaultsKey)
+            }
+            try? FileManager.default.removeItem(at: tmpDir)
+        }
+        let secSettings = CodaPersistedSettings(
+            serverBaseURLString: "https://codahub.dev",
+            sessionToken: "tok_secret_value_123",
+            ownerHandle: "alice",
+            voiceConfig: CodaVoiceModelConfig(apiKey: "sk-voice-secret-999")
+        )
+        secSettings.save()
+        if let rawDefaults = UserDefaults.standard.data(forKey: defaultsKey),
+           let decodedRaw = try? JSONDecoder().decode(CodaPersistedSettings.self, from: rawDefaults) {
+            precondition(decodedRaw.sessionToken.isEmpty, "UserDefaults must NOT store plaintext sessionToken")
+            precondition(decodedRaw.voiceConfig.apiKey.isEmpty, "UserDefaults must NOT store plaintext apiKey")
+        } else {
+            preconditionFailure("Expected scrubbed settings in UserDefaults")
+        }
+        let reloaded = CodaPersistedSettings.load()
+        precondition(reloaded.sessionToken == "tok_secret_value_123")
+        precondition(reloaded.voiceConfig.apiKey == "sk-voice-secret-999")
+        let secretFiles = try FileManager.default.contentsOfDirectory(at: tmpDir, includingPropertiesForKeys: nil)
+        precondition(secretFiles.count >= 2)
+        for f in secretFiles {
+            let attrs = try FileManager.default.attributesOfItem(atPath: f.path)
+            let perms = (attrs[.posixPermissions] as? NSNumber)?.intValue
+            precondition(perms == 0o600, "Expected 0600 permissions on secret file, got \(String(describing: perms))")
+        }
+
+        // 8e. GhosttyReflowEngine stateful VT100 UTF-8 split chunks, \r/BS, alt-screen, split OSC 7501 & reflow
+        var vt = GhosttyReflowEngine(columns: 20, rows: 6)
+        let splitUTF8 = Data("Hi 你🚀\r\n".utf8)
+        vt.feed(splitUTF8.subdata(in: 0..<5))
+        vt.feed(splitUTF8.subdata(in: 5..<splitUTF8.count))
+        precondition(vt.visibleLines.first == "Hi 你🚀", "Split UTF-8 failed: \(vt.visibleLines)")
+        vt.feed(Data("FAIL\rPASS!\u{08} \r\n".utf8))
+        precondition(vt.visibleLines.count == 2 && vt.visibleLines[1] == "PASS")
+        vt.feed(Data("\u{1B}[?1049hALT SCREEN\u{1B}[?1049l".utf8))
+        precondition(vt.visibleLines[0] == "Hi 你🚀" && vt.visibleLines[1] == "PASS")
+        let splitOSC = Data("\u{1B}]7501;state=blocked;kind=permission;msg=Proceed?\u{07}".utf8)
+        vt.feed(splitOSC.subdata(in: 0..<11))
+        vt.feed(splitOSC.subdata(in: 11..<splitOSC.count))
+        precondition(vt.latestHerdrStatus?.state == .needsYou && vt.latestHerdrStatus?.message == "Proceed?")
+        precondition(!vt.plainVisibleText.contains("7501"))
+
+        var vtReflow = GhosttyReflowEngine(columns: 40, rows: 8)
+        vtReflow.feed(Data("123456789012345678901234567890".utf8))
+        vtReflow.resizeReflow(columns: 20, rows: 8)
+        precondition(vtReflow.visibleLines.count == 2)
+
+        // 8f. Path boundary helper
+        precondition(codaPathWithinRoot("/Users/dev/coda", root: "/Users/dev/coda"))
+        precondition(codaPathWithinRoot("/Users/dev/coda/crates/coda-server", root: "/Users/dev/coda"))
+        precondition(!codaPathWithinRoot("/Users/dev/coda-other", root: "/Users/dev/coda"))
+        precondition(!codaPathWithinRoot("/Users/dev/coda/../coda-other", root: "/Users/dev/coda"))
     }
 
     private static func readFramed(conn: NWConnection, completion: @escaping @Sendable ([String: Any]?) -> Void) {

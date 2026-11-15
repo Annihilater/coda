@@ -2,6 +2,162 @@ import CoreGraphics
 import CryptoKit
 import Darwin
 import Foundation
+import Security
+
+// MARK: - Secure Secret Storage (Keychain on Signed Bundles / iOS + 0600 File Store for CLI / Tests)
+
+public enum CodaSecretStore {
+    private static let serviceName = "dev.codahub.client.secrets.v1"
+
+    private static var shouldBypassKeychain: Bool {
+        if let override = ProcessInfo.processInfo.environment["CODA_APPLE_SECRETS_DIR"], !override.isEmpty {
+            return true
+        }
+        #if os(macOS)
+        // Unsigned CLI executables and XCTest runners on macOS trigger modal Keychain prompts across rebuilds;
+        // use 0600 file-backed secret storage unless running inside a signed .app bundle.
+        return Bundle.main.bundleURL.pathExtension != "app"
+        #else
+        return false
+        #endif
+    }
+
+    private static func fallbackDirectoryURL() -> URL {
+        if let override = ProcessInfo.processInfo.environment["CODA_APPLE_SECRETS_DIR"], !override.isEmpty {
+            return URL(fileURLWithPath: override, isDirectory: true)
+        }
+        if let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first {
+            return appSupport.appendingPathComponent("Coda/secrets", isDirectory: true)
+        }
+        return FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".config/coda/apple-secrets", isDirectory: true)
+    }
+
+    private static func fallbackFileURL(account: String) -> URL {
+        let digest = SHA256.hash(data: Data(account.utf8))
+        let hex = digest.map { String(format: "%02x", $0) }.joined()
+        return fallbackDirectoryURL().appendingPathComponent("\(hex).bin", isDirectory: false)
+    }
+
+    private static func writeFallback(_ data: Data, account: String) {
+        let dir = fallbackDirectoryURL()
+        try? FileManager.default.createDirectory(
+            at: dir,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: NSNumber(value: Int16(0o700))]
+        )
+        _ = chmod(dir.path, 0o700)
+
+        let target = fallbackFileURL(account: account)
+        let tmp = dir.appendingPathComponent(".\(UUID().uuidString).tmp", isDirectory: false)
+        let fd = open(tmp.path, O_WRONLY | O_CREAT | O_TRUNC, 0o600)
+        guard fd >= 0 else { return }
+        let wroteAll = data.withUnsafeBytes { rawBuf -> Bool in
+            guard let base = rawBuf.baseAddress else { return true }
+            var offset = 0
+            while offset < rawBuf.count {
+                let n = Darwin.write(fd, base.advanced(by: offset), rawBuf.count - offset)
+                if n < 0 {
+                    if errno == EINTR { continue }
+                    return false
+                }
+                offset += n
+            }
+            return true
+        }
+        _ = fsync(fd)
+        _ = fchmod(fd, 0o600)
+        _ = close(fd)
+        if wroteAll {
+            _ = rename(tmp.path, target.path)
+        } else {
+            _ = unlink(tmp.path)
+        }
+    }
+
+    private static func readFallback(account: String) -> Data? {
+        let url = fallbackFileURL(account: account)
+        return try? Data(contentsOf: url)
+    }
+
+    private static func deleteFallback(account: String) {
+        let url = fallbackFileURL(account: account)
+        try? FileManager.default.removeItem(at: url)
+    }
+
+    public static func saveData(_ data: Data, account: String) {
+        if shouldBypassKeychain {
+            writeFallback(data, account: account)
+            return
+        }
+
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: serviceName,
+            kSecAttrAccount as String: account,
+        ]
+        let updateAttrs: [String: Any] = [
+            kSecValueData as String: data,
+            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
+        ]
+
+        var status = SecItemUpdate(query as CFDictionary, updateAttrs as CFDictionary)
+        if status == errSecItemNotFound {
+            var addQuery = query
+            addQuery[kSecValueData as String] = data
+            addQuery[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+            status = SecItemAdd(addQuery as CFDictionary, nil)
+        }
+        if status == errSecSuccess {
+            deleteFallback(account: account)
+        } else {
+            writeFallback(data, account: account)
+        }
+    }
+
+    public static func readData(account: String) -> Data? {
+        if !shouldBypassKeychain {
+            let query: [String: Any] = [
+                kSecClass as String: kSecClassGenericPassword,
+                kSecAttrService as String: serviceName,
+                kSecAttrAccount as String: account,
+                kSecReturnData as String: true,
+                kSecMatchLimit as String: kSecMatchLimitOne,
+            ]
+            var item: CFTypeRef?
+            let status = SecItemCopyMatching(query as CFDictionary, &item)
+            if status == errSecSuccess, let data = item as? Data {
+                return data
+            }
+        }
+        return readFallback(account: account)
+    }
+
+    public static func saveString(_ value: String, account: String) {
+        if value.isEmpty {
+            delete(account: account)
+        } else {
+            saveData(Data(value.utf8), account: account)
+        }
+    }
+
+    public static func readString(account: String) -> String? {
+        guard let data = readData(account: account) else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
+    public static func delete(account: String) {
+        if !shouldBypassKeychain {
+            let query: [String: Any] = [
+                kSecClass as String: kSecClassGenericPassword,
+                kSecAttrService as String: serviceName,
+                kSecAttrAccount as String: account,
+            ]
+            _ = SecItemDelete(query as CFDictionary)
+        }
+        deleteFallback(account: account)
+    }
+}
 
 // MARK: - Zero-Knowledge Device Identity & E2EE Session (100% Rust `coda-protocol` Wire Compatible)
 
@@ -23,6 +179,7 @@ public struct CodaDeviceIdentity: Codable, Sendable, Equatable {
     }
 
     private static let persistedDefaultsKey = "dev.codahub.client.device_identity.v2"
+    private static let secretStoreAccount = "coda.device_identity.v2"
 
     public static func generate(name: String) -> CodaDeviceIdentity {
         let signing = Curve25519.Signing.PrivateKey()
@@ -38,9 +195,16 @@ public struct CodaDeviceIdentity: Codable, Sendable, Equatable {
     }
 
     public static func loadOrCreatePersisted(defaultName: String) -> CodaDeviceIdentity {
-        if let data = UserDefaults.standard.data(forKey: persistedDefaultsKey),
+        if let data = CodaSecretStore.readData(account: secretStoreAccount),
            let decoded = try? JSONDecoder().decode(CodaDeviceIdentity.self, from: data) {
+            // Ensure any legacy plaintext copy in UserDefaults is purged.
+            UserDefaults.standard.removeObject(forKey: persistedDefaultsKey)
             return decoded
+        }
+        if let legacyData = UserDefaults.standard.data(forKey: persistedDefaultsKey),
+           let legacy = try? JSONDecoder().decode(CodaDeviceIdentity.self, from: legacyData) {
+            savePersisted(legacy)
+            return legacy
         }
         let created = generate(name: defaultName)
         savePersisted(created)
@@ -49,8 +213,9 @@ public struct CodaDeviceIdentity: Codable, Sendable, Equatable {
 
     public static func savePersisted(_ identity: CodaDeviceIdentity) {
         if let data = try? JSONEncoder().encode(identity) {
-            UserDefaults.standard.set(data, forKey: persistedDefaultsKey)
+            CodaSecretStore.saveData(data, account: secretStoreAccount)
         }
+        UserDefaults.standard.removeObject(forKey: persistedDefaultsKey)
     }
 
     public func sign(message: Data) throws -> String {
@@ -61,20 +226,41 @@ public struct CodaDeviceIdentity: Codable, Sendable, Equatable {
         let sig = try key.signature(for: message)
         return sig.base64EncodedString()
     }
+
+    public static func verifySignature(
+        ed25519PublicB64: String,
+        message: Data,
+        signatureB64: String
+    ) -> Bool {
+        guard let pkRaw = Data(base64Encoded: ed25519PublicB64),
+              pkRaw.count == 32,
+              let sigRaw = Data(base64Encoded: signatureB64),
+              sigRaw.count == 64,
+              let vk = try? Curve25519.Signing.PublicKey(rawRepresentation: pkRaw) else {
+            return false
+        }
+        return vk.isValidSignature(sigRaw, for: message)
+    }
 }
 
 public enum CodaCryptoError: Error, LocalizedError {
     case invalidKeyEncoding
+    case nonContributoryKey
     case replayDetected(UInt64)
     case invalidCiphertext
     case compressedFrameRequiresRustFFI
+    case decompressedFrameTooLarge
+    case invalidHandshake(String)
 
     public var errorDescription: String? {
         switch self {
         case .invalidKeyEncoding: return "Invalid Curve25519 key encoding"
+        case .nonContributoryKey: return "Non-contributory (low-order) Curve25519 key"
         case .replayDetected(let seq): return "Replay or out-of-order E2EE sequence: \(seq)"
         case .invalidCiphertext: return "Invalid ChaCha20-Poly1305 ciphertext"
-        case .compressedFrameRequiresRustFFI: return "zstd frame decompression requires libcoda_apple_ffi or swift-* req_id negotiation"
+        case .compressedFrameRequiresRustFFI: return "zstd frame decompression requires libcoda_apple_ffi or supports_zstd=false negotiation"
+        case .decompressedFrameTooLarge: return "Decompressed E2EE frame exceeds 16 MiB limit"
+        case .invalidHandshake(let msg): return "E2EE handshake rejected: \(msg)"
         }
     }
 }
@@ -83,30 +269,149 @@ public struct CodaEncryptedPayload: Codable, Sendable {
     public let seq: UInt64
     public let compressed: Bool
     public let ciphertextB64: String
+    public let sessionNonceB64: String?
 
     enum CodingKeys: String, CodingKey {
         case seq
         case compressed
         case ciphertextB64 = "ciphertext_b64"
+        case sessionNonceB64 = "session_nonce_b64"
+    }
+
+    public init(seq: UInt64, compressed: Bool, ciphertextB64: String, sessionNonceB64: String? = nil) {
+        self.seq = seq
+        self.compressed = compressed
+        self.ciphertextB64 = ciphertextB64
+        self.sessionNonceB64 = sessionNonceB64
+    }
+}
+
+/// 64-bit sliding anti-replay window matching `crates/coda-protocol::ReplayWindow`.
+/// Call `check(_:)` before AEAD decryption and `commit(_:)` ONLY after AEAD authentication succeeds.
+public struct CodaReplayWindow: Sendable {
+    public private(set) var highestSeq: UInt64 = 0
+    private var bitmap: UInt64 = 0
+
+    public init() {}
+
+    public func check(_ seq: UInt64) throws {
+        if seq == 0 {
+            throw CodaCryptoError.replayDetected(seq)
+        }
+        if highestSeq > 0 && seq <= highestSeq {
+            let diff = highestSeq - seq
+            if diff >= 64 {
+                throw CodaCryptoError.replayDetected(seq)
+            }
+            if (bitmap & (UInt64(1) << diff)) != 0 {
+                throw CodaCryptoError.replayDetected(seq)
+            }
+        }
+    }
+
+    public mutating func commit(_ seq: UInt64) {
+        if highestSeq == 0 {
+            highestSeq = seq
+            bitmap = 1
+        } else if seq > highestSeq {
+            let shift = seq - highestSeq
+            bitmap = shift >= 64 ? 1 : ((bitmap << shift) | 1)
+            highestSeq = seq
+        } else {
+            let diff = highestSeq - seq
+            if diff < 64 {
+                bitmap |= (UInt64(1) << diff)
+            }
+        }
+    }
+}
+
+private final class CodaFFILoader: @unchecked Sendable {
+    static let shared = CodaFFILoader()
+    private let lock = NSLock()
+    private var loadedHandle: UnsafeMutableRawPointer?
+
+    func resolveSymbol(_ name: String) -> UnsafeMutableRawPointer? {
+        let rtldDefault = UnsafeMutableRawPointer(bitPattern: -2)
+        if let sym = dlsym(rtldDefault, name) {
+            return sym
+        }
+        lock.lock()
+        defer { lock.unlock() }
+        if let handle = loadedHandle, let sym = dlsym(handle, name) {
+            return sym
+        }
+        for path in candidateDylibPaths() {
+            guard FileManager.default.fileExists(atPath: path) else { continue }
+            if let handle = dlopen(path, RTLD_NOW | RTLD_GLOBAL) {
+                loadedHandle = handle
+                if let sym = dlsym(handle, name) {
+                    return sym
+                }
+            }
+        }
+        return nil
+    }
+
+    private func candidateDylibPaths() -> [String] {
+        var candidates: [String] = []
+        if let env = ProcessInfo.processInfo.environment["CODA_FFI_DYLIB_PATH"], !env.isEmpty {
+            candidates.append(env)
+        }
+        if let execURL = Bundle.main.executableURL {
+            let execDir = execURL.deletingLastPathComponent()
+            candidates.append(execDir.appendingPathComponent("libcoda_apple_ffi.dylib").path)
+            candidates.append(execDir.appendingPathComponent("../Frameworks/libcoda_apple_ffi.dylib").path)
+        }
+        let cwd = FileManager.default.currentDirectoryPath
+        candidates.append("\(cwd)/target/release/libcoda_apple_ffi.dylib")
+        candidates.append("\(cwd)/../target/release/libcoda_apple_ffi.dylib")
+        candidates.append("\(cwd)/target/debug/libcoda_apple_ffi.dylib")
+        candidates.append("\(cwd)/../target/debug/libcoda_apple_ffi.dylib")
+        // Derive workspace root relative to source file if executed inside SwiftPM test runner.
+        let sourceRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent() // CodaKit
+            .deletingLastPathComponent() // Sources
+            .deletingLastPathComponent() // apple
+            .deletingLastPathComponent() // repo root
+        candidates.append(sourceRoot.appendingPathComponent("target/release/libcoda_apple_ffi.dylib").path)
+        candidates.append(sourceRoot.appendingPathComponent("target/debug/libcoda_apple_ffi.dylib").path)
+        return candidates
     }
 }
 
 /// Pure Apple `CryptoKit` implementation of Coda's directional E2EE session (`X25519 + HKDF-SHA256 + ChaChaPoly`).
-/// Matches `crates/coda-protocol/src/lib.rs` byte-for-byte, with dynamic `dlsym` FFI support for `zstd` frames.
+/// Matches `crates/coda-protocol/src/lib.rs` byte-for-byte, with dynamic `dlopen`/`dlsym` FFI support for binary-safe `zstd` frames.
 public struct CodaE2EESession: Sendable {
+    private static let maxDecompressedBytes = 16 * 1024 * 1024
+
     private let txKey: SymmetricKey
     private let rxKey: SymmetricKey
     private let txDirTag: UInt8
     private let rxDirTag: UInt8
+    private let aadBinding: Data?
+    public let sessionNonceB64: String?
     private var nextTxSeq: UInt64 = 1
-    private var highestRxSeq: UInt64?
+    private var rxWindow = CodaReplayWindow()
 
     private typealias ZstdDecompressFn = @convention(c) (UnsafePointer<CChar>?) -> UnsafeMutablePointer<CChar>?
     private typealias StringFreeFn = @convention(c) (UnsafeMutablePointer<CChar>?) -> Void
 
     public static var hasNativeZstdFFI: Bool {
-        let rtldDefault = UnsafeMutableRawPointer(bitPattern: -2)
-        return dlsym(rtldDefault, "coda_ffi_zstd_decompress_b64") != nil
+        CodaFFILoader.shared.resolveSymbol("coda_ffi_zstd_decompress_b64_to_b64") != nil
+            || CodaFFILoader.shared.resolveSymbol("coda_ffi_zstd_decompress_b64") != nil
+    }
+
+    public static var hasRelayV2FFIBridge: Bool {
+        CodaFFILoader.shared.resolveSymbol("coda_ffi_session_new_relay_v2") != nil
+    }
+
+    private static func checkContributorySharedSecret(_ shared: SharedSecret) throws -> Data {
+        let raw = shared.withUnsafeBytes { Data($0) }
+        guard raw.count == 32, raw.contains(where: { $0 != 0 }) else {
+            throw CodaCryptoError.nonContributoryKey
+        }
+        return raw
     }
 
     public init(myX25519SecretB64: String, peerX25519PublicB64: String, isClientInitiator: Bool = true) throws {
@@ -117,6 +422,7 @@ public struct CodaE2EESession: Sendable {
         let myPriv = try Curve25519.KeyAgreement.PrivateKey(rawRepresentation: myRaw)
         let peerPub = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: peerRaw)
         let shared = try myPriv.sharedSecretFromKeyAgreement(with: peerPub)
+        _ = try Self.checkContributorySharedSecret(shared)
 
         let salt = Data("coda-zk-mesh-salt-v1".utf8)
         let c2d = shared.hkdfDerivedSymmetricKey(
@@ -143,6 +449,8 @@ public struct CodaE2EESession: Sendable {
             self.txDirTag = 0x02
             self.rxDirTag = 0x01
         }
+        self.aadBinding = nil
+        self.sessionNonceB64 = nil
     }
 
     public init(myIdentity: CodaDeviceIdentity, peerX25519PublicB64: String, isInitiator: Bool = true) throws {
@@ -151,6 +459,169 @@ public struct CodaE2EESession: Sendable {
             peerX25519PublicB64: peerX25519PublicB64,
             isClientInitiator: isInitiator
         )
+    }
+
+    /// Direct P2P v2 hybrid static + ephemeral X25519 derivation matching `E2eeSession::derive_ephemeral_p2p`.
+    public init(
+        directP2Pv2Identity myIdentity: CodaDeviceIdentity,
+        peerStaticX25519PublicB64: String,
+        myEphemeralPrivateKey: Curve25519.KeyAgreement.PrivateKey,
+        peerEphemeralX25519PublicB64: String,
+        clientDeviceId: UUID,
+        daemonDeviceId: UUID,
+        isInitiator: Bool = true
+    ) throws {
+        guard let myStaticRaw = Data(base64Encoded: myIdentity.x25519SecretB64),
+              let peerStaticRaw = Data(base64Encoded: peerStaticX25519PublicB64),
+              let peerEphRaw = Data(base64Encoded: peerEphemeralX25519PublicB64),
+              peerStaticRaw.count == 32,
+              peerEphRaw.count == 32 else {
+            throw CodaCryptoError.invalidKeyEncoding
+        }
+        let myStaticPriv = try Curve25519.KeyAgreement.PrivateKey(rawRepresentation: myStaticRaw)
+        let peerStaticPub = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: peerStaticRaw)
+        let peerEphPub = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: peerEphRaw)
+
+        let staticShared = try Self.checkContributorySharedSecret(
+            try myStaticPriv.sharedSecretFromKeyAgreement(with: peerStaticPub)
+        )
+        let ephShared = try Self.checkContributorySharedSecret(
+            try myEphemeralPrivateKey.sharedSecretFromKeyAgreement(with: peerEphPub)
+        )
+
+        let myEphRaw = myEphemeralPrivateKey.publicKey.rawRepresentation
+        let clientEphRaw = isInitiator ? myEphRaw : peerEphRaw
+        let daemonEphRaw = isInitiator ? peerEphRaw : myEphRaw
+
+        var hasher = SHA256()
+        hasher.update(data: clientEphRaw)
+        hasher.update(data: daemonEphRaw)
+        let salt = Data(hasher.finalize())
+
+        var ikm = Data(capacity: 64)
+        ikm.append(staticShared)
+        ikm.append(ephShared)
+
+        let cStr = clientDeviceId.uuidString.lowercased()
+        let dStr = daemonDeviceId.uuidString.lowercased()
+        let c2d = HKDF<SHA256>.deriveKey(
+            inputKeyMaterial: SymmetricKey(data: ikm),
+            salt: salt,
+            info: Data("coda-p2p-v2-c2d:\(cStr):\(dStr)".utf8),
+            outputByteCount: 32
+        )
+        let d2c = HKDF<SHA256>.deriveKey(
+            inputKeyMaterial: SymmetricKey(data: ikm),
+            salt: salt,
+            info: Data("coda-p2p-v2-d2c:\(cStr):\(dStr)".utf8),
+            outputByteCount: 32
+        )
+
+        if isInitiator {
+            self.txKey = c2d
+            self.rxKey = d2c
+            self.txDirTag = 0x01
+            self.rxDirTag = 0x02
+        } else {
+            self.txKey = d2c
+            self.rxKey = c2d
+            self.txDirTag = 0x02
+            self.rxDirTag = 0x01
+        }
+        self.aadBinding = Data(salt.prefix(16))
+        self.sessionNonceB64 = nil
+    }
+
+    /// Relay v2 salted X25519 session derivation matching `E2eeSession::derive_relay_session`.
+    public init(
+        relayV2Identity myIdentity: CodaDeviceIdentity,
+        peerStaticX25519PublicB64: String,
+        sessionNonceB64: String,
+        clientDeviceId: UUID,
+        daemonDeviceId: UUID,
+        isInitiator: Bool = true
+    ) throws {
+        guard let myStaticRaw = Data(base64Encoded: myIdentity.x25519SecretB64),
+              let peerStaticRaw = Data(base64Encoded: peerStaticX25519PublicB64),
+              let nonceRaw = Data(base64Encoded: sessionNonceB64),
+              peerStaticRaw.count == 32,
+              nonceRaw.count == 16 else {
+            throw CodaCryptoError.invalidKeyEncoding
+        }
+        let myStaticPriv = try Curve25519.KeyAgreement.PrivateKey(rawRepresentation: myStaticRaw)
+        let peerStaticPub = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: peerStaticRaw)
+        let staticShared = try Self.checkContributorySharedSecret(
+            try myStaticPriv.sharedSecretFromKeyAgreement(with: peerStaticPub)
+        )
+
+        let cStr = clientDeviceId.uuidString.lowercased()
+        let dStr = daemonDeviceId.uuidString.lowercased()
+        let c2d = HKDF<SHA256>.deriveKey(
+            inputKeyMaterial: SymmetricKey(data: staticShared),
+            salt: nonceRaw,
+            info: Data("coda-relay-v2-c2d:\(cStr):\(dStr)".utf8),
+            outputByteCount: 32
+        )
+        let d2c = HKDF<SHA256>.deriveKey(
+            inputKeyMaterial: SymmetricKey(data: staticShared),
+            salt: nonceRaw,
+            info: Data("coda-relay-v2-d2c:\(cStr):\(dStr)".utf8),
+            outputByteCount: 32
+        )
+
+        if isInitiator {
+            self.txKey = c2d
+            self.rxKey = d2c
+            self.txDirTag = 0x01
+            self.rxDirTag = 0x02
+        } else {
+            self.txKey = d2c
+            self.rxKey = c2d
+            self.txDirTag = 0x02
+            self.rxDirTag = 0x01
+        }
+        self.aadBinding = nonceRaw
+        self.sessionNonceB64 = nonceRaw.base64EncodedString()
+    }
+
+    public static func randomSessionNonceB64() -> String {
+        var bytes = [UInt8](repeating: 0, count: 16)
+        _ = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
+        return Data(bytes).base64EncodedString()
+    }
+
+    public static func decompressZstdB64ToData(_ compressedB64: String) throws -> Data {
+        if let sym = CodaFFILoader.shared.resolveSymbol("coda_ffi_zstd_decompress_b64_to_b64"),
+           let freeSym = CodaFFILoader.shared.resolveSymbol("coda_ffi_string_free") {
+            let decompFn = unsafeBitCast(sym, to: ZstdDecompressFn.self)
+            let freeFn = unsafeBitCast(freeSym, to: StringFreeFn.self)
+            if let outPtr = compressedB64.withCString({ decompFn($0) }) {
+                defer { freeFn(outPtr) }
+                let b64Out = String(cString: outPtr)
+                guard let decoded = Data(base64Encoded: b64Out) else {
+                    throw CodaCryptoError.invalidCiphertext
+                }
+                guard decoded.count <= maxDecompressedBytes else {
+                    throw CodaCryptoError.decompressedFrameTooLarge
+                }
+                return decoded
+            }
+        }
+        if let sym = CodaFFILoader.shared.resolveSymbol("coda_ffi_zstd_decompress_b64"),
+           let freeSym = CodaFFILoader.shared.resolveSymbol("coda_ffi_string_free") {
+            let decompFn = unsafeBitCast(sym, to: ZstdDecompressFn.self)
+            let freeFn = unsafeBitCast(freeSym, to: StringFreeFn.self)
+            if let outPtr = compressedB64.withCString({ decompFn($0) }) {
+                defer { freeFn(outPtr) }
+                let utf8 = String(cString: outPtr)
+                let decoded = Data(utf8.utf8)
+                guard decoded.count <= maxDecompressedBytes else {
+                    throw CodaCryptoError.decompressedFrameTooLarge
+                }
+                return decoded
+            }
+        }
+        throw CodaCryptoError.compressedFrameRequiresRustFFI
     }
 
     private static func makeNonce(dirTag: UInt8, seq: UInt64) throws -> ChaChaPoly.Nonce {
@@ -165,24 +636,41 @@ public struct CodaE2EESession: Sendable {
         return try ChaChaPoly.Nonce(data: Data(bytes))
     }
 
+    private func makeAAD(compressed: Bool, dirTag: UInt8) -> Data {
+        let cByte: UInt8 = compressed ? 0x01 : 0x00
+        guard let binding = aadBinding else {
+            return Data([cByte])
+        }
+        var aad = Data(capacity: 2 + binding.count)
+        aad.append(cByte)
+        aad.append(dirTag)
+        aad.append(binding)
+        return aad
+    }
+
     public mutating func sealJSON(_ jsonBytes: Data) throws -> CodaEncryptedPayload {
         let seq = nextTxSeq
         nextTxSeq += 1
         let nonce = try Self.makeNonce(dirTag: txDirTag, seq: seq)
-        let aad = Data([0x00])
+        let aad = makeAAD(compressed: false, dirTag: txDirTag)
         let box = try ChaChaPoly.seal(jsonBytes, using: txKey, nonce: nonce, authenticating: aad)
         let combinedCiphertextAndTag = box.ciphertext + box.tag
         return CodaEncryptedPayload(
             seq: seq,
             compressed: false,
-            ciphertextB64: combinedCiphertextAndTag.base64EncodedString()
+            ciphertextB64: combinedCiphertextAndTag.base64EncodedString(),
+            sessionNonceB64: sessionNonceB64
         )
     }
 
     public mutating func openJSON(_ payload: CodaEncryptedPayload) throws -> Data {
-        if let prev = highestRxSeq, payload.seq <= prev {
-            throw CodaCryptoError.replayDetected(payload.seq)
+        if let expectedNonce = sessionNonceB64 {
+            guard payload.sessionNonceB64 == expectedNonce else {
+                throw CodaCryptoError.invalidCiphertext
+            }
         }
+        try rxWindow.check(payload.seq)
+
         guard let raw = Data(base64Encoded: payload.ciphertextB64), raw.count >= 16 else {
             throw CodaCryptoError.invalidCiphertext
         }
@@ -190,32 +678,99 @@ public struct CodaE2EESession: Sendable {
         let tag = raw.suffix(16)
         let nonce = try Self.makeNonce(dirTag: rxDirTag, seq: payload.seq)
         let box = try ChaChaPoly.SealedBox(nonce: nonce, ciphertext: ct, tag: tag)
-        let aad = Data([payload.compressed ? 0x01 : 0x00])
+        let aad = makeAAD(compressed: payload.compressed, dirTag: rxDirTag)
         let pt = try ChaChaPoly.open(box, using: rxKey, authenticating: aad)
 
+        let decoded: Data
         if payload.compressed {
-            let rtldDefault = UnsafeMutableRawPointer(bitPattern: -2)
-            if let zstdSym = dlsym(rtldDefault, "coda_ffi_zstd_decompress_b64"),
-               let freeSym = dlsym(rtldDefault, "coda_ffi_string_free") {
-                let decompFn = unsafeBitCast(zstdSym, to: ZstdDecompressFn.self)
-                let freeFn = unsafeBitCast(freeSym, to: StringFreeFn.self)
-                let outPtr = pt.base64EncodedString().withCString { decompFn($0) }
-                if let outPtr {
-                    defer { freeFn(outPtr) }
-                    let utf8 = String(cString: outPtr)
-                    highestRxSeq = payload.seq
-                    return Data(utf8.utf8)
-                }
+            decoded = try Self.decompressZstdB64ToData(pt.base64EncodedString())
+        } else {
+            guard pt.count <= Self.maxDecompressedBytes else {
+                throw CodaCryptoError.decompressedFrameTooLarge
             }
-            if let zlibData = try? (pt as NSData).decompressed(using: .zlib) as Data {
-                highestRxSeq = payload.seq
-                return zlibData
-            }
-            throw CodaCryptoError.compressedFrameRequiresRustFFI
+            decoded = pt
         }
 
-        highestRxSeq = payload.seq
-        return pt
+        // Only advance replay window AFTER AEAD authentication and bounded decompression succeed.
+        rxWindow.commit(payload.seq)
+        return decoded
+    }
+}
+
+/// Safe Rust FFI session wrapper backed by `libcoda_apple_ffi.dylib` when available (used for cross-language verification).
+public final class CodaRustFFISessionBridge: @unchecked Sendable {
+    private typealias NewRelayV2Fn = @convention(c) (
+        UnsafePointer<CChar>?, UnsafePointer<CChar>?, UnsafePointer<CChar>?,
+        UnsafePointer<CChar>?, UnsafePointer<CChar>?, Bool, Bool
+    ) -> OpaquePointer?
+    private typealias FreeFn = @convention(c) (OpaquePointer?) -> Void
+    private typealias CallFn = @convention(c) (OpaquePointer?, UnsafePointer<CChar>?) -> UnsafeMutablePointer<CChar>?
+    private typealias StringFreeFn = @convention(c) (UnsafeMutablePointer<CChar>?) -> Void
+
+    private var ptr: OpaquePointer?
+    private let freeFn: FreeFn
+    private let sealFn: CallFn
+    private let openFn: CallFn
+    private let strFreeFn: StringFreeFn
+
+    public init?(
+        identity: CodaDeviceIdentity,
+        peerX25519PublicB64: String,
+        sessionNonceB64: String,
+        clientDeviceId: UUID,
+        daemonDeviceId: UUID,
+        isInitiator: Bool,
+        peerSupportsZstd: Bool = true
+    ) {
+        guard let newSym = CodaFFILoader.shared.resolveSymbol("coda_ffi_session_new_relay_v2"),
+              let freeSym = CodaFFILoader.shared.resolveSymbol("coda_ffi_session_free"),
+              let sealSym = CodaFFILoader.shared.resolveSymbol("coda_ffi_session_seal"),
+              let openSym = CodaFFILoader.shared.resolveSymbol("coda_ffi_session_open"),
+              let strFreeSym = CodaFFILoader.shared.resolveSymbol("coda_ffi_string_free"),
+              let idData = try? JSONEncoder().encode(identity),
+              let idJSON = String(data: idData, encoding: .utf8) else {
+            return nil
+        }
+        let newFn = unsafeBitCast(newSym, to: NewRelayV2Fn.self)
+        self.freeFn = unsafeBitCast(freeSym, to: FreeFn.self)
+        self.sealFn = unsafeBitCast(sealSym, to: CallFn.self)
+        self.openFn = unsafeBitCast(openSym, to: CallFn.self)
+        self.strFreeFn = unsafeBitCast(strFreeSym, to: StringFreeFn.self)
+
+        let cid = clientDeviceId.uuidString.lowercased()
+        let did = daemonDeviceId.uuidString.lowercased()
+        self.ptr = idJSON.withCString { pId in
+            peerX25519PublicB64.withCString { pPeer in
+                sessionNonceB64.withCString { pNonce in
+                    cid.withCString { pCid in
+                        did.withCString { pDid in
+                            newFn(pId, pPeer, pNonce, pCid, pDid, isInitiator, peerSupportsZstd)
+                        }
+                    }
+                }
+            }
+        }
+        if self.ptr == nil { return nil }
+    }
+
+    deinit {
+        if let ptr {
+            freeFn(ptr)
+        }
+    }
+
+    public func sealPeerMessageJSON(_ msgJSON: String) -> String? {
+        guard let ptr else { return nil }
+        guard let outPtr = msgJSON.withCString({ sealFn(ptr, $0) }) else { return nil }
+        defer { strFreeFn(outPtr) }
+        return String(cString: outPtr)
+    }
+
+    public func openEncryptedPayloadJSON(_ payloadJSON: String) -> String? {
+        guard let ptr else { return nil }
+        guard let outPtr = payloadJSON.withCString({ openFn(ptr, $0) }) else { return nil }
+        defer { strFreeFn(outPtr) }
+        return String(cString: outPtr)
     }
 }
 
@@ -383,8 +938,21 @@ public struct CodaPersistedSettings: Codable, Sendable, Equatable {
     public var locale: CodaUILocale
     public var pinnedSessionIDs: [String]
     public var voiceConfig: CodaVoiceModelConfig
+    public var registeredDeviceIDs: [String: String]
 
     private static let defaultsKey = "dev.codahub.client.settings.v2"
+    private static let sessionTokenSecretAccount = "coda.session_token.v1"
+    private static let voiceApiKeySecretAccount = "coda.voice_api_key.v1"
+
+    enum CodingKeys: String, CodingKey {
+        case serverBaseURLString
+        case sessionToken
+        case ownerHandle
+        case locale
+        case pinnedSessionIDs
+        case voiceConfig
+        case registeredDeviceIDs
+    }
 
     public init(
         serverBaseURLString: String = "https://codahub.dev",
@@ -392,7 +960,8 @@ public struct CodaPersistedSettings: Codable, Sendable, Equatable {
         ownerHandle: String = "",
         locale: CodaUILocale = .en,
         pinnedSessionIDs: [String] = [],
-        voiceConfig: CodaVoiceModelConfig = CodaVoiceModelConfig()
+        voiceConfig: CodaVoiceModelConfig = CodaVoiceModelConfig(),
+        registeredDeviceIDs: [String: String] = [:]
     ) {
         self.serverBaseURLString = serverBaseURLString
         self.sessionToken = sessionToken
@@ -400,20 +969,71 @@ public struct CodaPersistedSettings: Codable, Sendable, Equatable {
         self.locale = locale
         self.pinnedSessionIDs = pinnedSessionIDs
         self.voiceConfig = voiceConfig
+        self.registeredDeviceIDs = registeredDeviceIDs
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.serverBaseURLString = (try? c.decodeIfPresent(String.self, forKey: .serverBaseURLString)) ?? "https://codahub.dev"
+        self.sessionToken = (try? c.decodeIfPresent(String.self, forKey: .sessionToken)) ?? ""
+        self.ownerHandle = (try? c.decodeIfPresent(String.self, forKey: .ownerHandle)) ?? ""
+        self.locale = (try? c.decodeIfPresent(CodaUILocale.self, forKey: .locale)) ?? .en
+        self.pinnedSessionIDs = (try? c.decodeIfPresent([String].self, forKey: .pinnedSessionIDs)) ?? []
+        self.voiceConfig = (try? c.decodeIfPresent(CodaVoiceModelConfig.self, forKey: .voiceConfig)) ?? CodaVoiceModelConfig()
+        self.registeredDeviceIDs = (try? c.decodeIfPresent([String: String].self, forKey: .registeredDeviceIDs)) ?? [:]
     }
 
     public static func load() -> CodaPersistedSettings {
-        guard let data = UserDefaults.standard.data(forKey: defaultsKey),
-              let decoded = try? JSONDecoder().decode(CodaPersistedSettings.self, from: data) else {
-            return CodaPersistedSettings()
+        var settings: CodaPersistedSettings
+        if let data = UserDefaults.standard.data(forKey: defaultsKey),
+           let decoded = try? JSONDecoder().decode(CodaPersistedSettings.self, from: data) {
+            settings = decoded
+        } else {
+            settings = CodaPersistedSettings()
         }
-        return decoded
+
+        // Migrate any legacy plaintext secrets out of UserDefaults into CodaSecretStore.
+        var needsDefaultsRewrite = false
+        if !settings.sessionToken.isEmpty {
+            CodaSecretStore.saveString(settings.sessionToken, account: sessionTokenSecretAccount)
+            needsDefaultsRewrite = true
+        }
+        if !settings.voiceConfig.apiKey.isEmpty {
+            CodaSecretStore.saveString(settings.voiceConfig.apiKey, account: voiceApiKeySecretAccount)
+            needsDefaultsRewrite = true
+        }
+        if needsDefaultsRewrite {
+            var sanitized = settings
+            sanitized.sessionToken = ""
+            sanitized.voiceConfig.apiKey = ""
+            if let data = try? JSONEncoder().encode(sanitized) {
+                UserDefaults.standard.set(data, forKey: defaultsKey)
+            }
+        }
+
+        settings.sessionToken = CodaSecretStore.readString(account: sessionTokenSecretAccount) ?? ""
+        settings.voiceConfig.apiKey = CodaSecretStore.readString(account: voiceApiKeySecretAccount) ?? ""
+        return settings
     }
 
     public func save() {
-        if let data = try? JSONEncoder().encode(self) {
+        CodaSecretStore.saveString(sessionToken, account: Self.sessionTokenSecretAccount)
+        CodaSecretStore.saveString(voiceConfig.apiKey, account: Self.voiceApiKeySecretAccount)
+
+        // Persist non-secret preferences only; secret token & API key stay in CodaSecretStore.
+        var sanitized = self
+        sanitized.sessionToken = ""
+        sanitized.voiceConfig.apiKey = ""
+        if let data = try? JSONEncoder().encode(sanitized) {
             UserDefaults.standard.set(data, forKey: Self.defaultsKey)
         }
+    }
+
+    public static func registrationKey(serverBaseURL: String, ownerHandle: String) -> String {
+        let s = serverBaseURL.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let normalized = s.hasSuffix("/") ? String(s.dropLast()) : s
+        let h = ownerHandle.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return "\(normalized)|\(h)"
     }
 }
 
@@ -570,6 +1190,7 @@ public struct CodaRemoteDevice: Identifiable, Codable, Sendable, Equatable, Hash
     public let name: String
     public let role: String
     public let platform: String
+    public let ed25519Pubkey: String
     public let x25519Pubkey: String
     public let endpoints: [CodaEndpointCandidate]
     public let isOnline: Bool
@@ -581,8 +1202,10 @@ public struct CodaRemoteDevice: Identifiable, Codable, Sendable, Equatable, Hash
         case name
         case role
         case platform
+        case ed25519Pubkey = "ed25519_pubkey"
         case x25519Pubkey = "x25519_pubkey"
-        case endpoints = "endpoints_json"
+        case endpointsJson = "endpoints_json"
+        case endpoints
         case isOnline = "is_online"
     }
 
@@ -591,6 +1214,7 @@ public struct CodaRemoteDevice: Identifiable, Codable, Sendable, Equatable, Hash
         name: String,
         role: String,
         platform: String,
+        ed25519Pubkey: String = "",
         x25519Pubkey: String,
         endpoints: [CodaEndpointCandidate],
         isOnline: Bool
@@ -599,6 +1223,7 @@ public struct CodaRemoteDevice: Identifiable, Codable, Sendable, Equatable, Hash
         self.name = name
         self.role = role
         self.platform = platform
+        self.ed25519Pubkey = ed25519Pubkey
         self.x25519Pubkey = x25519Pubkey
         self.endpoints = endpoints
         self.isOnline = isOnline
@@ -610,9 +1235,28 @@ public struct CodaRemoteDevice: Identifiable, Codable, Sendable, Equatable, Hash
         name = try c.decode(String.self, forKey: .name)
         role = try c.decode(String.self, forKey: .role)
         platform = try c.decode(String.self, forKey: .platform)
+        ed25519Pubkey = (try? c.decodeIfPresent(String.self, forKey: .ed25519Pubkey)) ?? ""
         x25519Pubkey = try c.decode(String.self, forKey: .x25519Pubkey)
-        endpoints = (try? c.decodeIfPresent([CodaEndpointCandidate].self, forKey: .endpoints)) ?? []
+        if let eps = try? c.decodeIfPresent([CodaEndpointCandidate].self, forKey: .endpointsJson) {
+            endpoints = eps
+        } else if let eps = try? c.decodeIfPresent([CodaEndpointCandidate].self, forKey: .endpoints) {
+            endpoints = eps
+        } else {
+            endpoints = []
+        }
         isOnline = try c.decode(Bool.self, forKey: .isOnline)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(id, forKey: .id)
+        try c.encode(name, forKey: .name)
+        try c.encode(role, forKey: .role)
+        try c.encode(platform, forKey: .platform)
+        try c.encode(ed25519Pubkey, forKey: .ed25519Pubkey)
+        try c.encode(x25519Pubkey, forKey: .x25519Pubkey)
+        try c.encode(endpoints, forKey: .endpointsJson)
+        try c.encode(isOnline, forKey: .isOnline)
     }
 }
 
@@ -1147,4 +1791,22 @@ public struct CodaIPhoneDeviceSpec: Sendable, Equatable, Identifiable {
             expectedLandscapeFormFactor: .iphoneDuoInnerLandscape
         ),
     ]
+}
+
+// MARK: - Path Boundary Helpers
+
+/// Returns true iff `candidate` equals `root` or lies strictly underneath `root/` at a path segment boundary.
+public func codaPathWithinRoot(_ candidate: String, root: String) -> Bool {
+    let trimmedRoot = root.trimmingCharacters(in: .whitespacesAndNewlines)
+    let trimmedCandidate = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmedRoot.isEmpty, !trimmedCandidate.isEmpty else { return false }
+    let normalizedRoot = URL(fileURLWithPath: trimmedRoot).standardized.path
+    let normalizedCandidate = URL(fileURLWithPath: trimmedCandidate).standardized.path
+    if normalizedCandidate == normalizedRoot {
+        return true
+    }
+    if normalizedRoot == "/" {
+        return normalizedCandidate.hasPrefix("/")
+    }
+    return normalizedCandidate.hasPrefix(normalizedRoot + "/")
 }

@@ -4,14 +4,24 @@ import SwiftUI
 // MARK: - Adaptive Root View (`iPhone` Compact Tab/Stack <-> `iPadOS` / `Mac` Split View)
 
 public struct CodaAdaptiveRootView: View {
-    @StateObject private var store = CodaWorkspaceStore()
+    @ObservedObject private var store: CodaWorkspaceStore
+    @StateObject private var ownedStore: CodaWorkspaceStore
     @FocusState private var sidebarSearchFocused: Bool
 #if os(iOS)
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @Environment(\.verticalSizeClass) private var verticalSizeClass
 #endif
 
-    public init() {}
+    public init() {
+        let created = CodaWorkspaceStore()
+        _store = ObservedObject(wrappedValue: created)
+        _ownedStore = StateObject(wrappedValue: created)
+    }
+
+    public init(store: CodaWorkspaceStore) {
+        _store = ObservedObject(wrappedValue: store)
+        _ownedStore = StateObject(wrappedValue: store)
+    }
 
     private var isHorizontalRegular: Bool? {
 #if os(iOS)
@@ -425,7 +435,9 @@ public struct CodaAdaptiveRootView: View {
 
             ForEach(group.repos) { repo in
                 let isExpanded = store.expandedWorkspaces.contains(repo.id)
-                let matching = group.sessions.filter { $0.cwd.hasPrefix(repo.rootPath) || $0.workspaceName == repo.repoName }
+                let matching = group.sessions.filter {
+                    codaPathWithinRoot($0.cwd, root: repo.rootPath) || $0.workspaceName == repo.repoName
+                }
                 VStack(alignment: .leading, spacing: 4) {
                     Button {
                         if isExpanded {

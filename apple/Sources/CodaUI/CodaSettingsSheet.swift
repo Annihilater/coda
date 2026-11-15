@@ -381,6 +381,26 @@ public struct CodaSettingsAndPairingSheet: View {
                         .padding(.vertical, 8)
                         .background(RoundedRectangle(cornerRadius: 8).fill(CodaHerdrTheme.canvasBG))
                 }
+                HStack {
+                    Button {
+                        Task { await store.saveVoiceConfig() }
+                    } label: {
+                        Label(
+                            tr("Save & Sync Voice Config", "保存并同步语音配置", locale: store.locale),
+                            systemImage: "icloud.and.arrow.up"
+                        )
+                        .font(.system(size: 12, weight: .medium))
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+
+                    if let status = store.voiceConfigSyncMessage {
+                        Text(status)
+                            .font(.system(size: 11))
+                            .foregroundStyle(CodaHerdrTheme.textSecondary)
+                            .lineLimit(1)
+                    }
+                }
             }
         }
     }

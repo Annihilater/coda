@@ -72,9 +72,11 @@ public struct CodaTerminalSessionView: View {
                                 let scaled = max(9.5, min(20.0, store.terminalFontSize * value / local.baseFontScale))
                                 store.terminalFontSize = scaled
                                 local.baseFontScale = value
+                                store.recomputeTerminalGridForFontChange()
                             }
                             .onEnded { _ in
                                 local.baseFontScale = 1.0
+                                store.recomputeTerminalGridForFontChange()
                             }
                     )
 
@@ -104,14 +106,23 @@ public struct CodaTerminalSessionView: View {
             }
         }
         .background(CodaHerdrTheme.canvasBG)
-        .sheet(isPresented: $store.showComposeSheet) {
-            CodaComposePromptSheet(store: store, session: session)
+        .sheet(isPresented: Binding(
+            get: { !isSecondaryLeaf && store.showComposeSheet },
+            set: { if !isSecondaryLeaf { store.showComposeSheet = $0 } }
+        )) {
+            CodaComposePromptSheet(store: store, session: store.selectedSession ?? session)
         }
-        .sheet(isPresented: $store.showPaneMinimapSheet) {
-            CodaPaneMinimapSheet(store: store, session: session)
+        .sheet(isPresented: Binding(
+            get: { !isSecondaryLeaf && store.showPaneMinimapSheet },
+            set: { if !isSecondaryLeaf { store.showPaneMinimapSheet = $0 } }
+        )) {
+            CodaPaneMinimapSheet(store: store, session: store.selectedSession ?? session)
         }
-        .sheet(isPresented: $store.showGitDiffSheet) {
-            CodaGitDiffSheet(store: store, session: session)
+        .sheet(isPresented: Binding(
+            get: { !isSecondaryLeaf && store.showGitDiffSheet },
+            set: { if !isSecondaryLeaf { store.showGitDiffSheet = $0 } }
+        )) {
+            CodaGitDiffSheet(store: store, session: store.selectedSession ?? session)
         }
     }
 
