@@ -1,8 +1,11 @@
 //! Real local Git repository inspector (`status`, `diff`, `log`) and workspace file browser.
 //! All commands execute on background worker threads and never block the GPUI render loop.
 
-use std::path::{Path, PathBuf};
+use std::io::Read;
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
+
+const MAX_PREVIEW_BYTES: usize = 512 * 1024;
 
 #[derive(Debug, Clone, Default)]
 pub struct ChangedFileEntry {
@@ -45,11 +48,50 @@ pub struct WorkspaceFileEntry {
     pub size_bytes: u64,
 }
 
+/// Resolves `rel` strictly inside `root` without escaping via `..`, absolute paths, or symlinks.
+pub fn resolve_contained_path(root: &Path, rel: &str) -> Option<PathBuf> {
+    let trimmed = rel.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let rel_path = Path::new(trimmed);
+    for comp in rel_path.components() {
+        match comp {
+            Component::Normal(_) | Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    let canon_root = std::fs::canonicalize(root).ok()?;
+    let joined = canon_root.join(rel_path);
+    let canon_target = std::fs::canonicalize(&joined).ok()?;
+    if canon_target.starts_with(&canon_root) {
+        Some(canon_target)
+    } else {
+        None
+    }
+}
+
+fn read_bounded_preview_bytes(path: &Path, max_bytes: usize) -> std::io::Result<(Vec<u8>, u64, bool)> {
+    let f = std::fs::File::open(path)?;
+    let total_len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    let mut buf = Vec::with_capacity(max_bytes.min(total_len as usize).saturating_add(1));
+    f.take((max_bytes + 1) as u64).read_to_end(&mut buf)?;
+    let truncated = buf.len() > max_bytes;
+    if truncated {
+        buf.truncate(max_bytes);
+    }
+    Ok((buf, total_len, truncated))
+}
+
 fn run_git(repo_path: &Path, args: &[&str]) -> Option<String> {
     let out = Command::new("git")
+        .arg("-c")
+        .arg("core.quotePath=false")
         .arg("-C")
         .arg(repo_path)
         .args(args)
+        .env("PATH", crate::config::augmented_gui_path_string())
+        .env("GIT_TERMINAL_PROMPT", "0")
         .output()
         .ok()?;
     if !out.status.success() {
@@ -106,17 +148,20 @@ pub fn compute_repo_snapshot(
     let status_raw = run_git(repo_path, &["status", "--porcelain=v1", "-uall"]).unwrap_or_default();
     let mut changed_files = Vec::new();
     for line in status_raw.lines() {
-        if line.len() < 4 {
+        let Some(code_raw) = line.get(..2) else {
             continue;
-        }
-        let code = line[..2].trim().to_string();
-        let raw_path = line[3..].trim();
-        let path = raw_path
-            .rsplit(" -> ")
-            .next()
-            .unwrap_or(raw_path)
-            .trim_matches('"')
-            .to_string();
+        };
+        let Some(rest) = line.get(3..) else {
+            continue;
+        };
+        let code = code_raw.trim().to_string();
+        let raw_path = rest.trim();
+        let target_raw = raw_path.rsplit(" -> ").next().unwrap_or(raw_path);
+        let path = if target_raw.starts_with('"') && target_raw.ends_with('"') && target_raw.len() >= 2 {
+            target_raw[1..target_raw.len() - 1].to_string()
+        } else {
+            target_raw.to_string()
+        };
         changed_files.push(ChangedFileEntry {
             status: if code.is_empty() { "M".into() } else { code },
             path,
@@ -161,17 +206,42 @@ pub fn compute_repo_snapshot(
                 patch = run_git(repo_path, &["diff", "--cached", "--", rel]).unwrap_or_default();
             }
             if patch.trim().is_empty() {
-                // Untracked or binary fallback: read plain file content prefixed as additions.
-                let abs = repo_path.join(rel);
-                patch = read_untracked_diff_preview(&abs, rel);
+                // Untracked or binary fallback: safely read bounded preview inside repo root.
+                if let Some(abs) = resolve_contained_path(repo_path, rel) {
+                    patch = read_untracked_diff_preview(&abs, rel);
+                } else {
+                    patch = format!("(Blocked path outside workspace: {rel})");
+                }
             }
             (format!("Working Tree: {rel}"), truncate_lines(&patch, 400))
         }
         Some(sel) if sel.starts_with("commit:") => {
-            let sha = &sel["commit:".len()..];
-            let show = run_git(repo_path, &["show", "--stat", "--patch", "--max-count=1", sha])
+            let sha = sel["commit:".len()..].trim();
+            if sha.is_empty()
+                || sha.starts_with('-')
+                || sha.len() > 64
+                || !sha.chars().all(|c| c.is_ascii_hexdigit())
+            {
+                (
+                    "Invalid commit ref".into(),
+                    "Refusing invalid or ambiguous commit selector.".into(),
+                )
+            } else {
+                let show = run_git(
+                    repo_path,
+                    &[
+                        "show",
+                        "--stat",
+                        "--patch",
+                        "--max-count=1",
+                        "--end-of-options",
+                        sha,
+                        "--",
+                    ],
+                )
                 .unwrap_or_else(|| "Unable to load commit diff.".into());
-            (format!("Commit {sha}"), truncate_lines(&show, 400))
+                (format!("Commit {sha}"), truncate_lines(&show, 400))
+            }
         }
         _ => (
             format!("{repo_name} ({branch})"),
@@ -214,12 +284,12 @@ fn compute_numstat(repo_path: &Path) -> (u32, u32) {
 }
 
 fn read_untracked_diff_preview(path: &Path, rel: &str) -> String {
-    let Ok(bytes) = std::fs::read(path) else {
+    let Ok((bytes, total_len, truncated_bytes)) = read_bounded_preview_bytes(path, MAX_PREVIEW_BYTES) else {
         return format!("(Cannot read file: {rel})");
     };
     let sample = &bytes[..bytes.len().min(4096)];
     if sample.contains(&0) {
-        return format!("Binary file ({} bytes): {rel}", bytes.len());
+        return format!("Binary file ({total_len} bytes): {rel}");
     }
     let text = String::from_utf8_lossy(&bytes);
     let mut out = format!("+++ b/{rel} (untracked)\n");
@@ -230,6 +300,9 @@ fn read_untracked_diff_preview(path: &Path, rel: &str) -> String {
         if idx == 299 {
             out.push_str("... (truncated at 300 lines)\n");
         }
+    }
+    if truncated_bytes {
+        out.push_str(&format!("... (preview capped at {MAX_PREVIEW_BYTES} bytes)\n"));
     }
     out
 }
@@ -253,7 +326,16 @@ fn truncate_lines(input: &str, max_lines: usize) -> String {
 
 /// Lists non-hidden entries (plus `.github` / `.env.example` excluding `.git`) inside `dir`.
 pub fn list_workspace_dir(repo_root: &Path, dir: &Path) -> Vec<WorkspaceFileEntry> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
+    let Some(canon_root) = std::fs::canonicalize(repo_root).ok() else {
+        return Vec::new();
+    };
+    let Ok(canon_dir) = std::fs::canonicalize(dir) else {
+        return Vec::new();
+    };
+    if !canon_dir.starts_with(&canon_root) {
+        return Vec::new();
+    }
+    let Ok(entries) = std::fs::read_dir(&canon_dir) else {
         return Vec::new();
     };
     let mut items: Vec<WorkspaceFileEntry> = entries
@@ -263,18 +345,27 @@ pub fn list_workspace_dir(repo_root: &Path, dir: &Path) -> Vec<WorkspaceFileEntr
             if name == ".git" || name == ".DS_Store" || name == "target" || name == "node_modules" {
                 return None;
             }
-            let full = e.path();
-            let meta = e.metadata().ok();
-            let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or_else(|| full.is_dir());
+            let raw_full = e.path();
+            let Ok(canon_full) = std::fs::canonicalize(&raw_full) else {
+                return None;
+            };
+            if !canon_full.starts_with(&canon_root) {
+                return None;
+            }
+            let meta = std::fs::metadata(&canon_full).ok();
+            let is_dir = meta
+                .as_ref()
+                .map(|m| m.is_dir())
+                .unwrap_or_else(|| canon_full.is_dir());
             let size_bytes = meta.map(|m| m.len()).unwrap_or(0);
-            let rel_path = full
-                .strip_prefix(repo_root)
-                .unwrap_or(&full)
+            let rel_path = canon_full
+                .strip_prefix(&canon_root)
+                .ok()?
                 .to_string_lossy()
                 .to_string();
             Some(WorkspaceFileEntry {
                 name,
-                full_path: full.to_string_lossy().to_string(),
+                full_path: canon_full.to_string_lossy().to_string(),
                 rel_path,
                 is_dir,
                 size_bytes,
@@ -290,14 +381,14 @@ pub fn list_workspace_dir(repo_root: &Path, dir: &Path) -> Vec<WorkspaceFileEntr
     items
 }
 
-/// Reads up to `max_lines` of a UTF-8 text file for previewing inside the `Files` inspector tab.
+/// Reads up to `max_lines` (and at most `MAX_PREVIEW_BYTES`) of a UTF-8 text file for previewing inside the `Files` inspector tab.
 pub fn read_workspace_file_preview(path: &Path, max_lines: usize) -> String {
-    let Ok(bytes) = std::fs::read(path) else {
+    let Ok((bytes, total_len, truncated_bytes)) = read_bounded_preview_bytes(path, MAX_PREVIEW_BYTES) else {
         return format!("Unable to read {}", path.display());
     };
     let sample = &bytes[..bytes.len().min(4096)];
     if sample.contains(&0) {
-        return format!("Binary file ({} bytes)", bytes.len());
+        return format!("Binary file ({total_len} bytes)");
     }
     let text = String::from_utf8_lossy(&bytes);
     let mut numbered = Vec::new();
@@ -312,6 +403,8 @@ pub fn read_workspace_file_preview(path: &Path, max_lines: usize) -> String {
     let mut out = numbered.join("\n");
     if total_truncated {
         out.push_str(&format!("\n... (truncated at {max_lines} lines)"));
+    } else if truncated_bytes {
+        out.push_str(&format!("\n... (preview capped at {MAX_PREVIEW_BYTES} bytes)"));
     }
     if out.is_empty() {
         "(empty file)".into()

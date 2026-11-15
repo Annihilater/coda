@@ -2,9 +2,64 @@
 //! and real local Git repository discovery for `coda-desktop`.
 
 use std::collections::HashSet;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, RwLock};
 
 use serde::{Deserialize, Serialize};
+
+static CONFIG_DIR_OVERRIDE: RwLock<Option<PathBuf>> = RwLock::new(None);
+static ATOMIC_WRITE_SEQ: AtomicU64 = AtomicU64::new(1);
+static ATOMIC_WRITE_LOCK: Mutex<()> = Mutex::new(());
+
+/// Sets or clears an explicit configuration root directory override (used by `--self-test` and unit tests).
+pub fn set_config_root_override(dir: Option<PathBuf>) {
+    if let Ok(mut g) = CONFIG_DIR_OVERRIDE.write() {
+        *g = dir;
+    }
+}
+
+/// Writes `bytes` atomically to `path` with explicit Unix file permissions (`mode`), `sync_all`, and rename.
+pub fn write_file_atomic_mode(path: &Path, bytes: &[u8], mode: u32) -> anyhow::Result<()> {
+    let _guard = ATOMIC_WRITE_LOCK
+        .lock()
+        .map_err(|_| anyhow::anyhow!("atomic write lock poisoned"))?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("target path has no parent: {}", path.display()))?;
+    std::fs::create_dir_all(parent)?;
+    let seq = ATOMIC_WRITE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("coda.tmp");
+    let tmp_path = parent.join(format!(".{file_name}.tmp.{pid}.{seq}"));
+
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(mode);
+    }
+    let write_res: anyhow::Result<()> = (|| {
+        let mut f = opts.open(&tmp_path)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        Ok(())
+    })();
+    if let Err(e) = write_res {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+    if let Err(e) = std::fs::rename(&tmp_path, path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e.into());
+    }
+    Ok(())
+}
 
 /// Supported UI locales for the Coda desktop workbench. Defaults to English (`En`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -35,8 +90,13 @@ impl UiLocale {
     }
 }
 
-/// Returns `~/.config/coda`.
+/// Returns `~/.config/coda` (or the test/self-test override directory if set).
 pub fn config_root_dir() -> Option<PathBuf> {
+    if let Ok(g) = CONFIG_DIR_OVERRIDE.read() {
+        if let Some(dir) = g.as_ref() {
+            return Some(dir.clone());
+        }
+    }
     let home = std::env::var("HOME").ok()?;
     if home.trim().is_empty() {
         return None;
@@ -52,10 +112,10 @@ pub fn tr<'a>(locale: UiLocale, en: &'a str, zh: &'a str) -> &'a str {
     }
 }
 
-/// Normalizes `PATH` when launched from a macOS `.app` bundle (Finder/Dock launchd
-/// passes only `/usr/bin:/bin:/usr/sbin:/sbin`) so `git`, `hc`, `cargo`, `claude`,
-/// `codex`, `gemini`, `bun`, and Homebrew tools resolve reliably.
-pub fn ensure_macos_gui_path() {
+/// Computes an augmented `PATH` string suitable for child processes launched from a macOS
+/// `.app` bundle (where launchd only passes `/usr/bin:/bin:/usr/sbin:/sbin`) WITHOUT mutating
+/// the global process environment (`std::env::set_var`), eliminating multi-threaded getenv/setenv UB.
+pub fn augmented_gui_path_string() -> String {
     let home = std::env::var("HOME").unwrap_or_default();
     let current = std::env::var("PATH").unwrap_or_default();
 
@@ -88,9 +148,17 @@ pub fn ensure_macos_gui_path() {
         }
     }
 
-    if !ordered.is_empty() {
-        std::env::set_var("PATH", ordered.join(":"));
+    if ordered.is_empty() {
+        current
+    } else {
+        ordered.join(":")
     }
+}
+
+/// Retained for API compatibility; child spawns use `augmented_gui_path_string()` directly so no
+/// unsafe global `std::env::set_var("PATH", ...)` mutation occurs after threads start.
+pub fn ensure_macos_gui_path() {
+    let _ = augmented_gui_path_string();
 }
 
 /// Persisted user desktop preferences stored at `~/.config/coda/desktop.json`.
@@ -126,8 +194,9 @@ impl Default for DesktopPreferences {
 
 impl DesktopPreferences {
     pub fn default_path() -> PathBuf {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-        PathBuf::from(home).join(".config/coda/desktop.json")
+        config_root_dir()
+            .unwrap_or_else(|| PathBuf::from(".config/coda"))
+            .join("desktop.json")
     }
 
     pub fn load_or_default() -> Self {
@@ -140,11 +209,8 @@ impl DesktopPreferences {
 
     pub fn save(&self) -> anyhow::Result<()> {
         let path = Self::default_path();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
         let body = serde_json::to_string_pretty(self)?;
-        std::fs::write(&path, body)?;
+        write_file_atomic_mode(&path, body.as_bytes(), 0o600)?;
         Ok(())
     }
 }
@@ -355,26 +421,40 @@ pub fn pick_folder_via_native_dialog() -> Option<String> {
 /// Formats an absolute filesystem path cleanly using `~` for `$HOME` when possible.
 pub fn display_compact_path(path: &str) -> String {
     if let Ok(home) = std::env::var("HOME") {
-        if !home.is_empty() && path.starts_with(&home) {
-            let rest = &path[home.len()..];
-            if rest.is_empty() {
+        let home_trimmed = home.trim_end_matches('/');
+        if !home_trimmed.is_empty() {
+            if path == home_trimmed {
                 return "~".into();
             }
-            return format!("~{rest}");
+            if let Some(rest) = path.strip_prefix(home_trimmed) {
+                if rest.starts_with('/') {
+                    return format!("~{rest}");
+                }
+            }
         }
     }
     path.to_string()
 }
 
-/// Opens a local folder in macOS Finder (`open <path>`).
+/// Opens an existing canonicalized local directory or file in macOS Finder (`open <path>`) / Linux file manager.
 pub fn reveal_in_finder(path: &str) {
+    let trimmed = path.trim();
+    if trimmed.is_empty() || trimmed.contains("://") {
+        return;
+    }
+    let Ok(canon) = std::fs::canonicalize(trimmed) else {
+        return;
+    };
+    if !canon.is_dir() && !canon.is_file() {
+        return;
+    }
     #[cfg(target_os = "macos")]
     {
-        let _ = std::process::Command::new("open").arg(path).spawn();
+        let _ = std::process::Command::new("open").arg(&canon).spawn();
     }
     #[cfg(target_os = "linux")]
     {
-        let _ = std::process::Command::new("xdg-open").arg(path).spawn();
+        let _ = std::process::Command::new("xdg-open").arg(&canon).spawn();
     }
 }
 
@@ -480,11 +560,8 @@ impl MalleableLayoutConfig {
 
     pub fn save(&self) -> Result<(), String> {
         let path = Self::path().ok_or_else(|| "cannot resolve config directory".to_string())?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-        }
         let payload = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
-        std::fs::write(&path, payload).map_err(|e| e.to_string())
+        write_file_atomic_mode(&path, payload.as_bytes(), 0o644).map_err(|e| e.to_string())
     }
 
     pub fn accent_color_u32(&self) -> u32 {
@@ -506,7 +583,6 @@ pub fn ensure_agents_md_manual() -> Option<PathBuf> {
     let dir = config_root_dir()?;
     let path = dir.join("AGENTS.md");
     if !path.exists() {
-        let _ = std::fs::create_dir_all(&dir);
         let manual = r##"# Coda Workbench & Agent Integration Guide
 
 Coda watches `~/.config/coda/layout.json` (hot-reloaded every 1s) so you or agents running inside Coda can adapt the workspace layout programmatically.
@@ -543,7 +619,7 @@ printf '\033]7501;state=idle\007'
 
 When `hc` (`herdr-core`) is installed, Coda attaches sessions via `hc attach` so agent processes continue running even if the desktop window is closed.
 "##;
-        let _ = std::fs::write(&path, manual);
+        let _ = write_file_atomic_mode(&path, manual.as_bytes(), 0o644);
     }
     Some(path)
 }
@@ -564,4 +640,75 @@ pub fn space_avatar_color(name: &str) -> u32 {
         .bytes()
         .fold(2166136261u32, |acc, b| acc.wrapping_mul(16777619) ^ (b as u32));
     PALETTE[(hash as usize) % PALETTE.len()]
+}
+
+/// Persisted E2EE desktop client identity (`~/.config/coda/desktop_client_identity.json`, mode `0600`)
+/// so desktop restarts reuse one registered client device instead of minting endless devices on the server.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DesktopClientIdentityRecord {
+    pub server_url: String,
+    pub token_sha256_hex: String,
+    pub device_id: uuid::Uuid,
+    pub identity: coda_protocol::StoredDeviceIdentity,
+}
+
+impl DesktopClientIdentityRecord {
+    pub fn default_path() -> PathBuf {
+        config_root_dir()
+            .unwrap_or_else(|| PathBuf::from(".config/coda"))
+            .join("desktop_client_identity.json")
+    }
+
+    pub fn token_hash_hex(server_url: &str, token: &str) -> String {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(server_url.trim().trim_end_matches('/').as_bytes());
+        h.update(b"|");
+        h.update(token.trim().as_bytes());
+        hex::encode(h.finalize())
+    }
+
+    pub fn load_matching(server_url: &str, token: &str) -> Option<(uuid::Uuid, coda_protocol::StoredDeviceIdentity)> {
+        let path = Self::default_path();
+        let raw = std::fs::read_to_string(&path).ok()?;
+        let rec: Self = serde_json::from_str(&raw).ok()?;
+        let expected_hash = Self::token_hash_hex(server_url, token);
+        let clean_server = server_url.trim().trim_end_matches('/');
+        if rec.server_url.trim().trim_end_matches('/') == clean_server
+            && rec.token_sha256_hex == expected_hash
+        {
+            Some((rec.device_id, rec.identity))
+        } else {
+            None
+        }
+    }
+
+    pub fn save_for_token(
+        server_url: &str,
+        token: &str,
+        device_id: uuid::Uuid,
+        identity: &coda_protocol::StoredDeviceIdentity,
+    ) -> anyhow::Result<()> {
+        let rec = Self {
+            server_url: server_url.trim().trim_end_matches('/').to_string(),
+            token_sha256_hex: Self::token_hash_hex(server_url, token),
+            device_id,
+            identity: identity.clone(),
+        };
+        let body = serde_json::to_string_pretty(&rec)?;
+        write_file_atomic_mode(&Self::default_path(), body.as_bytes(), 0o600)?;
+        Ok(())
+    }
+
+    pub fn remove_saved() {
+        let _ = std::fs::remove_file(Self::default_path());
+    }
+}
+
+/// Validates that `raw` is a clean `http://` or `https://` URL with no whitespace or control characters.
+pub fn is_safe_http_url(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    (trimmed.starts_with("https://") || trimmed.starts_with("http://"))
+        && trimmed.len() <= 2048
+        && !trimmed.chars().any(|c| c.is_control() || c.is_whitespace())
 }

@@ -1,6 +1,8 @@
 use anyhow::Result;
 use clap::Parser;
-use coda_desktop::config::{ensure_agents_md_manual, ensure_macos_gui_path, MalleableLayoutConfig};
+use coda_desktop::config::{
+    ensure_agents_md_manual, ensure_macos_gui_path, set_config_root_override, MalleableLayoutConfig,
+};
 use coda_desktop::git_inspector::compute_repo_snapshot;
 use coda_desktop::pty::LocalPtyManager;
 use coda_desktop::{launch_gpui_desktop_app, CodaDesktopState};
@@ -22,6 +24,8 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     if cli.self_test {
         ensure_macos_gui_path();
+        let tmp_cfg = std::env::temp_dir().join(format!("coda-desktop-selftest-{}", std::process::id()));
+        set_config_root_override(Some(tmp_cfg.clone()));
         MalleableLayoutConfig::save_default_if_missing();
         ensure_agents_md_manual();
 
@@ -43,6 +47,8 @@ fn main() -> Result<()> {
 
         let git_snap = compute_repo_snapshot(&cwd, None);
         let st = CodaDesktopState::default();
+        set_config_root_override(None);
+        let _ = std::fs::remove_dir_all(&tmp_cfg);
         anyhow::ensure!(st.sessions.is_empty(), "default state must not seed fake sessions");
         anyhow::ensure!(st.spaces.is_empty(), "default state must not seed fake spaces");
         anyhow::ensure!(pty_ok, "real local PTY self-test failed to observe echoed marker");

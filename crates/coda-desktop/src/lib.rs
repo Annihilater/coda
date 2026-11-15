@@ -21,28 +21,30 @@ use std::time::{Duration, Instant, SystemTime};
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use coda_daemon::{
     list_account_hosts, login_with_password_and_enroll, mint_peer_relay_config,
-    poll_device_login_until_approved, start_device_login_flow, start_embedded_host_if_configured,
-    subscribe_account_events_ws, DaemonConfig, LivePeerSession, PeerAsyncEvent, RemoteHostSummary,
+    poll_device_login_until_approved, start_device_login_flow, start_embedded_host_with_handle,
+    subscribe_account_events_ws, DaemonConfig, EmbeddedHostHandle, LivePeerSession, PeerAsyncEvent,
+    RemoteHostSummary,
 };
 use coda_herdr::{discover_hc_binary, ensure_or_install_hc_binary, HerdrClient};
 use coda_protocol::{HerdrTerminalSummary, PeerMessage, RemoteFileItem, TrafficLane};
 use gpui::{
-    actions, div, point, prelude::*, px, rgb, rgba, size, App, Application, Bounds, ClickEvent,
-    ClipboardItem, Context, FocusHandle, Focusable, FontWeight, HighlightStyle, Hsla, KeyBinding,
-    Menu, MenuItem, MouseButton, MouseDownEvent, ScrollDelta, ScrollWheelEvent, SharedString,
-    StyledText, SystemMenuType, TitlebarOptions, Window, WindowBounds, WindowOptions,
+    actions, canvas, div, point, prelude::*, px, rgb, rgba, size, App, Application, Bounds,
+    ClickEvent, ClipboardItem, Context, ElementInputHandler, EntityInputHandler, FocusHandle,
+    Focusable, FontWeight, HighlightStyle, Hsla, KeyBinding, KeyDownEvent, Menu, MenuItem,
+    MouseButton, MouseDownEvent, Pixels, ScrollDelta, ScrollWheelEvent, SharedString, StyledText,
+    SystemMenuType, TitlebarOptions, UTF16Selection, Window, WindowBounds, WindowOptions,
 };
 use uuid::Uuid;
 
 use crate::config::{
     config_root_dir, detect_local_machine_name, discover_local_git_repositories,
-    display_compact_path, ensure_agents_md_manual, ensure_macos_gui_path,
-    pick_folder_via_native_dialog, reveal_in_finder, space_avatar_color, tr, DesktopPreferences,
-    LayoutMode, MalleableLayoutConfig, UiLocale,
+    display_compact_path, ensure_agents_md_manual, ensure_macos_gui_path, is_safe_http_url,
+    pick_folder_via_native_dialog, reveal_in_finder, space_avatar_color, tr,
+    DesktopClientIdentityRecord, DesktopPreferences, LayoutMode, MalleableLayoutConfig, UiLocale,
 };
 use crate::git_inspector::{
-    compute_repo_snapshot, list_workspace_dir, read_workspace_file_preview, ChangedFileEntry,
-    RepoInspectorSnapshot, WorkspaceFileEntry,
+    compute_repo_snapshot, list_workspace_dir, read_workspace_file_preview, resolve_contained_path,
+    ChangedFileEntry, RepoInspectorSnapshot, WorkspaceFileEntry,
 };
 use crate::pty::{AgentLifecycleState, LocalPtyManager, Osc7501Status, StyledTerminalLine};
 
@@ -92,7 +94,7 @@ pub enum ActiveInputTarget {
 }
 
 /// Primary or Secondary split terminal pane.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum SplitPane {
     #[default]
     Primary,
@@ -464,6 +466,12 @@ pub struct CodaGpuWorkspaceView {
     pub ui_dirty: Arc<AtomicBool>,
     pub mesh_hub: Arc<RemoteMeshHub>,
     pub focus_handle: FocusHandle,
+    ime_bounds: Arc<Mutex<Option<Bounds<Pixels>>>>,
+    marked_text: String,
+    viewport_dims: Arc<Mutex<HashMap<String, (u16, u16)>>>,
+    visible_rows_by_pane: Arc<Mutex<HashMap<SplitPane, usize>>>,
+    pty_synced_gen: Mutex<HashMap<String, (u64, bool)>>,
+    inspector_seq: Arc<AtomicU64>,
 }
 
 impl Focusable for CodaGpuWorkspaceView {
@@ -472,11 +480,114 @@ impl Focusable for CodaGpuWorkspaceView {
     }
 }
 
+fn utf16_slice(s: &str, range_utf16: std::ops::Range<usize>) -> String {
+    let utf16: Vec<u16> = s.encode_utf16().collect();
+    let start = range_utf16.start.min(utf16.len());
+    let end = range_utf16.end.min(utf16.len()).max(start);
+    String::from_utf16_lossy(&utf16[start..end])
+}
+
+impl EntityInputHandler for CodaGpuWorkspaceView {
+    fn text_for_range(
+        &mut self,
+        range: std::ops::Range<usize>,
+        adjusted_range: &mut Option<std::ops::Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<String> {
+        let len = self.marked_text.encode_utf16().count();
+        let clamped_start = range.start.min(len);
+        let clamped_end = range.end.min(len).max(clamped_start);
+        *adjusted_range = Some(clamped_start..clamped_end);
+        Some(utf16_slice(&self.marked_text, clamped_start..clamped_end))
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled_input: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        let len = self.marked_text.encode_utf16().count();
+        Some(UTF16Selection {
+            range: len..len,
+            reversed: false,
+        })
+    }
+
+    fn marked_text_range(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<std::ops::Range<usize>> {
+        let len = self.marked_text.encode_utf16().count();
+        if len == 0 {
+            None
+        } else {
+            Some(0..len)
+        }
+    }
+
+    fn unmark_text(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if !self.marked_text.is_empty() {
+            self.marked_text.clear();
+            cx.notify();
+        }
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        _range: Option<std::ops::Range<usize>>,
+        text: &str,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.marked_text.clear();
+        if !text.is_empty() {
+            self.commit_text_to_active_target(text);
+        }
+        cx.notify();
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        _range: Option<std::ops::Range<usize>>,
+        new_text: &str,
+        _new_selected_range: Option<std::ops::Range<usize>>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.marked_text = new_text.to_string();
+        cx.notify();
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        _range_utf16: std::ops::Range<usize>,
+        element_bounds: Bounds<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        self.ime_bounds
+            .lock()
+            .ok()
+            .and_then(|g| *g)
+            .or(Some(element_bounds))
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _point: gpui::Point<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        None
+    }
+}
+
 impl CodaGpuWorkspaceView {
     pub fn new(cx: &mut Context<Self>) -> Self {
         ensure_macos_gui_path();
-        MalleableLayoutConfig::save_default_if_missing();
-        ensure_agents_md_manual();
 
         let prefs = DesktopPreferences::load_or_default();
         let (layout_cfg, layout_mtime) = MalleableLayoutConfig::load_with_mtime();
@@ -503,55 +614,34 @@ impl CodaGpuWorkspaceView {
 
         init_state.dismissed_spaces = prefs.dismissed_spaces.iter().cloned().collect();
 
-        // Discover real local repositories + saved user folders, falling back to `$HOME` if none exist.
-        let mut candidates: Vec<PathBuf> = discover_local_git_repositories(&prefs.workspace_roots)
-            .into_iter()
-            .filter(|p| {
-                !init_state.dismissed_spaces.contains(p)
-                    && !init_state.dismissed_spaces.contains(&format!("local:{p}"))
-            })
-            .map(PathBuf::from)
-            .collect();
-        if candidates.is_empty() {
-            if let Ok(home) = std::env::var("HOME") {
-                if !init_state.dismissed_spaces.contains(&home)
-                    && !init_state
-                        .dismissed_spaces
-                        .contains(&format!("local:{home}"))
-                {
-                    candidates.push(PathBuf::from(home));
-                }
-            } else if let Ok(cwd) = std::env::current_dir() {
-                let cwd_s = cwd.to_string_lossy().to_string();
-                if !init_state.dismissed_spaces.contains(&cwd_s)
-                    && !init_state
-                        .dismissed_spaces
-                        .contains(&format!("local:{cwd_s}"))
-                {
-                    candidates.push(cwd);
-                }
-            }
-        }
-
+        // Seed fast placeholder local spaces from saved roots so GPUI first paint never blocks on git subprocesses.
         let machine_label = init_state.local_machine_name.clone();
-        for path in candidates {
-            let snap = compute_repo_snapshot(&path, None);
-            let name = path
+        for raw_root in &prefs.workspace_roots {
+            let p = PathBuf::from(raw_root.trim());
+            if !p.is_dir() {
+                continue;
+            }
+            let path_str = p.to_string_lossy().to_string();
+            if init_state.dismissed_spaces.contains(&path_str)
+                || init_state.dismissed_spaces.contains(&format!("local:{path_str}"))
+            {
+                continue;
+            }
+            let name = p
                 .file_name()
                 .and_then(|s| s.to_str())
                 .unwrap_or("workspace")
                 .to_string();
-            let path_str = path.to_string_lossy().to_string();
             init_state.spaces.push(SpaceEntry {
-                id: format!("local:{}", path_str),
+                id: format!("local:{path_str}"),
                 avatar_color: space_avatar_color(&name),
                 name,
                 path: path_str,
                 machine_id: "local".to_string(),
                 machine_label: machine_label.clone(),
                 is_remote: false,
-                branch: snap.branch,
-                dirty_files: snap.changed_files.len(),
+                branch: "…".to_string(),
+                dirty_files: 0,
                 ahead: 0,
                 behind: 0,
             });
@@ -576,6 +666,7 @@ impl CodaGpuWorkspaceView {
             Arc::clone(&pty_mgr),
             Arc::clone(&ui_dirty),
         );
+        let inspector_seq = Arc::new(AtomicU64::new(0));
 
         let view = Self {
             state: Arc::clone(&state),
@@ -583,10 +674,125 @@ impl CodaGpuWorkspaceView {
             ui_dirty: Arc::clone(&ui_dirty),
             mesh_hub: Arc::clone(&mesh_hub),
             focus_handle: cx.focus_handle(),
+            ime_bounds: Arc::new(Mutex::new(None)),
+            marked_text: String::new(),
+            viewport_dims: Arc::new(Mutex::new(HashMap::new())),
+            visible_rows_by_pane: Arc::new(Mutex::new(HashMap::new())),
+            pty_synced_gen: Mutex::new(HashMap::new()),
+            inspector_seq: Arc::clone(&inspector_seq),
         };
 
-        // Inspect active Git/Files workspace and start pure `herdr-core` + real-time mesh sync.
-        view.refresh_active_space_inspector();
+        // Run filesystem/git discovery and default config creation off the GPUI UI thread.
+        let state_bg = Arc::clone(&state);
+        let ui_dirty_bg = Arc::clone(&ui_dirty);
+        let saved_roots = prefs.workspace_roots.clone();
+        let selected_repo = prefs.selected_repo_path.clone();
+        let dismissed_clone = prefs.dismissed_spaces.clone();
+        let seq_bg = Arc::clone(&inspector_seq);
+        std::thread::spawn(move || {
+            MalleableLayoutConfig::save_default_if_missing();
+            ensure_agents_md_manual();
+
+            let mut candidates: Vec<PathBuf> = discover_local_git_repositories(&saved_roots)
+                .into_iter()
+                .filter(|p| {
+                    !dismissed_clone.contains(p)
+                        && !dismissed_clone.contains(&format!("local:{p}"))
+                })
+                .map(PathBuf::from)
+                .collect();
+            if candidates.is_empty() {
+                if let Ok(home) = std::env::var("HOME") {
+                    if !dismissed_clone.contains(&home)
+                        && !dismissed_clone.contains(&format!("local:{home}"))
+                    {
+                        candidates.push(PathBuf::from(home));
+                    }
+                } else if let Ok(cwd) = std::env::current_dir() {
+                    let cwd_s = cwd.to_string_lossy().to_string();
+                    if !dismissed_clone.contains(&cwd_s)
+                        && !dismissed_clone.contains(&format!("local:{cwd_s}"))
+                    {
+                        candidates.push(cwd);
+                    }
+                }
+            }
+
+            let mut discovered_spaces = Vec::new();
+            for path in candidates {
+                let snap = compute_repo_snapshot(&path, None);
+                let name = path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("workspace")
+                    .to_string();
+                let path_str = path.to_string_lossy().to_string();
+                discovered_spaces.push((
+                    SpaceEntry {
+                        id: format!("local:{path_str}"),
+                        avatar_color: space_avatar_color(&name),
+                        name,
+                        path: path_str,
+                        machine_id: "local".to_string(),
+                        machine_label: machine_label.clone(),
+                        is_remote: false,
+                        branch: snap.branch.clone(),
+                        dirty_files: snap.changed_files.len(),
+                        ahead: 0,
+                        behind: 0,
+                    },
+                    snap,
+                ));
+            }
+
+            let first_inspect: Option<(String, PathBuf)> = {
+                let Ok(mut g) = state_bg.lock() else {
+                    return;
+                };
+                for (sp, snap) in &discovered_spaces {
+                    if !g.dismissed_spaces.contains(&sp.id)
+                        && !g.dismissed_spaces.contains(&sp.path)
+                    {
+                        if let Some(existing) = g.spaces.iter_mut().find(|s| s.id == sp.id) {
+                            existing.branch = snap.branch.clone();
+                            existing.dirty_files = snap.changed_files.len();
+                        } else {
+                            g.spaces.push(sp.clone());
+                        }
+                    }
+                }
+                if g.active_space_id.is_none() {
+                    g.active_space_id = selected_repo
+                        .as_deref()
+                        .and_then(|sel| {
+                            g.spaces
+                                .iter()
+                                .find(|s| s.id == sel || s.path == sel)
+                                .map(|s| s.id.clone())
+                        })
+                        .or_else(|| g.spaces.first().map(|s| s.id.clone()));
+                }
+                g.active_space()
+                    .filter(|sp| !sp.is_remote)
+                    .map(|sp| (sp.id.clone(), PathBuf::from(&sp.path)))
+            };
+
+            if let Some((sp_id, sp_path)) = first_inspect {
+                let cur_seq = seq_bg.load(Ordering::Acquire);
+                let snap = compute_repo_snapshot(&sp_path, None);
+                let entries = list_workspace_dir(&sp_path, &sp_path);
+                if seq_bg.load(Ordering::Acquire) == cur_seq {
+                    if let Ok(mut g) = state_bg.lock() {
+                        if g.active_space_id.as_deref() == Some(sp_id.as_str()) {
+                            g.repo_snapshot = snap;
+                            g.dir_entries = entries;
+                        }
+                    }
+                }
+            }
+            ui_dirty_bg.store(true, Ordering::Release);
+        });
+
         spawn_herdr_discovery(Arc::clone(&state), Arc::clone(&pty_mgr), Arc::clone(&ui_dirty));
         mesh_hub.ensure_embedded_host();
         mesh_hub.start_account_sync();
@@ -649,11 +855,411 @@ impl CodaGpuWorkspaceView {
         true
     }
 
-    fn persist_layout_config(&self) {
-        if let Ok(mut g) = self.state.lock() {
-            let _ = g.layout.save();
-            g.layout_mtime = MalleableLayoutConfig::load_with_mtime().1;
+    fn update_prefs_async<F>(f: F)
+    where
+        F: FnOnce(&mut DesktopPreferences) + Send + 'static,
+    {
+        std::thread::spawn(move || {
+            let mut prefs = DesktopPreferences::load_or_default();
+            f(&mut prefs);
+            let _ = prefs.save();
+        });
+    }
+
+    fn keystroke_to_terminal_bytes(
+        key: &str,
+        mods: &gpui::Modifiers,
+        key_char: Option<&str>,
+    ) -> Option<Vec<u8>> {
+        if mods.control && !mods.platform && !mods.alt {
+            if key == "space" {
+                return Some(vec![0x00]);
+            }
+            if key.len() == 1 {
+                let b = key.as_bytes()[0].to_ascii_lowercase();
+                return match b {
+                    b'a'..=b'z' => Some(vec![b - b'a' + 1]),
+                    b'@' => Some(vec![0x00]),
+                    b'[' => Some(vec![0x1b]),
+                    b'\\' => Some(vec![0x1c]),
+                    b']' => Some(vec![0x1d]),
+                    b'^' => Some(vec![0x1e]),
+                    b'_' => Some(vec![0x1f]),
+                    _ => None,
+                };
+            }
+            return None;
         }
+
+        if mods.alt && !mods.platform && !mods.control {
+            match key {
+                "backspace" => return Some(vec![0x1b, 0x7f]),
+                "left" => return Some(b"\x1b[1;3D".to_vec()),
+                "right" => return Some(b"\x1b[1;3C".to_vec()),
+                "up" => return Some(b"\x1b[1;3A".to_vec()),
+                "down" => return Some(b"\x1b[1;3B".to_vec()),
+                _ => {
+                    if let Some(ch) = key_char.filter(|s| !s.is_empty()) {
+                        let mut out = vec![0x1b];
+                        out.extend_from_slice(ch.as_bytes());
+                        return Some(out);
+                    }
+                    if key.len() == 1 && key.is_ascii() {
+                        return Some(vec![0x1b, key.as_bytes()[0]]);
+                    }
+                    return None;
+                }
+            }
+        }
+
+        if mods.control || mods.platform || mods.alt {
+            return None;
+        }
+
+        match key {
+            "enter" | "return" => Some(b"\r".to_vec()),
+            "backspace" => Some(vec![0x7f]),
+            "delete" => Some(b"\x1b[3~".to_vec()),
+            "tab" => Some(if mods.shift {
+                b"\x1b[Z".to_vec()
+            } else {
+                b"\t".to_vec()
+            }),
+            "escape" => Some(vec![0x1b]),
+            "up" => Some(b"\x1b[A".to_vec()),
+            "down" => Some(b"\x1b[B".to_vec()),
+            "right" => Some(b"\x1b[C".to_vec()),
+            "left" => Some(b"\x1b[D".to_vec()),
+            "home" => Some(b"\x1b[H".to_vec()),
+            "end" => Some(b"\x1b[F".to_vec()),
+            "pageup" => Some(b"\x1b[5~".to_vec()),
+            "pagedown" => Some(b"\x1b[6~".to_vec()),
+            _ => None,
+        }
+    }
+
+    fn commit_text_to_active_target(&self, text: &str) {
+        let (target, palette_open, settings_open, focused_id) = self
+            .state
+            .lock()
+            .map(|g| {
+                (
+                    g.input_target,
+                    g.palette_open,
+                    g.settings_open,
+                    g.focused_session_id().map(|s| s.to_string()),
+                )
+            })
+            .unwrap_or((ActiveInputTarget::TerminalDirect, false, false, None));
+
+        if palette_open || target == ActiveInputTarget::CommandPalette {
+            if let Ok(mut g) = self.state.lock() {
+                g.palette_query.push_str(text);
+                g.palette_selected = 0;
+            }
+            return;
+        }
+
+        match target {
+            ActiveInputTarget::TerminalDirect => {
+                if !settings_open {
+                    if let Some(id) = focused_id {
+                        if let Ok(mut g) = self.state.lock() {
+                            if let Some(s) = g.sessions.iter_mut().find(|s| s.id == id) {
+                                s.scroll_offset = 0;
+                            }
+                        }
+                        self.send_bytes_to_session(&id, text.as_bytes());
+                    }
+                }
+            }
+            ActiveInputTarget::AuthServerUrl => {
+                if let Ok(mut g) = self.state.lock() {
+                    g.server_url.push_str(text);
+                }
+            }
+            ActiveInputTarget::AuthAccount => {
+                if let Ok(mut g) = self.state.lock() {
+                    g.auth_account_input.push_str(text);
+                }
+            }
+            ActiveInputTarget::AuthPassword => {
+                if let Ok(mut g) = self.state.lock() {
+                    g.auth_password_input.push_str(text);
+                }
+            }
+            ActiveInputTarget::CommandPalette => {}
+        }
+    }
+
+    fn handle_key_down(&mut self, ev: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        let key = ev.keystroke.key.as_str();
+        let mods = &ev.keystroke.modifiers;
+
+        if mods.platform {
+            if key == "v" {
+                if let Some(txt) = cx.read_from_clipboard().and_then(|i| i.text()) {
+                    let (target, palette_open) = self
+                        .state
+                        .lock()
+                        .map(|g| (g.input_target, g.palette_open))
+                        .unwrap_or((ActiveInputTarget::TerminalDirect, false));
+                    let payload = if palette_open
+                        || matches!(
+                            target,
+                            ActiveInputTarget::CommandPalette
+                                | ActiveInputTarget::AuthServerUrl
+                                | ActiveInputTarget::AuthAccount
+                        ) {
+                        txt.trim().to_string()
+                    } else {
+                        txt
+                    };
+                    self.commit_text_to_active_target(&payload);
+                    cx.notify();
+                }
+                cx.stop_propagation();
+            } else if key == "c" {
+                let copy_text = self.state.lock().ok().and_then(|g| {
+                    if g.input_target != ActiveInputTarget::TerminalDirect
+                        || g.settings_open
+                        || g.palette_open
+                    {
+                        return None;
+                    }
+                    let id = g.focused_session_id()?;
+                    let sess = g.session_by_id(id)?;
+                    let joined = sess.lines.join("\n").trim_end().to_string();
+                    if joined.is_empty() { None } else { Some(joined) }
+                });
+                if let Some(text) = copy_text {
+                    cx.write_to_clipboard(ClipboardItem::new_string(text));
+                    if let Ok(mut g) = self.state.lock() {
+                        g.status_notice = Some(
+                            tr(g.locale, "Copied terminal output", "已复制终端输出").to_string(),
+                        );
+                    }
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+            }
+            return;
+        }
+
+        let (target, palette_open, settings_open, focused_id) = self
+            .state
+            .lock()
+            .map(|g| {
+                (
+                    g.input_target,
+                    g.palette_open,
+                    g.settings_open,
+                    g.focused_session_id().map(|s| s.to_string()),
+                )
+            })
+            .unwrap_or((ActiveInputTarget::TerminalDirect, false, false, None));
+
+        if palette_open || target == ActiveInputTarget::CommandPalette {
+            match key {
+                "escape" => {
+                    if let Ok(mut g) = self.state.lock() {
+                        g.palette_open = false;
+                        g.palette_query.clear();
+                        g.input_target = ActiveInputTarget::TerminalDirect;
+                    }
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                "up" => {
+                    if let Ok(mut g) = self.state.lock() {
+                        g.palette_selected = g.palette_selected.saturating_sub(1);
+                    }
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                "down" => {
+                    if let Ok(mut g) = self.state.lock() {
+                        let len = g.palette_items().len();
+                        if g.palette_selected + 1 < len {
+                            g.palette_selected += 1;
+                        }
+                    }
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                "enter" | "return" => {
+                    let selected_action = self.state.lock().ok().and_then(|g| {
+                        let items = g.palette_items();
+                        items
+                            .get(g.palette_selected.min(items.len().saturating_sub(1)))
+                            .map(|i| i.action.clone())
+                    });
+                    if let Some(action) = selected_action {
+                        self.execute_palette_action(action);
+                    }
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                "backspace" => {
+                    if let Ok(mut g) = self.state.lock() {
+                        g.palette_query.pop();
+                        g.palette_selected = 0;
+                    }
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        if settings_open && target == ActiveInputTarget::TerminalDirect {
+            if key == "escape" {
+                if let Ok(mut g) = self.state.lock() {
+                    g.settings_open = false;
+                }
+                cx.notify();
+                cx.stop_propagation();
+            }
+            return;
+        }
+
+        if target == ActiveInputTarget::TerminalDirect {
+            if let Some(id) = focused_id {
+                if mods.control && !mods.alt && key == "c" {
+                    if let Ok(mut g) = self.state.lock() {
+                        if let Some(s) = g.sessions.iter_mut().find(|s| s.id == id) {
+                            s.scroll_offset = 0;
+                        }
+                    }
+                    self.interrupt_session(&id);
+                    cx.notify();
+                    cx.stop_propagation();
+                    return;
+                }
+                if let Some(bytes) =
+                    Self::keystroke_to_terminal_bytes(key, mods, ev.keystroke.key_char.as_deref())
+                {
+                    if let Ok(mut g) = self.state.lock() {
+                        if let Some(s) = g.sessions.iter_mut().find(|s| s.id == id) {
+                            s.scroll_offset = 0;
+                        }
+                    }
+                    self.send_bytes_to_session(&id, &bytes);
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+            }
+            return;
+        }
+
+        match target {
+            ActiveInputTarget::AuthServerUrl => match key {
+                "backspace" => {
+                    if let Ok(mut g) = self.state.lock() {
+                        g.server_url.pop();
+                    }
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                "enter" | "return" => {
+                    let url = self
+                        .state
+                        .lock()
+                        .map(|g| g.server_url.clone())
+                        .unwrap_or_default();
+                    self.save_server_url_preference(&url);
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                "escape" => {
+                    if let Ok(mut g) = self.state.lock() {
+                        g.input_target = ActiveInputTarget::TerminalDirect;
+                    }
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                _ => {}
+            },
+            ActiveInputTarget::AuthAccount => match key {
+                "backspace" => {
+                    if let Ok(mut g) = self.state.lock() {
+                        g.auth_account_input.pop();
+                    }
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                "tab" | "enter" | "return" => {
+                    if let Ok(mut g) = self.state.lock() {
+                        g.input_target = ActiveInputTarget::AuthPassword;
+                    }
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                "escape" => {
+                    if let Ok(mut g) = self.state.lock() {
+                        g.input_target = ActiveInputTarget::TerminalDirect;
+                    }
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                _ => {}
+            },
+            ActiveInputTarget::AuthPassword => match key {
+                "backspace" => {
+                    if let Ok(mut g) = self.state.lock() {
+                        g.auth_password_input.pop();
+                    }
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                "enter" | "return" => {
+                    let (srv, acc, pw) = {
+                        let Ok(g) = self.state.lock() else {
+                            return;
+                        };
+                        (
+                            g.server_url.clone(),
+                            g.auth_account_input.clone(),
+                            g.auth_password_input.clone(),
+                        )
+                    };
+                    spawn_password_login(
+                        Arc::clone(&self.state),
+                        Arc::clone(&self.ui_dirty),
+                        Arc::clone(&self.mesh_hub),
+                        srv,
+                        acc,
+                        pw,
+                    );
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                "escape" => {
+                    if let Ok(mut g) = self.state.lock() {
+                        g.input_target = ActiveInputTarget::TerminalDirect;
+                    }
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                _ => {}
+            },
+            ActiveInputTarget::TerminalDirect | ActiveInputTarget::CommandPalette => {}
+        }
+    }
+
+    fn persist_layout_config(&self) {
+        let Ok(layout) = self.state.lock().map(|g| g.layout.clone()) else {
+            return;
+        };
+        let state_bg = Arc::clone(&self.state);
+        std::thread::spawn(move || {
+            let _ = layout.save();
+            let (_, mtime) = MalleableLayoutConfig::load_with_mtime();
+            if let Ok(mut g) = state_bg.lock() {
+                g.layout_mtime = mtime;
+            }
+        });
     }
 
     fn sync_pty_snapshots_into_state(&self) {
@@ -661,11 +1267,20 @@ impl CodaGpuWorkspaceView {
             Ok(mgr) => mgr.snapshot_all(250),
             Err(_) => return,
         };
+        let Ok(mut synced) = self.pty_synced_gen.lock() else {
+            return;
+        };
+        synced.retain(|id, _| snaps.contains_key(id));
         let Ok(mut g) = self.state.lock() else {
             return;
         };
         for sess in &mut g.sessions {
             if let Some(snap) = snaps.get(&sess.id) {
+                let prev = synced.get(&sess.id).copied();
+                if prev == Some((snap.generation, snap.alive)) {
+                    continue;
+                }
+                synced.insert(sess.id.clone(), (snap.generation, snap.alive));
                 let sig = snap
                     .lines
                     .iter()
@@ -771,8 +1386,22 @@ impl CodaGpuWorkspaceView {
     }
 
     fn refresh_active_space_inspector(&self) {
-        let (space_id, space_path_str, remote_host_id, browse_rel, selected_change) = {
-            let Ok(g) = self.state.lock() else {
+        Self::refresh_inspector_arcs(
+            &self.state,
+            &self.mesh_hub,
+            &self.inspector_seq,
+            &self.ui_dirty,
+        );
+    }
+
+    fn refresh_inspector_arcs(
+        state: &Arc<Mutex<CodaDesktopState>>,
+        mesh_hub: &Arc<RemoteMeshHub>,
+        inspector_seq: &Arc<AtomicU64>,
+        ui_dirty: &Arc<AtomicBool>,
+    ) {
+        let (space_id, space_path_str, remote_host_id, browse_rel, selected_change, selected_file_rel) = {
+            let Ok(g) = state.lock() else {
                 return;
             };
             let Some(space) = g.active_space() else {
@@ -789,60 +1418,86 @@ impl CodaGpuWorkspaceView {
                 host_uuid,
                 g.current_browse_rel.clone(),
                 g.selected_change_path.as_ref().map(|p| format!("file:{p}")),
+                g.selected_file_rel.clone(),
             )
         };
 
         if let Some(host_id) = remote_host_id {
-            self.mesh_hub
-                .refresh_remote_git_diff(host_id, &space_id, &space_path_str);
+            mesh_hub.refresh_remote_git_diff(host_id, &space_id, &space_path_str);
             if space_path_str != "." {
-                self.mesh_hub.refresh_remote_directory(
-                    host_id,
-                    &space_id,
-                    &space_path_str,
-                    &browse_rel,
-                );
+                mesh_hub.refresh_remote_directory(host_id, &space_id, &space_path_str, &browse_rel);
             }
             return;
         }
-        let space_path = PathBuf::from(&space_path_str);
-        let browse_dir = if browse_rel.trim().is_empty() {
-            space_path.clone()
-        } else {
-            let candidate = space_path.join(&browse_rel);
-            if candidate.is_dir() {
-                candidate
+
+        let seq = inspector_seq.fetch_add(1, Ordering::AcqRel) + 1;
+        let seq_ref = Arc::clone(inspector_seq);
+        let state_bg = Arc::clone(state);
+        let ui_dirty = Arc::clone(ui_dirty);
+        std::thread::spawn(move || {
+            let space_path = PathBuf::from(&space_path_str);
+            let browse_dir = if browse_rel.trim().is_empty() {
+                space_path.clone()
+            } else if let Some(contained) = resolve_contained_path(&space_path, &browse_rel) {
+                if contained.is_dir() {
+                    contained
+                } else {
+                    space_path.clone()
+                }
             } else {
                 space_path.clone()
-            }
-        };
+            };
 
-        let snap = compute_repo_snapshot(&space_path, selected_change.as_deref());
-        let entries = list_workspace_dir(&space_path, &browse_dir);
+            let snap = compute_repo_snapshot(&space_path, selected_change.as_deref());
+            let entries = list_workspace_dir(&space_path, &browse_dir);
+            let file_preview = selected_file_rel.as_deref().and_then(|rel| {
+                let full = resolve_contained_path(&space_path, rel)?;
+                full.is_file()
+                    .then(|| read_workspace_file_preview(&full, 120_000))
+            });
 
-        if let Ok(mut g) = self.state.lock() {
-            if let Some(sp) = g.spaces.iter_mut().find(|s| s.id == space_id) {
-                sp.branch = snap.branch.clone();
-                sp.dirty_files = snap.changed_files.len();
-                sp.ahead = 0;
-                sp.behind = 0;
+            if seq_ref.load(Ordering::Acquire) != seq {
+                return;
             }
-            g.repo_snapshot = snap;
-            g.dir_entries = entries;
-            if let Some(ref rel) = g.selected_file_rel {
-                let full = space_path.join(rel);
-                if full.is_file() {
-                    g.selected_file_content = read_workspace_file_preview(&full, 120_000);
+            if let Ok(mut g) = state_bg.lock() {
+                if let Some(sp) = g.spaces.iter_mut().find(|s| s.id == space_id) {
+                    sp.branch = snap.branch.clone();
+                    sp.dirty_files = snap.changed_files.len();
+                    sp.ahead = 0;
+                    sp.behind = 0;
+                }
+                if g.active_space_id.as_deref() == Some(space_id.as_str()) {
+                    g.repo_snapshot = snap;
+                    g.dir_entries = entries;
+                    if let Some(preview) = file_preview {
+                        g.selected_file_content = preview;
+                    }
                 }
             }
-        }
-        self.ui_dirty.store(true, Ordering::Release);
+            ui_dirty.store(true, Ordering::Release);
+        });
     }
 
     fn spawn_terminal_in_active_space(&self, command: Option<&str>) {
         self.ensure_active_space();
+        Self::spawn_terminal_in_active_space_arcs(
+            &self.state,
+            &self.pty_mgr,
+            &self.mesh_hub,
+            &self.ui_dirty,
+            command,
+        );
+    }
+
+    fn spawn_terminal_in_active_space_arcs(
+        state: &Arc<Mutex<CodaDesktopState>>,
+        pty_mgr: &Arc<Mutex<LocalPtyManager>>,
+        mesh_hub: &Arc<RemoteMeshHub>,
+        ui_dirty: &Arc<AtomicBool>,
+        command: Option<&str>,
+    ) {
         let (space_id, space_name, cwd_str, is_remote, machine_id, hc_path, loc) = {
-            let Ok(g) = self.state.lock() else {
+            let Ok(g) = state.lock() else {
                 return;
             };
             let Some(sp) = g.active_space() else {
@@ -862,9 +1517,8 @@ impl CodaGpuWorkspaceView {
         if is_remote {
             if let Ok(host_id) = Uuid::parse_str(&machine_id) {
                 let agent = command.unwrap_or("shell");
-                self.mesh_hub
-                    .spawn_remote_terminal_or_agent(host_id, agent, &cwd_str, &space_id);
-            } else if let Ok(mut g) = self.state.lock() {
+                mesh_hub.spawn_remote_terminal_or_agent(host_id, agent, &cwd_str, &space_id);
+            } else if let Ok(mut g) = state.lock() {
                 g.status_notice = Some(
                     tr(
                         loc,
@@ -873,7 +1527,7 @@ impl CodaGpuWorkspaceView {
                     )
                     .to_string(),
                 );
-                self.ui_dirty.store(true, Ordering::Release);
+                ui_dirty.store(true, Ordering::Release);
             }
             return;
         }
@@ -888,15 +1542,15 @@ impl CodaGpuWorkspaceView {
         let effective_cwd_str = cwd.to_string_lossy().to_string();
 
         if let Some(hc_bin) = hc_path {
-            if let Ok(mut g) = self.state.lock() {
+            if let Ok(mut g) = state.lock() {
                 g.status_notice = Some(
                     tr(loc, "Starting terminal...", "正在启动终端...").to_string(),
                 );
             }
-            self.ui_dirty.store(true, Ordering::Release);
-            let state_bg = Arc::clone(&self.state);
-            let pty_mgr_bg = Arc::clone(&self.pty_mgr);
-            let ui_dirty = Arc::clone(&self.ui_dirty);
+            ui_dirty.store(true, Ordering::Release);
+            let state_bg = Arc::clone(state);
+            let pty_mgr_bg = Arc::clone(pty_mgr);
+            let ui_dirty = Arc::clone(ui_dirty);
             let agent = command.unwrap_or("shell").to_string();
             let title = if command.is_some() {
                 format!("{space_name} · {agent}")
@@ -1017,20 +1671,20 @@ impl CodaGpuWorkspaceView {
             .unwrap_or_else(|| "zsh".to_string());
         let id = format!("pty-{}", &Uuid::new_v4().simple().to_string()[..8]);
 
-        let spawned = match self.pty_mgr.lock() {
+        let spawned = match pty_mgr.lock() {
             Ok(mut mgr) => mgr.spawn_session(&id, &cwd, command, 120, 36),
             Err(e) => Err(e.to_string()),
         };
 
         if let Err(err) = spawned {
-            if let Ok(mut g) = self.state.lock() {
+            if let Ok(mut g) = state.lock() {
                 g.status_notice = Some(err);
             }
-            self.ui_dirty.store(true, Ordering::Release);
+            ui_dirty.store(true, Ordering::Release);
             return;
         }
 
-        if let Ok(mut g) = self.state.lock() {
+        if let Ok(mut g) = state.lock() {
             g.closed_session_ids.remove(&id);
             g.did_auto_seed_local = true;
             g.status_notice = None;
@@ -1064,7 +1718,7 @@ impl CodaGpuWorkspaceView {
             }
             g.input_target = ActiveInputTarget::TerminalDirect;
         }
-        self.ui_dirty.store(true, Ordering::Release);
+        ui_dirty.store(true, Ordering::Release);
     }
 
     fn launch_agent_session(&self, agent_cmd: &str) {
@@ -1286,16 +1940,35 @@ impl CodaGpuWorkspaceView {
     }
 
     fn select_space(&self, space_id: &str) {
+        Self::select_space_arcs(
+            &self.state,
+            &self.pty_mgr,
+            &self.mesh_hub,
+            &self.inspector_seq,
+            &self.ui_dirty,
+            space_id,
+        );
+    }
+
+    fn select_space_arcs(
+        state: &Arc<Mutex<CodaDesktopState>>,
+        pty_mgr: &Arc<Mutex<LocalPtyManager>>,
+        mesh_hub: &Arc<RemoteMeshHub>,
+        inspector_seq: &Arc<AtomicU64>,
+        ui_dirty: &Arc<AtomicBool>,
+        space_id: &str,
+    ) {
         let mut need_spawn = false;
-        if let Ok(mut g) = self.state.lock() {
+        if let Ok(mut g) = state.lock() {
             g.active_space_id = Some(space_id.to_string());
             g.current_browse_rel.clear();
             g.selected_file_rel = None;
             g.selected_file_content.clear();
             g.selected_change_path = None;
-            let mut prefs = DesktopPreferences::load_or_default();
-            prefs.selected_repo_path = Some(space_id.to_string());
-            let _ = prefs.save();
+            let sp_owned = space_id.to_string();
+            Self::update_prefs_async(move |prefs| {
+                prefs.selected_repo_path = Some(sp_owned);
+            });
 
             let first_sess = g
                 .sessions
@@ -1319,9 +1992,9 @@ impl CodaGpuWorkspaceView {
             }
             g.input_target = ActiveInputTarget::TerminalDirect;
         }
-        self.refresh_active_space_inspector();
+        Self::refresh_inspector_arcs(state, mesh_hub, inspector_seq, ui_dirty);
         if need_spawn {
-            self.spawn_terminal_in_active_space(None);
+            Self::spawn_terminal_in_active_space_arcs(state, pty_mgr, mesh_hub, ui_dirty, None);
         }
     }
 
@@ -1461,17 +2134,19 @@ impl CodaGpuWorkspaceView {
                 .find(|s| s.id == space_id)
                 .map(|s| s.path.clone());
             g.dismissed_spaces.insert(space_id.to_string());
-            let mut prefs = DesktopPreferences::load_or_default();
-            if !prefs.dismissed_spaces.iter().any(|x| x == space_id) {
-                prefs.dismissed_spaces.push(space_id.to_string());
-            }
-            if let Some(ref rp) = removed_path {
-                prefs.workspace_roots.retain(|r| r != rp);
-            }
-            if prefs.selected_repo_path.as_deref() == Some(space_id) {
-                prefs.selected_repo_path = None;
-            }
-            let _ = prefs.save();
+            let sp_owned = space_id.to_string();
+            let rp_owned = removed_path.clone();
+            Self::update_prefs_async(move |prefs| {
+                if !prefs.dismissed_spaces.iter().any(|x| x == &sp_owned) {
+                    prefs.dismissed_spaces.push(sp_owned.clone());
+                }
+                if let Some(ref rp) = rp_owned {
+                    prefs.workspace_roots.retain(|r| r != rp);
+                }
+                if prefs.selected_repo_path.as_deref() == Some(sp_owned.as_str()) {
+                    prefs.selected_repo_path = None;
+                }
+            });
 
             g.spaces.retain(|s| s.id != space_id);
             if g.active_space_id.as_deref() == Some(space_id) {
@@ -1543,29 +2218,51 @@ impl CodaGpuWorkspaceView {
             return;
         }
 
-        let base_path = PathBuf::from(&space_path_str);
-        let full = if clean_rel.is_empty() {
-            base_path.clone()
-        } else {
-            base_path.join(&clean_rel)
-        };
-        if is_dir || full.is_dir() {
-            let entries = list_workspace_dir(&base_path, &full);
-            if let Ok(mut g) = self.state.lock() {
-                g.current_browse_rel = clean_rel;
-                g.dir_entries = entries;
-                g.selected_file_rel = None;
-                g.selected_file_content.clear();
+        let seq = self.inspector_seq.fetch_add(1, Ordering::AcqRel) + 1;
+        let seq_ref = Arc::clone(&self.inspector_seq);
+        let state_bg = Arc::clone(&self.state);
+        let ui_dirty = Arc::clone(&self.ui_dirty);
+        std::thread::spawn(move || {
+            let base_path = PathBuf::from(&space_path_str);
+            let target = if clean_rel.is_empty() {
+                base_path.clone()
+            } else if let Some(contained) = resolve_contained_path(&base_path, &clean_rel) {
+                contained
+            } else {
+                if let Ok(mut g) = state_bg.lock() {
+                    g.status_notice = Some("Blocked path outside active workspace".to_string());
+                }
+                ui_dirty.store(true, Ordering::Release);
+                return;
+            };
+            if is_dir || target.is_dir() {
+                let entries = list_workspace_dir(&base_path, &target);
+                if seq_ref.load(Ordering::Acquire) != seq {
+                    return;
+                }
+                if let Ok(mut g) = state_bg.lock() {
+                    if g.active_space_id.as_deref() == Some(space_id.as_str()) {
+                        g.current_browse_rel = clean_rel;
+                        g.dir_entries = entries;
+                        g.selected_file_rel = None;
+                        g.selected_file_content.clear();
+                    }
+                }
+            } else if target.is_file() {
+                let content = read_workspace_file_preview(&target, 120_000);
+                if seq_ref.load(Ordering::Acquire) != seq {
+                    return;
+                }
+                if let Ok(mut g) = state_bg.lock() {
+                    if g.active_space_id.as_deref() == Some(space_id.as_str()) {
+                        g.selected_file_rel = Some(clean_rel);
+                        g.selected_file_content = content;
+                        g.right_drawer = Some(RightDrawerTab::Files);
+                    }
+                }
             }
-        } else if full.is_file() {
-            let content = read_workspace_file_preview(&full, 120_000);
-            if let Ok(mut g) = self.state.lock() {
-                g.selected_file_rel = Some(clean_rel);
-                g.selected_file_content = content;
-                g.right_drawer = Some(RightDrawerTab::Files);
-            }
-        }
-        self.ui_dirty.store(true, Ordering::Release);
+            ui_dirty.store(true, Ordering::Release);
+        });
     }
 
     fn navigate_parent_dir(&self) {
@@ -1586,47 +2283,64 @@ impl CodaGpuWorkspaceView {
     }
 
     fn add_workspace_folder(&self) {
-        let Some(path_str) = pick_folder_via_native_dialog() else {
-            return;
-        };
-        let folder = PathBuf::from(&path_str);
-        let snap = compute_repo_snapshot(&folder, None);
-        let name = folder
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("workspace")
-            .to_string();
-        let space_id = format!("local:{path_str}");
+        let state_bg = Arc::clone(&self.state);
+        let pty_mgr_bg = Arc::clone(&self.pty_mgr);
+        let mesh_hub_bg = Arc::clone(&self.mesh_hub);
+        let seq_bg = Arc::clone(&self.inspector_seq);
+        let ui_dirty = Arc::clone(&self.ui_dirty);
+        std::thread::spawn(move || {
+            let Some(path_str) = pick_folder_via_native_dialog() else {
+                return;
+            };
+            let folder = PathBuf::from(&path_str);
+            let snap = compute_repo_snapshot(&folder, None);
+            let name = folder
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("workspace")
+                .to_string();
+            let space_id = format!("local:{path_str}");
 
-        if let Ok(mut g) = self.state.lock() {
-            g.dismissed_spaces.remove(&space_id);
-            g.dismissed_spaces.remove(&path_str);
-            let machine_label = g.local_machine_name.clone();
-            if !g.spaces.iter().any(|s| s.id == space_id) {
-                g.spaces.push(SpaceEntry {
-                    id: space_id.clone(),
-                    avatar_color: space_avatar_color(&name),
-                    name,
-                    path: path_str.clone(),
-                    machine_id: "local".to_string(),
-                    machine_label,
-                    is_remote: false,
-                    branch: snap.branch,
-                    dirty_files: snap.changed_files.len(),
-                    ahead: 0,
-                    behind: 0,
-                });
+            if let Ok(mut g) = state_bg.lock() {
+                g.dismissed_spaces.remove(&space_id);
+                g.dismissed_spaces.remove(&path_str);
+                let machine_label = g.local_machine_name.clone();
+                if !g.spaces.iter().any(|s| s.id == space_id) {
+                    g.spaces.push(SpaceEntry {
+                        id: space_id.clone(),
+                        avatar_color: space_avatar_color(&name),
+                        name,
+                        path: path_str.clone(),
+                        machine_id: "local".to_string(),
+                        machine_label,
+                        is_remote: false,
+                        branch: snap.branch,
+                        dirty_files: snap.changed_files.len(),
+                        ahead: 0,
+                        behind: 0,
+                    });
+                }
             }
-            let mut prefs = DesktopPreferences::load_or_default();
-            prefs
-                .dismissed_spaces
-                .retain(|x| x != &space_id && x != &path_str);
-            if !prefs.workspace_roots.contains(&path_str) {
-                prefs.workspace_roots.push(path_str);
-            }
-            let _ = prefs.save();
-        }
-        self.select_space(&space_id);
+            let space_id_pref = space_id.clone();
+            let path_pref = path_str.clone();
+            Self::update_prefs_async(move |prefs| {
+                prefs
+                    .dismissed_spaces
+                    .retain(|x| x != &space_id_pref && x != &path_pref);
+                if !prefs.workspace_roots.contains(&path_pref) {
+                    prefs.workspace_roots.push(path_pref);
+                }
+            });
+            Self::select_space_arcs(
+                &state_bg,
+                &pty_mgr_bg,
+                &mesh_hub_bg,
+                &seq_bg,
+                &ui_dirty,
+                &space_id,
+            );
+            ui_dirty.store(true, Ordering::Release);
+        });
     }
 
     fn execute_palette_action(&self, action: PaletteAction) {
@@ -1682,10 +2396,10 @@ impl CodaGpuWorkspaceView {
     fn set_locale(&self, locale: UiLocale) {
         if let Ok(mut g) = self.state.lock() {
             g.locale = locale;
-            let mut prefs = DesktopPreferences::load_or_default();
-            prefs.locale = locale;
-            let _ = prefs.save();
         }
+        Self::update_prefs_async(move |prefs| {
+            prefs.locale = locale;
+        });
         self.ui_dirty.store(true, Ordering::Release);
     }
 
@@ -1705,30 +2419,46 @@ impl CodaGpuWorkspaceView {
         if trimmed.is_empty() {
             return;
         }
+        if !is_safe_http_url(&trimmed) {
+            if let Ok(mut g) = self.state.lock() {
+                g.status_notice = Some(
+                    tr(
+                        g.locale,
+                        "Invalid server URL (must start with http:// or https://)",
+                        "无效的服务端地址（必须以 http:// 或 https:// 开头）",
+                    )
+                    .to_string(),
+                );
+            }
+            self.ui_dirty.store(true, Ordering::Release);
+            return;
+        }
         if let Ok(mut g) = self.state.lock() {
             g.server_url = trimmed.clone();
             g.input_target = ActiveInputTarget::TerminalDirect;
         }
-        let mut prefs = DesktopPreferences::load_or_default();
-        prefs.server_url = trimmed;
-        let _ = prefs.save();
+        Self::update_prefs_async(move |prefs| {
+            prefs.server_url = trimmed;
+        });
         self.ui_dirty.store(true, Ordering::Release);
     }
 
     fn restore_dismissed_spaces(&self) {
-        let mut prefs = DesktopPreferences::load_or_default();
-        prefs.dismissed_spaces.clear();
-        let _ = prefs.save();
-
-        let candidates = discover_local_git_repositories(&prefs.workspace_roots);
         if let Ok(mut g) = self.state.lock() {
             g.dismissed_spaces.clear();
-            let machine_label = g.local_machine_name.clone();
+        }
+        let state_bg = Arc::clone(&self.state);
+        let mesh_hub_bg = Arc::clone(&self.mesh_hub);
+        let seq_bg = Arc::clone(&self.inspector_seq);
+        let ui_dirty = Arc::clone(&self.ui_dirty);
+        std::thread::spawn(move || {
+            let mut prefs = DesktopPreferences::load_or_default();
+            prefs.dismissed_spaces.clear();
+            let _ = prefs.save();
+
+            let candidates = discover_local_git_repositories(&prefs.workspace_roots);
+            let mut parsed = Vec::new();
             for path_str in candidates {
-                let space_id = format!("local:{path_str}");
-                if g.spaces.iter().any(|s| s.id == space_id) {
-                    continue;
-                }
                 let p = PathBuf::from(&path_str);
                 let snap = compute_repo_snapshot(&p, None);
                 let name = p
@@ -1736,26 +2466,36 @@ impl CodaGpuWorkspaceView {
                     .and_then(|s| s.to_str())
                     .unwrap_or("workspace")
                     .to_string();
-                g.spaces.push(SpaceEntry {
-                    id: space_id,
-                    avatar_color: space_avatar_color(&name),
-                    name,
-                    path: path_str,
-                    machine_id: "local".to_string(),
-                    machine_label: machine_label.clone(),
-                    is_remote: false,
-                    branch: snap.branch,
-                    dirty_files: snap.changed_files.len(),
-                    ahead: 0,
-                    behind: 0,
-                });
+                parsed.push((path_str, name, snap));
             }
-            if g.active_space_id.is_none() {
-                g.active_space_id = g.spaces.first().map(|s| s.id.clone());
+            if let Ok(mut g) = state_bg.lock() {
+                let machine_label = g.local_machine_name.clone();
+                for (path_str, name, snap) in parsed {
+                    let space_id = format!("local:{path_str}");
+                    if g.spaces.iter().any(|s| s.id == space_id) {
+                        continue;
+                    }
+                    g.spaces.push(SpaceEntry {
+                        id: space_id,
+                        avatar_color: space_avatar_color(&name),
+                        name,
+                        path: path_str,
+                        machine_id: "local".to_string(),
+                        machine_label: machine_label.clone(),
+                        is_remote: false,
+                        branch: snap.branch,
+                        dirty_files: snap.changed_files.len(),
+                        ahead: 0,
+                        behind: 0,
+                    });
+                }
+                if g.active_space_id.is_none() {
+                    g.active_space_id = g.spaces.first().map(|s| s.id.clone());
+                }
             }
-        }
-        self.refresh_active_space_inspector();
-        self.ui_dirty.store(true, Ordering::Release);
+            Self::refresh_inspector_arcs(&state_bg, &mesh_hub_bg, &seq_bg, &ui_dirty);
+            ui_dirty.store(true, Ordering::Release);
+        });
     }
 }
 
@@ -1770,15 +2510,37 @@ impl Render for CodaGpuWorkspaceView {
             Err(_) => CodaDesktopState::default(),
         };
 
+        let focused_pane_has_sess = if st.layout.split_terminals && st.focused_pane == SplitPane::Secondary {
+            st.split_session_id
+                .as_deref()
+                .and_then(|id| st.session_by_id(id))
+                .is_some()
+        } else {
+            st.active_session_id
+                .as_deref()
+                .and_then(|id| st.session_by_id(id))
+                .is_some()
+        };
+        let terminal_ime_active = !st.palette_open
+            && !st.settings_open
+            && st.input_target == ActiveInputTarget::TerminalDirect
+            && st.layout.layout == LayoutMode::Workbench
+            && focused_pane_has_sess;
+
         let main_area = match st.layout.layout {
             LayoutMode::Workbench => self.render_workbench_panes(&st, cx).into_any_element(),
             LayoutMode::Terminals => self.render_terminals_grid(&st, cx).into_any_element(),
         };
 
+        let fallback_focus = self.focus_handle.clone();
+        let fallback_entity = cx.entity();
+        let fallback_ime_bounds = Arc::clone(&self.ime_bounds);
+
         div()
             .id("coda-root")
             .key_context("CodaWorkbench")
             .track_focus(&self.focus_handle)
+            .on_key_down(cx.listener(Self::handle_key_down))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {
                 if let Ok(mut g) = this.state.lock() {
                     g.layout.sidebar_visible = !g.layout.sidebar_visible;
@@ -1886,6 +2648,36 @@ impl Render for CodaGpuWorkspaceView {
                             ),
                     ),
             )
+            .when(!terminal_ime_active, |el| {
+                el.child(
+                    div()
+                        .absolute()
+                        .top(px(0.0))
+                        .left(px(0.0))
+                        .w(px(1.0))
+                        .h(px(1.0))
+                        .child(
+                            canvas(
+                                |_, _, _| {},
+                                move |bounds, (), window, cx| {
+                                    let ime_box = Bounds {
+                                        origin: point(bounds.origin.x + px(40.0), bounds.origin.y + px(80.0)),
+                                        size: size(px(240.0), px(24.0)),
+                                    };
+                                    if let Ok(mut g) = fallback_ime_bounds.lock() {
+                                        *g = Some(ime_box);
+                                    }
+                                    window.handle_input(
+                                        &fallback_focus,
+                                        ElementInputHandler::new(ime_box, fallback_entity.clone()),
+                                        cx,
+                                    );
+                                },
+                            )
+                            .size_full(),
+                        ),
+                )
+            })
             .when(st.palette_open, |el| {
                 el.child(self.render_command_palette_overlay(&st, cx))
             })
@@ -2982,6 +3774,34 @@ impl CodaGpuWorkspaceView {
         let sid_focus = sess.id.clone();
         let sid_scroll = sess.id.clone();
         let sid_jump_bottom = sess.id.clone();
+        let sid_resize = sess.id.clone();
+        let remote_host_uuid = sess
+            .remote_host_id
+            .as_deref()
+            .and_then(|s| Uuid::parse_str(s).ok());
+        let hc_addr_clone = sess.hc_addr.clone();
+        let pane_ime_active = is_focused
+            && !st.palette_open
+            && !st.settings_open
+            && st.input_target == ActiveInputTarget::TerminalDirect
+            && st.layout.layout == LayoutMode::Workbench;
+        let ime_marked = self.marked_text.clone();
+        let viewport_dims_bg = Arc::clone(&self.viewport_dims);
+        let visible_rows_bg = Arc::clone(&self.visible_rows_by_pane);
+        let ime_bounds_bg = Arc::clone(&self.ime_bounds);
+        let pty_mgr_bg = Arc::clone(&self.pty_mgr);
+        let mesh_hub_bg = Arc::clone(&self.mesh_hub);
+        let ui_dirty_bg = Arc::clone(&self.ui_dirty);
+        let focus_handle_bg = self.focus_handle.clone();
+        let view_entity_bg = cx.entity();
+
+        let measured_rows = self
+            .visible_rows_by_pane
+            .lock()
+            .ok()
+            .and_then(|m| m.get(&pane_slot).copied())
+            .unwrap_or(visible_rows);
+
         let branch_label = st
             .spaces
             .iter()
@@ -2992,10 +3812,10 @@ impl CodaGpuWorkspaceView {
         let osc_badge = sess.osc_status.as_ref().and_then(|o| o.task.clone());
 
         let total_lines = sess.styled_lines.len();
-        let max_off = total_lines.saturating_sub(visible_rows);
+        let max_off = total_lines.saturating_sub(measured_rows);
         let eff_off = sess.scroll_offset.min(max_off);
         let end = total_lines.saturating_sub(eff_off);
-        let start = end.saturating_sub(visible_rows);
+        let start = end.saturating_sub(measured_rows);
         let visible_slice = &sess.styled_lines[start..end];
 
         div()
@@ -3064,6 +3884,7 @@ impl CodaGpuWorkspaceView {
                     .px(px(14.0))
                     .py(px(10.0))
                     .overflow_hidden()
+                    .relative()
                     .font_family(font_family)
                     .text_size(font_size)
                     .flex()
@@ -3073,6 +3894,69 @@ impl CodaGpuWorkspaceView {
                         visible_slice
                             .iter()
                             .map(|line| render_styled_terminal_line(line, line_h)),
+                    )
+                    .child(
+                        div().absolute().inset_0().child(
+                            canvas(
+                                |_, _, _| {},
+                                move |bounds, (), window, cx| {
+                                    let inner_w = (f32::from(bounds.size.width) - 28.0).max(120.0);
+                                    let inner_h = (f32::from(bounds.size.height) - 20.0).max(60.0);
+                                    let cell_w = (font_size_px * 0.605).max(6.0);
+                                    let row_step = (line_h + 1.5).max(10.0);
+                                    let cols = (inner_w / cell_w).floor().clamp(24.0, 400.0) as u16;
+                                    let rows = (inner_h / row_step).floor().clamp(6.0, 200.0) as u16;
+
+                                    if let Ok(mut map) = visible_rows_bg.lock() {
+                                        let r = rows as usize;
+                                        if map.get(&pane_slot).copied() != Some(r) {
+                                            map.insert(pane_slot, r);
+                                            ui_dirty_bg.store(true, Ordering::Release);
+                                        }
+                                    }
+
+                                    let mut dim_changed = false;
+                                    if let Ok(mut dims) = viewport_dims_bg.lock() {
+                                        if dims.get(&sid_resize).copied() != Some((cols, rows)) {
+                                            dims.insert(sid_resize.clone(), (cols, rows));
+                                            dim_changed = true;
+                                        }
+                                    }
+                                    if dim_changed {
+                                        if let Ok(mut mgr) = pty_mgr_bg.lock() {
+                                            mgr.resize(&sid_resize, cols, rows);
+                                        }
+                                        if let (Some(hid), Some(ref term_addr)) =
+                                            (remote_host_uuid, hc_addr_clone.as_ref())
+                                        {
+                                            mesh_hub_bg.resize_remote_pty(hid, term_addr, cols, rows);
+                                        }
+                                    }
+
+                                    if pane_ime_active {
+                                        let cursor_y = (bounds.origin.y + bounds.size.height
+                                            - px(line_h + 14.0))
+                                        .max(bounds.origin.y + px(10.0));
+                                        let cursor_bounds = Bounds {
+                                            origin: point(bounds.origin.x + px(14.0), cursor_y),
+                                            size: size(px(220.0), px(line_h)),
+                                        };
+                                        if let Ok(mut ib) = ime_bounds_bg.lock() {
+                                            *ib = Some(cursor_bounds);
+                                        }
+                                        window.handle_input(
+                                            &focus_handle_bg,
+                                            ElementInputHandler::new(
+                                                cursor_bounds,
+                                                view_entity_bg.clone(),
+                                            ),
+                                            cx,
+                                        );
+                                    }
+                                },
+                            )
+                            .size_full(),
+                        ),
                     ),
             )
             .child(
@@ -3173,6 +4057,18 @@ impl CodaGpuWorkspaceView {
                                                 cx.notify();
                                             },
                                         )),
+                                )
+                            })
+                            .when(is_focused && !ime_marked.is_empty(), |el| {
+                                el.child(
+                                    div()
+                                        .px(px(6.0))
+                                        .py(px(1.0))
+                                        .rounded(px(4.0))
+                                        .bg(rgb(palette::SURFACE_BG))
+                                        .text_size(px(10.5))
+                                        .text_color(rgb(accent))
+                                        .child(format!("[IME: {ime_marked}]")),
                                 )
                             })
                             .child(
@@ -5149,16 +6045,7 @@ impl CodaGpuWorkspaceView {
                                             false,
                                             accent,
                                             cx.listener(|this, _: &ClickEvent, _, cx| {
-                                                let _ =
-                                                    std::fs::remove_file(DaemonConfig::default_path());
-                                                if let Ok(mut g) = this.state.lock() {
-                                                    g.is_logged_in = false;
-                                                    g.auth_form_expanded = false;
-                                                    g.account_email.clear();
-                                                    g.remote_hosts.clear();
-                                                    g.input_target =
-                                                        ActiveInputTarget::TerminalDirect;
-                                                }
+                                                this.mesh_hub.sign_out();
                                                 cx.notify();
                                             }),
                                         )),
@@ -6005,13 +6892,21 @@ fn normalize_newlines_for_vt(text: &str) -> Vec<u8> {
     out
 }
 
+fn path_within_root(path: &str, root: &str) -> bool {
+    let p = path.trim_end_matches('/');
+    let r = root.trim_end_matches('/');
+    !p.is_empty()
+        && !r.is_empty()
+        && (p == r || (p.len() > r.len() && p.starts_with(r) && p.as_bytes()[r.len()] == b'/'))
+}
+
 fn parse_git_status_short(status_short: &str) -> Vec<ChangedFileEntry> {
     status_short
         .lines()
-        .filter(|l| l.len() >= 3)
-        .map(|l| ChangedFileEntry {
-            status: l[..2].trim().to_string(),
-            path: l[3..].trim().to_string(),
+        .filter_map(|l| {
+            let status = l.get(..2)?.trim().to_string();
+            let path = l.get(3..)?.trim().to_string();
+            (!path.is_empty()).then_some(ChangedFileEntry { status, path })
         })
         .collect()
 }
@@ -6024,6 +6919,8 @@ pub struct RemoteMeshHub {
     peers: tokio::sync::Mutex<HashMap<Uuid, Arc<LivePeerSession>>>,
     client_identities: tokio::sync::Mutex<HashMap<Uuid, (Uuid, coda_protocol::StoredDeviceIdentity)>>,
     attached_terms: tokio::sync::Mutex<HashSet<(Uuid, String)>>,
+    embedded_host_handle: tokio::sync::Mutex<Option<EmbeddedHostHandle>>,
+    peer_connect_locks: tokio::sync::Mutex<HashMap<Uuid, Arc<tokio::sync::Mutex<()>>>>,
     watcher_gen: AtomicU64,
 }
 
@@ -6054,6 +6951,8 @@ impl RemoteMeshHub {
             peers: tokio::sync::Mutex::new(HashMap::new()),
             client_identities: tokio::sync::Mutex::new(HashMap::new()),
             attached_terms: tokio::sync::Mutex::new(HashSet::new()),
+            embedded_host_handle: tokio::sync::Mutex::new(None),
+            peer_connect_locks: tokio::sync::Mutex::new(HashMap::new()),
             watcher_gen: AtomicU64::new(0),
         })
     }
@@ -6078,9 +6977,89 @@ impl RemoteMeshHub {
         {
             return;
         }
+        let hub = Arc::clone(self);
         self.spawn_bg(async move {
-            if start_embedded_host_if_configured(&cfg_path).await.is_none() {
+            if let Some(handle) = start_embedded_host_with_handle(&cfg_path).await {
+                if !EMBEDDED_HOST_STARTED.load(Ordering::Acquire) {
+                    handle.stop();
+                    return;
+                }
+                *hub.embedded_host_handle.lock().await = Some(handle);
+            } else {
                 EMBEDDED_HOST_STARTED.store(false, Ordering::Release);
+            }
+        });
+    }
+
+    pub fn sign_out(self: &Arc<Self>) {
+        self.watcher_gen.fetch_add(1, Ordering::AcqRel);
+        EMBEDDED_HOST_STARTED.store(false, Ordering::Release);
+
+        let cfg_path = DaemonConfig::default_path();
+        let prev_cfg = DaemonConfig::load(&cfg_path).ok();
+        let _ = std::fs::remove_file(&cfg_path);
+        DesktopClientIdentityRecord::remove_saved();
+
+        let mut removed_remote_sids = Vec::new();
+        if let Ok(mut g) = self.state.lock() {
+            for s in &g.sessions {
+                if s.remote_host_id.is_some() {
+                    removed_remote_sids.push(s.id.clone());
+                }
+            }
+            g.is_logged_in = false;
+            g.auth_form_expanded = false;
+            g.account_email.clear();
+            g.auth_account_input.clear();
+            g.auth_password_input.clear();
+            g.device_login_code = None;
+            g.device_login_uri = None;
+            g.remote_hosts.clear();
+            g.remote_probe_status = None;
+            g.spaces.retain(|sp| !sp.is_remote);
+            g.sessions.retain(|s| s.remote_host_id.is_none());
+            if g.active_space().is_none() {
+                g.active_space_id = g.spaces.first().map(|sp| sp.id.clone());
+            }
+            if let Some(ref aid) = g.active_session_id {
+                if !g.sessions.iter().any(|s| s.id == *aid) {
+                    g.active_session_id = g.sessions.first().map(|s| s.id.clone());
+                }
+            }
+            if let Some(ref sid) = g.split_session_id {
+                if !g.sessions.iter().any(|s| s.id == *sid) {
+                    g.split_session_id = None;
+                }
+            }
+            g.input_target = ActiveInputTarget::TerminalDirect;
+            g.status_notice = Some(
+                tr(g.locale, "Signed out", "已退出登录").to_string(),
+            );
+        }
+        if let Ok(mut mgr) = self.pty_mgr.lock() {
+            for sid in removed_remote_sids {
+                mgr.remove_remote_buffer(&sid);
+            }
+        }
+        self.ui_dirty.store(true, Ordering::Release);
+
+        let hub = Arc::clone(self);
+        self.spawn_bg(async move {
+            if let Some(handle) = hub.embedded_host_handle.lock().await.take() {
+                handle.stop();
+            }
+            let peers_to_close: Vec<Arc<LivePeerSession>> =
+                hub.peers.lock().await.drain().map(|(_, p)| p).collect();
+            for peer in peers_to_close {
+                peer.close();
+            }
+            hub.attached_terms.lock().await.clear();
+            hub.client_identities.lock().await.clear();
+            hub.peer_connect_locks.lock().await.clear();
+            if let Some(cfg) = prev_cfg {
+                if let Some(ref tok) = cfg.session_token {
+                    let _ = coda_daemon::logout_account_session(&cfg.server_url, tok).await;
+                }
             }
         });
     }
@@ -6229,46 +7208,116 @@ impl RemoteMeshHub {
         if let Some(existing) = self.peers.lock().await.get(&host.id).cloned() {
             return Ok(existing);
         }
-        let (client_dev_id, client_identity) = {
-            if let Some(existing) = self.client_identities.lock().await.get(&host.id).cloned() {
-                existing
+        let connect_lock = {
+            let mut locks = self.peer_connect_locks.lock().await;
+            Arc::clone(
+                locks
+                    .entry(host.id)
+                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+            )
+        };
+        let _connect_guard = connect_lock.lock().await;
+        if let Some(existing) = self.peers.lock().await.get(&host.id).cloned() {
+            return Ok(existing);
+        }
+
+        let (mut client_dev_id, mut client_identity, loaded_from_disk) = {
+            if let Some(existing) = self.client_identities.lock().await.get(&Uuid::nil()).cloned() {
+                (existing.0, existing.1, true)
             } else if let Some(tok) = cfg.session_token.as_deref() {
-                if let Ok(created) = coda_daemon::register_client_identity(
-                    &cfg.server_url,
-                    tok,
-                    &format!("desktop-client-{}", &host.id.to_string()[..8]),
-                    "macos",
-                )
-                .await
+                if let Some((saved_id, saved_ident)) =
+                    DesktopClientIdentityRecord::load_matching(&cfg.server_url, tok)
                 {
                     self.client_identities
                         .lock()
                         .await
-                        .insert(host.id, created.clone());
-                    created
+                        .insert(Uuid::nil(), (saved_id, saved_ident.clone()));
+                    (saved_id, saved_ident, true)
+                } else if let Ok(created) = coda_daemon::register_client_identity(
+                    &cfg.server_url,
+                    tok,
+                    "desktop-client",
+                    "macos",
+                )
+                .await
+                {
+                    let _ = DesktopClientIdentityRecord::save_for_token(
+                        &cfg.server_url,
+                        tok,
+                        created.0,
+                        &created.1,
+                    );
+                    self.client_identities
+                        .lock()
+                        .await
+                        .insert(Uuid::nil(), created.clone());
+                    (created.0, created.1, false)
                 } else {
-                    (cfg.device_id, cfg.identity.clone())
+                    (cfg.device_id, cfg.identity.clone(), false)
                 }
             } else {
-                (cfg.device_id, cfg.identity.clone())
+                (cfg.device_id, cfg.identity.clone(), false)
             }
         };
+
         let relay_cfg = match cfg.session_token.as_deref() {
-            Some(tok) => mint_peer_relay_config(
-                &cfg.server_url,
-                tok,
-                client_dev_id,
-                host.id,
-                &host.x25519_pubkey,
-            )
-            .await
-            .ok(),
+            Some(tok) => {
+                let first_try = mint_peer_relay_config(
+                    &cfg.server_url,
+                    tok,
+                    client_dev_id,
+                    host.id,
+                    &host.ed25519_pubkey,
+                    &host.x25519_pubkey,
+                )
+                .await;
+                if let Ok(rc) = first_try {
+                    Some(rc)
+                } else if loaded_from_disk {
+                    if let Ok(fresh) = coda_daemon::register_client_identity(
+                        &cfg.server_url,
+                        tok,
+                        "desktop-client",
+                        "macos",
+                    )
+                    .await
+                    {
+                        client_dev_id = fresh.0;
+                        client_identity = fresh.1.clone();
+                        let _ = DesktopClientIdentityRecord::save_for_token(
+                            &cfg.server_url,
+                            tok,
+                            client_dev_id,
+                            &client_identity,
+                        );
+                        self.client_identities
+                            .lock()
+                            .await
+                            .insert(Uuid::nil(), (client_dev_id, client_identity.clone()));
+                        mint_peer_relay_config(
+                            &cfg.server_url,
+                            tok,
+                            client_dev_id,
+                            host.id,
+                            &host.ed25519_pubkey,
+                            &host.x25519_pubkey,
+                        )
+                        .await
+                        .ok()
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
             None => None,
         };
         let session = LivePeerSession::connect_auto(
             client_identity,
             client_dev_id,
             host.id,
+            host.identity_pin(),
             host.endpoints.clone(),
             Some("255.255.255.255:24444".parse().unwrap()),
             relay_cfg,
@@ -6486,7 +7535,7 @@ impl RemoteMeshHub {
                         .spaces
                         .iter()
                         .filter(|sp| sp.machine_id == host_id_str)
-                        .filter(|sp| !term.cwd.is_empty() && term.cwd.starts_with(&sp.path))
+                        .filter(|sp| path_within_root(&term.cwd, &sp.path))
                         .max_by_key(|sp| sp.path.len())
                         .or_else(|| g.spaces.iter().find(|sp| sp.machine_id == host_id_str))
                         .map(|sp| sp.id.clone())
@@ -6759,6 +7808,31 @@ impl RemoteMeshHub {
             if let Some(peer) = hub.peers.lock().await.get(&host_id).cloned() {
                 let _ = peer
                     .send_oneway(PeerMessage::PtyInput { terminal, data_b64 }, TrafficLane::ControlP0)
+                    .await;
+            }
+        });
+    }
+
+    pub fn resize_remote_pty(
+        self: &Arc<Self>,
+        host_id: Uuid,
+        terminal: &str,
+        cols: u16,
+        rows: u16,
+    ) {
+        let hub = Arc::clone(self);
+        let terminal = terminal.to_string();
+        self.spawn_bg(async move {
+            if let Some(peer) = hub.peers.lock().await.get(&host_id).cloned() {
+                let _ = peer
+                    .send_oneway(
+                        PeerMessage::PtyResize {
+                            terminal,
+                            cols,
+                            rows,
+                        },
+                        TrafficLane::ControlP0,
+                    )
                     .await;
             }
         });
@@ -7053,7 +8127,12 @@ impl RemoteMeshHub {
                             let found_sp = g
                                 .spaces
                                 .iter()
-                                .find(|s| s.machine_id == host_id_str)
+                                .find(|s| {
+                                    s.machine_id == host_id_str
+                                        && s.id.starts_with(&repo_prefix)
+                                        && s.path != "."
+                                })
+                                .or_else(|| g.spaces.iter().find(|s| s.machine_id == host_id_str))
                                 .map(|s| (s.id.clone(), s.path.clone()));
                             if let Some((ref sp_id, _)) = found_sp {
                                 g.active_space_id = Some(sp_id.clone());
@@ -7087,9 +8166,10 @@ impl RemoteMeshHub {
                         })
                         .unwrap_or((0, None));
                     if let Some((sp_id, sp_path)) = target_space {
-                        let mut p = DesktopPreferences::load_or_default();
-                        p.selected_repo_path = Some(sp_id.clone());
-                        let _ = p.save();
+                        let sp_id_pref = sp_id.clone();
+                        CodaGpuWorkspaceView::update_prefs_async(move |p| {
+                            p.selected_repo_path = Some(sp_id_pref);
+                        });
                         hub.refresh_remote_git_diff(host.id, &sp_id, &sp_path);
                         if sp_path != "." {
                             hub.refresh_remote_directory(host.id, &sp_id, &sp_path, "");
@@ -7156,7 +8236,7 @@ fn spawn_device_login(
                 Ok(flow) => {
                     let uri = flow.verification_uri_complete.clone();
                     #[cfg(target_os = "macos")]
-                    {
+                    if is_safe_http_url(&uri) {
                         let _ = std::process::Command::new("open").arg(&uri).spawn();
                     }
                     if let Ok(mut g) = state_bg.lock() {
@@ -7265,7 +8345,6 @@ pub fn launch_gpui_desktop_app() {
             KeyBinding::new("cmd-k", ToggleCommandPalette, None),
             KeyBinding::new("cmd-1", SwitchLayoutWorkbench, None),
             KeyBinding::new("cmd-2", SwitchLayoutTerminals, None),
-            KeyBinding::new("ctrl-c", InterruptActiveTerminal, None),
         ]);
         cx.set_menus(vec![
             Menu {
@@ -7332,288 +8411,14 @@ pub fn launch_gpui_desktop_app() {
             });
         });
 
-        cx.observe_keystrokes(move |ev, _, cx| {
-            let key = ev.keystroke.key.as_str();
-            let mods = &ev.keystroke.modifiers;
-
-            // Cmd+V Paste into focused input target or active PTY
-            if mods.platform && key == "v" {
-                if let Some(txt) = cx.read_from_clipboard().and_then(|i| i.text()) {
-                    view.update(cx, |this, cx| {
-                        let (target, settings_open, focused_id) = this
-                            .state
-                            .lock()
-                            .map(|g| {
-                                (
-                                    g.input_target,
-                                    g.settings_open,
-                                    g.focused_session_id().map(|s| s.to_string()),
-                                )
-                            })
-                            .unwrap_or((ActiveInputTarget::TerminalDirect, false, None));
-                        match target {
-                            ActiveInputTarget::TerminalDirect => {
-                                if !settings_open {
-                                    if let Some(id) = focused_id {
-                                        this.send_bytes_to_session(&id, txt.as_bytes());
-                                    }
-                                }
-                            }
-                            ActiveInputTarget::CommandPalette => {
-                                if let Ok(mut g) = this.state.lock() {
-                                    g.palette_query.push_str(txt.trim());
-                                    g.palette_selected = 0;
-                                }
-                            }
-                            ActiveInputTarget::AuthServerUrl => {
-                                if let Ok(mut g) = this.state.lock() {
-                                    g.server_url.push_str(txt.trim());
-                                }
-                            }
-                            ActiveInputTarget::AuthAccount => {
-                                if let Ok(mut g) = this.state.lock() {
-                                    g.auth_account_input.push_str(txt.trim());
-                                }
-                            }
-                            ActiveInputTarget::AuthPassword => {
-                                if let Ok(mut g) = this.state.lock() {
-                                    g.auth_password_input.push_str(&txt);
-                                }
-                            }
-                        }
-                        cx.notify();
-                    });
-                }
-                return;
-            }
-
-            if mods.platform {
-                return;
-            }
-
-            view.update(cx, |this, cx| {
-                let (target, palette_open, settings_open, focused_id) = this
-                    .state
-                    .lock()
-                    .map(|g| {
-                        (
-                            g.input_target,
-                            g.palette_open,
-                            g.settings_open,
-                            g.focused_session_id().map(|s| s.to_string()),
-                        )
-                    })
-                    .unwrap_or((ActiveInputTarget::TerminalDirect, false, false, None));
-
-                if palette_open || target == ActiveInputTarget::CommandPalette {
-                    match key {
-                        "escape" => {
-                            if let Ok(mut g) = this.state.lock() {
-                                g.palette_open = false;
-                                g.palette_query.clear();
-                                g.input_target = ActiveInputTarget::TerminalDirect;
-                            }
-                        }
-                        "up" => {
-                            if let Ok(mut g) = this.state.lock() {
-                                g.palette_selected = g.palette_selected.saturating_sub(1);
-                            }
-                        }
-                        "down" => {
-                            if let Ok(mut g) = this.state.lock() {
-                                let len = g.palette_items().len();
-                                if g.palette_selected + 1 < len {
-                                    g.palette_selected += 1;
-                                }
-                            }
-                        }
-                        "enter" => {
-                            let selected_action = this.state.lock().ok().and_then(|g| {
-                                let items = g.palette_items();
-                                items
-                                    .get(g.palette_selected.min(items.len().saturating_sub(1)))
-                                    .map(|i| i.action.clone())
-                            });
-                            if let Some(action) = selected_action {
-                                this.execute_palette_action(action);
-                            }
-                        }
-                        "backspace" => {
-                            if let Ok(mut g) = this.state.lock() {
-                                g.palette_query.pop();
-                                g.palette_selected = 0;
-                            }
-                        }
-                        _ => {
-                            if let Some(ref ch) = ev.keystroke.key_char {
-                                if !mods.control {
-                                    if let Ok(mut g) = this.state.lock() {
-                                        g.palette_query.push_str(ch);
-                                        g.palette_selected = 0;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    cx.notify();
-                    return;
-                }
-
-                if settings_open && target == ActiveInputTarget::TerminalDirect {
-                    if key == "escape" {
-                        if let Ok(mut g) = this.state.lock() {
-                            g.settings_open = false;
-                        }
-                        cx.notify();
-                    }
-                    return;
-                }
-
-                if target == ActiveInputTarget::TerminalDirect {
-                    if let Some(id) = focused_id {
-                        if let Ok(mut g) = this.state.lock() {
-                            if let Some(s) = g.sessions.iter_mut().find(|s| s.id == id) {
-                                s.scroll_offset = 0;
-                            }
-                        }
-                        if mods.control {
-                            let ctrl_byte = match key {
-                                "c" => Some(0x03u8),
-                                "d" => Some(0x04u8),
-                                "l" => Some(0x0cu8),
-                                "z" => Some(0x1au8),
-                                _ => None,
-                            };
-                            if let Some(b) = ctrl_byte {
-                                this.send_bytes_to_session(&id, &[b]);
-                            }
-                            cx.notify();
-                            return;
-                        }
-                        let seq: Option<&[u8]> = match key {
-                            "enter" => Some(b"\r"),
-                            "backspace" => Some(&[0x7f]),
-                            "tab" => Some(b"\t"),
-                            "escape" => Some(b"\x1b"),
-                            "up" => Some(b"\x1b[A"),
-                            "down" => Some(b"\x1b[B"),
-                            "right" => Some(b"\x1b[C"),
-                            "left" => Some(b"\x1b[D"),
-                            _ => None,
-                        };
-                        if let Some(bytes) = seq {
-                            this.send_bytes_to_session(&id, bytes);
-                        } else if let Some(ref ch) = ev.keystroke.key_char {
-                            this.send_bytes_to_session(&id, ch.as_bytes());
-                        }
-                        cx.notify();
-                        return;
-                    }
-                }
-
-                // Auth form input fields inside Mesh drawer or Settings -> Machines
-                match target {
-                    ActiveInputTarget::AuthServerUrl => match key {
-                        "backspace" => {
-                            if let Ok(mut g) = this.state.lock() {
-                                g.server_url.pop();
-                            }
-                        }
-                        "enter" => {
-                            let url = this
-                                .state
-                                .lock()
-                                .map(|g| g.server_url.clone())
-                                .unwrap_or_default();
-                            this.save_server_url_preference(&url);
-                        }
-                        "escape" => {
-                            if let Ok(mut g) = this.state.lock() {
-                                g.input_target = ActiveInputTarget::TerminalDirect;
-                            }
-                        }
-                        _ => {
-                            if let Some(ref ch) = ev.keystroke.key_char {
-                                if !mods.control {
-                                    if let Ok(mut g) = this.state.lock() {
-                                        g.server_url.push_str(ch);
-                                    }
-                                }
-                            }
-                        }
-                    },
-                    ActiveInputTarget::AuthAccount => match key {
-                        "backspace" => {
-                            if let Ok(mut g) = this.state.lock() {
-                                g.auth_account_input.pop();
-                            }
-                        }
-                        "tab" | "enter" => {
-                            if let Ok(mut g) = this.state.lock() {
-                                g.input_target = ActiveInputTarget::AuthPassword;
-                            }
-                        }
-                        _ => {
-                            if let Some(ref ch) = ev.keystroke.key_char {
-                                if !mods.control {
-                                    if let Ok(mut g) = this.state.lock() {
-                                        g.auth_account_input.push_str(ch);
-                                    }
-                                }
-                            }
-                        }
-                    },
-                    ActiveInputTarget::AuthPassword => match key {
-                        "backspace" => {
-                            if let Ok(mut g) = this.state.lock() {
-                                g.auth_password_input.pop();
-                            }
-                        }
-                        "enter" => {
-                            let (srv, acc, pw) = {
-                                let Ok(g) = this.state.lock() else {
-                                    return;
-                                };
-                                (
-                                    g.server_url.clone(),
-                                    g.auth_account_input.clone(),
-                                    g.auth_password_input.clone(),
-                                )
-                            };
-                            spawn_password_login(
-                                Arc::clone(&this.state),
-                                Arc::clone(&this.ui_dirty),
-                                Arc::clone(&this.mesh_hub),
-                                srv,
-                                acc,
-                                pw,
-                            );
-                        }
-                        _ => {
-                            if let Some(ref ch) = ev.keystroke.key_char {
-                                if !mods.control {
-                                    if let Ok(mut g) = this.state.lock() {
-                                        g.auth_password_input.push_str(ch);
-                                    }
-                                }
-                            }
-                        }
-                    },
-                    ActiveInputTarget::TerminalDirect | ActiveInputTarget::CommandPalette => {}
-                }
-                cx.notify();
-            });
-        })
-        .detach();
-
         cx.activate(true);
-        let _ = ClipboardItem::new_string;
     });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::set_config_root_override;
     use crate::pty::VtScreenBuffer;
 
     #[test]
@@ -7688,6 +8493,22 @@ mod tests {
 
     #[test]
     fn test_malleable_layout_and_agents_md_generation() {
+        struct OverrideReset;
+        impl Drop for OverrideReset {
+            fn drop(&mut self) {
+                set_config_root_override(None);
+            }
+        }
+
+        let tmp_dir = std::env::temp_dir().join(format!("coda-layout-test-{}", Uuid::new_v4()));
+        set_config_root_override(Some(tmp_dir.clone()));
+        let _guard = OverrideReset;
+
+        MalleableLayoutConfig::save_default_if_missing();
+        assert!(tmp_dir.join("layout.json").is_file());
+        let agents_path = ensure_agents_md_manual().expect("expected AGENTS.md path");
+        assert!(agents_path.is_file());
+
         let cfg = MalleableLayoutConfig::default();
         assert_eq!(cfg.layout, LayoutMode::Workbench);
         assert_eq!(cfg.accent_color_u32(), 0x38bdf8);
@@ -7704,6 +8525,39 @@ mod tests {
             let raw = format!(r#"{{"layout":"{legacy}"}}"#);
             let parsed: MalleableLayoutConfig = serde_json::from_str(&raw).unwrap();
             assert_eq!(parsed.layout, LayoutMode::Workbench);
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_vt_cjk_wide_cells_charset_utf8_osc_and_path_boundaries() {
+        let mut vt = VtScreenBuffer::new(20, 6);
+        // CJK wide char ("中") occupies 2 columns, followed immediately by ASCII 'a', then overwrite col 0
+        vt.feed_bytes("中a\rX".as_bytes());
+        // ESC ( B charset designator sequence must be consumed cleanly without leaking 'B'
+        vt.feed_bytes(b"\x1b(B!");
+        let lines = vt.render_lines(10);
+        assert_eq!(lines[0], "X!a", "overwriting left half of wide char should clear continuation cell cleanly: {lines:?}");
+
+        // UTF-8 multi-byte OSC 7501 status task
+        vt.feed_bytes("\x1b]7501;state=working;title=测试任务中\x07".as_bytes());
+        let osc = vt.osc_status().expect("expected UTF-8 OSC 7501 status");
+        assert_eq!(osc.state, AgentLifecycleState::Working);
+        assert_eq!(osc.task.as_deref(), Some("测试任务中"));
+
+        // Path containment and compact display '/' boundary checks
+        assert!(path_within_root("/Users/alice/repo/sub", "/Users/alice/repo"));
+        assert!(!path_within_root("/Users/alice/repo2/sub", "/Users/alice/repo"));
+
+        if let Ok(home) = std::env::var("HOME") {
+            let trimmed_home = home.trim_end_matches('/');
+            if !trimmed_home.is_empty() {
+                let sibling = format!("{trimmed_home}-other/proj");
+                assert_eq!(display_compact_path(&sibling), sibling);
+                let inside = format!("{trimmed_home}/proj");
+                assert_eq!(display_compact_path(&inside), "~/proj");
+            }
         }
     }
 

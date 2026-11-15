@@ -4,8 +4,53 @@ use std::io::Write;
 use std::os::fd::RawFd;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+const MAX_CSI_BUF_BYTES: usize = 256;
+const MAX_OSC_BUF_BYTES: usize = 4096;
+
+/// Display cell width (`0` combining/control, `2` CJK/Fullwidth/Emoji, `1` narrow).
+pub fn char_display_width(ch: char) -> usize {
+    let cp = ch as u32;
+    if ch.is_control()
+        || matches!(
+            cp,
+            0x0300..=0x036F
+                | 0x1AB0..=0x1AFF
+                | 0x1DC0..=0x1DFF
+                | 0x200B..=0x200F
+                | 0x202A..=0x202E
+                | 0x2060..=0x206F
+                | 0x20D0..=0x20FF
+                | 0xFE00..=0xFE0F
+                | 0xFE20..=0xFE2F
+                | 0xFEFF
+                | 0xE0100..=0xE01EF
+        )
+    {
+        return 0;
+    }
+    if matches!(
+        cp,
+        0x1100..=0x115F
+            | 0x2329..=0x232A
+            | 0x2E80..=0x303E
+            | 0x3040..=0xA4CF
+            | 0xAC00..=0xD7A3
+            | 0xF900..=0xFAFF
+            | 0xFE10..=0xFE19
+            | 0xFE30..=0xFE6F
+            | 0xFF01..=0xFF60
+            | 0xFFE0..=0xFFE6
+            | 0x1F300..=0x1FAFF
+            | 0x20000..=0x3FFFF
+    ) {
+        return 2;
+    }
+    1
+}
 
 /// Normalized agent / terminal lifecycle state aligned with Herdr OSC 7501 and board columns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -52,6 +97,8 @@ pub struct VtCell {
     pub fg: Option<u32>,
     pub bg: Option<u32>,
     pub bold: bool,
+    /// True for the trailing placeholder cell of a width-2 CJK/Emoji glyph.
+    pub continuation: bool,
 }
 
 impl Default for VtCell {
@@ -61,6 +108,7 @@ impl Default for VtCell {
             fg: None,
             bg: None,
             bold: false,
+            continuation: false,
         }
     }
 }
@@ -91,12 +139,14 @@ pub struct PtySnapshot {
     pub osc_status: Option<Osc7501Status>,
     pub started_at: Instant,
     pub attached_hc: bool,
+    pub generation: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ParseState {
     Ground,
     Escape,
+    EscCharset,
     Csi,
     Osc,
     OscEsc,
@@ -149,9 +199,11 @@ pub struct VtScreenBuffer {
     alt_saved: Option<SavedScreenState>,
     parse_state: ParseState,
     csi_buf: String,
-    osc_buf: String,
+    osc_buf: Vec<u8>,
+    osc_overflow: bool,
     utf8_pending: Vec<u8>,
     osc_status: Option<Osc7501Status>,
+    generation: u64,
 }
 
 impl VtScreenBuffer {
@@ -173,10 +225,16 @@ impl VtScreenBuffer {
             alt_saved: None,
             parse_state: ParseState::Ground,
             csi_buf: String::new(),
-            osc_buf: String::new(),
+            osc_buf: Vec::new(),
+            osc_overflow: false,
             utf8_pending: Vec::with_capacity(4),
             osc_status: None,
+            generation: 1,
         }
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     pub fn resize(&mut self, cols: usize, rows: usize) {
@@ -192,6 +250,14 @@ impl VtScreenBuffer {
             for c in 0..copy_cols {
                 next[r][c] = self.grid[r][c];
             }
+            // Drop dangling trailing wide half if resize cut between wide char & continuation.
+            if copy_cols > 0 {
+                if next[r][copy_cols - 1].continuation {
+                    next[r][copy_cols - 1] = VtCell::default();
+                } else if char_display_width(next[r][copy_cols - 1].ch) == 2 {
+                    next[r][copy_cols - 1] = VtCell::default();
+                }
+            }
         }
         self.grid = next;
         self.cols = new_cols;
@@ -200,6 +266,7 @@ impl VtScreenBuffer {
         self.cursor_col = self.cursor_col.min(new_cols - 1);
         self.scroll_top = 0;
         self.scroll_bottom = new_rows - 1;
+        self.generation = self.generation.wrapping_add(1);
     }
 
     pub fn clear_all(&mut self) {
@@ -209,6 +276,7 @@ impl VtScreenBuffer {
         self.scrollback.clear();
         self.cursor_row = 0;
         self.cursor_col = 0;
+        self.generation = self.generation.wrapping_add(1);
     }
 
     pub fn osc_status(&self) -> Option<Osc7501Status> {
@@ -216,9 +284,13 @@ impl VtScreenBuffer {
     }
 
     pub fn feed_bytes(&mut self, data: &[u8]) {
+        if data.is_empty() {
+            return;
+        }
         for &byte in data {
             self.feed_byte(byte);
         }
+        self.generation = self.generation.wrapping_add(1);
     }
 
     fn feed_byte(&mut self, byte: u8) {
@@ -267,6 +339,7 @@ impl VtScreenBuffer {
                 }
                 b']' => {
                     self.osc_buf.clear();
+                    self.osc_overflow = false;
                     self.parse_state = ParseState::Osc;
                 }
                 b'M' => {
@@ -287,47 +360,122 @@ impl VtScreenBuffer {
                     self.style = SgrStyle::default();
                     self.parse_state = ParseState::Ground;
                 }
-                b'(' | b')' | b'*' | b'+' => {
-                    self.parse_state = ParseState::Ground;
+                b'(' | b')' | b'*' | b'+' | b'#' => {
+                    self.parse_state = ParseState::EscCharset;
                 }
                 _ => self.parse_state = ParseState::Ground,
             },
+            ParseState::EscCharset => {
+                // Consume the charset/line-drawing designator byte (e.g., 'B', '0', '8').
+                self.parse_state = ParseState::Ground;
+            }
             ParseState::Csi => {
                 if (0x40..=0x7e).contains(&byte) {
                     let seq = std::mem::take(&mut self.csi_buf);
                     self.dispatch_csi(&seq, byte as char);
                     self.parse_state = ParseState::Ground;
-                } else {
+                } else if byte == 0x1b {
+                    self.csi_buf.clear();
+                    self.parse_state = ParseState::Escape;
+                } else if self.csi_buf.len() < MAX_CSI_BUF_BYTES {
                     self.csi_buf.push(byte as char);
+                } else {
+                    self.csi_buf.clear();
+                    self.parse_state = ParseState::Ground;
                 }
             }
             ParseState::Osc => match byte {
                 0x07 => {
-                    let seq = std::mem::take(&mut self.osc_buf);
-                    self.dispatch_osc(&seq);
+                    let raw = std::mem::take(&mut self.osc_buf);
+                    if !self.osc_overflow {
+                        let seq = String::from_utf8_lossy(&raw).into_owned();
+                        self.dispatch_osc(&seq);
+                    }
+                    self.osc_overflow = false;
                     self.parse_state = ParseState::Ground;
                 }
                 0x1b => self.parse_state = ParseState::OscEsc,
-                _ => self.osc_buf.push(byte as char),
+                _ => {
+                    if !self.osc_overflow && self.osc_buf.len() < MAX_OSC_BUF_BYTES {
+                        self.osc_buf.push(byte);
+                    } else {
+                        self.osc_overflow = true;
+                        self.osc_buf.clear();
+                    }
+                }
             },
             ParseState::OscEsc => {
                 if byte == b'\\' {
-                    let seq = std::mem::take(&mut self.osc_buf);
-                    self.dispatch_osc(&seq);
+                    let raw = std::mem::take(&mut self.osc_buf);
+                    if !self.osc_overflow {
+                        let seq = String::from_utf8_lossy(&raw).into_owned();
+                        self.dispatch_osc(&seq);
+                    }
+                    self.osc_overflow = false;
                 }
                 self.parse_state = ParseState::Ground;
             }
         }
     }
 
+    fn clear_cell_preserving_wide(&mut self, row: usize, col: usize) {
+        if row >= self.rows || col >= self.cols {
+            return;
+        }
+        if self.grid[row][col].continuation && col > 0 {
+            self.grid[row][col - 1] = VtCell::default();
+        } else if col + 1 < self.cols && self.grid[row][col + 1].continuation {
+            self.grid[row][col + 1] = VtCell::default();
+        }
+        self.grid[row][col] = VtCell::default();
+    }
+
     fn put_char(&mut self, ch: char) {
-        if self.cursor_col >= self.cols {
-            self.cursor_col = 0;
-            self.line_feed();
+        let width = char_display_width(ch);
+        if width == 0 {
+            return;
         }
         let (fg, bg, bold) = self.style.to_cell_colors();
-        self.grid[self.cursor_row][self.cursor_col] = VtCell { ch, fg, bg, bold };
-        self.cursor_col += 1;
+        if width == 2 && self.cols >= 2 {
+            if self.cursor_col + 1 >= self.cols {
+                if self.cursor_col < self.cols {
+                    self.clear_cell_preserving_wide(self.cursor_row, self.cursor_col);
+                }
+                self.cursor_col = 0;
+                self.line_feed();
+            }
+            self.clear_cell_preserving_wide(self.cursor_row, self.cursor_col);
+            self.clear_cell_preserving_wide(self.cursor_row, self.cursor_col + 1);
+            self.grid[self.cursor_row][self.cursor_col] = VtCell {
+                ch,
+                fg,
+                bg,
+                bold,
+                continuation: false,
+            };
+            self.grid[self.cursor_row][self.cursor_col + 1] = VtCell {
+                ch: ' ',
+                fg,
+                bg,
+                bold,
+                continuation: true,
+            };
+            self.cursor_col += 2;
+        } else {
+            if self.cursor_col >= self.cols {
+                self.cursor_col = 0;
+                self.line_feed();
+            }
+            self.clear_cell_preserving_wide(self.cursor_row, self.cursor_col);
+            self.grid[self.cursor_row][self.cursor_col] = VtCell {
+                ch,
+                fg,
+                bg,
+                bold,
+                continuation: false,
+            };
+            self.cursor_col += 1;
+        }
     }
 
     fn line_feed(&mut self) {
@@ -377,7 +525,7 @@ impl VtScreenBuffer {
     }
 
     fn dispatch_osc(&mut self, seq: &str) {
-        // Format: 7501;state=working;task=Running cargo test
+        // Format: 7501;state=working;task=Running cargo test (also accepts title= / msg=)
         let Some(rest) = seq.strip_prefix("7501;") else {
             return;
         };
@@ -386,7 +534,11 @@ impl VtScreenBuffer {
         for part in rest.split(';') {
             if let Some(val) = part.strip_prefix("state=") {
                 state = Some(AgentLifecycleState::from_str_lossy(val));
-            } else if let Some(val) = part.strip_prefix("task=") {
+            } else if let Some(val) = part
+                .strip_prefix("task=")
+                .or_else(|| part.strip_prefix("title="))
+                .or_else(|| part.strip_prefix("msg="))
+            {
                 let trimmed = val.trim();
                 if !trimmed.is_empty() {
                     task = Some(trimmed.to_string());
@@ -489,7 +641,7 @@ impl VtScreenBuffer {
                 match p0 {
                     0 => {
                         for c in col..self.cols {
-                            self.grid[row][c] = VtCell::default();
+                            self.clear_cell_preserving_wide(row, c);
                         }
                         for r in (row + 1)..self.rows {
                             self.grid[r].fill(VtCell::default());
@@ -500,7 +652,7 @@ impl VtScreenBuffer {
                             self.grid[r].fill(VtCell::default());
                         }
                         for c in 0..=col.min(self.cols - 1) {
-                            self.grid[row][c] = VtCell::default();
+                            self.clear_cell_preserving_wide(row, c);
                         }
                     }
                     2 | 3 => {
@@ -520,12 +672,12 @@ impl VtScreenBuffer {
                 match p0 {
                     0 => {
                         for c in col..self.cols {
-                            self.grid[row][c] = VtCell::default();
+                            self.clear_cell_preserving_wide(row, c);
                         }
                     }
                     1 => {
                         for c in 0..=col.min(self.cols - 1) {
-                            self.grid[row][c] = VtCell::default();
+                            self.clear_cell_preserving_wide(row, c);
                         }
                     }
                     2 => self.grid[row].fill(VtCell::default()),
@@ -566,7 +718,7 @@ impl VtScreenBuffer {
                 let row = self.cursor_row;
                 let col = self.cursor_col;
                 for c in col..(col + p0_one).min(self.cols) {
-                    self.grid[row][c] = VtCell::default();
+                    self.clear_cell_preserving_wide(row, c);
                 }
             }
             'r' => {
@@ -661,7 +813,11 @@ impl VtScreenBuffer {
             let Some((last_cells, cursor_col)) = raw_rows.last() else {
                 break;
             };
-            if cursor_col.is_some() || last_cells.iter().any(|c| c.ch != ' ' || c.bg.is_some()) {
+            if cursor_col.is_some()
+                || last_cells
+                    .iter()
+                    .any(|c| !c.continuation && (c.ch != ' ' || c.bg.is_some()))
+            {
                 break;
             }
             raw_rows.pop();
@@ -678,8 +834,14 @@ impl VtScreenBuffer {
 fn cells_to_styled_line(cells: &[VtCell], cursor_col: Option<usize>) -> StyledTerminalLine {
     let mut last_non_space = cells
         .iter()
-        .rposition(|c| c.ch != ' ' || c.bg.is_some())
-        .map(|idx| idx + 1)
+        .rposition(|c| !c.continuation && (c.ch != ' ' || c.bg.is_some()))
+        .map(|idx| {
+            if idx + 1 < cells.len() && cells[idx + 1].continuation {
+                idx + 2
+            } else {
+                idx + 1
+            }
+        })
         .unwrap_or(0);
     if let Some(c_col) = cursor_col {
         last_non_space = last_non_space.max(c_col + 1).min(cells.len());
@@ -689,7 +851,12 @@ fn cells_to_styled_line(cells: &[VtCell], cursor_col: Option<usize>) -> StyledTe
     let mut spans: Vec<TerminalColorSpan> = Vec::new();
 
     for (col_idx, cell) in cells[..last_non_space].iter().enumerate() {
-        let is_cursor = cursor_col == Some(col_idx);
+        if cell.continuation {
+            continue;
+        }
+        let is_cursor = cursor_col == Some(col_idx)
+            || (cursor_col == Some(col_idx + 1)
+                && cells.get(col_idx + 1).is_some_and(|n| n.continuation));
         let (fg, bg, bold) = if is_cursor {
             (Some(0x0d0e11), Some(0xe6edf3), cell.bold)
         } else {
@@ -770,9 +937,147 @@ fn ansi256_color(idx: usize) -> u32 {
     (gray << 16) | (gray << 8) | gray
 }
 
+#[derive(Clone)]
+struct CachedSnapshot {
+    generation: u64,
+    max_lines: usize,
+    alive: bool,
+    snapshot: PtySnapshot,
+}
+
+enum PtyWriteCmd {
+    Bytes(Vec<u8>),
+    DetachAndExit,
+}
+
+fn set_fd_cloexec(fd: RawFd) {
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFD);
+        if flags >= 0 {
+            libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+        }
+    }
+}
+
+fn write_all_fd_blocking(fd: RawFd, data: &[u8]) -> Result<(), String> {
+    let mut written = 0usize;
+    let mut eagain_retries = 0u32;
+    while written < data.len() {
+        let rc = unsafe {
+            libc::write(
+                fd,
+                data[written..].as_ptr().cast(),
+                data.len() - written,
+            )
+        };
+        if rc > 0 {
+            written += rc as usize;
+            eagain_retries = 0;
+            continue;
+        }
+        let err = std::io::Error::last_os_error();
+        let raw = err.raw_os_error().unwrap_or_default();
+        if raw == libc::EINTR {
+            continue;
+        }
+        if (raw == libc::EAGAIN || raw == libc::EWOULDBLOCK) && eagain_retries < 40 {
+            eagain_retries += 1;
+            let mut pfd = libc::pollfd {
+                fd,
+                events: libc::POLLOUT,
+                revents: 0,
+            };
+            unsafe {
+                libc::poll(&mut pfd, 1, 50);
+            }
+            continue;
+        }
+        return Err(format!("pty write failed: {err}"));
+    }
+    Ok(())
+}
+
+fn resolve_executable_in_path(program: &str, path_env: &str) -> String {
+    if program.contains('/') {
+        return program.to_string();
+    }
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    for dir in path_env.split(':').filter(|d| !d.is_empty()) {
+        let cand = Path::new(dir).join(program);
+        if let Ok(meta) = std::fs::metadata(&cand) {
+            if meta.is_file() {
+                #[cfg(unix)]
+                if meta.permissions().mode() & 0o111 != 0 {
+                    return cand.to_string_lossy().to_string();
+                }
+                #[cfg(not(unix))]
+                return cand.to_string_lossy().to_string();
+            }
+        }
+    }
+    program.to_string()
+}
+
+fn build_child_env_cstrings(path_env: &str) -> Result<Vec<CString>, String> {
+    let mut envs = Vec::new();
+    for (k, v) in std::env::vars() {
+        if matches!(
+            k.as_str(),
+            "TERM" | "COLORTERM" | "LANG" | "LC_ALL" | "PATH"
+        ) {
+            continue;
+        }
+        if !k.contains('=') && !k.contains('\0') && !v.contains('\0') {
+            if let Ok(c) = CString::new(format!("{k}={v}")) {
+                envs.push(c);
+            }
+        }
+    }
+    envs.push(CString::new("TERM=xterm-256color").map_err(|e| e.to_string())?);
+    envs.push(CString::new("COLORTERM=truecolor").map_err(|e| e.to_string())?);
+    envs.push(CString::new("LANG=en_US.UTF-8").map_err(|e| e.to_string())?);
+    envs.push(CString::new("LC_ALL=en_US.UTF-8").map_err(|e| e.to_string())?);
+    envs.push(CString::new(format!("PATH={path_env}")).map_err(|e| e.to_string())?);
+    Ok(envs)
+}
+
+fn try_reap_pid(pid_slot: &Arc<Mutex<Option<libc::pid_t>>>, nohang: bool) -> bool {
+    let Ok(mut guard) = pid_slot.lock() else {
+        return true;
+    };
+    let Some(pid) = *guard else {
+        return true;
+    };
+    if pid <= 0 {
+        *guard = None;
+        return true;
+    }
+    let flags = if nohang { libc::WNOHANG } else { 0 };
+    let mut status: libc::c_int = 0;
+    loop {
+        let rc = unsafe { libc::waitpid(pid, &mut status, flags) };
+        if rc < 0 {
+            let raw = std::io::Error::last_os_error().raw_os_error();
+            if raw == Some(libc::EINTR) {
+                continue;
+            }
+            // ECHILD or already reaped.
+            *guard = None;
+            return true;
+        }
+        if rc == 0 {
+            return false;
+        }
+        *guard = None;
+        return true;
+    }
+}
+
 struct PtySessionHandle {
     master_fd: RawFd,
-    child_pid: libc::pid_t,
+    pid_slot: Arc<Mutex<Option<libc::pid_t>>>,
+    writer_tx: Option<SyncSender<PtyWriteCmd>>,
     cols: u16,
     rows: u16,
     alive: Arc<AtomicBool>,
@@ -780,27 +1085,69 @@ struct PtySessionHandle {
     attached_hc: bool,
     started_at: Instant,
     screen: Arc<Mutex<VtScreenBuffer>>,
+    snapshot_cache: Mutex<Option<CachedSnapshot>>,
 }
 
 impl Drop for PtySessionHandle {
     fn drop(&mut self) {
         self.alive.store(false, Ordering::SeqCst);
-        if self.master_fd >= 0 {
-            if self.detach_on_drop {
-                let detach_key = [0x1c_u8];
+        let tx = self.writer_tx.take();
+        if self.detach_on_drop {
+            if let Some(ref sender) = tx {
+                if sender.try_send(PtyWriteCmd::DetachAndExit).is_err() && self.master_fd >= 0 {
+                    let _ = write_all_fd_blocking(self.master_fd, &[0x1c_u8]);
+                }
+            } else if self.master_fd >= 0 {
+                let _ = write_all_fd_blocking(self.master_fd, &[0x1c_u8]);
+            }
+        }
+        drop(tx);
+
+        let pid_opt = self.pid_slot.lock().ok().and_then(|g| *g);
+        if !self.detach_on_drop {
+            if let Some(pid) = pid_opt.filter(|&p| p > 0) {
                 unsafe {
-                    libc::write(self.master_fd, detach_key.as_ptr().cast(), 1);
+                    if libc::kill(-pid, libc::SIGHUP) != 0 {
+                        libc::kill(pid, libc::SIGHUP);
+                    }
                 }
             }
+        }
+        if self.master_fd >= 0 {
             unsafe {
                 libc::close(self.master_fd);
             }
             self.master_fd = -1;
         }
-        if !self.detach_on_drop && self.child_pid > 0 {
-            unsafe {
-                libc::kill(self.child_pid, libc::SIGHUP);
-            }
+        if let Some(pid) = pid_opt.filter(|&p| p > 0) {
+            let pid_slot = Arc::clone(&self.pid_slot);
+            let detach_on_drop = self.detach_on_drop;
+            std::thread::spawn(move || {
+                let max_polls = if detach_on_drop { 60 } else { 25 };
+                for _ in 0..max_polls {
+                    if try_reap_pid(&pid_slot, true) {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                if let Ok(g) = pid_slot.lock() {
+                    if *g == Some(pid) {
+                        unsafe {
+                            let sig = if detach_on_drop { libc::SIGHUP } else { libc::SIGKILL };
+                            if libc::kill(-pid, sig) != 0 {
+                                libc::kill(pid, sig);
+                            }
+                            if detach_on_drop {
+                                std::thread::sleep(Duration::from_millis(100));
+                                if libc::kill(-pid, libc::SIGKILL) != 0 {
+                                    libc::kill(pid, libc::SIGKILL);
+                                }
+                            }
+                        }
+                    }
+                }
+                let _ = try_reap_pid(&pid_slot, false);
+            });
         }
     }
 }
@@ -811,6 +1158,7 @@ struct RemoteVtHandle {
     alive: Arc<AtomicBool>,
     started_at: Instant,
     screen: Arc<Mutex<VtScreenBuffer>>,
+    snapshot_cache: Mutex<Option<CachedSnapshot>>,
 }
 
 /// Manages multiple local Unix `openpty` and streamed remote `herdr` terminal sessions wired into GPUI.
@@ -850,6 +1198,7 @@ impl LocalPtyManager {
                     cols as usize,
                     rows as usize,
                 ))),
+                snapshot_cache: Mutex::new(None),
             },
         );
         self.ui_dirty.store(true, Ordering::SeqCst);
@@ -949,8 +1298,12 @@ impl LocalPtyManager {
         if open_rc != 0 {
             return Err(format!("openpty failed: {}", std::io::Error::last_os_error()));
         }
+        set_fd_cloexec(master_fd);
+        set_fd_cloexec(slave_fd);
 
-        let prog_c = CString::new(program).map_err(|e| e.to_string())?;
+        let path_env = crate::config::augmented_gui_path_string();
+        let resolved_prog = resolve_executable_in_path(program, &path_env);
+        let prog_c = CString::new(resolved_prog).map_err(|e| e.to_string())?;
         let cwd_c = CString::new(cwd.to_string_lossy().as_bytes()).map_err(|e| e.to_string())?;
         let argv_c: Vec<CString> = argv
             .iter()
@@ -960,8 +1313,10 @@ impl LocalPtyManager {
             argv_c.iter().map(|s| s.as_ptr()).collect();
         argv_ptrs.push(std::ptr::null());
 
-        let term_env = CString::new("TERM=xterm-256color").unwrap();
-        let colorterm_env = CString::new("COLORTERM=truecolor").unwrap();
+        let env_c = build_child_env_cstrings(&path_env)?;
+        let mut env_ptrs: Vec<*const libc::c_char> =
+            env_c.iter().map(|s| s.as_ptr()).collect();
+        env_ptrs.push(std::ptr::null());
 
         let pid = unsafe { libc::fork() };
         if pid < 0 {
@@ -984,9 +1339,7 @@ impl LocalPtyManager {
                     libc::close(slave_fd);
                 }
                 libc::chdir(cwd_c.as_ptr());
-                libc::putenv(term_env.as_ptr() as *mut libc::c_char);
-                libc::putenv(colorterm_env.as_ptr() as *mut libc::c_char);
-                libc::execvp(prog_c.as_ptr(), argv_ptrs.as_ptr());
+                libc::execve(prog_c.as_ptr(), argv_ptrs.as_ptr(), env_ptrs.as_ptr());
                 libc::_exit(127);
             }
         }
@@ -995,26 +1348,69 @@ impl LocalPtyManager {
             libc::close(slave_fd);
         }
 
-        let reader_fd = unsafe { libc::dup(master_fd) };
+        let reader_fd = unsafe { libc::fcntl(master_fd, libc::F_DUPFD_CLOEXEC, 0) };
         if reader_fd < 0 {
             unsafe {
+                libc::kill(-pid, libc::SIGHUP);
                 libc::close(master_fd);
             }
+            let pid_slot = Arc::new(Mutex::new(Some(pid)));
+            let _ = try_reap_pid(&pid_slot, false);
             return Err("dup(master_fd) failed".to_string());
+        }
+        let writer_fd = unsafe { libc::fcntl(master_fd, libc::F_DUPFD_CLOEXEC, 0) };
+        if writer_fd < 0 {
+            unsafe {
+                libc::kill(-pid, libc::SIGHUP);
+                libc::close(reader_fd);
+                libc::close(master_fd);
+            }
+            let pid_slot = Arc::new(Mutex::new(Some(pid)));
+            let _ = try_reap_pid(&pid_slot, false);
+            return Err("dup(writer_fd) failed".to_string());
         }
 
         let alive = Arc::new(AtomicBool::new(true));
         let screen = Arc::new(Mutex::new(VtScreenBuffer::new(cols as usize, rows as usize)));
+        let pid_slot = Arc::new(Mutex::new(Some(pid)));
 
         let alive_bg = Arc::clone(&alive);
         let screen_bg = Arc::clone(&screen);
+        let pid_slot_reader = Arc::clone(&pid_slot);
         let ui_dirty = Arc::clone(&self.ui_dirty);
+
+        let (writer_tx, writer_rx) = mpsc::sync_channel::<PtyWriteCmd>(512);
+        std::thread::spawn(move || {
+            while let Ok(cmd) = writer_rx.recv() {
+                match cmd {
+                    PtyWriteCmd::Bytes(bytes) => {
+                        if write_all_fd_blocking(writer_fd, &bytes).is_err() {
+                            break;
+                        }
+                    }
+                    PtyWriteCmd::DetachAndExit => {
+                        let _ = write_all_fd_blocking(writer_fd, &[0x1c_u8]);
+                        break;
+                    }
+                }
+            }
+            unsafe {
+                libc::close(writer_fd);
+            }
+        });
 
         std::thread::spawn(move || {
             let mut buf = [0u8; 8192];
             loop {
                 let n = unsafe { libc::read(reader_fd, buf.as_mut_ptr().cast(), buf.len()) };
-                if n <= 0 {
+                if n < 0 {
+                    let raw = std::io::Error::last_os_error().raw_os_error();
+                    if raw == Some(libc::EINTR) {
+                        continue;
+                    }
+                    break;
+                }
+                if n == 0 {
                     break;
                 }
                 if let Ok(mut guard) = screen_bg.lock() {
@@ -1025,9 +1421,11 @@ impl LocalPtyManager {
             unsafe {
                 libc::close(reader_fd);
             }
-            let mut status: libc::c_int = 0;
-            unsafe {
-                libc::waitpid(pid, &mut status, libc::WNOHANG);
+            for _ in 0..10 {
+                if try_reap_pid(&pid_slot_reader, true) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
             }
             alive_bg.store(false, Ordering::SeqCst);
             ui_dirty.store(true, Ordering::SeqCst);
@@ -1037,7 +1435,8 @@ impl LocalPtyManager {
             id.to_string(),
             PtySessionHandle {
                 master_fd,
-                child_pid: pid,
+                pid_slot,
+                writer_tx: Some(writer_tx),
                 cols,
                 rows,
                 alive,
@@ -1045,6 +1444,7 @@ impl LocalPtyManager {
                 attached_hc: detach_on_drop,
                 started_at: Instant::now(),
                 screen,
+                snapshot_cache: Mutex::new(None),
             },
         );
         self.ui_dirty.store(true, Ordering::SeqCst);
@@ -1055,21 +1455,17 @@ impl LocalPtyManager {
         let Some(session) = self.sessions.get(id) else {
             return Err(format!("PTY session '{id}' not found"));
         };
-        let mut written = 0usize;
-        while written < bytes.len() {
-            let rc = unsafe {
-                libc::write(
-                    session.master_fd,
-                    bytes[written..].as_ptr().cast(),
-                    bytes.len() - written,
-                )
-            };
-            if rc <= 0 {
-                return Err(format!("pty write failed: {}", std::io::Error::last_os_error()));
-            }
-            written += rc as usize;
+        if bytes.is_empty() {
+            return Ok(());
         }
-        Ok(())
+        let Some(ref tx) = session.writer_tx else {
+            return Err(format!("PTY writer closed for '{id}'"));
+        };
+        match tx.try_send(PtyWriteCmd::Bytes(bytes.to_vec())) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => Err(format!("PTY write queue full for '{id}'")),
+            Err(TrySendError::Disconnected(_)) => Err(format!("PTY writer disconnected for '{id}'")),
+        }
     }
 
     pub fn send_command_line(&self, id: &str, command: &str) -> Result<(), String> {
@@ -1139,8 +1535,9 @@ impl LocalPtyManager {
             let alive = session.alive.load(Ordering::SeqCst);
             out.insert(
                 id.clone(),
-                build_pty_snapshot(
+                build_pty_snapshot_cached(
                     &session.screen,
+                    &session.snapshot_cache,
                     alive,
                     session.started_at,
                     session.attached_hc,
@@ -1152,8 +1549,9 @@ impl LocalPtyManager {
             let alive = remote.alive.load(Ordering::SeqCst);
             out.insert(
                 id.clone(),
-                build_pty_snapshot(
+                build_pty_snapshot_cached(
                     &remote.screen,
+                    &remote.snapshot_cache,
                     alive,
                     remote.started_at,
                     true,
@@ -1175,26 +1573,55 @@ impl LocalPtyManager {
     }
 }
 
-fn build_pty_snapshot(
+fn build_pty_snapshot_cached(
     screen: &Arc<Mutex<VtScreenBuffer>>,
+    cache: &Mutex<Option<CachedSnapshot>>,
     alive: bool,
     started_at: Instant,
     attached_hc: bool,
     max_lines: usize,
 ) -> PtySnapshot {
-    let (styled_lines, osc_status) = screen
-        .lock()
-        .map(|g| (g.render_styled_lines(max_lines, alive), g.osc_status()))
-        .unwrap_or_default();
+    let Ok(guard) = screen.lock() else {
+        return PtySnapshot {
+            lines: Vec::new(),
+            styled_lines: Vec::new(),
+            alive,
+            osc_status: None,
+            started_at,
+            attached_hc,
+            generation: 0,
+        };
+    };
+    let generation = guard.generation();
+    if let Ok(c) = cache.lock() {
+        if let Some(ref hit) = *c {
+            if hit.generation == generation && hit.max_lines == max_lines && hit.alive == alive {
+                return hit.snapshot.clone();
+            }
+        }
+    }
+    let styled_lines = guard.render_styled_lines(max_lines, alive);
+    let osc_status = guard.osc_status();
+    drop(guard);
     let lines = styled_lines.iter().map(|l| l.text.clone()).collect();
-    PtySnapshot {
+    let snap = PtySnapshot {
         lines,
         styled_lines,
         alive,
         osc_status,
         started_at,
         attached_hc,
+        generation,
+    };
+    if let Ok(mut c) = cache.lock() {
+        *c = Some(CachedSnapshot {
+            generation,
+            max_lines,
+            alive,
+            snapshot: snap.clone(),
+        });
     }
+    snap
 }
 
 #[cfg(test)]
