@@ -1,4 +1,107 @@
-import { BrowserE2EESession, loadOrCreateWebIdentity, signWebMessage } from "./crypto";
+import {
+  BrowserE2EESession,
+  RelaySessionAuth,
+  createRelaySessionAuth,
+  fromB64,
+  generateEphemeralX25519,
+  isTimestampFresh,
+  loadOrCreateWebIdentity,
+  p2pAckV2SigningText,
+  p2pHelloV2SigningText,
+  signWebMessage,
+  toB64,
+  verifyEd25519Signature,
+  verifyRelaySessionAuth,
+} from "./crypto";
+import { WebVtTerminal, escapeHtml, safeHref } from "./vt";
+
+if (typeof window !== "undefined" && typeof document !== "undefined") {
+  try {
+    const pref = localStorage.getItem("coda_theme") || "dark";
+    const resolved =
+      pref === "system"
+        ? window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches
+          ? "light"
+          : "dark"
+        : pref === "light"
+          ? "light"
+          : "dark";
+    document.documentElement.dataset.theme = resolved;
+    document.documentElement.style.colorScheme = resolved;
+    const qLang = new URLSearchParams(window.location.search).get("lang");
+    const loc =
+      qLang === "zh" || qLang === "zh-CN"
+        ? "zh"
+        : qLang === "en"
+          ? "en"
+          : localStorage.getItem("coda_locale") === "zh"
+            ? "zh"
+            : "en";
+    document.documentElement.lang = loc === "zh" ? "zh-CN" : "en";
+  } catch {
+    document.documentElement.dataset.theme = "dark";
+    document.documentElement.lang = "en";
+  }
+}
+
+const MAX_UPLOAD_BYTES = 8 * 1024 * 1024;
+
+function readSessionOrLegacyToken(): string | null {
+  try {
+    if (typeof sessionStorage !== "undefined") {
+      const s = sessionStorage.getItem("coda_token");
+      if (s) return s;
+      if (typeof localStorage !== "undefined") {
+        const legacy = localStorage.getItem("coda_token");
+        if (legacy) {
+          sessionStorage.setItem("coda_token", legacy);
+          localStorage.removeItem("coda_token");
+          return legacy;
+        }
+      }
+      return null;
+    }
+    if (typeof localStorage !== "undefined") return localStorage.getItem("coda_token");
+  } catch {
+    // ignore storage access errors
+  }
+  return null;
+}
+
+function saveSessionToken(token: string): void {
+  try {
+    if (typeof sessionStorage !== "undefined") sessionStorage.setItem("coda_token", token);
+    if (typeof localStorage !== "undefined") localStorage.removeItem("coda_token");
+  } catch {
+    // ignore storage errors
+  }
+}
+
+function clearSessionToken(): void {
+  try {
+    if (typeof sessionStorage !== "undefined") sessionStorage.removeItem("coda_token");
+    if (typeof localStorage !== "undefined") localStorage.removeItem("coda_token");
+  } catch {
+    // ignore storage errors
+  }
+}
+
+function readLocalPref(key: string, fallback: string): string {
+  try {
+    if (typeof localStorage !== "undefined") return localStorage.getItem(key) || fallback;
+  } catch {
+    // ignore
+  }
+  return fallback;
+}
+
+function writeLocalPref(key: string, val: string): void {
+  try {
+    if (typeof localStorage !== "undefined") localStorage.setItem(key, val);
+  } catch {
+    // ignore
+  }
+}
 
 interface User {
   id: string;
@@ -19,10 +122,19 @@ interface Device {
   name: string;
   role: string;
   platform: string;
+  ed25519_pubkey?: string;
   x25519_pubkey: string;
   endpoints_json?: EndpointCandidate[];
   herdr_version?: string | null;
   is_online: boolean;
+}
+
+interface RelayNodeInfo {
+  id: string;
+  region: string;
+  mode: string;
+  endpoint: string;
+  priority: number;
 }
 
 interface HerdrTerminal {
@@ -261,9 +373,9 @@ function soft(p: number): number {
 
 type AppRoute = "home" | "login" | "register" | "activate" | "console";
 
-class CodaTerminalWebApp {
-  private token: string | null = localStorage.getItem("coda_token");
-  private themePref: ThemePreference = (localStorage.getItem("coda_theme") as ThemePreference) || "dark";
+export class CodaTerminalWebApp {
+  private token: string | null = readSessionOrLegacyToken();
+  private themePref: ThemePreference = readLocalPref("coda_theme", "dark") as ThemePreference;
   private locale: Locale = this.resolveInitialLocale();
   private route: AppRoute = "home";
   private authMode: "login" | "register" = "login";
@@ -276,6 +388,7 @@ class CodaTerminalWebApp {
   private pendingActivationCode: string = "";
   private pendingDeviceInfo: DeviceAuthPublicInfo | null = null;
   private activationSuccessMsg = "";
+  private consoleNotice: { kind: "ok" | "err"; text: string } | null = null;
   private copiedToast: "" | "ok" | "manual" = "";
   private user: User | null = null;
   private devices: Device[] = [];
@@ -290,21 +403,36 @@ class CodaTerminalWebApp {
     model: "gpt-4o-mini-transcribe",
   };
   private activeTerminalAddr: string | null = null;
-  private terminalScreen = "";
   private draftInput = "";
+  private imeComposing = false;
   private showSidebar = true;
   private showSettingsModal = false;
   private showKeyboardInputBar = false;
   private pairCommand: string | null = null;
   private latestInviteCode: string | null = null;
   private rttMs: number | null = null;
+  private termCols = 108;
+  private termRows = 32;
   private ws: WebSocket | null = null;
+  private eventsWs: WebSocket | null = null;
   private directWs: WebSocket | null = null;
   private directWsPeerId: string | null = null;
   private activeTransportMode: "lan_ws" | "relay_ws" = "relay_ws";
   private negotiatingPeerId: string | null = null;
-  private e2eeSessions = new Map<string, BrowserE2EESession>();
+  private relayGeneration = 0;
+  private relayKeepAliveTimer: ReturnType<typeof setInterval> | null = null;
+  private relayReconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private eventsReconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private relayBackoffMs = 1000;
+  private eventsBackoffMs = 1000;
+  private termPaintRafId: number | null = null;
+  private termResizeObserver: ResizeObserver | null = null;
+  private resizeDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+  private e2eeSessions = new Map<string, { session: BrowserE2EESession; auth: RelaySessionAuth; confirmed: boolean }>();
   private directE2eeSessions = new Map<string, BrowserE2EESession>();
+  private vtTerminals = new Map<string, WebVtTerminal>();
+  private vtStreamActive = new Set<string>();
+  private lastWorkspacesQueryAt = 0;
   private webIdentity = loadOrCreateWebIdentity();
   private errorMsg = "";
 
@@ -312,7 +440,7 @@ class CodaTerminalWebApp {
   private bentoRafId: number | null = null;
   private bentoObserver: IntersectionObserver | null = null;
   private bentoVisible = true;
-  private bentoStartMs = performance.now();
+  private bentoStartMs = typeof performance !== "undefined" ? performance.now() : 0;
 
   private resolveRouteFromLocation(): AppRoute {
     const pathname = window.location.pathname.replace(/\/+$/, "") || "/";
@@ -362,16 +490,19 @@ class CodaTerminalWebApp {
 
   private resolveInitialLocale(): Locale {
     try {
+      if (typeof window === "undefined") {
+        return readLocalPref("coda_locale", "en") === "zh" ? "zh" : "en";
+      }
       const qLang = new URLSearchParams(window.location.search).get("lang");
       if (qLang === "zh" || qLang === "zh-CN") {
-        localStorage.setItem("coda_locale", "zh");
+        writeLocalPref("coda_locale", "zh");
         return "zh";
       }
       if (qLang === "en") {
-        localStorage.setItem("coda_locale", "en");
+        writeLocalPref("coda_locale", "en");
         return "en";
       }
-      return localStorage.getItem("coda_locale") === "zh" ? "zh" : "en";
+      return readLocalPref("coda_locale", "en") === "zh" ? "zh" : "en";
     } catch {
       return "en";
     }
@@ -410,11 +541,7 @@ class CodaTerminalWebApp {
 
     this.locale = loc;
     if (persist) {
-      try {
-        localStorage.setItem("coda_locale", loc);
-      } catch {
-        // ignore storage errors
-      }
+      writeLocalPref("coda_locale", loc);
     }
     this.syncDocumentLocaleMeta();
     this.render();
@@ -478,20 +605,22 @@ class CodaTerminalWebApp {
     }
 
     window.addEventListener("online", () => {
+      if (this.token) {
+        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+          void this.connectRelayWebSocket();
+        }
+        if (!this.eventsWs || this.eventsWs.readyState !== WebSocket.OPEN) {
+          this.connectAccountEventsWebSocket();
+        }
+      }
       if (this.selectedDaemon?.is_online) {
         void this.tryNegotiateDirectLanWs(this.selectedDaemon);
       }
     });
+
     window.addEventListener("resize", () => {
-      if (this.selectedDaemon && this.activeTerminalAddr) {
-        const cols = Math.max(48, Math.floor((window.innerWidth - (this.showSidebar ? 390 : 80)) / 8.2));
-        const rows = Math.max(16, Math.floor((window.innerHeight - 210) / 20));
-        this.sendEncrypted(this.selectedDaemon, {
-          op: "pty_resize",
-          terminal: this.activeTerminalAddr,
-          cols,
-          rows,
-        });
+      if (this.route === "console" && this.selectedDaemon && this.activeTerminalAddr) {
+        this.scheduleTerminalResizeSync();
       }
     });
 
@@ -518,7 +647,7 @@ class CodaTerminalWebApp {
         }
       } catch {
         this.token = null;
-        localStorage.removeItem("coda_token");
+        clearSessionToken();
       }
     }
     this.render();
@@ -527,7 +656,7 @@ class CodaTerminalWebApp {
   private applyTheme(pref: ThemePreference, persist = true) {
     this.themePref = pref;
     if (persist) {
-      localStorage.setItem("coda_theme", pref);
+      writeLocalPref("coda_theme", pref);
     }
     const resolved =
       pref === "system"
@@ -735,6 +864,178 @@ class CodaTerminalWebApp {
     return data;
   }
 
+  private isTypingIntoInput(): boolean {
+    if (this.imeComposing) return true;
+    const active = typeof document !== "undefined" ? document.activeElement : null;
+    if (!active) return false;
+    const tag = active.tagName;
+    return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT";
+  }
+
+  private vtKey(daemonId: string, terminalAddr: string): string {
+    return `${daemonId}:${terminalAddr}`;
+  }
+
+  private getOrCreateVt(daemonId: string, terminalAddr: string): WebVtTerminal {
+    const key = this.vtKey(daemonId, terminalAddr);
+    let vt = this.vtTerminals.get(key);
+    if (!vt) {
+      vt = new WebVtTerminal(this.termCols, this.termRows);
+      this.vtTerminals.set(key, vt);
+    }
+    return vt;
+  }
+
+  private scheduleTerminalPaint() {
+    if (typeof requestAnimationFrame === "undefined") return;
+    if (this.termPaintRafId !== null) return;
+    this.termPaintRafId = requestAnimationFrame(() => {
+      this.termPaintRafId = null;
+      this.paintActiveTerminalViewport();
+    });
+  }
+
+  private paintActiveTerminalViewport() {
+    if (this.route !== "console" || !this.selectedDaemon || !this.activeTerminalAddr) return;
+    const key = this.vtKey(this.selectedDaemon.id, this.activeTerminalAddr);
+    const vt = this.vtTerminals.get(key);
+    const screenEl = document.getElementById("term-screen-output");
+    const boxEl = document.getElementById("term-box");
+    if (screenEl && vt && this.vtStreamActive.has(key)) {
+      const wasNearBottom = boxEl
+        ? boxEl.scrollHeight - boxEl.scrollTop - boxEl.clientHeight <= 28
+        : true;
+      screenEl.innerHTML = vt.renderHtml();
+      if (boxEl && wasNearBottom) {
+        boxEl.scrollTop = boxEl.scrollHeight;
+      }
+    }
+    const activeTerm = this.terminals.find((t) => t.address === this.activeTerminalAddr);
+    const titleEl = document.getElementById("active-term-title");
+    if (titleEl && activeTerm) {
+      titleEl.textContent =
+        activeTerm.status?.title ||
+        activeTerm.name ||
+        this.tr("Coda Interactive AI Terminal", "Coda 交互式 AI 终端会话");
+    }
+  }
+
+  private updateTransportFooterInPlace() {
+    const rttEl = document.getElementById("console-rtt-label");
+    if (rttEl) {
+      const modeLabel =
+        this.activeTransportMode === "lan_ws"
+          ? this.tr("LAN Direct", "局域网直连")
+          : this.tr("Smart Relay", "智能中继");
+      rttEl.textContent = `${modeLabel}${this.rttMs !== null ? ` (${this.rttMs}ms)` : ""}`;
+    }
+    const metaEl = document.getElementById("term-footer-meta");
+    if (metaEl) {
+      const modeText =
+        this.activeTransportMode === "lan_ws"
+          ? `LAN Direct :24444`
+          : `Relay WSS :443`;
+      const rttText = this.rttMs !== null ? `${this.rttMs}ms RTT` : modeText;
+      metaEl.textContent = `${rttText} · E2EE X25519 + ChaCha20 · ${this.termCols}×${this.termRows} · ${this.terminals.length} PTY`;
+    }
+  }
+
+  private computeTerminalDimsFromDom(): { cols: number; rows: number } {
+    const box = typeof document !== "undefined" ? document.getElementById("term-box") : null;
+    if (box && box.clientWidth > 120 && box.clientHeight > 80) {
+      const cols = Math.max(40, Math.min(240, Math.floor((box.clientWidth - 20) / 7.85)));
+      const rows = Math.max(12, Math.min(90, Math.floor((box.clientHeight - 76) / 21)));
+      return { cols, rows };
+    }
+    const vw = typeof window !== "undefined" ? window.innerWidth : 1280;
+    const vh = typeof window !== "undefined" ? window.innerHeight : 800;
+    const cols = Math.max(40, Math.min(240, Math.floor((vw - (this.showSidebar ? 390 : 80)) / 8.2)));
+    const rows = Math.max(12, Math.min(90, Math.floor((vh - 210) / 21)));
+    return { cols, rows };
+  }
+
+  private scheduleTerminalResizeSync() {
+    if (this.resizeDebounceTimer) clearTimeout(this.resizeDebounceTimer);
+    this.resizeDebounceTimer = setTimeout(() => {
+      this.resizeDebounceTimer = null;
+      this.measureAndSyncTerminalSize(true);
+    }, 120);
+  }
+
+  private measureAndSyncTerminalSize(sendRemote = true) {
+    const { cols, rows } = this.computeTerminalDimsFromDom();
+    const changed = cols !== this.termCols || rows !== this.termRows;
+    this.termCols = cols;
+    this.termRows = rows;
+    if (this.selectedDaemon && this.activeTerminalAddr) {
+      const vt = this.getOrCreateVt(this.selectedDaemon.id, this.activeTerminalAddr);
+      vt.resize(cols, rows);
+      this.updateTransportFooterInPlace();
+      if (changed && sendRemote) {
+        this.sendEncrypted(this.selectedDaemon, {
+          op: "pty_resize",
+          terminal: this.activeTerminalAddr,
+          cols,
+          rows,
+        });
+      }
+    }
+  }
+
+  private stopAllTransportsAndTimers() {
+    if (this.relayKeepAliveTimer) {
+      clearInterval(this.relayKeepAliveTimer);
+      this.relayKeepAliveTimer = null;
+    }
+    if (this.relayReconnectTimer) {
+      clearTimeout(this.relayReconnectTimer);
+      this.relayReconnectTimer = null;
+    }
+    if (this.eventsReconnectTimer) {
+      clearTimeout(this.eventsReconnectTimer);
+      this.eventsReconnectTimer = null;
+    }
+    if (this.resizeDebounceTimer) {
+      clearTimeout(this.resizeDebounceTimer);
+      this.resizeDebounceTimer = null;
+    }
+    if (this.termPaintRafId !== null && typeof cancelAnimationFrame !== "undefined") {
+      cancelAnimationFrame(this.termPaintRafId);
+      this.termPaintRafId = null;
+    }
+    if (this.termResizeObserver) {
+      this.termResizeObserver.disconnect();
+      this.termResizeObserver = null;
+    }
+    if (this.eventsWs) {
+      this.eventsWs.onopen = null;
+      this.eventsWs.onmessage = null;
+      this.eventsWs.onerror = null;
+      this.eventsWs.onclose = null;
+      try { this.eventsWs.close(); } catch {}
+      this.eventsWs = null;
+    }
+    if (this.directWs) {
+      this.directWs.onopen = null;
+      this.directWs.onmessage = null;
+      this.directWs.onerror = null;
+      this.directWs.onclose = null;
+      try { this.directWs.close(); } catch {}
+      this.directWs = null;
+    }
+    if (this.ws) {
+      this.ws.onopen = null;
+      this.ws.onmessage = null;
+      this.ws.onerror = null;
+      this.ws.onclose = null;
+      try { this.ws.close(); } catch {}
+      this.ws = null;
+    }
+    this.directWsPeerId = null;
+    this.activeTransportMode = "relay_ws";
+    this.negotiatingPeerId = null;
+  }
+
   private async bootstrapMesh() {
     this.myClientDevice = await this.api("/api/v1/devices/register-client", "POST", {
       name: this.webIdentity.name,
@@ -743,6 +1044,7 @@ class CodaTerminalWebApp {
       x25519_pubkey: this.webIdentity.x25519PublicB64,
     });
     await this.refreshDevices();
+    this.connectAccountEventsWebSocket();
     await this.connectRelayWebSocket();
   }
 
@@ -756,61 +1058,328 @@ class CodaTerminalWebApp {
     }
   }
 
-  private async connectRelayWebSocket() {
-    if (!this.myClientDevice) return;
-    const ticketRes = await this.api("/api/v1/relay/ticket", "POST", {
-      device_id: this.myClientDevice.id,
-      peer_device_id: null,
-    });
-    const proto = location.protocol === "https:" ? "wss:" : "ws:";
-    const ws = new WebSocket(`${proto}//${location.host}/v1/tunnel/ws`);
-    this.ws?.close();
-    this.ws = ws;
+  private connectAccountEventsWebSocket() {
+    if (!this.token || typeof WebSocket === "undefined") return;
+    if (this.eventsReconnectTimer) {
+      clearTimeout(this.eventsReconnectTimer);
+      this.eventsReconnectTimer = null;
+    }
+    if (this.eventsWs) {
+      this.eventsWs.onopen = null;
+      this.eventsWs.onmessage = null;
+      this.eventsWs.onerror = null;
+      this.eventsWs.onclose = null;
+      try { this.eventsWs.close(); } catch {}
+      this.eventsWs = null;
+    }
 
-    ws.onopen = () => {
-      ws.send(
-        JSON.stringify({
-          frame_type: "auth_bind",
-          ticket: ticketRes.ticket,
-          lane: "control_p0",
-          generation: Date.now(),
-        })
-      );
+    const proto = location.protocol === "https:" ? "wss:" : "ws:";
+    const sock = new WebSocket(`${proto}//${location.host}/api/v1/events/ws`, [
+      "coda-auth",
+      `coda-bearer.${this.token}`,
+    ]);
+    this.eventsWs = sock;
+
+    sock.onopen = () => {
+      this.eventsBackoffMs = 1000;
     };
 
-    ws.onmessage = async (ev) => {
-      const frame = JSON.parse(ev.data);
-      if (frame.frame_type === "auth_ack" && frame.ok) {
-        if (this.selectedDaemon?.is_online) {
-          this.queryDaemonOverview(this.selectedDaemon);
-          void this.tryNegotiateDirectLanWs(this.selectedDaemon);
-        }
-      } else if (frame.frame_type === "peer_presence") {
-        if (Array.isArray(frame.endpoints)) {
-          const idx = this.devices.findIndex((d) => d.id === frame.device_id);
-          if (idx >= 0) {
-            this.devices[idx].endpoints_json = frame.endpoints;
-            this.devices[idx].is_online = frame.is_online;
+    sock.onmessage = async (ev) => {
+      let evt: any;
+      try {
+        evt = JSON.parse(String(ev.data));
+      } catch {
+        return;
+      }
+      if (evt.kind === "devices_changed" || evt.kind === "peer_presence" || evt.kind === "connected") {
+        try {
+          const prevSelectedId = this.selectedDaemon?.id;
+          const wasOnline = this.selectedDaemon?.is_online ?? false;
+          await this.refreshDevices();
+          if (this.selectedDaemon?.is_online && (this.selectedDaemon.id !== prevSelectedId || !wasOnline)) {
+            this.queryDaemonOverview(this.selectedDaemon);
+            void this.tryNegotiateDirectLanWs(this.selectedDaemon);
           }
+          if (!this.isTypingIntoInput() && !this.showSettingsModal) {
+            this.render();
+          }
+        } catch {
+          // ignore transient refresh failure
         }
-        await this.refreshDevices();
-        if (this.selectedDaemon?.is_online) {
-          void this.tryNegotiateDirectLanWs(this.selectedDaemon);
-        } else if (this.directWsPeerId === frame.device_id && !frame.is_online) {
-          this.directWs?.close();
-        }
-        this.render();
-      } else if (frame.frame_type === "route_packet") {
-        const peer = this.devices.find((d) => d.id === frame.src_device_id);
-        if (!peer) return;
-        const sess = this.getOrCreateSession(peer);
-        const msg = sess.openMessage(frame.e2ee);
-        this.handlePeerMessage(msg);
       }
     };
+
+    const scheduleReconnect = () => {
+      if (this.eventsWs !== sock) return;
+      this.eventsWs = null;
+      if (!this.token) return;
+      if (this.eventsReconnectTimer) return;
+      const delay = this.eventsBackoffMs;
+      this.eventsBackoffMs = Math.min(15_000, this.eventsBackoffMs * 2);
+      this.eventsReconnectTimer = setTimeout(() => {
+        this.eventsReconnectTimer = null;
+        this.connectAccountEventsWebSocket();
+      }, delay);
+    };
+
+    sock.onerror = scheduleReconnect;
+    sock.onclose = scheduleReconnect;
   }
 
-  private queryDaemonOverview(peer: Device) {
+  private scheduleRelayReconnect() {
+    if (!this.token || !this.myClientDevice || this.relayReconnectTimer) return;
+    const delay = this.relayBackoffMs;
+    this.relayBackoffMs = Math.min(15_000, this.relayBackoffMs * 2);
+    this.relayReconnectTimer = setTimeout(() => {
+      this.relayReconnectTimer = null;
+      void this.connectRelayWebSocket();
+    }, delay);
+  }
+
+  private collectRelayWsCandidates(relays: RelayNodeInfo[] | undefined): string[] {
+    const out: string[] = [];
+    const pushUnique = (u: string) => {
+      if (!u) return;
+      if (location.protocol === "https:") {
+        const isLocalWs = u.startsWith("ws://127.0.0.1") || u.startsWith("ws://localhost");
+        if (!u.startsWith("wss://") && !isLocalWs) return;
+      }
+      if (!out.includes(u)) out.push(u);
+    };
+    const sorted = [...(relays || [])].sort((a, b) => a.priority - b.priority);
+    for (const r of sorted) {
+      const ep = String(r.endpoint || "").trim();
+      if (!ep) continue;
+      if (ep.startsWith("wss://") || ep.startsWith("ws://")) {
+        pushUnique(ep);
+      } else if (r.mode === "wss") {
+        pushUnique(`wss://${ep.replace(/^https?:\/\//, "")}`);
+      } else if (r.mode === "ws") {
+        pushUnique(`ws://${ep.replace(/^https?:\/\//, "")}`);
+      }
+    }
+    const proto = location.protocol === "https:" ? "wss:" : "ws:";
+    pushUnique(`${proto}//${location.host}/v1/tunnel/ws`);
+    return out;
+  }
+
+  private async connectRelayWebSocket() {
+    if (!this.myClientDevice || !this.token || typeof WebSocket === "undefined") return;
+    if (this.relayReconnectTimer) {
+      clearTimeout(this.relayReconnectTimer);
+      this.relayReconnectTimer = null;
+    }
+
+    let ticketRes: { ticket: string; relays?: RelayNodeInfo[] };
+    try {
+      ticketRes = await this.api("/api/v1/relay/ticket", "POST", {
+        device_id: this.myClientDevice.id,
+        peer_device_id: null,
+      });
+    } catch {
+      this.scheduleRelayReconnect();
+      return;
+    }
+
+    const candidates = this.collectRelayWsCandidates(ticketRes.relays);
+    const gen = Math.max(this.relayGeneration + 1, Date.now());
+    this.relayGeneration = gen;
+
+    let connected = false;
+    for (const wsUrl of candidates) {
+      if (!this.token) return;
+      const ok = await this.tryOpenRelayCandidate(wsUrl, ticketRes.ticket, gen);
+      if (ok) {
+        connected = true;
+        break;
+      }
+    }
+
+    if (!connected && this.token) {
+      this.scheduleRelayReconnect();
+    }
+  }
+
+  private tryOpenRelayCandidate(wsUrl: string, ticket: string, gen: number): Promise<boolean> {
+    return new Promise((resolve) => {
+      let settled = false;
+      let sock: WebSocket;
+      try {
+        sock = new WebSocket(wsUrl);
+      } catch {
+        resolve(false);
+        return;
+      }
+
+      const failCandidate = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(authTimer);
+        sock.onopen = null;
+        sock.onmessage = null;
+        sock.onerror = null;
+        sock.onclose = null;
+        try { sock.close(); } catch {}
+        resolve(false);
+      };
+
+      const authTimer = setTimeout(failCandidate, 5000);
+
+      sock.onopen = () => {
+        sock.send(
+          JSON.stringify({
+            frame_type: "auth_bind",
+            ticket,
+            lane: "control_p0",
+            generation: gen,
+          })
+        );
+      };
+
+      sock.onmessage = async (ev) => {
+        let frame: any;
+        try {
+          frame = JSON.parse(String(ev.data));
+        } catch {
+          return;
+        }
+
+        if (!settled) {
+          if (frame.frame_type === "auth_ack" && frame.ok) {
+            settled = true;
+            clearTimeout(authTimer);
+            this.relayBackoffMs = 1000;
+            if (this.relayKeepAliveTimer) {
+              clearInterval(this.relayKeepAliveTimer);
+              this.relayKeepAliveTimer = null;
+            }
+            if (this.ws && this.ws !== sock) {
+              this.ws.onopen = null;
+              this.ws.onmessage = null;
+              this.ws.onerror = null;
+              this.ws.onclose = null;
+              try { this.ws.close(); } catch {}
+            }
+            this.ws = sock;
+            this.relayKeepAliveTimer = setInterval(() => {
+              if (this.ws === sock && sock.readyState === WebSocket.OPEN) {
+                try {
+                  sock.send(JSON.stringify({ frame_type: "keep_alive", ts_ms: Date.now() }));
+                } catch {
+                  // ignore
+                }
+              }
+            }, 25_000);
+            if (this.selectedDaemon?.is_online) {
+              this.queryDaemonOverview(this.selectedDaemon);
+              void this.tryNegotiateDirectLanWs(this.selectedDaemon);
+            }
+            resolve(true);
+          } else {
+            failCandidate();
+          }
+          return;
+        }
+
+        await this.handleRelayFrame(frame);
+      };
+
+      const onDrop = () => {
+        if (!settled) {
+          failCandidate();
+          return;
+        }
+        if (this.ws !== sock) return;
+        this.ws = null;
+        if (this.relayKeepAliveTimer) {
+          clearInterval(this.relayKeepAliveTimer);
+          this.relayKeepAliveTimer = null;
+        }
+        if (this.token) {
+          this.scheduleRelayReconnect();
+        }
+      };
+
+      sock.onerror = onDrop;
+      sock.onclose = onDrop;
+    });
+  }
+
+  private async handleRelayFrame(frame: any) {
+    if (frame.frame_type === "peer_presence") {
+      if (Array.isArray(frame.endpoints)) {
+        const idx = this.devices.findIndex((d) => d.id === frame.device_id);
+        if (idx >= 0) {
+          this.devices[idx].endpoints_json = frame.endpoints;
+          this.devices[idx].is_online = frame.is_online;
+        }
+      }
+      try {
+        await this.refreshDevices();
+      } catch {
+        // ignore transient refresh failure
+      }
+      if (this.selectedDaemon?.is_online) {
+        void this.tryNegotiateDirectLanWs(this.selectedDaemon);
+      } else if (this.directWsPeerId === frame.device_id && !frame.is_online) {
+        this.directWs?.close();
+      }
+      if (!this.isTypingIntoInput() && !this.showSettingsModal) {
+        this.render();
+      }
+    } else if (frame.frame_type === "route_packet") {
+      this.openRelayPacket(frame);
+    }
+  }
+
+  private openRelayPacket(frame: any) {
+    if (!this.myClientDevice || !frame?.e2ee) return;
+    const srcId = String(frame.src_device_id || "").toLowerCase();
+    const peer = this.devices.find((d) => d.id.toLowerCase() === srcId);
+    if (!peer) return;
+
+    try {
+      const existing = this.e2eeSessions.get(peer.id);
+      const pktNonce = frame.e2ee.session_nonce_b64 || null;
+      const incomingAuth = frame.session_auth as RelaySessionAuth | undefined;
+
+      if (
+        existing &&
+        existing.session.sessionNonceB64 === pktNonce &&
+        (!incomingAuth || incomingAuth.session_nonce_b64 === existing.session.sessionNonceB64)
+      ) {
+        const msg = existing.session.openMessage(frame.e2ee);
+        existing.confirmed = true;
+        this.handlePeerMessage(peer.id, msg);
+        return;
+      }
+
+      if (incomingAuth && peer.ed25519_pubkey && peer.x25519_pubkey && pktNonce === incomingAuth.session_nonce_b64) {
+        verifyRelaySessionAuth(
+          incomingAuth,
+          peer.id,
+          this.myClientDevice.id,
+          peer.ed25519_pubkey,
+          peer.x25519_pubkey
+        );
+        const fresh = BrowserE2EESession.deriveRelayV2({
+          myStaticSecretB64: this.webIdentity.x25519SecretB64,
+          peerStaticPublicB64: peer.x25519_pubkey,
+          sessionNonceB64: incomingAuth.session_nonce_b64,
+          clientDeviceId: peer.id,
+          daemonDeviceId: this.myClientDevice.id,
+          isInitiator: false,
+        });
+        const msg = fresh.openMessage(frame.e2ee);
+        this.e2eeSessions.set(peer.id, { session: fresh, auth: incomingAuth, confirmed: true });
+        this.handlePeerMessage(peer.id, msg);
+      }
+    } catch {
+      // drop unauthenticated, replayed, or tampered packet without poisoning active state
+    }
+  }
+
+  private queryDaemonOverview(peer: Device, includeWorkspaces = true) {
     this.sendEncrypted(peer, {
       op: "ping",
       req_id: `p-${Date.now()}`,
@@ -821,11 +1390,15 @@ class CodaTerminalWebApp {
       req_id: `ls-${Date.now()}`,
       include_finished: false,
     });
-    this.sendEncrypted(peer, {
-      op: "list_workspaces",
-      req_id: `ws-${Date.now()}`,
-      root_dirs: [],
-    });
+    const now = Date.now();
+    if (includeWorkspaces || now - this.lastWorkspacesQueryAt >= 30_000) {
+      this.lastWorkspacesQueryAt = now;
+      this.sendEncrypted(peer, {
+        op: "list_workspaces",
+        req_id: `ws-${now}`,
+        root_dirs: [],
+      });
+    }
   }
 
   private collectDirectWsCandidates(peer: Device): string[] {
@@ -854,7 +1427,7 @@ class CodaTerminalWebApp {
   }
 
   private async tryNegotiateDirectLanWs(peer: Device) {
-    if (!peer.is_online || !this.myClientDevice) return;
+    if (!peer.is_online || !this.myClientDevice || !peer.ed25519_pubkey) return;
     if (this.directWs && this.directWs.readyState === WebSocket.OPEN && this.directWsPeerId === peer.id) {
       return;
     }
@@ -871,7 +1444,7 @@ class CodaTerminalWebApp {
             req_id: `lan-p-${Date.now()}`,
             sent_ms: Date.now(),
           });
-          this.render();
+          this.updateTransportFooterInPlace();
           break;
         }
       }
@@ -882,10 +1455,15 @@ class CodaTerminalWebApp {
 
   private probeSingleDirectWs(peer: Device, wsUrl: string): Promise<boolean> {
     return new Promise((resolve) => {
-      if (!this.myClientDevice) {
+      if (!this.myClientDevice || !peer.ed25519_pubkey || !peer.x25519_pubkey) {
         resolve(false);
         return;
       }
+      const myDevId = this.myClientDevice.id;
+      const expectedEd = peer.ed25519_pubkey;
+      const expectedX = peer.x25519_pubkey;
+      const eph = generateEphemeralX25519();
+
       let settled = false;
       const done = (val: boolean) => {
         if (!settled) {
@@ -905,28 +1483,34 @@ class CodaTerminalWebApp {
 
       const timer = setTimeout(() => {
         if (!settled) {
-          try {
-            sock.close();
-          } catch {}
+          sock.onopen = null;
+          sock.onmessage = null;
+          sock.onerror = null;
+          sock.onclose = null;
+          try { sock.close(); } catch {}
           done(false);
         }
-      }, 600);
+      }, 1200);
 
       sock.onopen = () => {
-        if (!this.myClientDevice) {
-          done(false);
-          return;
-        }
         const tsMs = Date.now();
-        const signedMsg = `p2p:${this.myClientDevice.id}:${peer.id}:${tsMs}`;
+        const signedMsg = p2pHelloV2SigningText(
+          myDevId,
+          peer.id,
+          this.webIdentity.x25519PublicB64,
+          eph.publicB64,
+          tsMs
+        );
         const sigB64 = signWebMessage(this.webIdentity, signedMsg);
         sock.send(
           JSON.stringify({
             frame_type: "direct_p2p_hello",
-            client_device_id: this.myClientDevice.id,
+            client_device_id: myDevId,
             target_device_id: peer.id,
             client_ed25519_pub_b64: this.webIdentity.ed25519PublicB64,
             client_x25519_pub_b64: this.webIdentity.x25519PublicB64,
+            client_ephemeral_x25519_pub_b64: eph.publicB64,
+            supports_zstd: true,
             timestamp_ms: tsMs,
             signature_b64: sigB64,
           })
@@ -936,27 +1520,59 @@ class CodaTerminalWebApp {
       sock.onmessage = (ev) => {
         let frame: any;
         try {
-          frame = JSON.parse(ev.data);
+          frame = JSON.parse(String(ev.data));
         } catch {
           return;
         }
 
         if (!settled) {
-          if (frame.frame_type === "direct_p2p_ack" && frame.ok) {
-            const directSess = new BrowserE2EESession(
-              this.webIdentity.x25519SecretB64,
-              frame.daemon_x25519_pub_b64 || peer.x25519_pubkey
-            );
-            this.directWs?.close();
+          try {
+            if (frame.frame_type !== "direct_p2p_ack" || !frame.ok) {
+              throw new Error("rejected");
+            }
+            if (String(frame.daemon_device_id || "").toLowerCase() !== peer.id.toLowerCase()) {
+              throw new Error("daemon_device_id mismatch");
+            }
+            if (frame.daemon_ed25519_pub_b64 !== expectedEd || frame.daemon_x25519_pub_b64 !== expectedX) {
+              throw new Error("daemon pinned pubkey mismatch");
+            }
+            const daemonEph = String(frame.daemon_ephemeral_x25519_pub_b64 || "");
+            const ackTs = Number(frame.timestamp_ms || 0);
+            const ackSig = String(frame.signature_b64 || "");
+            if (!daemonEph || !isTimestampFresh(ackTs)) {
+              throw new Error("missing ephemeral pubkey or stale ack timestamp");
+            }
+            const ackSigning = p2pAckV2SigningText(myDevId, peer.id, eph.publicB64, daemonEph, ackTs);
+            if (!verifyEd25519Signature(expectedEd, ackSigning, ackSig)) {
+              throw new Error("DirectP2pAck Ed25519 signature invalid");
+            }
+            const directSess = BrowserE2EESession.deriveDirectP2Pv2({
+              myStaticSecretB64: this.webIdentity.x25519SecretB64,
+              peerStaticPublicB64: expectedX,
+              myEphemeralSecret: eph.secret,
+              peerEphemeralPublicB64: daemonEph,
+              clientDeviceId: myDevId,
+              daemonDeviceId: peer.id,
+              isInitiator: true,
+            });
+            if (this.directWs && this.directWs !== sock) {
+              this.directWs.onopen = null;
+              this.directWs.onmessage = null;
+              this.directWs.onerror = null;
+              this.directWs.onclose = null;
+              try { this.directWs.close(); } catch {}
+            }
             this.directWs = sock;
             this.directWsPeerId = peer.id;
             this.directE2eeSessions.set(peer.id, directSess);
             this.activeTransportMode = "lan_ws";
             done(true);
-          } else {
-            try {
-              sock.close();
-            } catch {}
+          } catch {
+            sock.onopen = null;
+            sock.onmessage = null;
+            sock.onerror = null;
+            sock.onclose = null;
+            try { sock.close(); } catch {}
             done(false);
           }
           return;
@@ -967,44 +1583,52 @@ class CodaTerminalWebApp {
           if (!directSess) return;
           try {
             const msg = directSess.openMessage(frame.e2ee);
-            this.handlePeerMessage(msg);
+            this.handlePeerMessage(peer.id, msg);
           } catch {
-            // ignore malformed/out-of-order frame
+            // ignore malformed/replayed/tampered frame
           }
         }
       };
 
-      sock.onerror = () => {
+      const onDrop = () => {
         if (this.directWs === sock) {
           this.directWs = null;
           this.directWsPeerId = null;
           this.directE2eeSessions.delete(peer.id);
           this.activeTransportMode = "relay_ws";
-          this.render();
+          this.updateTransportFooterInPlace();
         }
         done(false);
       };
 
-      sock.onclose = () => {
-        if (this.directWs === sock) {
-          this.directWs = null;
-          this.directWsPeerId = null;
-          this.directE2eeSessions.delete(peer.id);
-          this.activeTransportMode = "relay_ws";
-          this.render();
-        }
-        done(false);
-      };
+      sock.onerror = onDrop;
+      sock.onclose = onDrop;
     });
   }
 
-  private getOrCreateSession(peer: Device): BrowserE2EESession {
-    let s = this.e2eeSessions.get(peer.id);
-    if (!s) {
-      s = new BrowserE2EESession(this.webIdentity.x25519SecretB64, peer.x25519_pubkey);
-      this.e2eeSessions.set(peer.id, s);
+  private getOrCreateRelaySessionState(peer: Device): {
+    session: BrowserE2EESession;
+    auth: RelaySessionAuth;
+    confirmed: boolean;
+  } {
+    let state = this.e2eeSessions.get(peer.id);
+    if (!state) {
+      if (!this.myClientDevice) {
+        throw new Error("missing client device identity");
+      }
+      const auth = createRelaySessionAuth(this.webIdentity, this.myClientDevice.id, peer.id);
+      const session = BrowserE2EESession.deriveRelayV2({
+        myStaticSecretB64: this.webIdentity.x25519SecretB64,
+        peerStaticPublicB64: peer.x25519_pubkey,
+        sessionNonceB64: auth.session_nonce_b64,
+        clientDeviceId: this.myClientDevice.id,
+        daemonDeviceId: peer.id,
+        isInitiator: true,
+      });
+      state = { session, auth, confirmed: false };
+      this.e2eeSessions.set(peer.id, state);
     }
-    return s;
+    return state;
   }
 
   private sendEncrypted(peer: Device, msg: unknown) {
@@ -1025,7 +1649,6 @@ class CodaTerminalWebApp {
             dst_device_id: peer.id,
             lane: "control_p0",
             e2ee,
-            sender_x25519_pub_b64: this.webIdentity.x25519PublicB64,
           })
         );
         return;
@@ -1033,8 +1656,8 @@ class CodaTerminalWebApp {
     }
 
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
-    const sess = this.getOrCreateSession(peer);
-    const e2ee = sess.sealMessage(msg);
+    const state = this.getOrCreateRelaySessionState(peer);
+    const e2ee = state.session.sealMessage(msg);
     this.ws.send(
       JSON.stringify({
         frame_type: "route_packet",
@@ -1043,64 +1666,186 @@ class CodaTerminalWebApp {
         lane: "control_p0",
         e2ee,
         sender_x25519_pub_b64: this.webIdentity.x25519PublicB64,
+        session_auth: state.confirmed ? undefined : state.auth,
       })
     );
   }
 
-  private handlePeerMessage(msg: any) {
+  private handlePeerMessage(peerId: string, msg: any) {
     if (msg.op === "pong") {
-      this.rttMs = Math.max(1, Date.now() - msg.sent_ms);
-    } else if (msg.op === "workspaces_snapshot") {
+      this.rttMs = Math.max(1, Date.now() - Number(msg.sent_ms || Date.now()));
+      this.updateTransportFooterInPlace();
+      return;
+    }
+
+    if (msg.op === "workspaces_snapshot") {
       this.repos = msg.repos || [];
       if (msg.voice_config) {
         this.voiceConfig = msg.voice_config;
       }
-    } else if (msg.op === "voice_config_ack" && msg.config) {
+      if (!this.isTypingIntoInput() && !this.showSettingsModal) this.render();
+      return;
+    }
+
+    if (msg.op === "voice_config_ack" && msg.config) {
       this.voiceConfig = msg.config;
-    } else if (msg.op === "terminals_snapshot") {
+      this.consoleNotice = {
+        kind: msg.ok ? "ok" : "err",
+        text: msg.ok
+          ? this.tr("Saved voice model config on host.", "已同步语音模型配置至主机。")
+          : this.tr("Failed saving voice model config.", "保存语音模型配置失败。"),
+      };
+      this.render();
+      return;
+    }
+
+    if (msg.op === "terminals_snapshot") {
       this.terminals = msg.terminals || [];
+      if (this.activeTerminalAddr && !this.terminals.some((t) => t.address === this.activeTerminalAddr)) {
+        this.activeTerminalAddr = null;
+      }
       if (!this.activeTerminalAddr && this.terminals.length > 0) {
         this.activeTerminalAddr = this.terminals[0].address;
         this.attachAndReadTerminal(this.activeTerminalAddr);
       }
-    } else if (msg.op === "launch_agent_result" && msg.ok && msg.terminal) {
-      this.terminals = [msg.terminal, ...this.terminals];
-      this.activeTerminalAddr = msg.terminal.address;
-      setTimeout(() => {
-        if (this.activeTerminalAddr) this.attachAndReadTerminal(this.activeTerminalAddr);
-      }, 250);
-    } else if (msg.op === "terminal_screen_snapshot") {
-      this.terminalScreen = msg.text || "";
-    } else if (msg.op === "pty_output_chunk" && msg.terminal === this.activeTerminalAddr) {
+      if (!this.isTypingIntoInput() && !this.showSettingsModal) this.render();
+      return;
+    }
+
+    if (msg.op === "launch_agent_result") {
+      if (msg.ok && msg.terminal) {
+        this.detachActiveTerminal();
+        this.terminals = [msg.terminal, ...this.terminals.filter((t) => t.address !== msg.terminal.address)];
+        this.activeTerminalAddr = msg.terminal.address;
+        this.render();
+        setTimeout(() => {
+          if (this.activeTerminalAddr === msg.terminal.address) {
+            this.attachAndReadTerminal(msg.terminal.address);
+          }
+        }, 180);
+      } else if (!msg.ok) {
+        this.consoleNotice = {
+          kind: "err",
+          text: msg.error || this.tr("Failed spawning terminal", "新建终端失败"),
+        };
+        this.render();
+      }
+      return;
+    }
+
+    if (msg.op === "terminal_screen_snapshot") {
+      const addr = String(msg.terminal || this.activeTerminalAddr || "");
+      if (!addr) return;
+      const key = this.vtKey(peerId, addr);
+      if (!this.vtStreamActive.has(key)) {
+        const vt = this.getOrCreateVt(peerId, addr);
+        vt.loadSnapshot(msg.text || "");
+        this.vtStreamActive.add(key);
+        if (msg.status) {
+          const term = this.terminals.find((t) => t.address === addr);
+          if (term) term.status = msg.status;
+        }
+        if (addr === this.activeTerminalAddr) {
+          this.scheduleTerminalPaint();
+        }
+      }
+      return;
+    }
+
+    if (msg.op === "pty_output_chunk") {
+      const addr = String(msg.terminal || "");
+      if (!addr) return;
       try {
-        const bin = atob(msg.data_b64);
-        const bytes = new Uint8Array(bin.length);
-        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-        const chunkText = new TextDecoder().decode(bytes);
-        const stripped = chunkText.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "").replace(/\x1b\][^\x07]*\x07/g, "");
-        this.terminalScreen = (this.terminalScreen + stripped).slice(-12000);
+        const key = this.vtKey(peerId, addr);
+        const vt = this.getOrCreateVt(peerId, addr);
+        this.vtStreamActive.add(key);
+        vt.feedBytes(fromB64(String(msg.data_b64 || "")));
+        if (vt.latestStatus) {
+          const term = this.terminals.find((t) => t.address === addr);
+          if (term) {
+            term.status = {
+              state: vt.latestStatus.state,
+              kind: vt.latestStatus.kind || null,
+              app: vt.latestStatus.app || null,
+              title: vt.latestStatus.title || null,
+              msg: vt.latestStatus.msg || null,
+            };
+          }
+        }
+        if (peerId === this.selectedDaemon?.id && addr === this.activeTerminalAddr) {
+          this.scheduleTerminalPaint();
+        }
       } catch {
         // ignore malformed chunk
       }
-    } else if (msg.op === "upload_terminal_file_result" && msg.ok && msg.remote_path) {
-      this.draftInput = this.draftInput ? `${this.draftInput} ${msg.remote_path}` : msg.remote_path;
-    } else if (msg.op === "action_ack") {
-      if (this.activeTerminalAddr) {
-        setTimeout(() => this.requestScreen(this.activeTerminalAddr!), 220);
-      }
+      return;
     }
-    this.render();
+
+    if (msg.op === "herdr_live_event") {
+      if (msg.terminal) {
+        const idx = this.terminals.findIndex((t) => t.address === msg.terminal.address);
+        if (idx >= 0) {
+          this.terminals[idx] = msg.terminal;
+        }
+        if (msg.terminal.address === this.activeTerminalAddr) {
+          this.scheduleTerminalPaint();
+        }
+      }
+      return;
+    }
+
+    if (msg.op === "upload_terminal_file_result") {
+      if (msg.ok && msg.remote_path) {
+        this.draftInput = this.draftInput ? `${this.draftInput} ${msg.remote_path}` : msg.remote_path;
+        this.consoleNotice = {
+          kind: "ok",
+          text: this.tr(`Uploaded to ${msg.remote_path}`, `已上传至 ${msg.remote_path}`),
+        };
+      } else {
+        this.consoleNotice = {
+          kind: "err",
+          text: msg.error || this.tr("Upload failed", "上传失败"),
+        };
+      }
+      this.render();
+      return;
+    }
+
+    if (msg.op === "action_ack" && !msg.ok) {
+      this.consoleNotice = {
+        kind: "err",
+        text: msg.detail || this.tr("Host action failed", "远端操作失败"),
+      };
+      this.render();
+    }
+  }
+
+  private detachActiveTerminal() {
+    if (!this.selectedDaemon || !this.activeTerminalAddr) return;
+    this.sendEncrypted(this.selectedDaemon, {
+      op: "pty_detach",
+      req_id: `det-${Date.now()}`,
+      terminal: this.activeTerminalAddr,
+    });
   }
 
   private attachAndReadTerminal(addr: string) {
     if (!this.selectedDaemon) return;
-    this.requestScreen(addr);
+    const { cols, rows } = this.computeTerminalDimsFromDom();
+    this.termCols = cols;
+    this.termRows = rows;
+    const vt = this.getOrCreateVt(this.selectedDaemon.id, addr);
+    vt.resize(cols, rows);
+    const key = this.vtKey(this.selectedDaemon.id, addr);
+    if (!this.vtStreamActive.has(key)) {
+      this.requestScreen(addr);
+    }
     this.sendEncrypted(this.selectedDaemon, {
       op: "pty_attach",
       req_id: `pty-${Date.now()}`,
       terminal: addr,
-      cols: 108,
-      rows: 32,
+      cols,
+      rows,
     });
   }
 
@@ -1110,7 +1855,7 @@ class CodaTerminalWebApp {
       op: "read_terminal_screen",
       req_id: `rd-${Date.now()}`,
       terminal: addr,
-      history_lines: 80,
+      history_lines: 120,
     });
   }
 
@@ -1587,8 +2332,8 @@ class CodaTerminalWebApp {
               </p>
               <div class="pm-hero-actions">
                 ${
-                  dl
-                    ? `<a class="pm-btn pm-btn-primary pm-btn-lg" href="${dl.desktop_macos_dmg}" target="_blank">${svgIcon("apple", 15)} ${this.tr("Download for macOS (.dmg)", "下载 macOS 桌面端 (.dmg)")}</a>`
+                  dl && safeHref(dl.desktop_macos_dmg) !== "#"
+                    ? `<a class="pm-btn pm-btn-primary pm-btn-lg" href="${this.escapeHtml(safeHref(dl.desktop_macos_dmg))}" target="_blank" rel="noopener noreferrer">${svgIcon("apple", 15)} ${this.tr("Download for macOS (.dmg)", "下载 macOS 桌面端 (.dmg)")}</a>`
                     : `<a class="pm-btn pm-btn-primary pm-btn-lg" href="#downloads">${svgIcon("laptop", 15)} ${this.tr("Download Clients", "获取全端客户端")}</a>`
                 }
                 <a class="pm-btn pm-btn-secondary pm-btn-lg" href="${this.user ? "/console" : "/login"}" data-nav="${this.user ? "/console" : "/login"}">
@@ -2017,7 +2762,7 @@ class CodaTerminalWebApp {
                   '任意设备安装后登录同一个 Coda 账号，或通过 <a href="/activate" data-nav="/activate" style="color:var(--signal-blue);text-decoration:underline;"><code>/activate</code></a> 设备码授权即可实时互通。'
                 )}</p>
               </div>
-              ${dl ? `<a class="pm-btn pm-btn-secondary pm-btn-sm" href="${dl.releases_page}" target="_blank">${this.tr("GitHub Releases &amp; Checksums", "查看 GitHub Releases &amp; Checksums")} ${svgIcon("arrowRight", 13)}</a>` : ""}
+              ${dl && safeHref(dl.releases_page) !== "#" ? `<a class="pm-btn pm-btn-secondary pm-btn-sm" href="${this.escapeHtml(safeHref(dl.releases_page))}" target="_blank" rel="noopener noreferrer">${this.tr("GitHub Releases &amp; Checksums", "查看 GitHub Releases &amp; Checksums")} ${svgIcon("arrowRight", 13)}</a>` : ""}
             </div>
 
             <div class="pm-frame">
@@ -2038,8 +2783,8 @@ class CodaTerminalWebApp {
                     </p>
                   </div>
                   <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
-                    ${dl ? `<a class="pm-btn pm-btn-primary pm-btn-sm" href="${dl.desktop_macos_dmg}" target="_blank">${this.tr("Download .dmg", "下载 .dmg 安装包")}</a>` : ""}
-                    ${dl ? `<a class="pm-btn pm-btn-secondary pm-btn-sm" href="${dl.desktop_macos_tar}" target="_blank">${this.tr("Full .tar.gz", "全套 .tar.gz")}</a>` : ""}
+                    ${dl && safeHref(dl.desktop_macos_dmg) !== "#" ? `<a class="pm-btn pm-btn-primary pm-btn-sm" href="${this.escapeHtml(safeHref(dl.desktop_macos_dmg))}" target="_blank" rel="noopener noreferrer">${this.tr("Download .dmg", "下载 .dmg 安装包")}</a>` : ""}
+                    ${dl && safeHref(dl.desktop_macos_tar) !== "#" ? `<a class="pm-btn pm-btn-secondary pm-btn-sm" href="${this.escapeHtml(safeHref(dl.desktop_macos_tar))}" target="_blank" rel="noopener noreferrer">${this.tr("Full .tar.gz", "全套 .tar.gz")}</a>` : ""}
                     <span class="coda-mono" style="font-size:11px;color:var(--text-tertiary);">macOS 14+</span>
                   </div>
                 </div>
@@ -2058,9 +2803,9 @@ class CodaTerminalWebApp {
                     </p>
                   </div>
                   <div style="display:flex;gap:8px;flex-wrap:wrap;">
-                    ${dl ? `<a class="pm-btn pm-btn-secondary pm-btn-sm" href="${dl.daemon_linux_x64}" target="_blank">Linux x86_64</a>` : ""}
-                    ${dl ? `<a class="pm-btn pm-btn-secondary pm-btn-sm" href="${dl.daemon_linux_arm64}" target="_blank">Linux ARM64</a>` : ""}
-                    ${dl ? `<a class="pm-btn pm-btn-secondary pm-btn-sm" href="${dl.daemon_macos_arm64}" target="_blank">macOS Daemon</a>` : ""}
+                    ${dl && safeHref(dl.daemon_linux_x64) !== "#" ? `<a class="pm-btn pm-btn-secondary pm-btn-sm" href="${this.escapeHtml(safeHref(dl.daemon_linux_x64))}" target="_blank" rel="noopener noreferrer">Linux x86_64</a>` : ""}
+                    ${dl && safeHref(dl.daemon_linux_arm64) !== "#" ? `<a class="pm-btn pm-btn-secondary pm-btn-sm" href="${this.escapeHtml(safeHref(dl.daemon_linux_arm64))}" target="_blank" rel="noopener noreferrer">Linux ARM64</a>` : ""}
+                    ${dl && safeHref(dl.daemon_macos_arm64) !== "#" ? `<a class="pm-btn pm-btn-secondary pm-btn-sm" href="${this.escapeHtml(safeHref(dl.daemon_macos_arm64))}" target="_blank" rel="noopener noreferrer">macOS Daemon</a>` : ""}
                   </div>
                 </div>
 
@@ -2079,8 +2824,8 @@ class CodaTerminalWebApp {
                   </div>
                   <div style="display:flex;gap:8px;flex-wrap:wrap;">
                     ${
-                      dl?.ios_beta_url
-                        ? `<a class="pm-btn pm-btn-primary pm-btn-sm" href="${this.escapeHtml(dl.ios_beta_url)}" target="_blank">${this.tr("Open TestFlight Beta", "打开 TestFlight Beta")}</a>`
+                      dl?.ios_beta_url && safeHref(dl.ios_beta_url) !== "#"
+                        ? `<a class="pm-btn pm-btn-primary pm-btn-sm" href="${this.escapeHtml(safeHref(dl.ios_beta_url))}" target="_blank" rel="noopener noreferrer">${this.tr("Open TestFlight Beta", "打开 TestFlight Beta")}</a>`
                         : `<a class="pm-btn pm-btn-secondary pm-btn-sm" href="${this.user ? "/console" : "/login"}" data-nav="${this.user ? "/console" : "/login"}">${this.tr("Open Mobile Web Console", "打开 Web 移动端控制台")}</a>`
                     }
                   </div>
@@ -2100,8 +2845,8 @@ class CodaTerminalWebApp {
                     </p>
                   </div>
                   <div style="display:flex;gap:8px;flex-wrap:wrap;">
-                    ${dl ? `<a class="pm-btn pm-btn-secondary pm-btn-sm" href="${dl.deploy_bundle}" target="_blank">${this.tr("Download deploy-bundle", "下载 deploy-bundle")}</a>` : ""}
-                    ${dl ? `<a class="pm-btn pm-btn-secondary pm-btn-sm" href="${dl.releases_page}" target="_blank">GitHub Releases</a>` : ""}
+                    ${dl && safeHref(dl.deploy_bundle) !== "#" ? `<a class="pm-btn pm-btn-secondary pm-btn-sm" href="${this.escapeHtml(safeHref(dl.deploy_bundle))}" target="_blank" rel="noopener noreferrer">${this.tr("Download deploy-bundle", "下载 deploy-bundle")}</a>` : ""}
+                    ${dl && safeHref(dl.releases_page) !== "#" ? `<a class="pm-btn pm-btn-secondary pm-btn-sm" href="${this.escapeHtml(safeHref(dl.releases_page))}" target="_blank" rel="noopener noreferrer">GitHub Releases</a>` : ""}
                   </div>
                 </div>
               </div>
@@ -2173,7 +2918,7 @@ class CodaTerminalWebApp {
                 <a href="#downloads">${this.tr("macOS Desktop (.dmg)", "macOS 桌面端 (.dmg)")}</a>
                 <a href="#downloads">Linux / macOS Daemon</a>
                 <a href="#downloads">Docker + CF Tunnel</a>
-                ${dl ? `<a href="${dl.releases_page}" target="_blank">${this.tr("GitHub Releases (Latest)", "GitHub Releases (最新版)")}</a>` : ""}
+                ${dl && safeHref(dl.releases_page) !== "#" ? `<a href="${this.escapeHtml(safeHref(dl.releases_page))}" target="_blank" rel="noopener noreferrer">${this.tr("GitHub Releases (Latest)", "GitHub Releases (最新版)")}</a>` : ""}
               </div>
             </div>
             <div>
@@ -2277,8 +3022,8 @@ class CodaTerminalWebApp {
               <span class="pm-kbd">/activate</span>
             </button>
             ${
-              dl
-                ? `<a class="cmd-row" href="${dl.desktop_macos_dmg}" target="_blank">
+              dl && safeHref(dl.desktop_macos_dmg) !== "#"
+                ? `<a class="cmd-row" href="${this.escapeHtml(safeHref(dl.desktop_macos_dmg))}" target="_blank" rel="noopener noreferrer">
                     <span style="display:inline-flex;align-items:center;gap:8px;">${svgIcon("laptop", 14)} ${this.tr("Download macOS Desktop (.dmg)", "下载 macOS 桌面端 (.dmg)")}</span>
                     <span class="pm-badge">${this.tr("Latest", "最新版")}</span>
                   </a>`
@@ -2524,7 +3269,7 @@ class CodaTerminalWebApp {
         this.token = res.token;
         this.user = res.user;
         this.errorMsg = "";
-        localStorage.setItem("coda_token", res.token);
+        this.saveSessionToken(res.token);
         await this.bootstrapMesh();
         if (this.pendingActivationCode) {
           this.navigate(`/activate?code=${encodeURIComponent(this.pendingActivationCode)}`);
@@ -2694,6 +3439,36 @@ class CodaTerminalWebApp {
     const nowTime = new Date().toTimeString().slice(0, 5);
     const isNarrowViewport = window.innerWidth < 900;
     const renderTouchKeypad = isNarrowViewport || this.showMobileKeypadOnDesktop;
+    const allBranches = this.repos.flatMap((r) => r.branches || []);
+    const branchForTerm = (t?: HerdrTerminal): BranchWorktreeItem | undefined => {
+      if (!t) return undefined;
+      return allBranches.find(
+        (b) =>
+          b.active_terminals?.some((bt) => bt.address === t.address) ||
+          Boolean(t.cwd && b.worktree_path && (t.cwd === b.worktree_path || t.cwd.startsWith(`${b.worktree_path}/`)))
+      );
+    };
+    const activeBranch = branchForTerm(activeTerm);
+    const selectedVtKey =
+      this.selectedDaemon && activeTerm ? this.vtKey(this.selectedDaemon.id, activeTerm.address) : "";
+    const activeVt = selectedVtKey ? this.vtTerminals.get(selectedVtKey) : undefined;
+    const initialVtHtml =
+      activeVt && this.vtStreamActive.has(selectedVtKey)
+        ? activeVt.renderHtml()
+        : this.tr(
+            `  - Connected to PostgreSQL 18 multi-tenant control plane &amp; E2EE tunnel (X25519 + ChaCha20-Poly1305)\n  - Local Herdr Core online. Use '+' on the right rail to launch Claude Code / Codex / Gemini CLI.\n\n* Ready · ${this.rttMs !== null ? `RTT ${this.rttMs}ms` : "Relay WSS :443 & Direct LAN P2P Ready"}`,
+            `  - 已连接 PostgreSQL 18 多租户控制面与端到端加密隧道 (X25519 + ChaCha20-Poly1305)\n  - 本机 Herdr Core 在线，随时可通过右侧「+」拉起 Claude Code / Codex / Gemini CLI\n\n* Ready · ${this.rttMs !== null ? `RTT ${this.rttMs}ms` : "Relay WSS :443 & Direct LAN P2P Ready"}`
+          );
+    const modeLabel =
+      this.activeTransportMode === "lan_ws"
+        ? this.tr("LAN Direct", "局域网直连")
+        : this.tr("Smart Relay", "智能中继");
+    const footerTransport =
+      this.rttMs !== null
+        ? `${this.rttMs}ms RTT`
+        : this.activeTransportMode === "lan_ws"
+          ? "LAN Direct :24444"
+          : "Relay WSS :443";
 
     root.innerHTML = `
       <div class="shell-root">
@@ -2706,10 +3481,10 @@ class CodaTerminalWebApp {
               <div style="display:flex;align-items:center;gap:10px;min-width:0;">
                 ${codaLogoSVG(24)}
                 <div style="min-width:0;">
-                  <div style="font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${this.user.email}</div>
+                  <div style="font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${this.escapeHtml(this.user.email)}</div>
                   <div style="font-size:11px;color:var(--emerald);margin-top:2px;display:inline-flex;align-items:center;gap:4px;">
-                    ${this.activeTransportMode === "lan_ws" ? `${svgIcon("zap", 11)} ${this.tr("LAN Direct", "局域网直连")}` : `${svgIcon("cloud", 11)} ${this.tr("Smart Relay", "智能中继")}`}
-                    ${this.rttMs !== null ? `(${this.rttMs}ms)` : ""}
+                    ${this.activeTransportMode === "lan_ws" ? svgIcon("zap", 11) : svgIcon("cloud", 11)}
+                    <span id="console-rtt-label">${this.escapeHtml(`${modeLabel}${this.rttMs !== null ? ` (${this.rttMs}ms)` : ""}`)}</span>
                   </div>
                 </div>
               </div>
@@ -2732,39 +3507,46 @@ class CodaTerminalWebApp {
                       .map(
                         (d) => `
                   <div style="margin-bottom:18px;">
-                    <div style="display:flex;align-items:center;gap:6px;padding:4px 6px;font-size:12px;color:var(--text-tertiary);">
+                    <div style="display:flex;align-items:center;gap:6px;padding:4px 6px;font-size:12px;color:var(--text-tertiary);cursor:pointer;" data-dev="${this.escapeHtml(d.id)}">
                       <span style="width:7px;height:7px;border-radius:99px;background:${d.is_online ? "var(--emerald)" : "var(--text-quaternary)"};"></span>
-                      <span style="color:var(--text-primary);font-weight:500;">coda</span>
-                      <span>&middot; ${d.name}</span>
+                      <span style="color:var(--text-primary);font-weight:500;">${this.escapeHtml(d.platform || "host")}</span>
+                      <span>&middot; ${this.escapeHtml(d.name)}</span>
                     </div>
                     ${
                       this.selectedDaemon?.id === d.id && this.terminals.length > 0
                         ? this.terminals
-                            .map(
-                              (t) => `
-                          <div class="branch-item ${this.activeTerminalAddr === t.address ? "active" : ""}" data-term="${t.address}">
+                            .map((t) => {
+                              const b = branchForTerm(t);
+                              const rightMeta =
+                                b && (b.diff_added > 0 || b.diff_deleted > 0)
+                                  ? `<div class="coda-mono pm-num" style="font-size:11px;color:var(--emerald);">+${b.diff_added} <span style="color:var(--rose);">-${b.diff_deleted}</span></div>`
+                                  : `<div class="coda-mono" style="font-size:11px;color:var(--text-tertiary);">${this.escapeHtml(
+                                      b?.branch || (t.alive ? this.tr("live", "运行") : this.tr("exited", "已退出"))
+                                    )}</div>`;
+                              return `
+                          <div class="branch-item ${this.activeTerminalAddr === t.address ? "active" : ""}" data-term="${this.escapeHtml(t.address)}">
                             <div style="display:flex;align-items:center;gap:10px;min-width:0;">
-                              ${codaNodeDotSVG("#e06c50")}
+                              ${codaNodeDotSVG(t.alive ? "#e06c50" : "#52525b")}
                               <div style="min-width:0;">
                                 <div class="coda-mono" style="font-size:13px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
-                                  ${t.name || t.address}
+                                  ${this.escapeHtml(t.name || t.address)}
                                 </div>
                                 <div style="font-size:11px;color:var(--emerald);margin-top:2px;">
-                                  ${t.status?.state || this.tr("Running", "终端运行中")}
+                                  ${this.escapeHtml(t.status?.state || this.tr("Running", "终端运行中"))}
                                 </div>
                               </div>
                             </div>
-                            <div class="coda-mono pm-num" style="font-size:11px;color:var(--emerald);">+184 <span style="color:var(--rose);">-19</span></div>
+                            ${rightMeta}
                           </div>
-                        `
-                            )
+                        `;
+                            })
                             .join("")
                         : `
-                        <div class="branch-item ${this.selectedDaemon?.id === d.id ? "active" : ""}" data-dev="${d.id}">
+                        <div class="branch-item ${this.selectedDaemon?.id === d.id ? "active" : ""}" data-dev="${this.escapeHtml(d.id)}">
                           <div style="display:flex;align-items:center;gap:10px;">
                             ${codaNodeDotSVG(d.is_online ? "#e06c50" : "#52525b")}
                             <div>
-                              <div class="coda-mono" style="font-size:13px;">main</div>
+                              <div class="coda-mono" style="font-size:13px;">${this.escapeHtml(d.name)}</div>
                               <div style="font-size:11px;color:${d.is_online ? "var(--emerald)" : "var(--text-tertiary)"};">
                                 ${d.is_online ? this.tr("Click to load Herdr PTYs", "点击加载 Herdr 终端") : this.tr("Host offline", "主机离线")}
                               </div>
@@ -2772,6 +3554,22 @@ class CodaTerminalWebApp {
                           </div>
                         </div>
                       `
+                    }
+                    ${
+                      this.selectedDaemon?.id === d.id && this.repos.length > 0
+                        ? this.repos
+                            .slice(0, 6)
+                            .map((r) => {
+                              const sumAdded = (r.branches || []).reduce((acc, b) => acc + (b.diff_added || 0), 0);
+                              const sumDel = (r.branches || []).reduce((acc, b) => acc + (b.diff_deleted || 0), 0);
+                              return `
+                          <div style="padding:4px 8px;margin-top:4px;font-size:11px;color:var(--text-tertiary);display:flex;justify-content:space-between;gap:8px;">
+                            <span class="coda-mono" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${this.escapeHtml(r.repo_name)}</span>
+                            <span class="coda-mono" style="color:var(--emerald);">+${sumAdded} <span style="color:var(--rose);">-${sumDel}</span></span>
+                          </div>`;
+                            })
+                            .join("")
+                        : ""
                     }
                   </div>
                 `
@@ -2789,18 +3587,18 @@ class CodaTerminalWebApp {
           <!-- Top Session Header + Overlapping Agent Avatars -->
           <div style="display:flex;align-items:flex-start;justify-content:space-between;padding-bottom:8px;border-bottom:1px solid var(--border-primary);">
             <div style="min-width:0;">
-              <div style="font-size:15px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
-                ${activeTerm?.status?.title || activeTerm?.name || this.tr("Coda Interactive AI Terminal", "Coda 交互式 AI 终端会话")}
+              <div id="active-term-title" style="font-size:15px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
+                ${this.escapeHtml(activeTerm?.status?.title || activeTerm?.name || this.tr("Coda Interactive AI Terminal", "Coda 交互式 AI 终端会话"))}
               </div>
               <div class="coda-mono" style="font-size:12px;color:var(--text-tertiary);margin-top:2px;">
-                ${activeTerm?.cwd || "~/personal/github/coda"} &middot; main &middot; ${this.selectedDaemon?.name || "MacBook-Pro"}
+                ${this.escapeHtml(activeTerm?.cwd || "~")} &middot; ${this.escapeHtml(activeBranch?.branch || "main")} &middot; ${this.escapeHtml(this.selectedDaemon?.name || this.tr("Unselected", "未选择主机"))}
               </div>
             </div>
             <div style="display:flex;align-items:center;gap:8px;">
-              ${(this.terminals.length > 0 ? this.terminals : [{ address: "t1" } as any])
+              ${this.terminals
                 .map(
                   (t, i) => `
-                <button data-term="${t.address}" style="margin-left:${i === 0 ? "0" : "-8px"};width:34px;height:34px;border-radius:999px;background:var(--bg-card);border:${
+                <button data-term="${this.escapeHtml(t.address)}" title="${this.escapeHtml(t.name || t.address)}" style="margin-left:${i === 0 ? "0" : "-8px"};width:34px;height:34px;border-radius:999px;background:var(--bg-card);border:${
                     t.address === this.activeTerminalAddr ? "2px solid var(--text-primary)" : "1px solid var(--border-strong)"
                   };display:flex;align-items:center;justify-content:center;cursor:pointer;z-index:${10 - i};">
                   ${codaNodeDotSVG(i % 2 === 0 ? "#e06c50" : "#3b82f6")}
@@ -2813,21 +3611,18 @@ class CodaTerminalWebApp {
 
           <!-- Live Terminal Viewport -->
           <div class="term-viewport" id="term-box">${
-            this.terminalScreen
-              ? this.escapeHtml(this.terminalScreen)
-              : this.tr(
-                  `  - Connected to PostgreSQL 18 multi-tenant control plane &amp; E2EE tunnel (X25519 + ChaCha20-Poly1305)\n  - Local Herdr Core (hc 0.1.20) online. Use '+' on the right rail to launch Claude Code / Codex / Gemini CLI.\n\n* Ready · ${this.rttMs !== null ? `RTT ${this.rttMs}ms` : "CF Tunnel WSS :443 & Direct LAN P2P Ready"}`,
-                  `  - 已连接 PostgreSQL 18 多租户控制面与端到端加密隧道 (X25519 + ChaCha20-Poly1305)\n  - 本机 Herdr Core (hc 0.1.20) 在线，随时可通过右侧「+」拉起 Claude Code / Codex / Gemini CLI\n\n* Ready · ${this.rttMs !== null ? `RTT ${this.rttMs}ms` : "CF Tunnel WSS :443 & Direct LAN P2P Ready"}`
-                )
-          }
-
+            this.consoleNotice
+              ? `<div style="margin-bottom:10px;padding:8px 10px;border-radius:8px;font-size:12px;border:1px solid ${
+                  this.consoleNotice.kind === "err" ? "var(--rose-bd, rgba(244,63,94,0.35))" : "var(--emerald-bd)"
+                };background:${
+                  this.consoleNotice.kind === "err" ? "rgba(244,63,94,0.1)" : "var(--emerald-bg)"
+                };color:${this.consoleNotice.kind === "err" ? "var(--rose)" : "var(--emerald)"};">${this.escapeHtml(this.consoleNotice.text)}</div>`
+              : ""
+          }<div id="term-screen-output" style="white-space:pre;overflow-x:auto;">${initialVtHtml}</div>
 <div style="margin-top:14px;border-top:1px solid var(--border-primary);padding-top:6px;border-bottom:1px solid var(--border-primary);padding-bottom:6px;">&gt; ${this.formatCursorDraft(
             this.draftInput
           )}</div>
-<div style="font-size:12px;color:var(--text-tertiary);margin-top:4px;">Opus 4.6 | 5h <span style="color:var(--rose);">100%</span> | ${this.tr("7d total", "7d 总")} <span style="color:var(--text-secondary);">77%</span> | <span style="color:var(--amber);">E2EE zstd</span></div>
-<div style="font-size:12px;color:var(--coral);">bypass permissions on (shift+tab to cycle) <span style="color:var(--text-tertiary);">&middot; ${
-            this.terminals.length || 1
-          } agents &middot; PR</span></div></div>
+<div id="term-footer-meta" style="font-size:12px;color:var(--text-tertiary);margin-top:4px;">${this.escapeHtml(footerTransport)} &middot; E2EE X25519 + ChaCha20 &middot; ${this.termCols}&times;${this.termRows} &middot; ${this.terminals.length} PTY</div></div>
 
           ${
             this.showKeyboardInputBar
@@ -2895,7 +3690,7 @@ class CodaTerminalWebApp {
           <div style="text-align:center;" class="coda-mono">
             <div style="font-size:12px;font-weight:700;">${nowTime}</div>
             <div style="margin-top:6px;width:42px;height:42px;border-radius:999px;border:2px solid var(--border-strong);border-top-color:var(--text-primary);display:flex;flex-direction:column;align-items:center;justify-content:center;font-size:10.5px;">
-              <strong>68</strong>
+              <strong>${this.terminals.length}</strong>
               ${
                 this.activeTransportMode === "lan_ws"
                   ? `<span style="color:var(--emerald);">LAN</span>`
@@ -2996,14 +3791,14 @@ class CodaTerminalWebApp {
             ${
               this.pairCommand
                 ? `<div class="coda-mono" style="background:var(--bg-elevated);border:1px dashed var(--emerald);padding:10px;border-radius:8px;font-size:12px;margin-bottom:10px;word-break:break-all;">
-                    ${this.tr("One-line install &amp; pair on macOS / Linux:", "在 Mac / Linux 一键安装并配对：")}<br/>${this.pairCommand}
+                    ${this.tr("One-line install &amp; pair on macOS / Linux:", "在 Mac / Linux 一键安装并配对：")}<br/>${this.escapeHtml(this.pairCommand)}
                   </div>`
                 : ""
             }
             ${
               this.latestInviteCode
                 ? `<div class="coda-mono" style="background:var(--bg-elevated);border:1px dashed var(--signal-blue);padding:10px;border-radius:8px;font-size:12px;margin-bottom:10px;">
-                    ${this.tr("Invite code:", "好友注册邀请码：")} <b>${this.latestInviteCode}</b>
+                    ${this.tr("Invite code:", "好友注册邀请码：")} <b>${this.escapeHtml(this.latestInviteCode)}</b>
                   </div>`
                 : ""
             }
@@ -3114,14 +3909,48 @@ class CodaTerminalWebApp {
       this.showSettingsModal = false;
       this.navigate("/");
     });
-    document.getElementById("btn-logout")?.addEventListener("click", () => {
-      localStorage.removeItem("coda_token");
-      this.token = null;
-      this.user = null;
-      this.showSettingsModal = false;
-      this.directWs?.close();
-      this.ws?.close();
-      this.navigate("/login");
+    if (this.termResizeObserver) {
+      this.termResizeObserver.disconnect();
+      this.termResizeObserver = null;
+    }
+    const termBox = document.getElementById("term-box");
+    if (termBox && typeof ResizeObserver !== "undefined") {
+      this.termResizeObserver = new ResizeObserver(() => {
+        this.scheduleTerminalResizeSync();
+      });
+      this.termResizeObserver.observe(termBox);
+    }
+
+    document.getElementById("btn-logout")?.addEventListener("click", async () => {
+      try {
+        if (this.token) {
+          await this.api("/api/v1/auth/logout", "POST", {});
+        }
+      } catch {
+        // Ignore network/revoked errors during local teardown
+      } finally {
+        this.stopAllTransportsAndTimers();
+        clearSessionToken();
+        this.token = null;
+        this.user = null;
+        this.devices = [];
+        this.myClientDevice = null;
+        this.selectedDaemon = null;
+        this.terminals = [];
+        this.repos = [];
+        this.activeTerminalAddr = null;
+        this.draftInput = "";
+        this.pairCommand = null;
+        this.latestInviteCode = null;
+        this.rttMs = null;
+        this.consoleNotice = null;
+        this.e2eeSessions.clear();
+        this.directE2eeSessions.clear();
+        this.vtTerminals.clear();
+        this.vtStreamActive.clear();
+        this.showSettingsModal = false;
+        this.navigate("/login");
+      }
     });
 
     document.getElementById("btn-kb-toggle")?.addEventListener("click", () => {
@@ -3129,16 +3958,47 @@ class CodaTerminalWebApp {
       this.render();
     });
 
+    const kbInput = document.getElementById("kb-input") as HTMLInputElement | null;
+    kbInput?.addEventListener("compositionstart", () => {
+      this.imeComposing = true;
+    });
+    kbInput?.addEventListener("compositionend", () => {
+      this.imeComposing = false;
+      this.draftInput = kbInput.value;
+    });
+    kbInput?.addEventListener("input", () => {
+      this.draftInput = kbInput.value;
+    });
+    kbInput?.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && (e.isComposing || this.imeComposing)) {
+        e.preventDefault();
+      }
+    });
+
     document.getElementById("kb-form")?.addEventListener("submit", (e) => {
       e.preventDefault();
-      const inp = document.getElementById("kb-input") as HTMLInputElement;
-      this.draftInput = inp.value;
+      if (this.imeComposing) return;
+      const inp = document.getElementById("kb-input") as HTMLInputElement | null;
+      this.draftInput = inp ? inp.value : this.draftInput;
       this.showKeyboardInputBar = false;
       this.render();
     });
 
-    document.getElementById("desktop-prompt-input")?.addEventListener("input", (e) => {
-      this.draftInput = (e.target as HTMLInputElement).value;
+    const desktopInput = document.getElementById("desktop-prompt-input") as HTMLInputElement | null;
+    desktopInput?.addEventListener("compositionstart", () => {
+      this.imeComposing = true;
+    });
+    desktopInput?.addEventListener("compositionend", () => {
+      this.imeComposing = false;
+      this.draftInput = desktopInput.value;
+    });
+    desktopInput?.addEventListener("input", () => {
+      this.draftInput = desktopInput.value;
+    });
+    desktopInput?.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && (e.isComposing || this.imeComposing)) {
+        e.preventDefault();
+      }
     });
 
     document.getElementById("btn-toggle-touch-pad")?.addEventListener("click", () => {
@@ -3148,6 +4008,7 @@ class CodaTerminalWebApp {
 
     document.getElementById("desktop-prompt-form")?.addEventListener("submit", (e) => {
       e.preventDefault();
+      if (this.imeComposing) return;
       const inp = document.getElementById("desktop-prompt-input") as HTMLInputElement | null;
       const text = (inp ? inp.value : this.draftInput).trim();
       if (this.selectedDaemon && this.activeTerminalAddr && text) {
@@ -3164,6 +4025,9 @@ class CodaTerminalWebApp {
 
     document.getElementById("rail-spawn-btn")?.addEventListener("click", () => {
       if (this.selectedDaemon?.is_online) {
+        const { cols, rows } = this.computeTerminalDimsFromDom();
+        this.termCols = cols;
+        this.termRows = rows;
         this.sendEncrypted(this.selectedDaemon, {
           op: "launch_agent",
           req_id: `run-${Date.now()}`,
@@ -3171,8 +4035,8 @@ class CodaTerminalWebApp {
           name: null,
           cwd: null,
           initial_prompt: null,
-          cols: 108,
-          rows: 32,
+          cols,
+          rows,
         });
       }
     });
@@ -3186,23 +4050,68 @@ class CodaTerminalWebApp {
       }
     });
 
-    document.getElementById("rail-file-input")?.addEventListener("change", (ev) => {
+    document.getElementById("rail-file-input")?.addEventListener("change", async (ev) => {
       const inp = ev.target as HTMLInputElement;
       const file = inp.files?.[0];
+      inp.value = "";
       if (!file || !this.selectedDaemon || !this.activeTerminalAddr) return;
-      const reader = new FileReader();
-      reader.onload = () => {
-        const res = String(reader.result || "");
-        const b64 = res.includes(",") ? res.split(",")[1] : res;
-        this.sendEncrypted(this.selectedDaemon!, {
+      if (file.size > MAX_UPLOAD_BYTES) {
+        this.consoleNotice = {
+          kind: "err",
+          text: this.tr(
+            `File too large (${Math.ceil(file.size / (1024 * 1024))} MiB > 8 MiB limit)`,
+            `文件过大（超过 8 MiB 单次上传限制）`
+          ),
+        };
+        this.render();
+        return;
+      }
+      try {
+        const bytes = new Uint8Array(await file.arrayBuffer());
+        const b64 = toB64(bytes);
+        this.sendEncrypted(this.selectedDaemon, {
           op: "upload_terminal_file",
           req_id: `up-${Date.now()}`,
-          terminal: this.activeTerminalAddr!,
+          terminal: this.activeTerminalAddr,
           filename: file.name,
           data_b64: b64,
         });
-      };
-      reader.readAsDataURL(file);
+      } catch (err: any) {
+        this.consoleNotice = {
+          kind: "err",
+          text: String(err?.message || this.tr("Failed reading upload file", "读取上传文件失败")),
+        };
+        this.render();
+      }
+    });
+
+    document.getElementById("rail-paste-btn")?.addEventListener("click", async () => {
+      try {
+        if (!navigator.clipboard?.readText) {
+          this.consoleNotice = {
+            kind: "err",
+            text: this.tr("Clipboard API unavailable in this browser context", "当前浏览器上下文不支持剪贴板读取"),
+          };
+          this.render();
+          return;
+        }
+        const clip = await navigator.clipboard.readText();
+        if (!clip) return;
+        this.draftInput = this.draftInput ? `${this.draftInput}${clip}` : clip;
+        const desktopInp = document.getElementById("desktop-prompt-input") as HTMLInputElement | null;
+        if (desktopInp) {
+          desktopInp.value = this.draftInput;
+          desktopInp.focus();
+        } else {
+          this.render();
+        }
+      } catch {
+        this.consoleNotice = {
+          kind: "err",
+          text: this.tr("Clipboard permission denied; paste directly into the prompt bar", "剪贴板读取未授权，请直接在输入框中粘贴"),
+        };
+        this.render();
+      }
     });
 
     document.getElementById("voice-cfg-form")?.addEventListener("submit", (e) => {
@@ -3230,9 +4139,14 @@ class CodaTerminalWebApp {
         const devId = (el as HTMLElement).dataset.dev!;
         const peer = this.devices.find((d) => d.id === devId);
         if (!peer) return;
+        if (this.selectedDaemon && this.selectedDaemon.id !== peer.id) {
+          this.detachActiveTerminal();
+        }
         this.selectedDaemon = peer;
         this.terminals = [];
+        this.repos = [];
         this.activeTerminalAddr = null;
+        this.lastWorkspacesQueryAt = 0;
         if (peer.is_online) {
           this.queryDaemonOverview(peer);
           void this.tryNegotiateDirectLanWs(peer);
@@ -3243,8 +4157,13 @@ class CodaTerminalWebApp {
 
     document.querySelectorAll("[data-term]").forEach((el) => {
       el.addEventListener("click", () => {
-        this.activeTerminalAddr = (el as HTMLElement).dataset.term!;
-        this.attachAndReadTerminal(this.activeTerminalAddr);
+        const nextAddr = (el as HTMLElement).dataset.term!;
+        if (!nextAddr) return;
+        if (this.activeTerminalAddr && this.activeTerminalAddr !== nextAddr) {
+          this.detachActiveTerminal();
+        }
+        this.activeTerminalAddr = nextAddr;
+        this.attachAndReadTerminal(nextAddr);
         this.render();
       });
     });
@@ -3288,8 +4207,10 @@ class CodaTerminalWebApp {
   }
 
   private escapeHtml(str: string): string {
-    return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    return escapeHtml(str);
   }
 }
 
-new CodaTerminalWebApp().init();
+if (typeof window !== "undefined" && typeof document !== "undefined" && document.getElementById("app")) {
+  void new CodaTerminalWebApp().init();
+}

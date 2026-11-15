@@ -21,6 +21,7 @@ const hash = createHash("sha256").update(bundleBytes).digest("hex").slice(0, 10)
 const hashedBundleName = `app.${hash}.js`;
 
 writeFileSync(`./dist/${hashedBundleName}`, bundleBytes);
+rmSync("./dist/app.js", { force: true });
 
 if (existsSync("../assets/logo.svg")) {
   copyFileSync("../assets/logo.svg", "./dist/logo.svg");
