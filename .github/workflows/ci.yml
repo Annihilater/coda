@@ -185,4 +185,6 @@ jobs:
           cargo build --release -p coda-apple-ffi -p coda-server -p coda-daemon -p coda-desktop
           ./target/release/coda-desktop --self-test
       - name: Test, Build & Self-Test Apple Swift 6 Package (release)
-        run: cd apple && swift test && swift build -c release && ./.build/release/CodaSelfTest
+        run: |
+          export CODA_FFI_DYLIB_PATH="${GITHUB_WORKSPACE}/target/release/libcoda_apple_ffi.dylib"
+          cd apple && swift test && swift build -c release && ./.build/release/CodaSelfTest

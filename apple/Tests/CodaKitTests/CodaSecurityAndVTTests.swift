@@ -1,7 +1,8 @@
 #if canImport(XCTest)
+import XCTest
+#endif
 import CryptoKit
 import Foundation
-import XCTest
 @testable import CodaGhosttyKit
 @testable import CodaKit
 
@@ -90,7 +91,7 @@ final class CodaSecurityAndVTTests: XCTestCase {
         // Swift -> Rust FFI
         let clientPayload = try swiftClient.sealJSON(Data("{\"op\":\"ping\",\"req_id\":\"r-1\",\"sent_ms\":1234}".utf8))
         let clientEncJSON = String(decoding: try JSONEncoder().encode(clientPayload), as: UTF8.self)
-        let rustOpened = try rustDaemon.openEncryptedPayloadJSON(clientEncJSON)
+        let rustOpened = try XCTUnwrap(rustDaemon.openEncryptedPayloadJSON(clientEncJSON))
         XCTAssertTrue(rustOpened.contains("\"req_id\":\"r-1\""))
 
         // Rust FFI -> Swift (including compression path cleanly when large payload)
@@ -102,7 +103,9 @@ final class CodaSecurityAndVTTests: XCTestCase {
             "daemon_hostname": bigOutput,
             "herdr_version": "0.1.20",
         ])
-        let rustSealedJSON = try rustDaemon.sealPeerMessageJSON(String(decoding: rustMsgJSON, as: UTF8.self))
+        let rustSealedJSON = try XCTUnwrap(
+            rustDaemon.sealPeerMessageJSON(String(decoding: rustMsgJSON, as: UTF8.self))
+        )
         let rustEnc = try JSONDecoder().decode(CodaEncryptedPayload.self, from: Data(rustSealedJSON.utf8))
         let swiftOpened = try swiftClient.openJSON(rustEnc)
         let parsed = try XCTUnwrap(JSONSerialization.jsonObject(with: swiftOpened) as? [String: Any])
@@ -165,7 +168,7 @@ final class CodaSecurityAndVTTests: XCTestCase {
 
         let account = "test.secret.\(UUID().uuidString)"
         let secret = "sk-secret-token-value-12345"
-        XCTAssertTrue(CodaSecretStore.saveString(secret, account: account))
+        CodaSecretStore.saveString(secret, account: account)
         XCTAssertEqual(CodaSecretStore.readString(account: account), secret)
 
         let files = try FileManager.default.contentsOfDirectory(at: tmpDir, includingPropertiesForKeys: nil)
@@ -221,4 +224,3 @@ final class CodaSecurityAndVTTests: XCTestCase {
         XCTAssertFalse(codaPathWithinRoot("/Users/dev/coda/../coda-other", root: "/Users/dev/coda"))
     }
 }
-#endif

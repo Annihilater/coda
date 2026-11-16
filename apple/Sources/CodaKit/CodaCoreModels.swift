@@ -14,6 +14,10 @@ public enum CodaSecretStore {
             return true
         }
         #if os(macOS)
+        if NSClassFromString("XCTestCase") != nil
+            || Bundle.main.bundleIdentifier?.hasPrefix("com.apple.dt.") == true {
+            return true
+        }
         // Unsigned CLI executables and XCTest runners on macOS trigger modal Keychain prompts across rebuilds;
         // use 0600 file-backed secret storage unless running inside a signed .app bundle.
         return Bundle.main.bundleURL.pathExtension != "app"

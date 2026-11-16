@@ -1,8 +1,97 @@
 #if canImport(XCTest)
+import XCTest
+#else
+open class XCTestCase {}
+
+struct XCTestShimError: Error {
+    let message: String
+}
+
+func XCTFail(_ message: String = "", file: StaticString = #filePath, line: UInt = #line) {
+    fatalError("XCTFail at \(file):\(line): \(message)")
+}
+
+func XCTAssertEqual<T: Equatable>(
+    _ expression1: @autoclosure () throws -> T,
+    _ expression2: @autoclosure () throws -> T,
+    _ message: @autoclosure () -> String = "",
+    file: StaticString = #filePath,
+    line: UInt = #line
+) rethrows {
+    let lhs = try expression1()
+    let rhs = try expression2()
+    precondition(lhs == rhs, "XCTAssertEqual failed at \(file):\(line): \(lhs) != \(rhs) \(message())")
+}
+
+func XCTAssertGreaterThan<T: Comparable>(
+    _ expression1: @autoclosure () throws -> T,
+    _ expression2: @autoclosure () throws -> T,
+    _ message: @autoclosure () -> String = "",
+    file: StaticString = #filePath,
+    line: UInt = #line
+) rethrows {
+    let lhs = try expression1()
+    let rhs = try expression2()
+    precondition(lhs > rhs, "XCTAssertGreaterThan failed at \(file):\(line): \(lhs) <= \(rhs) \(message())")
+}
+
+func XCTAssertTrue(
+    _ expression: @autoclosure () throws -> Bool,
+    _ message: @autoclosure () -> String = "",
+    file: StaticString = #filePath,
+    line: UInt = #line
+) rethrows {
+    let ok = try expression()
+    precondition(ok, "XCTAssertTrue failed at \(file):\(line): \(message())")
+}
+
+func XCTAssertFalse(
+    _ expression: @autoclosure () throws -> Bool,
+    _ message: @autoclosure () -> String = "",
+    file: StaticString = #filePath,
+    line: UInt = #line
+) rethrows {
+    let flag = try expression()
+    precondition(!flag, "XCTAssertFalse failed at \(file):\(line): \(message())")
+}
+
+func XCTAssertNil(
+    _ expression: @autoclosure () throws -> Any?,
+    _ message: @autoclosure () -> String = "",
+    file: StaticString = #filePath,
+    line: UInt = #line
+) rethrows {
+    let val = try expression()
+    precondition(val == nil, "XCTAssertNil failed at \(file):\(line): \(message())")
+}
+
+func XCTAssertThrowsError<T>(
+    _ expression: @autoclosure () throws -> T,
+    _ message: @autoclosure () -> String = "",
+    file: StaticString = #filePath,
+    line: UInt = #line
+) {
+    do {
+        _ = try expression()
+        preconditionFailure("XCTAssertThrowsError failed at \(file):\(line): expected error \(message())")
+    } catch {}
+}
+
+func XCTUnwrap<T>(
+    _ expression: @autoclosure () throws -> T?,
+    _ message: @autoclosure () -> String = "",
+    file: StaticString = #filePath,
+    line: UInt = #line
+) throws -> T {
+    guard let value = try expression() else {
+        throw XCTestShimError(message: "XCTUnwrap failed at \(file):\(line): \(message())")
+    }
+    return value
+}
+#endif
 import CodaGhosttyKit
 import CodaKit
 import Foundation
-import XCTest
 
 final class CodaKitTests: XCTestCase {
     func testZeroKnowledgeE2EERoundtripAndReplayRejection() throws {
@@ -67,4 +156,3 @@ final class CodaKitTests: XCTestCase {
         XCTAssertEqual(ordered.map(\.id), ["s-needs", "s-done", "s-work", "s-idle"])
     }
 }
-#endif

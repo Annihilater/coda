@@ -139,6 +139,7 @@ jobs:
           ./target/release/coda-desktop --self-test
       - name: Test, Verify & Build Apple Swift 6 Desktop Companion
         run: |
+          export CODA_FFI_DYLIB_PATH="${GITHUB_WORKSPACE}/target/release/libcoda_apple_ffi.dylib"
           cd apple
           swift test
           swift build -c release
@@ -235,7 +236,7 @@ jobs:
 
       - name: Prepare Multi-Arch Docker Build Context
         run: |
-          mkdir -p docker-ctx/bin/linux-amd64 docker-ctx/bin/linux-arm64 docker-ctx/web docker-ctx/deploy dist-unpack dist-images
+          mkdir -p docker-ctx/bin/linux-amd64 docker-ctx/bin/linux-arm64 docker-ctx/web dist-unpack dist-images
           tar -C dist-unpack -xzf "linux-assets/coda-server-linux-x86_64-${RELEASE_TAG}.tar.gz"
           tar -C dist-unpack -xzf "linux-assets/coda-daemon-linux-x86_64-${RELEASE_TAG}.tar.gz"
           tar -C dist-unpack -xzf "linux-assets/coda-server-linux-aarch64-${RELEASE_TAG}.tar.gz"
@@ -248,6 +249,7 @@ jobs:
           cp -r dist-unpack/coda-server-linux-x86_64/web-dist docker-ctx/web/dist
           cp -r dist-unpack/coda-server-linux-x86_64/migrations docker-ctx/migrations
           cp -r deploy docker-ctx/deploy
+          test -f docker-ctx/deploy/install-daemon.sh
 
           sed 's/^          //' > docker-ctx/Dockerfile <<'DOCKERFILE_EOF'
           FROM debian:bookworm-slim
