@@ -222,7 +222,10 @@ struct CodaSelfTest {
         precondition(panoStyled.lines.contains(where: { $0.kind == .diffAdded }) && panoStyled.lines.contains(where: { $0.kind == .diffRemoved }))
         precondition(panoStyled.lines.contains(where: { $0.kind == .promptChoice }))
         precondition(GhosttyReflowEngine.encodeKey(.backspace) == Data([0x7F]))
-        precondition(HerdrQuickKey.backspace.herdrKeyNames == ["BSpace"])
+        precondition(HerdrQuickKey.backspace.herdrKeyNames == ["backspace"])
+        precondition(HerdrQuickKey.esc.herdrKeyNames == ["esc"])
+        precondition(HerdrQuickKey.shiftTab.herdrKeyNames == ["shift+tab"])
+        precondition(HerdrQuickKey.ctrlC.herdrKeyNames == ["ctrl+c"])
         precondition(GhosttyReflowEngine.encodeKey(.slash) == Data("/".utf8))
 
         // 7. Auto-LAN UDP Discovery + Direct P2P TCP Handshake + One-Way PtyResize + E2EE RPCs
@@ -584,9 +587,10 @@ struct CodaSelfTest {
                   let clientEdPub = hello["client_ed25519_pub_b64"] as? String,
                   let helloTs = (hello["timestamp_ms"] as? NSNumber)?.uint64Value,
                   let helloSig = hello["signature_b64"] as? String,
+                  let supportsZstd = (hello["supports_zstd"] as? Bool) ?? Optional(false),
                   CodaDeviceIdentity.verifySignature(
                       ed25519PublicB64: clientEdPub,
-                      message: Data("p2p-hello-v2:\(clientIdStr.lowercased()):\(daemonId.uuidString.lowercased()):\(clientPub):\(clientEphPub):\(helloTs)".utf8),
+                      message: Data("p2p-hello-v2:\(clientIdStr.lowercased()):\(daemonId.uuidString.lowercased()):\(clientPub):\(clientEphPub):\(helloTs):zstd=\(supportsZstd ? 1 : 0)".utf8),
                       signatureB64: helloSig
                   ),
                   let initialSess = try? CodaE2EESession(
@@ -939,6 +943,19 @@ struct CodaSelfTest {
         precondition(codaPathWithinRoot("/Users/dev/coda/crates/coda-server", root: "/Users/dev/coda"))
         precondition(!codaPathWithinRoot("/Users/dev/coda-other", root: "/Users/dev/coda"))
         precondition(!codaPathWithinRoot("/Users/dev/coda/../coda-other", root: "/Users/dev/coda"))
+
+        // 8g. Ghostty BG/Inverse, strict CSI prefix filtering, JSON OSC 7501 & Markdown bullet guard
+        var vtRich = GhosttyReflowEngine(columns: 80, rows: 10, treatLFAsCRLF: true)
+        vtRich.feed(Data(
+            "\u{1B}[>4;2mplain\u{1B}[38;2;250;200;100;48;2;10;20;30;7mHI\u{1B}[0m\n- Markdown bullet item\n-removedDiffLine\n\u{1B}]7501;{\"state\":\"blocked\",\"kind\":\"question\",\"title\":\"Confirm\",\"msg\":\"Ship?\"}\u{07}".utf8
+        ))
+        let richLines = vtRich.styledLines
+        precondition(richLines.count == 3, "Expected 3 styled lines, got \(richLines.count)")
+        precondition(richLines[0].spans.count == 2 && richLines[0].spans[0].text == "plain")
+        precondition(richLines[0].spans[1].bg == GhosttyRGBColor(r: 10, g: 20, b: 30) && richLines[0].spans[1].inverse)
+        precondition(richLines[1].kind == .normal, "Markdown bullet should stay .normal")
+        precondition(richLines[2].kind == .diffRemoved, "Unified diff deletion should be .diffRemoved")
+        precondition(vtRich.latestHerdrStatus?.state == .needsYou && vtRich.latestHerdrStatus?.message == "Ship?")
     }
 
     private static func readFramed(conn: NWConnection, completion: @escaping @Sendable ([String: Any]?) -> Void) {

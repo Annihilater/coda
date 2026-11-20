@@ -103,9 +103,16 @@ public final class CodaWorkspaceStore: ObservableObject {
     @Published public var secondarySessionID: String? = nil
     @Published public var showTactileTwoRowKeypad: Bool = false
     @Published public var voiceConfigSyncMessage: String? = nil
+    @Published public var isRecordingVoice: Bool = false
+    @Published public var isTranscribingVoice: Bool = false
+    @Published public var voiceError: String? = nil
+    @Published public var accountStatusMessage: String? = nil
 
     private var networkClient: CodaNetworkClient?
     private var networkClientURL: URL?
+    private let voiceRecorder = CodaVoiceRecorder()
+    private var pendingRefresh: Bool = false
+    private var pendingForceWorkspaces: Bool = false
     private var pollLoopTask: Task<Void, Never>?
     private var accountEventsTask: Task<Void, Never>?
     private var deviceAuthTask: Task<Void, Never>?
@@ -145,12 +152,8 @@ public final class CodaWorkspaceStore: ObservableObject {
         }
         self.localIdentity = loadedIdentity
 
-        if let url = URL(string: loadedSettings.serverBaseURLString), !loadedSettings.sessionToken.isEmpty {
-            let client = CodaNetworkClient(serverBaseURL: url)
-            self.networkClient = client
-            self.networkClientURL = url
+        if !loadedSettings.sessionToken.isEmpty {
             Task { [weak self] in
-                await client.setToken(loadedSettings.sessionToken)
                 await self?.refreshMachinesAndSessions()
             }
         }
@@ -212,21 +215,26 @@ public final class CodaWorkspaceStore: ObservableObject {
             return existing
         }
         let client = CodaNetworkClient(serverBaseURL: url)
-        let tok = settings.sessionToken
-        Task { [weak self] in
-            if !tok.isEmpty {
-                await client.setToken(tok)
-            }
-            await client.setAsyncEventHandler { [weak self] event in
-                Task { @MainActor in
-                    self?.handleAsyncPeerEvent(event)
-                }
-            }
-        }
         self.networkClient = client
         self.networkClientURL = url
         self.attachedSessionIDs.removeAll()
         self.accountEventsConnectedToken = nil
+        return client
+    }
+
+    /// Ensures the `CodaNetworkClient` instance exists AND has its bearer token and
+    /// async peer event handler installed before any network call proceeds.
+    private func preparedClient() async -> CodaNetworkClient? {
+        guard let client = ensureClient() else { return nil }
+        let tok = settings.sessionToken
+        if !tok.isEmpty {
+            await client.setToken(tok)
+        }
+        await client.setAsyncEventHandler { [weak self] event in
+            Task { @MainActor in
+                self?.handleAsyncPeerEvent(event)
+            }
+        }
         return client
     }
 
@@ -406,10 +414,26 @@ public final class CodaWorkspaceStore: ObservableObject {
     }
 
     private func handleAsyncPeerEvent(_ event: CodaAsyncEvent) {
+        let hostPrefix = event.sourceDeviceId.uuidString.lowercased()
+        if event.op == "peer_session_reset" {
+            let prefixWithSlash = "\(hostPrefix)/"
+            attachedSessionIDs = attachedSessionIDs.filter { !$0.hasPrefix(prefixWithSlash) }
+            for key in Array(surfaceEngines.keys) where key.hasPrefix(prefixWithSlash) {
+                surfaceEngines.removeValue(forKey: key)
+            }
+            Task { [weak self] in
+                guard let self else { return }
+                await self.refreshMachinesAndSessions()
+                if let sel = self.selectedSession, sel.deviceId == event.sourceDeviceId {
+                    await self.refreshTerminalScreen(for: sel, forceSnapshot: true)
+                }
+            }
+            return
+        }
+
         guard let obj = try? JSONSerialization.jsonObject(with: event.payloadData) as? [String: Any] else {
             return
         }
-        let hostPrefix = event.sourceDeviceId.uuidString.lowercased()
         if event.op == "pty_output_chunk",
            let terminal = obj["terminal"] as? String,
            let b64 = obj["data_b64"] as? String,
@@ -419,7 +443,7 @@ public final class CodaWorkspaceStore: ObservableObject {
                 columns: terminalColumns,
                 rows: terminalRows,
                 maxScrollback: 1500,
-                treatLFAsCRLF: true
+                treatLFAsCRLF: false
             )
             if engine.columns != terminalColumns || engine.rows != terminalRows {
                 engine.resizeReflow(columns: terminalColumns, rows: terminalRows)
@@ -476,7 +500,7 @@ public final class CodaWorkspaceStore: ObservableObject {
         authError = nil
         pendingDeviceAuth = nil
         deviceAuthTask?.cancel()
-        guard let client = ensureClient() else { return }
+        guard let client = await preparedClient() else { return }
 
         do {
             #if os(iOS)
@@ -549,7 +573,8 @@ public final class CodaWorkspaceStore: ObservableObject {
 
     public func signInWithPassword(emailOrHandle: String, password: String) async {
         authError = nil
-        guard let client = ensureClient() else { return }
+        accountStatusMessage = nil
+        guard let client = await preparedClient() else { return }
         do {
             let tok = try await client.login(
                 emailOrHandle: emailOrHandle.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -568,21 +593,24 @@ public final class CodaWorkspaceStore: ObservableObject {
             startLiveSync()
             await refreshMachinesAndSessions(forceWorkspaces: true)
         } catch {
-            authError = tr("Sign in failed. Check credentials or server URL.", "登录失败，请检查账号密码或服务器地址。", locale: locale)
+            authError = error.localizedDescription
         }
     }
 
-    public func registerAccount(email: String, handle: String, password: String) async {
+    public func registerAccount(email: String, handle: String, password: String, inviteCode: String? = nil) async {
         authError = nil
-        guard let client = ensureClient() else { return }
+        accountStatusMessage = nil
+        guard let client = await preparedClient() else { return }
         do {
             let cleanEmail = email.trimmingCharacters(in: .whitespacesAndNewlines)
             let cleanHandle = handle.trimmingCharacters(in: .whitespacesAndNewlines)
+            let cleanInvite = inviteCode?.trimmingCharacters(in: .whitespacesAndNewlines)
             let tok = try await client.register(
                 email: cleanEmail,
                 handle: cleanHandle,
                 displayName: cleanHandle.isEmpty ? cleanEmail : cleanHandle,
-                password: password
+                password: password,
+                inviteCode: (cleanInvite?.isEmpty == false) ? cleanInvite : nil
             )
             settings.sessionToken = tok
             settings.ownerHandle = cleanHandle
@@ -592,7 +620,7 @@ public final class CodaWorkspaceStore: ObservableObject {
             startLiveSync()
             await refreshMachinesAndSessions(forceWorkspaces: true)
         } catch {
-            authError = tr("Registration failed.", "注册失败，请检查输入信息。", locale: locale)
+            authError = error.localizedDescription
         }
     }
 
@@ -642,19 +670,140 @@ public final class CodaWorkspaceStore: ObservableObject {
 
     public func generateMachinePairingCommand(suggestedName: String?) async {
         authError = nil
-        guard let client = ensureClient(), isSignedIn else { return }
+        accountStatusMessage = nil
+        guard isSignedIn, let client = await preparedClient() else { return }
         do {
             let name = suggestedName?.trimmingCharacters(in: .whitespacesAndNewlines)
             let res = try await client.createPairingCode(suggestedName: (name?.isEmpty == false) ? name : nil)
             pairingCode = res.code
             pairingCommand = res.oneLiner
         } catch {
-            authError = tr("Could not create pairing token.", "生成配对码失败。", locale: locale)
+            authError = error.localizedDescription
         }
+    }
+
+    public func approveHostDeviceCode(_ userCode: String) async {
+        authError = nil
+        accountStatusMessage = nil
+        let clean = userCode.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clean.isEmpty, isSignedIn, let client = await preparedClient() else { return }
+        do {
+            let approved = try await client.approveDeviceAuth(userCode: clean)
+            accountStatusMessage = tr(
+                "Approved \(approved.name).",
+                "已批准设备 \(approved.name)。",
+                locale: locale
+            )
+            await refreshMachinesAndSessions(forceWorkspaces: true)
+        } catch {
+            authError = error.localizedDescription
+        }
+    }
+
+    public func renameRemoteMachine(_ device: CodaRemoteDevice, to newName: String) async {
+        authError = nil
+        accountStatusMessage = nil
+        let clean = newName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clean.isEmpty, isSignedIn, let client = await preparedClient() else { return }
+        do {
+            try await client.renameDevice(deviceId: device.id, name: clean)
+            accountStatusMessage = tr("Renamed host to \(clean).", "主机已重命名为 \(clean)。", locale: locale)
+            await refreshMachinesAndSessions()
+        } catch {
+            authError = error.localizedDescription
+        }
+    }
+
+    public func deleteRemoteMachine(_ device: CodaRemoteDevice) async {
+        authError = nil
+        accountStatusMessage = nil
+        guard isSignedIn, let client = await preparedClient() else { return }
+        do {
+            try await client.deleteDevice(deviceId: device.id)
+            let prefix = "\(device.id.uuidString.lowercased())/"
+            attachedSessionIDs = attachedSessionIDs.filter { !$0.hasPrefix(prefix) }
+            for key in Array(surfaceEngines.keys) where key.hasPrefix(prefix) {
+                surfaceEngines.removeValue(forKey: key)
+            }
+            if let sel = selectedSession, sel.deviceId == device.id {
+                selectedSessionID = nil
+            }
+            remoteMachines.removeAll { $0.id == device.id }
+            sessions.removeAll { $0.deviceId == device.id }
+            accountStatusMessage = tr("Removed host \(device.name).", "已移除主机 \(device.name)。", locale: locale)
+            await refreshMachinesAndSessions()
+        } catch {
+            authError = error.localizedDescription
+        }
+    }
+
+    public func changePassword(current: String, new: String) async -> Bool {
+        authError = nil
+        accountStatusMessage = nil
+        guard isSignedIn, let client = await preparedClient() else { return false }
+        do {
+            if let newToken = try await client.changePassword(currentPassword: current, newPassword: new) {
+                settings.sessionToken = newToken
+                settings.save()
+                await client.setToken(newToken)
+            }
+            accountStatusMessage = tr("Password updated.", "密码已更新。", locale: locale)
+            return true
+        } catch {
+            authError = error.localizedDescription
+            return false
+        }
+    }
+
+    public func deleteAccount(currentPassword: String) async -> Bool {
+        authError = nil
+        accountStatusMessage = nil
+        guard isSignedIn, let client = await preparedClient() else { return false }
+        do {
+            try await client.deleteAccount(currentPassword: currentPassword)
+            signOut()
+            return true
+        } catch {
+            authError = error.localizedDescription
+            return false
+        }
+    }
+
+    public func resetLocalIdentity() async {
+        authError = nil
+        accountStatusMessage = nil
+        #if os(iOS)
+        let defaultName = "iOS-Client"
+        #else
+        let defaultName = "Mac-Client"
+        #endif
+        let fresh = CodaDeviceIdentity.resetPersisted(defaultName: defaultName)
+        self.localIdentity = fresh
+        self.settings.registeredDeviceIDs.removeAll()
+        self.settings.save()
+        self.attachedSessionIDs.removeAll()
+        self.surfaceEngines.removeAll()
+        if let client = networkClient {
+            await client.disconnectTransport()
+        }
+        if isSignedIn, let client = await preparedClient() {
+            await ensureClientDeviceRegistered(using: client, force: true)
+            startLiveSync()
+            await refreshMachinesAndSessions(forceWorkspaces: true)
+        }
+        accountStatusMessage = tr(
+            "Local cryptographic identity rotated.",
+            "本地设备加密密钥已重置并重新注册。",
+            locale: locale
+        )
     }
 
     public func signOut() {
         let oldClient = networkClient
+        voiceRecorder.cancelRecording()
+        isRecordingVoice = false
+        isTranscribingVoice = false
+        voiceError = nil
         stopLiveSync()
         deviceAuthTask?.cancel()
         deviceAuthTask = nil
@@ -662,6 +811,8 @@ public final class CodaWorkspaceStore: ObservableObject {
         isPollingDeviceAuth = false
         pairingCode = nil
         pairingCommand = nil
+        authError = nil
+        accountStatusMessage = nil
         settings.sessionToken = ""
         settings.ownerHandle = ""
         settings.save()
@@ -691,16 +842,36 @@ public final class CodaWorkspaceStore: ObservableObject {
     // MARK: - Real Remote Synchronization
 
     public func refreshMachinesAndSessions(forceWorkspaces: Bool = false) async {
-        guard isSignedIn, let client = ensureClient() else { return }
-        if isRefreshing { return }
+        guard isSignedIn, let client = await preparedClient() else { return }
+        if isRefreshing {
+            pendingRefresh = true
+            if forceWorkspaces { pendingForceWorkspaces = true }
+            return
+        }
         isRefreshing = true
-        defer { isRefreshing = false }
+        defer {
+            isRefreshing = false
+            if pendingRefresh {
+                let nextForce = pendingForceWorkspaces
+                pendingRefresh = false
+                pendingForceWorkspaces = false
+                Task { [weak self] in
+                    await self?.refreshMachinesAndSessions(forceWorkspaces: nextForce)
+                }
+            }
+        }
 
         do {
             await ensureClientDeviceRegistered(using: client)
             let allDevices = try await client.listDevices()
-            if let myId = localIdentity.deviceId,
-               !allDevices.contains(where: { $0.id == myId }) {
+            let matchingLocal = localIdentity.deviceId.flatMap { myId in
+                allDevices.first(where: { $0.id == myId })
+            }
+            let identityKeyMismatch = matchingLocal.map { dev in
+                dev.ed25519Pubkey != localIdentity.ed25519PublicB64
+                    || dev.x25519Pubkey != localIdentity.x25519PublicB64
+            } ?? true
+            if identityKeyMismatch {
                 await ensureClientDeviceRegistered(using: client, force: true)
             }
             let hosts = allDevices.filter { $0.role == "daemon" || $0.role == "hybrid" }
@@ -1209,6 +1380,7 @@ public final class CodaWorkspaceStore: ObservableObject {
               let devId = session.deviceId,
               let dev = remoteMachines.first(where: { $0.id == devId }),
               let clientDevId = localIdentity.deviceId else { return }
+        let isAttached = attachedSessionIDs.contains(session.id)
         Task {
             try? await client.interruptTerminal(
                 on: dev,
@@ -1216,8 +1388,38 @@ public final class CodaWorkspaceStore: ObservableObject {
                 clientDeviceId: clientDevId,
                 terminal: session.terminalAddress
             )
-            try? await Task.sleep(nanoseconds: 250_000_000)
-            await refreshTerminalScreen(for: session)
+            if !isAttached {
+                try? await Task.sleep(nanoseconds: 250_000_000)
+                await refreshTerminalScreen(for: session, forceSnapshot: true)
+            }
+        }
+    }
+
+    public func killSession(_ session: CodaAgentSession) {
+        guard let client = networkClient,
+              let devId = session.deviceId,
+              let dev = remoteMachines.first(where: { $0.id == devId }),
+              let clientDevId = localIdentity.deviceId else { return }
+        let sid = session.id
+        attachedSessionIDs.remove(sid)
+        surfaceEngines.removeValue(forKey: sid)
+        terminalLinesBySession.removeValue(forKey: sid)
+        rawScreenTextBySession.removeValue(forKey: sid)
+        sessions.removeAll { $0.id == sid }
+        if selectedSessionID == sid {
+            selectedSessionID = nil
+        }
+        if secondarySessionID == sid {
+            secondarySessionID = nil
+        }
+        Task {
+            try? await client.killTerminal(
+                on: dev,
+                clientIdentity: localIdentity,
+                clientDeviceId: clientDevId,
+                terminal: session.terminalAddress
+            )
+            await refreshMachinesAndSessions()
         }
     }
 
@@ -1228,26 +1430,30 @@ public final class CodaWorkspaceStore: ObservableObject {
               let dev = remoteMachines.first(where: { $0.id == devId }),
               let clientDevId = localIdentity.deviceId else { return }
 
-        var keys = key.herdrKeyNames
-        if ctrlActive && keys.count == 1, !keys[0].lowercased().hasPrefix("ctrl+") {
-            keys = ["Ctrl+\(keys[0])"]
-        }
-        if altActive && keys.count == 1, !keys[0].lowercased().hasPrefix("alt+") {
-            keys = ["Alt+\(keys[0])"]
-        }
+        let useAlt = altActive
         ctrlActive = false
         altActive = false
 
+        var bytes = key.encodedBytes
+        if useAlt && !bytes.isEmpty && bytes.first != 0x1B {
+            var prefixed = Data([0x1B])
+            prefixed.append(bytes)
+            bytes = prefixed
+        }
+        let isAttached = attachedSessionIDs.contains(session.id)
+
         Task {
-            try? await client.sendTerminalKeys(
+            try? await client.sendPtyInput(
                 on: dev,
                 clientIdentity: localIdentity,
                 clientDeviceId: clientDevId,
                 terminal: session.terminalAddress,
-                keys: keys
+                data: bytes
             )
-            try? await Task.sleep(nanoseconds: 180_000_000)
-            await refreshTerminalScreen(for: session)
+            if !isAttached {
+                try? await Task.sleep(nanoseconds: 180_000_000)
+                await refreshTerminalScreen(for: session, forceSnapshot: true)
+            }
         }
     }
 
@@ -1264,31 +1470,30 @@ public final class CodaWorkspaceStore: ObservableObject {
         ctrlActive = false
         altActive = false
 
-        Task {
-            if (useCtrl || useAlt) && text.count == 1, let ch = text.first {
-                var combo = ""
-                if useCtrl { combo += "Ctrl+" }
-                if useAlt { combo += "Alt+" }
-                combo += String(ch)
-                try? await client.sendTerminalKeys(
-                    on: dev,
-                    clientIdentity: localIdentity,
-                    clientDeviceId: clientDevId,
-                    terminal: session.terminalAddress,
-                    keys: [combo]
-                )
-            } else {
-                try? await client.sendTerminalText(
-                    on: dev,
-                    clientIdentity: localIdentity,
-                    clientDeviceId: clientDevId,
-                    terminal: session.terminalAddress,
-                    text: text,
-                    submit: submit
-                )
+        let payloadBytes: Data
+        if useCtrl || useAlt {
+            payloadBytes = GhosttyReflowEngine.encodeModifiedText(text, ctrl: useCtrl, alt: useAlt)
+        } else {
+            var raw = Data(text.utf8)
+            if submit {
+                raw.append(0x0D)
             }
-            try? await Task.sleep(nanoseconds: 220_000_000)
-            await refreshTerminalScreen(for: session)
+            payloadBytes = raw
+        }
+        let isAttached = attachedSessionIDs.contains(session.id)
+
+        Task {
+            try? await client.sendPtyInput(
+                on: dev,
+                clientIdentity: localIdentity,
+                clientDeviceId: clientDevId,
+                terminal: session.terminalAddress,
+                data: payloadBytes
+            )
+            if !isAttached {
+                try? await Task.sleep(nanoseconds: 220_000_000)
+                await refreshTerminalScreen(for: session, forceSnapshot: true)
+            }
         }
     }
 
@@ -1302,21 +1507,43 @@ public final class CodaWorkspaceStore: ObservableObject {
 
         isSendingAction = true
         let toSend = trimmed
+        let isAttached = attachedSessionIDs.contains(session.id)
         composeText = ""
         showComposeSheet = false
 
         Task {
             defer { self.isSendingAction = false }
-            try? await client.sendTerminalText(
-                on: dev,
-                clientIdentity: localIdentity,
-                clientDeviceId: clientDevId,
-                terminal: session.terminalAddress,
-                text: toSend,
-                submit: true
-            )
-            try? await Task.sleep(nanoseconds: 250_000_000)
-            await refreshTerminalScreen(for: session)
+            if isAttached {
+                var bytes = Data()
+                if toSend.contains("\n") {
+                    // Use bracketed paste for multiline prompts so TUIs (Claude/Codex/Gemini) keep newlines intact.
+                    bytes.append(Data("\u{1B}[200~".utf8))
+                    bytes.append(Data(toSend.utf8))
+                    bytes.append(Data("\u{1B}[201~".utf8))
+                    bytes.append(0x0D)
+                } else {
+                    bytes.append(Data(toSend.utf8))
+                    bytes.append(0x0D)
+                }
+                try? await client.sendPtyInput(
+                    on: dev,
+                    clientIdentity: localIdentity,
+                    clientDeviceId: clientDevId,
+                    terminal: session.terminalAddress,
+                    data: bytes
+                )
+            } else {
+                try? await client.sendTerminalText(
+                    on: dev,
+                    clientIdentity: localIdentity,
+                    clientDeviceId: clientDevId,
+                    terminal: session.terminalAddress,
+                    text: toSend,
+                    submit: true
+                )
+                try? await Task.sleep(nanoseconds: 250_000_000)
+                await refreshTerminalScreen(for: session, forceSnapshot: true)
+            }
         }
     }
 
@@ -1377,10 +1604,55 @@ public final class CodaWorkspaceStore: ObservableObject {
         }
     }
 
+    public func toggleVoiceDictation() async {
+        voiceError = nil
+        if isTranscribingVoice { return }
+
+        if isRecordingVoice {
+            isRecordingVoice = false
+            isTranscribingVoice = true
+            defer { isTranscribingVoice = false }
+            do {
+                let transcript = try await voiceRecorder.stopAndTranscribe(config: settings.voiceConfig)
+                if !transcript.isEmpty {
+                    if composeText.isEmpty || composeText.hasSuffix(" ") || composeText.hasSuffix("\n") {
+                        composeText += transcript
+                    } else {
+                        composeText += " \(transcript)"
+                    }
+                }
+            } catch {
+                voiceError = error.localizedDescription
+            }
+            return
+        }
+
+        do {
+            _ = try CodaVoiceRecorder.validatedTranscriptionURL(from: settings.voiceConfig.baseURL)
+            try await voiceRecorder.startRecording()
+            isRecordingVoice = true
+        } catch {
+            isRecordingVoice = false
+            voiceError = error.localizedDescription
+        }
+    }
+
+    public func cancelVoiceDictation() {
+        voiceRecorder.cancelRecording()
+        isRecordingVoice = false
+        isTranscribingVoice = false
+    }
+
     public func saveVoiceConfig() async {
+        do {
+            _ = try CodaVoiceRecorder.validatedTranscriptionURL(from: settings.voiceConfig.baseURL)
+        } catch {
+            voiceConfigSyncMessage = error.localizedDescription
+            return
+        }
         settings.save()
         voiceConfigSyncMessage = tr("Saved to secure storage.", "已保存至安全存储。", locale: locale)
-        guard isSignedIn, let client = networkClient, let clientDevId = localIdentity.deviceId else { return }
+        guard isSignedIn, let client = await preparedClient(), let clientDevId = localIdentity.deviceId else { return }
         let onlineHosts = remoteMachines.filter(\.isOnline)
         guard !onlineHosts.isEmpty else { return }
         var syncedCount = 0
@@ -1391,7 +1663,12 @@ public final class CodaWorkspaceStore: ObservableObject {
                 clientDeviceId: clientDevId,
                 config: settings.voiceConfig
             ) {
-                settings.voiceConfig = synced
+                // Keep locally saved API key if daemon returned redacted empty string.
+                var merged = synced
+                if merged.apiKey.isEmpty && !settings.voiceConfig.apiKey.isEmpty {
+                    merged.apiKey = settings.voiceConfig.apiKey
+                }
+                settings.voiceConfig = merged
                 settings.save()
                 syncedCount += 1
             }

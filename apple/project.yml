@@ -31,6 +31,7 @@ targets:
         INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone: "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"
         INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad: "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"
         INFOPLIST_KEY_NSLocalNetworkUsageDescription: "Discover and connect directly to paired Coda hosts on your local Wi-Fi network with zero-knowledge E2EE."
+        INFOPLIST_KEY_NSMicrophoneUsageDescription: "Record voice commands and transcribe them into terminal prompts using your configured Whisper API."
         INFOPLIST_KEY_UILaunchScreen_Generation: true
     dependencies:
       - package: CodaApple

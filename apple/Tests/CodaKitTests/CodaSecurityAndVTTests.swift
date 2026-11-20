@@ -223,4 +223,65 @@ final class CodaSecurityAndVTTests: XCTestCase {
         XCTAssertFalse(codaPathWithinRoot("/Users/dev/coda2/src", root: "/Users/dev/coda"))
         XCTAssertFalse(codaPathWithinRoot("/Users/dev/coda/../coda-other", root: "/Users/dev/coda"))
     }
+
+    func testDirectP2PFailsClosedOnEmptyPinnedEd25519Key() async {
+        let net = CodaNetworkClient(serverBaseURL: URL(string: "https://codahub.dev")!)
+        let clientId = CodaDeviceIdentity.generate(name: "TestClient")
+        do {
+            _ = try await net.performDirectP2PHandshake(
+                host: "127.0.0.1",
+                port: 24444,
+                clientIdentity: clientId,
+                clientDeviceId: UUID(),
+                targetDeviceId: UUID(),
+                expectedDaemonEd25519Pubkey: ""
+            )
+            XCTFail("Expected empty pinned Ed25519 key to fail closed")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.lowercased().contains("ed25519"))
+        }
+    }
+
+    func testGhosttyBGInverseStrictCSIPrefixJSONOSCAndMarkdownBullets() {
+        var engine = GhosttyReflowEngine(columns: 80, rows: 10, treatLFAsCRLF: true)
+        // CSI >4;2m (modifyOtherKeys) MUST NOT alter SGR bold/fg; 48;2;10;20;30 sets bg; 7 sets inverse.
+        let raw = "\u{1B}[>4;2mplain\u{1B}[38;2;250;200;100;48;2;10;20;30;7mHI\u{1B}[0m\n"
+            + "- Markdown bullet item\n"
+            + "-removedDiffLine\n"
+            + "\u{1B}]7501;{\"state\":\"blocked\",\"kind\":\"question\",\"title\":\"Confirm\",\"msg\":\"Ship?\"}\u{07}"
+        engine.feed(Data(raw.utf8))
+
+        let lines = engine.styledLines
+        XCTAssertEqual(lines.count, 3)
+        XCTAssertEqual(lines[0].spans.count, 2)
+        XCTAssertEqual(lines[0].spans[0].text, "plain")
+        XCTAssertNil(lines[0].spans[0].fg)
+        XCTAssertNil(lines[0].spans[0].bg)
+        XCTAssertFalse(lines[0].spans[0].inverse)
+
+        XCTAssertEqual(lines[0].spans[1].text, "HI")
+        XCTAssertEqual(lines[0].spans[1].fg, GhosttyRGBColor(r: 250, g: 200, b: 100))
+        XCTAssertEqual(lines[0].spans[1].bg, GhosttyRGBColor(r: 10, g: 20, b: 30))
+        XCTAssertTrue(lines[0].spans[1].inverse)
+
+        // Markdown bullet "- ..." must stay .normal, whereas unified diff "-code" stays .diffRemoved
+        XCTAssertEqual(lines[1].kind, .normal)
+        XCTAssertEqual(lines[2].kind, .diffRemoved)
+
+        // JSON OSC 7501 payload parsed properly
+        XCTAssertEqual(engine.latestHerdrStatus?.state, .needsYou)
+        XCTAssertEqual(engine.latestHerdrStatus?.kind, "question")
+        XCTAssertEqual(engine.latestHerdrStatus?.title, "Confirm")
+        XCTAssertEqual(engine.latestHerdrStatus?.message, "Ship?")
+    }
+
+    func testHerdrQuickKeyNamesAndEncodedBytes() {
+        XCTAssertEqual(HerdrQuickKey.esc.herdrKeyNames, ["esc"])
+        XCTAssertEqual(HerdrQuickKey.tab.herdrKeyNames, ["tab"])
+        XCTAssertEqual(HerdrQuickKey.shiftTab.herdrKeyNames, ["shift+tab"])
+        XCTAssertEqual(HerdrQuickKey.backspace.herdrKeyNames, ["backspace"])
+        XCTAssertEqual(HerdrQuickKey.ctrlC.herdrKeyNames, ["ctrl+c"])
+        XCTAssertEqual(HerdrQuickKey.ctrlC.encodedBytes, Data([0x03]))
+        XCTAssertEqual(HerdrQuickKey.shiftTab.encodedBytes, Data("\u{1B}[Z".utf8))
+    }
 }

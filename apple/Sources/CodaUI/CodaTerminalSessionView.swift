@@ -8,6 +8,7 @@ import UniformTypeIdentifiers
 
 private final class TerminalViewportLocalState: ObservableObject {
     @Published var directInputBuffer: String = ""
+    @Published var showDirectInputBar: Bool = false
     @Published var baseFontScale: CGFloat = 1.0
     @Published var atBottom: Bool = true
 }
@@ -72,7 +73,6 @@ public struct CodaTerminalSessionView: View {
                                 let scaled = max(9.5, min(20.0, store.terminalFontSize * value / local.baseFontScale))
                                 store.terminalFontSize = scaled
                                 local.baseFontScale = value
-                                store.recomputeTerminalGridForFontChange()
                             }
                             .onEnded { _ in
                                 local.baseFontScale = 1.0
@@ -82,7 +82,7 @@ public struct CodaTerminalSessionView: View {
 
                 if !hideBottomControls {
                     VStack(spacing: 8) {
-                        if directKeyboardFocused {
+                        if local.showDirectInputBar {
                             directKeystrokeStrip
                                 .padding(.horizontal, 12)
                                 .transition(.move(edge: .bottom).combined(with: .opacity))
@@ -274,6 +274,39 @@ public struct CodaTerminalSessionView: View {
                     )
                 }
                 .buttonStyle(.plain)
+
+                Menu {
+                    Button {
+                        Task { await store.refreshTerminalScreen(for: session, forceSnapshot: true) }
+                    } label: {
+                        Label(tr("Refresh Screen", "刷新屏幕", locale: store.locale), systemImage: "arrow.clockwise")
+                    }
+                    Button {
+                        store.interruptSession(session)
+                    } label: {
+                        Label(tr("Interrupt (Ctrl+C)", "中断任务 (Ctrl+C)", locale: store.locale), systemImage: "stop.circle")
+                    }
+                    Divider()
+                    Button(role: .destructive) {
+                        store.killSession(session)
+                    } label: {
+                        Label(tr("Kill Terminal", "终止终端", locale: store.locale), systemImage: "trash")
+                    }
+                } label: {
+                    Image(systemName: "ellipsis")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(CodaHerdrTheme.textSecondary)
+                        .frame(width: 28, height: 32)
+                        .background(
+                            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                .fill(CodaHerdrTheme.elevatedBG)
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                        .strokeBorder(CodaHerdrTheme.borderHairline, lineWidth: 1)
+                                )
+                        )
+                }
+                .buttonStyle(.plain)
             }
         }
         .padding(.horizontal, 12)
@@ -374,12 +407,20 @@ public struct CodaTerminalSessionView: View {
                     }
 
                     Color.clear
-                        .frame(height: hideBottomControls ? 18 : ((directKeyboardFocused ? 148 : 88) + (store.showTactileTwoRowKeypad ? 86 : 0)))
+                        .frame(height: hideBottomControls ? 18 : ((local.showDirectInputBar ? 148 : 88) + (store.showTactileTwoRowKeypad ? 86 : 0)))
                         .id("terminal_bottom_anchor")
                 }
                 .padding(.horizontal, 12)
                 .padding(.top, 10)
             }
+            .simultaneousGesture(
+                DragGesture(minimumDistance: 12)
+                    .onChanged { value in
+                        if value.translation.height > 12 {
+                            local.atBottom = false
+                        }
+                    }
+            )
             .codaDismissKeyboardInteractively()
             .onChange(of: lines.count) { _, _ in
                 if local.atBottom {
@@ -388,7 +429,13 @@ public struct CodaTerminalSessionView: View {
                     }
                 }
             }
+            .onChange(of: lines.last?.plainText ?? "") { _, _ in
+                if local.atBottom {
+                    proxy.scrollTo("terminal_bottom_anchor", anchor: .bottom)
+                }
+            }
             .onAppear {
+                local.atBottom = true
                 proxy.scrollTo("terminal_bottom_anchor", anchor: .bottom)
             }
             .overlay(alignment: .bottomTrailing) {
@@ -400,17 +447,22 @@ public struct CodaTerminalSessionView: View {
                 } label: {
                     Image(systemName: "arrow.down")
                         .font(.system(size: 12, weight: .bold))
-                        .foregroundStyle(CodaHerdrTheme.textSecondary)
+                        .foregroundStyle(local.atBottom ? CodaHerdrTheme.textSecondary : CodaHerdrTheme.cyanWorking)
                         .frame(width: 28, height: 28)
                         .background(
                             Circle()
-                                .fill(CodaHerdrTheme.elevatedBG.opacity(0.9))
-                                .overlay(Circle().strokeBorder(CodaHerdrTheme.borderHairline, lineWidth: 1))
+                                .fill(CodaHerdrTheme.elevatedBG.opacity(local.atBottom ? 0.8 : 0.98))
+                                .overlay(
+                                    Circle().strokeBorder(
+                                        local.atBottom ? CodaHerdrTheme.borderHairline : CodaHerdrTheme.cyanWorking.opacity(0.7),
+                                        lineWidth: 1
+                                    )
+                                )
                         )
                 }
                 .buttonStyle(.plain)
                 .padding(.trailing, 14)
-                .padding(.bottom, hideBottomControls ? 14 : ((directKeyboardFocused ? 124 : 74) + (store.showTactileTwoRowKeypad ? 86 : 0)))
+                .padding(.bottom, hideBottomControls ? 14 : ((local.showDirectInputBar ? 124 : 74) + (store.showTactileTwoRowKeypad ? 86 : 0)))
             }
         }
     }
@@ -444,19 +496,36 @@ public struct CodaTerminalSessionView: View {
         var out = AttributedString()
         for span in line.spans {
             var seg = AttributedString(span.text)
+            let baseFG: Color
             if let fg = span.fg {
-                seg.foregroundColor = Color(
+                baseFG = Color(
                     red: Double(fg.r) / 255.0,
                     green: Double(fg.g) / 255.0,
                     blue: Double(fg.b) / 255.0
                 )
             } else {
                 switch line.kind {
-                case .diffAdded: seg.foregroundColor = CodaHerdrTheme.greenDiff
-                case .diffRemoved: seg.foregroundColor = CodaHerdrTheme.redDiff
-                case .diffHunk: seg.foregroundColor = CodaHerdrTheme.cyanWorking
-                case .promptChoice: seg.foregroundColor = CodaHerdrTheme.textPrimary
-                case .normal: seg.foregroundColor = span.dim ? CodaHerdrTheme.textSecondary : CodaHerdrTheme.textPrimary
+                case .diffAdded: baseFG = CodaHerdrTheme.greenDiff
+                case .diffRemoved: baseFG = CodaHerdrTheme.redDiff
+                case .diffHunk: baseFG = CodaHerdrTheme.cyanWorking
+                case .promptChoice: baseFG = CodaHerdrTheme.textPrimary
+                case .normal: baseFG = span.dim ? CodaHerdrTheme.textSecondary : CodaHerdrTheme.textPrimary
+                }
+            }
+            let baseBG: Color? = span.bg.map { bg in
+                Color(
+                    red: Double(bg.r) / 255.0,
+                    green: Double(bg.g) / 255.0,
+                    blue: Double(bg.b) / 255.0
+                )
+            }
+            if span.inverse {
+                seg.foregroundColor = baseBG ?? CodaHerdrTheme.canvasBG
+                seg.backgroundColor = baseFG
+            } else {
+                seg.foregroundColor = baseFG
+                if let baseBG {
+                    seg.backgroundColor = baseBG
                 }
             }
             if span.bold {
@@ -516,6 +585,18 @@ public struct CodaTerminalSessionView: View {
                     .foregroundStyle(CodaHerdrTheme.cyanWorking)
             }
             .buttonStyle(.plain)
+
+            Button {
+                directKeyboardFocused = false
+                withAnimation(.snappy(duration: 0.16)) {
+                    local.showDirectInputBar = false
+                }
+            } label: {
+                Image(systemName: "xmark.circle.fill")
+                    .font(.system(size: 16))
+                    .foregroundStyle(CodaHerdrTheme.textDim)
+            }
+            .buttonStyle(.plain)
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
@@ -524,6 +605,11 @@ public struct CodaTerminalSessionView: View {
                 .fill(CodaHerdrTheme.elevatedBG)
                 .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(CodaHerdrTheme.cyanWorking.opacity(0.4), lineWidth: 1))
         )
+        .onAppear {
+            Task { @MainActor in
+                directKeyboardFocused = true
+            }
+        }
     }
 
     private func modifierChip(_ title: String) -> some View {
@@ -647,18 +733,27 @@ public struct CodaTerminalSessionView: View {
     @ViewBuilder
     private var dockUtilityButtons: some View {
         Button {
-            directKeyboardFocused.toggle()
+            withAnimation(.snappy(duration: 0.16)) {
+                local.showDirectInputBar.toggle()
+            }
+            if local.showDirectInputBar {
+                Task { @MainActor in
+                    directKeyboardFocused = true
+                }
+            } else {
+                directKeyboardFocused = false
+            }
         } label: {
-            Image(systemName: directKeyboardFocused ? "keyboard.chevron.compact.down" : "keyboard")
+            Image(systemName: local.showDirectInputBar ? "keyboard.chevron.compact.down" : "keyboard")
                 .font(.system(size: 15, weight: .semibold))
-                .foregroundStyle(directKeyboardFocused ? CodaHerdrTheme.cyanWorking : CodaHerdrTheme.textPrimary)
+                .foregroundStyle(local.showDirectInputBar ? CodaHerdrTheme.cyanWorking : CodaHerdrTheme.textPrimary)
                 .frame(width: 40, height: 40)
                 .background(
                     Circle()
                         .fill(CodaHerdrTheme.elevatedBG.opacity(0.96))
                         .overlay(
                             Circle().strokeBorder(
-                                directKeyboardFocused ? CodaHerdrTheme.cyanWorking.opacity(0.6) : CodaHerdrTheme.borderHairline,
+                                local.showDirectInputBar ? CodaHerdrTheme.cyanWorking.opacity(0.6) : CodaHerdrTheme.borderHairline,
                                 lineWidth: 1
                             )
                         )
@@ -850,7 +945,13 @@ public struct CodaComposePromptSheet: View {
                     .foregroundStyle(CodaHerdrTheme.cyanWorking)
             }
 
-            HStack(spacing: 10) {
+            if let voiceErr = store.voiceError {
+                Text(voiceErr)
+                    .font(.system(size: 11))
+                    .foregroundStyle(CodaHerdrTheme.redDiff)
+            }
+
+            HStack(spacing: 8) {
                 Button {
                     local.showFileImporter = true
                 } label: {
@@ -868,25 +969,61 @@ public struct CodaComposePromptSheet: View {
                 .buttonStyle(.plain)
 
                 Button {
-                    dismiss()
-                    store.settingsInitialFocusPairing = false
-                    store.showSettingsSheet = true
+                    Task { await store.toggleVoiceDictation() }
                 } label: {
-                    Label(
-                        store.settings.voiceConfig.apiKey.isEmpty
-                            ? tr("Voice Setup", "配置语音", locale: store.locale)
-                            : store.settings.voiceConfig.model,
-                        systemImage: "waveform"
-                    )
+                    HStack(spacing: 6) {
+                        if store.isTranscribingVoice {
+                            ProgressView()
+                                .controlSize(.small)
+                                .tint(CodaHerdrTheme.cyanWorking)
+                        } else {
+                            Image(systemName: store.isRecordingVoice ? "stop.circle.fill" : "mic.fill")
+                        }
+                        Text(
+                            store.isTranscribingVoice
+                                ? tr("Transcribing...", "转写中...", locale: store.locale)
+                                : (store.isRecordingVoice
+                                    ? tr("Stop", "停止录音", locale: store.locale)
+                                    : tr("Voice", "语音输入", locale: store.locale))
+                        )
+                    }
                     .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(store.settings.voiceConfig.apiKey.isEmpty ? CodaHerdrTheme.textSecondary : CodaHerdrTheme.cyanWorking)
+                    .foregroundStyle(
+                        store.isRecordingVoice
+                            ? .white
+                            : (store.isTranscribingVoice ? CodaHerdrTheme.cyanWorking : CodaHerdrTheme.textPrimary)
+                    )
                     .padding(.horizontal, 12)
                     .padding(.vertical, 8)
                     .background(
                         Capsule()
-                            .fill(CodaHerdrTheme.elevatedBG)
-                            .overlay(Capsule().strokeBorder(CodaHerdrTheme.borderHairline, lineWidth: 1))
+                            .fill(store.isRecordingVoice ? CodaHerdrTheme.redDiff : CodaHerdrTheme.elevatedBG)
+                            .overlay(
+                                Capsule().strokeBorder(
+                                    store.isRecordingVoice ? CodaHerdrTheme.redDiff : CodaHerdrTheme.borderHairline,
+                                    lineWidth: 1
+                                )
+                            )
                     )
+                }
+                .buttonStyle(.plain)
+                .disabled(store.isTranscribingVoice)
+
+                Button {
+                    store.cancelVoiceDictation()
+                    dismiss()
+                    store.settingsInitialFocusPairing = false
+                    store.showSettingsSheet = true
+                } label: {
+                    Image(systemName: "slider.horizontal.3")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(CodaHerdrTheme.textSecondary)
+                        .frame(width: 32, height: 32)
+                        .background(
+                            Circle()
+                                .fill(CodaHerdrTheme.elevatedBG)
+                                .overlay(Circle().strokeBorder(CodaHerdrTheme.borderHairline, lineWidth: 1))
+                        )
                 }
                 .buttonStyle(.plain)
 
@@ -913,6 +1050,11 @@ public struct CodaComposePromptSheet: View {
         .padding(18)
         .background(CodaHerdrTheme.cardBG)
         .presentationDetents([.medium, .large])
+        .onDisappear {
+            if store.isRecordingVoice {
+                store.cancelVoiceDictation()
+            }
+        }
         .fileImporter(
             isPresented: $local.showFileImporter,
             allowedContentTypes: [.item]
@@ -949,7 +1091,7 @@ public struct CodaPaneMinimapSheet: View {
                         Button("Claude Code") { store.launchAgent(agent: "claude", on: device, cwd: session.cwd); dismiss() }
                         Button("Codex") { store.launchAgent(agent: "codex", on: device, cwd: session.cwd); dismiss() }
                         Button("Gemini CLI") { store.launchAgent(agent: "gemini", on: device, cwd: session.cwd); dismiss() }
-                        Button("Shell (zsh)") { store.launchAgent(agent: "zsh", on: device, cwd: session.cwd); dismiss() }
+                        Button("Shell") { store.launchAgent(agent: "shell", on: device, cwd: session.cwd); dismiss() }
                     } label: {
                         Label(tr("New Pane", "新建窗格", locale: store.locale), systemImage: "plus")
                             .font(.system(size: 12, weight: .semibold))
@@ -964,41 +1106,55 @@ public struct CodaPaneMinimapSheet: View {
             ScrollView {
                 LazyVGrid(columns: [GridItem(.flexible(), spacing: 10), GridItem(.flexible(), spacing: 10)], spacing: 10) {
                     ForEach(store.siblingSessionsForSelected) { sib in
-                        Button {
-                            store.selectSession(sib)
-                            dismiss()
-                        } label: {
-                            VStack(alignment: .leading, spacing: 6) {
-                                HStack {
-                                    Text(sib.agentName)
-                                        .font(.system(size: 12, weight: .semibold, design: .monospaced))
-                                        .foregroundStyle(CodaHerdrTheme.textPrimary)
-                                    Spacer()
-                                    CodaSessionStatusBadge(session: sib, locale: store.locale)
-                                }
-                                Text(sib.taskTitle)
-                                    .font(.system(size: 11, weight: .medium))
-                                    .foregroundStyle(CodaHerdrTheme.textSecondary)
+                        VStack(alignment: .leading, spacing: 6) {
+                            HStack(spacing: 6) {
+                                Text(sib.agentName)
+                                    .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                                    .foregroundStyle(CodaHerdrTheme.textPrimary)
                                     .lineLimit(1)
-
-                                Text(sib.screenPreview.isEmpty ? "…" : String(sib.screenPreview.suffix(120)))
-                                    .font(.system(size: 9, design: .monospaced))
-                                    .foregroundStyle(CodaHerdrTheme.textDim)
-                                    .lineLimit(4)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                                    .frame(height: 44, alignment: .topLeading)
+                                Spacer()
+                                CodaSessionStatusBadge(session: sib, locale: store.locale)
+                                Button {
+                                    store.killSession(sib)
+                                    if sib.id == session.id {
+                                        dismiss()
+                                    }
+                                } label: {
+                                    Image(systemName: "xmark.circle.fill")
+                                        .font(.system(size: 13))
+                                        .foregroundStyle(CodaHerdrTheme.textDim)
+                                }
+                                .buttonStyle(.plain)
                             }
-                            .padding(10)
-                            .background(
-                                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                                    .fill(CodaHerdrTheme.canvasBG)
-                                    .overlay(
-                                        RoundedRectangle(cornerRadius: 12, style: .continuous)
-                                            .strokeBorder(sib.id == session.id ? CodaHerdrTheme.cyanWorking : CodaHerdrTheme.borderHairline, lineWidth: sib.id == session.id ? 1.5 : 1)
-                                    )
-                            )
+                            Button {
+                                store.selectSession(sib)
+                                dismiss()
+                            } label: {
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text(sib.taskTitle)
+                                        .font(.system(size: 11, weight: .medium))
+                                        .foregroundStyle(CodaHerdrTheme.textSecondary)
+                                        .lineLimit(1)
+
+                                    Text(sib.screenPreview.isEmpty ? "…" : String(sib.screenPreview.suffix(120)))
+                                        .font(.system(size: 9, design: .monospaced))
+                                        .foregroundStyle(CodaHerdrTheme.textDim)
+                                        .lineLimit(4)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                        .frame(height: 44, alignment: .topLeading)
+                                }
+                            }
+                            .buttonStyle(.plain)
                         }
-                        .buttonStyle(.plain)
+                        .padding(10)
+                        .background(
+                            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                .fill(CodaHerdrTheme.canvasBG)
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                        .strokeBorder(sib.id == session.id ? CodaHerdrTheme.cyanWorking : CodaHerdrTheme.borderHairline, lineWidth: sib.id == session.id ? 1.5 : 1)
+                                )
+                        )
                     }
                 }
             }

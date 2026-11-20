@@ -131,6 +131,7 @@ public actor CodaNetworkClient {
     private var rawTCPConnection: NWConnection?
     private var rawTCPGeneration: UInt64 = 0
     private var relayReaderTask: Task<Void, Never>?
+    private var relayKeepAliveTask: Task<Void, Never>?
     private var activeRelayRouteMode: SmartPathRouteMode?
     private var directP2PPeers: [UUID: DirectP2PPeerState] = [:]
     private var p2pPeerDeviceId: UUID?
@@ -144,7 +145,7 @@ public actor CodaNetworkClient {
     private var accountEventsGeneration: UInt64 = 0
     public private(set) var activeRouteMode: SmartPathRouteMode = .globalCDNWSS
     private var pathMonitor: NWPathMonitor?
-    private var currentGeneration: UInt64 = 1
+    private var currentGeneration: UInt64 = max(1, UInt64(Date().timeIntervalSince1970 * 1000))
 
     public init(serverBaseURL: URL) {
         self.serverBaseURL = serverBaseURL
@@ -257,6 +258,23 @@ public actor CodaNetworkClient {
         accountEventsWSTask = task
     }
 
+    private func nextMonotonicGeneration() -> UInt64 {
+        let nowMs = UInt64(Date().timeIntervalSince1970 * 1000)
+        currentGeneration = max(currentGeneration &+ 1, nowMs)
+        return currentGeneration
+    }
+
+    public func invalidatePeerSession(peerDeviceId: UUID) {
+        relayPeerSessions.removeValue(forKey: peerDeviceId)
+        if let peer = directP2PPeers.removeValue(forKey: peerDeviceId) {
+            peer.readerTask?.cancel()
+            peer.connection.cancel()
+        }
+        if p2pPeerDeviceId == peerDeviceId {
+            p2pPeerDeviceId = nil
+        }
+    }
+
     public func disconnectTransport() {
         disconnectAccountEventsWebSocket()
         pathMonitor?.cancel()
@@ -267,6 +285,8 @@ public actor CodaNetworkClient {
         }
         directP2PPeers.removeAll()
         p2pPeerDeviceId = nil
+        relayKeepAliveTask?.cancel()
+        relayKeepAliveTask = nil
         relayReaderTask?.cancel()
         relayReaderTask = nil
         rawTCPConnection?.cancel()
@@ -316,11 +336,11 @@ public actor CodaNetworkClient {
 
         let (data, resp) = try await URLSession.shared.data(for: req)
         guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
-            throw URLError(.userAuthenticationRequired)
+            throw CodaAPIError.fromResponse(data: data, response: resp, fallback: "Sign in failed")
         }
         let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
         guard let token = json?["token"] as? String else {
-            throw URLError(.cannotParseResponse)
+            throw CodaAPIError.invalidResponse
         }
         self.bearerToken = token
         return token
@@ -350,14 +370,104 @@ public actor CodaNetworkClient {
 
         let (data, resp) = try await URLSession.shared.data(for: req)
         guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
-            throw URLError(.userAuthenticationRequired)
+            throw CodaAPIError.fromResponse(data: data, response: resp, fallback: "Registration failed")
         }
         let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
         guard let token = json?["token"] as? String else {
-            throw URLError(.cannotParseResponse)
+            throw CodaAPIError.invalidResponse
         }
         self.bearerToken = token
         return token
+    }
+
+    public func approveDeviceAuth(userCode: String) async throws -> CodaRemoteDevice {
+        let url = serverBaseURL.appendingPathComponent("api/v1/auth/device/approve")
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if let token = bearerToken {
+            req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
+        req.httpBody = try JSONSerialization.data(withJSONObject: [
+            "user_code": userCode.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        ])
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            throw CodaAPIError.fromResponse(data: data, response: resp, fallback: "Device approval failed")
+        }
+        return try JSONDecoder().decode(CodaRemoteDevice.self, from: data)
+    }
+
+    public func renameDevice(deviceId: UUID, name: String) async throws {
+        let url = serverBaseURL.appendingPathComponent("api/v1/devices/\(deviceId.uuidString.lowercased())")
+        var req = URLRequest(url: url)
+        req.httpMethod = "PATCH"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if let token = bearerToken {
+            req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
+        req.httpBody = try JSONSerialization.data(withJSONObject: ["name": name])
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            throw CodaAPIError.fromResponse(data: data, response: resp, fallback: "Rename device failed")
+        }
+    }
+
+    public func deleteDevice(deviceId: UUID) async throws {
+        let url = serverBaseURL.appendingPathComponent("api/v1/devices/\(deviceId.uuidString.lowercased())")
+        var req = URLRequest(url: url)
+        req.httpMethod = "DELETE"
+        if let token = bearerToken {
+            req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            throw CodaAPIError.fromResponse(data: data, response: resp, fallback: "Remove device failed")
+        }
+        invalidatePeerSession(peerDeviceId: deviceId)
+    }
+
+    public func changePassword(currentPassword: String, newPassword: String) async throws -> String? {
+        let url = serverBaseURL.appendingPathComponent("api/v1/auth/password")
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if let token = bearerToken {
+            req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
+        req.httpBody = try JSONSerialization.data(withJSONObject: [
+            "current_password": currentPassword,
+            "new_password": newPassword,
+        ])
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            throw CodaAPIError.fromResponse(data: data, response: resp, fallback: "Password update failed")
+        }
+        let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        if let newTok = json?["token"] as? String {
+            self.bearerToken = newTok
+            return newTok
+        }
+        return nil
+    }
+
+    public func deleteAccount(currentPassword: String) async throws {
+        let url = serverBaseURL.appendingPathComponent("api/v1/auth/me")
+        var req = URLRequest(url: url)
+        req.httpMethod = "DELETE"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if let token = bearerToken {
+            req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
+        req.httpBody = try JSONSerialization.data(withJSONObject: [
+            "current_password": currentPassword
+        ])
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            throw CodaAPIError.fromResponse(data: data, response: resp, fallback: "Delete account failed")
+        }
+        bearerToken = nil
+        disconnectTransport()
     }
 
     public func fetchAuthMe() async throws -> (handle: String, email: String) {
@@ -523,6 +633,62 @@ public actor CodaNetworkClient {
         return (code, cmd)
     }
 
+    private static func isAllowedRelayWSSURL(_ url: URL) -> Bool {
+        let scheme = (url.scheme ?? "").lowercased()
+        if scheme == "wss" { return true }
+        if scheme == "ws", let host = url.host, isLoopbackHost(host) { return true }
+        return false
+    }
+
+    private func startRelayKeepAliveLoop(forRawTCP conn: NWConnection, gen: UInt64) {
+        relayKeepAliveTask?.cancel()
+        relayKeepAliveTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 25_000_000_000)
+                if Task.isCancelled { break }
+                guard let self else { break }
+                let stillActive = await self.isRawTCPGenCurrent(gen)
+                if !stillActive { break }
+                let ka: [String: Any] = [
+                    "frame_type": "keep_alive",
+                    "ts_ms": UInt64(Date().timeIntervalSince1970 * 1000),
+                ]
+                if let framed = try? Self.encodeLengthDelimitedJSON(ka) {
+                    conn.send(content: framed, completion: .contentProcessed { _ in })
+                }
+            }
+        }
+    }
+
+    private func startRelayKeepAliveLoop(forWSS task: URLSessionWebSocketTask, gen: UInt64) {
+        relayKeepAliveTask?.cancel()
+        relayKeepAliveTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 25_000_000_000)
+                if Task.isCancelled { break }
+                guard let self else { break }
+                let stillActive = await self.isWSSGenCurrent(gen)
+                if !stillActive { break }
+                let ka: [String: Any] = [
+                    "frame_type": "keep_alive",
+                    "ts_ms": UInt64(Date().timeIntervalSince1970 * 1000),
+                ]
+                if let data = try? JSONSerialization.data(withJSONObject: ka),
+                   let txt = String(data: data, encoding: .utf8) {
+                    task.send(.string(txt)) { _ in }
+                }
+            }
+        }
+    }
+
+    private func isRawTCPGenCurrent(_ gen: UInt64) -> Bool {
+        rawTCPConnection != nil && rawTCPGeneration == gen
+    }
+
+    private func isWSSGenCurrent(_ gen: UInt64) -> Bool {
+        wsTask != nil && wsGeneration == gen
+    }
+
     // MARK: - Domestic No-ICP Raw TCP Relay (`Network.framework` NWConnection, TCP_NODELAY, Zero SNI)
 
     public func connectDomesticRawTCP(host: String, port: UInt16, relayTicket: String) {
@@ -533,8 +699,8 @@ public actor CodaNetworkClient {
 
         guard let nwPort = NWEndpoint.Port(rawValue: port) else { return }
         let conn = NWConnection(host: NWEndpoint.Host(host), port: nwPort, using: params)
-        let gen = self.currentGeneration
-        self.currentGeneration &+= 1
+        let gen = nextMonotonicGeneration()
+        self.relayKeepAliveTask?.cancel()
         self.relayReaderTask?.cancel()
         self.rawTCPConnection?.cancel()
         self.rawTCPConnection = conn
@@ -562,6 +728,7 @@ public actor CodaNetworkClient {
         self.relayReaderTask = Task { [weak self] in
             await Self.runRawTCPRelayReadLoop(client: self, conn: conn, gen: gen)
         }
+        startRelayKeepAliveLoop(forRawTCP: conn, gen: gen)
     }
 
     private func connectDomesticRawTCPAsync(host: String, port: UInt16, relayTicket: String) async throws {
@@ -574,8 +741,7 @@ public actor CodaNetworkClient {
             throw URLError(.badURL)
         }
         let conn = NWConnection(host: NWEndpoint.Host(host), port: nwPort, using: params)
-        let gen = self.currentGeneration
-        self.currentGeneration &+= 1
+        let gen = nextMonotonicGeneration()
 
         let timeoutTask = Task {
             try await Task.sleep(nanoseconds: 5_000_000_000)
@@ -609,6 +775,7 @@ public actor CodaNetworkClient {
             conn.cancel()
             throw URLError(.userAuthenticationRequired)
         }
+        self.relayKeepAliveTask?.cancel()
         self.relayReaderTask?.cancel()
         self.rawTCPConnection?.cancel()
         self.rawTCPConnection = conn
@@ -621,13 +788,16 @@ public actor CodaNetworkClient {
         self.relayReaderTask = Task { [weak self] in
             await Self.runRawTCPRelayReadLoop(client: self, conn: conn, gen: gen)
         }
+        startRelayKeepAliveLoop(forRawTCP: conn, gen: gen)
     }
 
     // MARK: - Overseas CDN WebSocket Relay (With 75s Make-Before-Break Seamless Handoff)
 
     public func connectOverseasCDNWSS(wssURL: URL, relayTicket: String) async throws {
-        let nextGen = self.currentGeneration
-        self.currentGeneration &+= 1
+        guard Self.isAllowedRelayWSSURL(wssURL) else {
+            throw CodaCryptoError.invalidHandshake("relay WebSocket must use wss:// (or loopback ws://)")
+        }
+        let nextGen = nextMonotonicGeneration()
 
         let task = URLSession.shared.webSocketTask(with: wssURL)
         task.maximumMessageSize = 8 * 1024 * 1024
@@ -663,6 +833,7 @@ public actor CodaNetworkClient {
             throw URLError(.userAuthenticationRequired)
         }
 
+        self.relayKeepAliveTask?.cancel()
         self.relayReaderTask?.cancel()
         self.rawTCPConnection?.cancel()
         self.rawTCPConnection = nil
@@ -675,6 +846,7 @@ public actor CodaNetworkClient {
         self.relayReaderTask = Task { [weak self] in
             await Self.runWSSRelayReadLoop(client: self, task: task, gen: nextGen)
         }
+        startRelayKeepAliveLoop(forWSS: task, gen: nextGen)
     }
 
     // MARK: - Auto-SmartPath Negotiator (UDP LAN Discovery + TCP Direct P2P + Seamless Relay Failover)
@@ -861,10 +1033,19 @@ public actor CodaNetworkClient {
         clientIdentity: CodaDeviceIdentity,
         clientDeviceId: UUID,
         targetDeviceId: UUID,
-        expectedDaemonEd25519Pubkey: String = "",
+        expectedDaemonEd25519Pubkey: String,
         expectedDaemonX25519Pubkey: String? = nil,
         timeoutMs: UInt64 = 350
     ) async throws -> SmartPathRouteMode {
+        // Fail closed: Direct P2P requires a pinned Ed25519 public key from the coordinator directory.
+        guard !expectedDaemonEd25519Pubkey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw CodaCryptoError.invalidHandshake("missing pinned daemon ed25519_pubkey")
+        }
+        if let expectedX = expectedDaemonX25519Pubkey,
+           expectedX.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            throw CodaCryptoError.invalidHandshake("empty pinned daemon x25519_pubkey")
+        }
+
         let tcpOptions = NWProtocolTCP.Options()
         tcpOptions.noDelay = true
         tcpOptions.enableKeepalive = true
@@ -880,7 +1061,8 @@ public actor CodaNetworkClient {
         let tsMs = UInt64(Date().timeIntervalSince1970 * 1000)
         let clientIdLower = clientDeviceId.uuidString.lowercased()
         let targetIdLower = targetDeviceId.uuidString.lowercased()
-        let signedMsg = "p2p-hello-v2:\(clientIdLower):\(targetIdLower):\(clientIdentity.x25519PublicB64):\(ephPubB64):\(tsMs)"
+        let supportsZstd = CodaE2EESession.hasNativeZstdFFI
+        let signedMsg = "p2p-hello-v2:\(clientIdLower):\(targetIdLower):\(clientIdentity.x25519PublicB64):\(ephPubB64):\(tsMs):zstd=\(supportsZstd ? 1 : 0)"
         let sigB64 = try clientIdentity.sign(message: Data(signedMsg.utf8))
 
         let helloFramed = try Self.encodeLengthDelimitedJSON([
@@ -890,7 +1072,7 @@ public actor CodaNetworkClient {
             "client_ed25519_pub_b64": clientIdentity.ed25519PublicB64,
             "client_x25519_pub_b64": clientIdentity.x25519PublicB64,
             "client_ephemeral_x25519_pub_b64": ephPubB64,
-            "supports_zstd": CodaE2EESession.hasNativeZstdFFI,
+            "supports_zstd": supportsZstd,
             "timestamp_ms": tsMs,
             "signature_b64": sigB64,
         ])
@@ -935,17 +1117,19 @@ public actor CodaNetworkClient {
         let ackTsMs = ackTsNum.uint64Value
         let nowMs = UInt64(Date().timeIntervalSince1970 * 1000)
         let skewMs = ackTsMs >= nowMs ? (ackTsMs - nowMs) : (nowMs - ackTsMs)
-        guard skewMs <= 300_000 else {
+        guard skewMs <= 120_000 else {
             conn.cancel()
-            throw CodaCryptoError.invalidHandshake("daemon timestamp skew \(skewMs)ms exceeds 300s")
+            throw CodaCryptoError.invalidHandshake("daemon timestamp skew \(skewMs)ms exceeds 120s")
         }
-        if !expectedDaemonEd25519Pubkey.isEmpty && daemonEdPubB64 != expectedDaemonEd25519Pubkey {
+        guard daemonEdPubB64 == expectedDaemonEd25519Pubkey else {
             conn.cancel()
             throw CodaCryptoError.invalidHandshake("daemon ed25519_pubkey mismatch")
         }
-        if let expectedX = expectedDaemonX25519Pubkey, !expectedX.isEmpty, daemonPubB64 != expectedX {
-            conn.cancel()
-            throw CodaCryptoError.invalidHandshake("daemon x25519_pubkey mismatch")
+        if let expectedX = expectedDaemonX25519Pubkey {
+            guard daemonPubB64 == expectedX else {
+                conn.cancel()
+                throw CodaCryptoError.invalidHandshake("daemon x25519_pubkey mismatch")
+            }
         }
         let expectedAckMsg = "p2p-ack-v2:\(clientIdLower):\(targetIdLower):\(ephPubB64):\(daemonEphPubB64):\(ackTsMs)"
         guard CodaDeviceIdentity.verifySignature(
@@ -968,8 +1152,7 @@ public actor CodaNetworkClient {
             daemonDeviceId: targetDeviceId,
             isInitiator: true
         )
-        let gen = self.currentGeneration
-        self.currentGeneration &+= 1
+        let gen = nextMonotonicGeneration()
         if let oldPeer = self.directP2PPeers[targetDeviceId] {
             oldPeer.readerTask?.cancel()
             oldPeer.connection.cancel()
@@ -1010,9 +1193,10 @@ public actor CodaNetworkClient {
         daemonDeviceId: UUID,
         senderX25519PubB64: String,
         sessionNonceB64: String,
-        initTsMs: UInt64
+        initTsMs: UInt64,
+        supportsZstd: Bool = CodaE2EESession.hasNativeZstdFFI
     ) -> String {
-        "relay-sess-v2:\(clientDeviceId.uuidString.lowercased()):\(daemonDeviceId.uuidString.lowercased()):\(senderX25519PubB64):\(sessionNonceB64):\(initTsMs)"
+        "relay-sess-v2:\(clientDeviceId.uuidString.lowercased()):\(daemonDeviceId.uuidString.lowercased()):\(senderX25519PubB64):\(sessionNonceB64):\(initTsMs):zstd=\(supportsZstd ? 1 : 0)"
     }
 
     private func resetRelayPeerSession(
@@ -1459,6 +1643,20 @@ public actor CodaNetworkClient {
             state.ackedByPeer = true
             relayPeerSessions[srcUUID] = state
             handleDecryptedPeerPayload(pt, sourceDeviceId: srcUUID)
+        } else if frameType == "session_reset",
+                  let srcStr = frame["src_device_id"] as? String,
+                  let srcUUID = UUID(uuidString: srcStr) {
+            relayPeerSessions.removeValue(forKey: srcUUID)
+            failPendingRequests(forPeer: srcUUID, transportGen: gen, error: URLError(.networkConnectionLost))
+            enqueueAsyncEvent(CodaAsyncEvent(op: "peer_session_reset", sourceDeviceId: srcUUID, payloadData: Data()))
+        } else if frameType == "peer_presence",
+                  let devStr = frame["device_id"] as? String,
+                  let devUUID = UUID(uuidString: devStr) {
+            let isOnline = (frame["is_online"] as? Bool) ?? false
+            if isOnline {
+                relayPeerSessions.removeValue(forKey: devUUID)
+                enqueueAsyncEvent(CodaAsyncEvent(op: "peer_session_reset", sourceDeviceId: devUUID, payloadData: Data()))
+            }
         } else if frameType == "auth_ack" {
             if (frame["ok"] as? Bool) == false {
                 handleRelayDisconnect(gen: gen)
@@ -1476,11 +1674,15 @@ public actor CodaNetworkClient {
 
     private func handleRelayDisconnect(gen: UInt64) {
         if rawTCPGeneration == gen {
+            relayKeepAliveTask?.cancel()
+            relayKeepAliveTask = nil
             rawTCPConnection?.cancel()
             rawTCPConnection = nil
             activeRelayRouteMode = nil
         }
         if wsGeneration == gen {
+            relayKeepAliveTask?.cancel()
+            relayKeepAliveTask = nil
             wsTask?.cancel(with: .normalClosure, reason: nil)
             wsTask = nil
             activeRelayRouteMode = nil
@@ -2018,6 +2220,26 @@ public actor CodaNetworkClient {
     ) async throws {
         let reqData = try JSONSerialization.data(withJSONObject: [
             "op": "interrupt_terminal",
+            "req_id": nextRequestID(),
+            "terminal": terminal,
+        ])
+        _ = try await sendPeerMessageData(
+            reqData,
+            to: device,
+            clientIdentity: clientIdentity,
+            clientDeviceId: clientDeviceId,
+            lane: "control_p0"
+        )
+    }
+
+    public func killTerminal(
+        on device: CodaRemoteDevice,
+        clientIdentity: CodaDeviceIdentity,
+        clientDeviceId: UUID,
+        terminal: String
+    ) async throws {
+        let reqData = try JSONSerialization.data(withJSONObject: [
+            "op": "kill_terminal",
             "req_id": nextRequestID(),
             "terminal": terminal,
         ])

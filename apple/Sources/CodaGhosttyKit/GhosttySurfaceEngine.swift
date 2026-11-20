@@ -81,15 +81,27 @@ public struct GhosttyStyledSpan: Sendable, Equatable, Identifiable {
     public let id: Int
     public let text: String
     public let fg: GhosttyRGBColor?
+    public let bg: GhosttyRGBColor?
     public let bold: Bool
     public let dim: Bool
+    public let inverse: Bool
 
-    public init(id: Int, text: String, fg: GhosttyRGBColor? = nil, bold: Bool = false, dim: Bool = false) {
+    public init(
+        id: Int,
+        text: String,
+        fg: GhosttyRGBColor? = nil,
+        bg: GhosttyRGBColor? = nil,
+        bold: Bool = false,
+        dim: Bool = false,
+        inverse: Bool = false
+    ) {
         self.id = id
         self.text = text
         self.fg = fg
+        self.bg = bg
         self.bold = bold
         self.dim = dim
+        self.inverse = inverse
     }
 }
 
@@ -133,46 +145,54 @@ public enum HerdrQuickKey: String, CaseIterable, Sendable {
 
     public var herdrKeyNames: [String] {
         switch self {
-        case .esc: return ["Escape"]
-        case .tab: return ["Tab"]
-        case .shiftTab: return ["BackTab"]
-        case .up: return ["Up"]
-        case .down: return ["Down"]
-        case .left: return ["Left"]
-        case .right: return ["Right"]
-        case .enter: return ["Enter"]
-        case .backspace: return ["BSpace"]
+        case .esc: return ["esc"]
+        case .tab: return ["tab"]
+        case .shiftTab: return ["shift+tab"]
+        case .up: return ["up"]
+        case .down: return ["down"]
+        case .left: return ["left"]
+        case .right: return ["right"]
+        case .enter: return ["enter"]
+        case .backspace: return ["backspace"]
         case .slash: return ["/"]
-        case .ctrlC: return ["Ctrl+c"]
-        case .ctrlD: return ["Ctrl+d"]
-        case .ctrlBackslash: return ["Ctrl+\\"]
+        case .ctrlC: return ["ctrl+c"]
+        case .ctrlD: return ["ctrl+d"]
+        case .ctrlBackslash: return ["ctrl+\\"]
         }
+    }
+
+    public var encodedBytes: Data {
+        GhosttyReflowEngine.encodeKey(self)
     }
 }
 
 /// Stateful VT100/xterm terminal surface engine supporting streaming UTF-8 bytes,
-/// CJK wide characters, 24-bit TrueColor SGR, alternate screen (`?1049h`/`?47h`),
-/// `OSC 7501` / `OSC 0/2`, scrollback reflow, and Git diff classification.
+/// CJK wide characters, 24-bit TrueColor SGR (fg + bg + inverse), alternate screen (`?1049h`/`?47h`),
+/// `OSC 7501` (kv & JSON) / `OSC 0/2`, scrollback reflow, and Git diff classification.
 public struct GhosttyReflowEngine: GhosttyVTSurface {
     private struct StyledCell: Sendable, Equatable {
         var ch: Character
         var fg: GhosttyRGBColor?
+        var bg: GhosttyRGBColor?
         var bold: Bool
         var dim: Bool
+        var inverse: Bool
         var width: UInt8 // 1 for normal, 2 for wide lead, 0 for continuation/empty
         var isWideContinuation: Bool
 
         static let blank = StyledCell(
             ch: " ",
             fg: nil,
+            bg: nil,
             bold: false,
             dim: false,
+            inverse: false,
             width: 1,
             isWideContinuation: false
         )
 
         var isDefaultBlank: Bool {
-            ch == " " && !isWideContinuation && width == 1 && fg == nil && !bold && !dim
+            ch == " " && !isWideContinuation && width == 1 && fg == nil && bg == nil && !bold && !dim && !inverse
         }
     }
 
@@ -185,8 +205,8 @@ public struct GhosttyReflowEngine: GhosttyVTSurface {
             self.softWrapped = softWrapped
         }
 
-        mutating func clear(fg: GhosttyRGBColor? = nil, bold: Bool = false, dim: Bool = false) {
-            let fill = StyledCell(ch: " ", fg: fg, bold: bold, dim: dim, width: 1, isWideContinuation: false)
+        mutating func clear(fg: GhosttyRGBColor? = nil, bg: GhosttyRGBColor? = nil, bold: Bool = false, dim: Bool = false) {
+            let fill = StyledCell(ch: " ", fg: fg, bg: bg, bold: bold, dim: dim, inverse: false, width: 1, isWideContinuation: false)
             cells = Array(repeating: fill, count: cells.count)
             softWrapped = false
         }
@@ -195,7 +215,7 @@ public struct GhosttyReflowEngine: GhosttyVTSurface {
             var end = cells.count
             while end > 0 {
                 let c = cells[end - 1]
-                if c.ch == " " && !c.isWideContinuation && c.fg == nil && !c.bold && !c.dim {
+                if c.ch == " " && !c.isWideContinuation && c.fg == nil && c.bg == nil && !c.bold && !c.dim && !c.inverse {
                     end -= 1
                 } else {
                     break
@@ -224,8 +244,10 @@ public struct GhosttyReflowEngine: GhosttyVTSurface {
         var row: Int = 0
         var col: Int = 0
         var fg: GhosttyRGBColor? = nil
+        var bg: GhosttyRGBColor? = nil
         var bold: Bool = false
         var dim: Bool = false
+        var inverse: Bool = false
         var pendingWrap: Bool = false
     }
 
@@ -264,8 +286,10 @@ public struct GhosttyReflowEngine: GhosttyVTSurface {
     private var scrollBottom: Int
 
     private var curFg: GhosttyRGBColor? = nil
+    private var curBg: GhosttyRGBColor? = nil
     private var curBold: Bool = false
     private var curDim: Bool = false
+    private var curInverse: Bool = false
     private var treatLFAsCRLF: Bool
 
     private var parseState: VTParseState = .ground
@@ -276,7 +300,7 @@ public struct GhosttyReflowEngine: GhosttyVTSurface {
     private static let maxCSIBytes = 256
     private static let maxOSCScalars = 4096
 
-    public init(columns: Int = 52, rows: Int = 24, maxScrollback: Int = 1500, treatLFAsCRLF: Bool = true) {
+    public init(columns: Int = 52, rows: Int = 24, maxScrollback: Int = 1500, treatLFAsCRLF: Bool = false) {
         let cols = max(20, columns)
         let rws = max(6, rows)
         self.columns = cols
@@ -302,8 +326,10 @@ public struct GhosttyReflowEngine: GhosttyVTSurface {
         scrollTop = 0
         scrollBottom = rows - 1
         curFg = nil
+        curBg = nil
         curBold = false
         curDim = false
+        curInverse = false
         parseState = .ground
         csiBuffer.removeAll(keepingCapacity: true)
         oscBuffer.removeAll(keepingCapacity: true)
@@ -709,8 +735,10 @@ public struct GhosttyReflowEngine: GhosttyVTSurface {
             row: cursorRow,
             col: cursorCol,
             fg: curFg,
+            bg: curBg,
             bold: curBold,
             dim: curDim,
+            inverse: curInverse,
             pendingWrap: pendingWrap
         )
         if inAltScreen {
@@ -725,8 +753,10 @@ public struct GhosttyReflowEngine: GhosttyVTSurface {
         cursorRow = min(max(0, snapshot.row), rows - 1)
         cursorCol = min(max(0, snapshot.col), columns - 1)
         curFg = snapshot.fg
+        curBg = snapshot.bg
         curBold = snapshot.bold
         curDim = snapshot.dim
+        curInverse = snapshot.inverse
         pendingWrap = snapshot.pendingWrap
     }
 
@@ -736,8 +766,10 @@ public struct GhosttyReflowEngine: GhosttyVTSurface {
                 row: cursorRow,
                 col: cursorCol,
                 fg: curFg,
+                bg: curBg,
                 bold: curBold,
                 dim: curDim,
+                inverse: curInverse,
                 pendingWrap: pendingWrap
             )
         }
@@ -825,8 +857,10 @@ public struct GhosttyReflowEngine: GhosttyVTSurface {
 
         let ch = Character(scalar)
         let fg = curFg
+        let bg = curBg
         let bold = curBold
         let dim = curDim
+        let inverse = curInverse
         let r = cursorRow
         let col = cursorCol
         let cols = columns
@@ -836,14 +870,14 @@ public struct GhosttyReflowEngine: GhosttyVTSurface {
             if w == 2 && col + 1 < cols {
                 Self.clearWideNeighbors(in: &grid[r], at: col + 1)
                 grid[r].cells[col] = StyledCell(
-                    ch: ch, fg: fg, bold: bold, dim: dim, width: 2, isWideContinuation: false
+                    ch: ch, fg: fg, bg: bg, bold: bold, dim: dim, inverse: inverse, width: 2, isWideContinuation: false
                 )
                 grid[r].cells[col + 1] = StyledCell(
-                    ch: " ", fg: fg, bold: bold, dim: dim, width: 0, isWideContinuation: true
+                    ch: " ", fg: fg, bg: bg, bold: bold, dim: dim, inverse: inverse, width: 0, isWideContinuation: true
                 )
             } else {
                 grid[r].cells[col] = StyledCell(
-                    ch: ch, fg: fg, bold: bold, dim: dim, width: 1, isWideContinuation: false
+                    ch: ch, fg: fg, bg: bg, bold: bold, dim: dim, inverse: inverse, width: 1, isWideContinuation: false
                 )
             }
         }
@@ -860,12 +894,23 @@ public struct GhosttyReflowEngine: GhosttyVTSurface {
 
     private mutating func executeCSI(finalByte: UInt8) {
         let raw = String(decoding: csiBuffer, as: UTF8.self)
-        let isPrivate = raw.hasPrefix("?")
-        let cleanParams = isPrivate ? String(raw.dropFirst()) : raw
+        var prefix: Character? = nil
+        var body = raw
+        if let first = raw.first, first == "?" || first == ">" || first == "<" || first == "=" {
+            prefix = first
+            body = String(raw.dropFirst())
+        }
+        let hasIntermediates = body.unicodeScalars.contains { $0.value >= 0x20 && $0.value <= 0x2F }
+        // Ignore non-`?` private prefixes (`>`, `<`, `=`) and intermediate sequences (`CSI > 1 u`, `CSI 2 q`, `CSI > 4 ; 2 m`)
+        if hasIntermediates || (prefix != nil && prefix != "?") {
+            return
+        }
+        let isPrivate = (prefix == "?")
+        let cleanParams = body
 
         // Preserve colon sub-parameters for SGR (`38:2::r:g:b`)
         if finalByte == 0x6D /* 'm' */ && !isPrivate {
-            Self.applySGR(params: cleanParams, fg: &curFg, bold: &curBold, dim: &curDim)
+            Self.applySGR(params: cleanParams, fg: &curFg, bg: &curBg, bold: &curBold, dim: &curDim, inverse: &curInverse)
             return
         }
 
@@ -1192,7 +1237,7 @@ public struct GhosttyReflowEngine: GhosttyVTSurface {
                 currentRow.cells[col] = cell
                 if w == 2 && col + 1 < newCols {
                     currentRow.cells[col + 1] = StyledCell(
-                        ch: " ", fg: cell.fg, bold: cell.bold, dim: cell.dim, width: 0, isWideContinuation: true
+                        ch: " ", fg: cell.fg, bg: cell.bg, bold: cell.bold, dim: cell.dim, inverse: cell.inverse, width: 0, isWideContinuation: true
                     )
                 }
                 col += w
@@ -1260,26 +1305,30 @@ public struct GhosttyReflowEngine: GhosttyVTSurface {
         var spans: [GhosttyStyledSpan] = []
         var buf = ""
         var curFg: GhosttyRGBColor?
+        var curBg: GhosttyRGBColor?
         var curBold = false
         var curDim = false
+        var curInverse = false
         var spanId = 0
 
         for cell in cells {
             if cell.isWideContinuation { continue }
-            if !buf.isEmpty && (cell.fg != curFg || cell.bold != curBold || cell.dim != curDim) {
-                spans.append(GhosttyStyledSpan(id: spanId, text: buf, fg: curFg, bold: curBold, dim: curDim))
+            if !buf.isEmpty && (cell.fg != curFg || cell.bg != curBg || cell.bold != curBold || cell.dim != curDim || cell.inverse != curInverse) {
+                spans.append(GhosttyStyledSpan(id: spanId, text: buf, fg: curFg, bg: curBg, bold: curBold, dim: curDim, inverse: curInverse))
                 spanId += 1
                 buf = ""
             }
             if buf.isEmpty {
                 curFg = cell.fg
+                curBg = cell.bg
                 curBold = cell.bold
                 curDim = cell.dim
+                curInverse = cell.inverse
             }
             buf.append(cell.ch)
         }
         if !buf.isEmpty {
-            spans.append(GhosttyStyledSpan(id: spanId, text: buf, fg: curFg, bold: curBold, dim: curDim))
+            spans.append(GhosttyStyledSpan(id: spanId, text: buf, fg: curFg, bg: curBg, bold: curBold, dim: curDim, inverse: curInverse))
         }
         return spans
     }
@@ -1315,37 +1364,46 @@ public struct GhosttyReflowEngine: GhosttyVTSurface {
     private static func applySGR(
         params: String,
         fg: inout GhosttyRGBColor?,
+        bg: inout GhosttyRGBColor?,
         bold: inout Bool,
-        dim: inout Bool
+        dim: inout Bool,
+        inverse: inout Bool
     ) {
         if params.isEmpty {
             fg = nil
+            bg = nil
             bold = false
             dim = false
+            inverse = false
             return
         }
 
-        // Support both `;` and `:` (ISO-8613-6 e.g. `38:2::r:g:b` or `38:5:idx`)
+        // Support both `;` and `:` (ISO-8613-6 e.g. `38:2::r:g:b`, `48:2::r:g:b`, `38:5:idx`, `48:5:idx`)
         let rawTokens = params.split(separator: ";", omittingEmptySubsequences: false)
         var idx = 0
         while idx < rawTokens.count {
             let tok = rawTokens[idx]
             if tok.contains(":") {
-                let sub = tok.split(separator: ":", omittingEmptySubsequences: false).compactMap { $0.isEmpty ? nil : Int($0) }
-                if let head = sub.first {
-                    if head == 38 {
-                        if sub.count >= 3 && sub[1] == 5 {
-                            fg = xterm256Color(sub[2])
-                        } else if sub.count >= 5 && sub[1] == 2 {
-                            // 38:2:cs:r:g:b or 38:2::r:g:b (sub omits empty cs -> sub.count==5)
-                            let offset = sub.count >= 6 ? 3 : 2
-                            if offset + 2 < sub.count {
-                                fg = GhosttyRGBColor(
-                                    r: UInt8(clamping: sub[offset]),
-                                    g: UInt8(clamping: sub[offset + 1]),
-                                    b: UInt8(clamping: sub[offset + 2])
-                                )
-                            }
+                let rawSub = tok.split(separator: ":", omittingEmptySubsequences: false)
+                if let headStr = rawSub.first, let head = Int(headStr), (head == 38 || head == 48) {
+                    let isFg = (head == 38)
+                    let kind = rawSub.count >= 2 ? Int(rawSub[1]) : nil
+                    if kind == 5 && rawSub.count >= 3, let n = Int(rawSub[2]) {
+                        let c = xterm256Color(n)
+                        if isFg { fg = c } else { bg = c }
+                    } else if kind == 2 {
+                        let off = rawSub.count >= 6 ? 3 : 2
+                        if rawSub.count >= off + 3,
+                           let r = Int(rawSub[off]),
+                           let g = Int(rawSub[off + 1]),
+                           let b = Int(rawSub[off + 2])
+                        {
+                            let c = GhosttyRGBColor(
+                                r: UInt8(clamping: r),
+                                g: UInt8(clamping: g),
+                                b: UInt8(clamping: b)
+                            )
+                            if isFg { fg = c } else { bg = c }
                         }
                     }
                 }
@@ -1357,25 +1415,39 @@ public struct GhosttyReflowEngine: GhosttyVTSurface {
             switch code {
             case 0:
                 fg = nil
+                bg = nil
                 bold = false
                 dim = false
+                inverse = false
             case 1:
                 bold = true
             case 2:
                 dim = true
+            case 7:
+                inverse = true
             case 22:
                 bold = false
                 dim = false
+            case 27:
+                inverse = false
             case 39:
                 fg = nil
+            case 49:
+                bg = nil
             case 30...37:
                 fg = standard16Color(code - 30)
             case 90...97:
                 fg = standard16Color(8 + (code - 90))
-            case 38:
+            case 40...47:
+                bg = standard16Color(code - 40)
+            case 100...107:
+                bg = standard16Color(8 + (code - 100))
+            case 38, 48:
+                let isFg = (code == 38)
                 let next1 = idx + 1 < rawTokens.count ? Int(rawTokens[idx + 1]) : nil
                 if next1 == 5, idx + 2 < rawTokens.count, let n = Int(rawTokens[idx + 2]) {
-                    fg = xterm256Color(n)
+                    let c = xterm256Color(n)
+                    if isFg { fg = c } else { bg = c }
                     idx += 2
                 } else if next1 == 2,
                           idx + 4 < rawTokens.count,
@@ -1383,18 +1455,12 @@ public struct GhosttyReflowEngine: GhosttyVTSurface {
                           let g = Int(rawTokens[idx + 3]),
                           let b = Int(rawTokens[idx + 4])
                 {
-                    fg = GhosttyRGBColor(
+                    let c = GhosttyRGBColor(
                         r: UInt8(clamping: r),
                         g: UInt8(clamping: g),
                         b: UInt8(clamping: b)
                     )
-                    idx += 4
-                }
-            case 48:
-                let next1 = idx + 1 < rawTokens.count ? Int(rawTokens[idx + 1]) : nil
-                if next1 == 5 && idx + 2 < rawTokens.count {
-                    idx += 2
-                } else if next1 == 2 && idx + 4 < rawTokens.count {
+                    if isFg { fg = c } else { bg = c }
                     idx += 4
                 }
             default:
@@ -1437,24 +1503,60 @@ public struct GhosttyReflowEngine: GhosttyVTSurface {
         return GhosttyRGBColor(r: levels[c / 36], g: levels[(c / 6) % 6], b: levels[c % 6])
     }
 
+    private static let numberedDiffAddRegex = try! NSRegularExpression(pattern: #"^\s*\d+\s+\+"#)
+    private static let numberedDiffDelRegex = try! NSRegularExpression(pattern: #"^\s*\d+\s+-"#)
+    private static let promptChoiceRegex = try! NSRegularExpression(pattern: #"^(?:[>❯]\s*)?\d+\.\s+\S+"#)
+
+    private static func matches(_ regex: NSRegularExpression, in text: String) -> Bool {
+        let nsRange = NSRange(text.startIndex..<text.endIndex, in: text)
+        return regex.firstMatch(in: text, options: [], range: nsRange) != nil
+    }
+
     private static func classifyLine(_ line: String) -> GhosttyLineKind {
         let trimmed = line.trimmingCharacters(in: .whitespaces)
         if trimmed.hasPrefix("@@") || trimmed.hasPrefix("diff --git") {
             return .diffHunk
         }
-        if (line.hasPrefix("+") && !line.hasPrefix("+++")) || line.range(of: #"^\s*\d+\s+\+"#, options: .regularExpression) != nil {
+        // Only classify actual unified diff additions/deletions (`+foo`, `+  indented`),
+        // never single-space Markdown bullet lists (`- item`, `+ item`).
+        let isMarkdownPlusBullet = line.hasPrefix("+ ") && !line.hasPrefix("+  ")
+        let isMarkdownMinusBullet = line.hasPrefix("- ") && !line.hasPrefix("-  ")
+        if (line.hasPrefix("+") && !line.hasPrefix("+++") && !isMarkdownPlusBullet)
+            || matches(numberedDiffAddRegex, in: line)
+        {
             return .diffAdded
         }
-        if (line.hasPrefix("-") && !line.hasPrefix("---")) || line.range(of: #"^\s*\d+\s+-"#, options: .regularExpression) != nil {
+        if (line.hasPrefix("-") && !line.hasPrefix("---") && !isMarkdownMinusBullet)
+            || matches(numberedDiffDelRegex, in: line)
+        {
             return .diffRemoved
         }
-        if trimmed.range(of: #"^(?:[>❯]\s*)?\d+\.\s+\S+"#, options: .regularExpression) != nil {
+        if matches(promptChoiceRegex, in: trimmed) {
             return .promptChoice
         }
         return .normal
     }
 
     private static func parseOSC7501Payload(_ payload: String, separator: Character) -> HerdrOSC7501Status? {
+        let trimmed = payload.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.hasPrefix("{"),
+           let data = trimmed.data(using: .utf8),
+           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        {
+            let state = HerdrLifecycleState.from(
+                rawState: obj["state"] as? String,
+                kind: obj["kind"] as? String
+            )
+            let progress = (obj["progress"] as? NSNumber)?.intValue
+            return HerdrOSC7501Status(
+                state: state,
+                kind: obj["kind"] as? String,
+                app: obj["app"] as? String,
+                title: obj["title"] as? String,
+                message: (obj["msg"] as? String) ?? (obj["task"] as? String),
+                progress: progress
+            )
+        }
         if payload.contains("=") {
             var kv: [String: String] = [:]
             for part in payload.split(separator: ";") {

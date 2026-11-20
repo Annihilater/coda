@@ -423,7 +423,8 @@ public struct CodaAdaptiveRootView: View {
                         Button("Claude Code") { store.launchAgent(agent: "claude", on: group.device, cwd: group.repos.first?.rootPath) }
                         Button("Codex") { store.launchAgent(agent: "codex", on: group.device, cwd: group.repos.first?.rootPath) }
                         Button("Gemini CLI") { store.launchAgent(agent: "gemini", on: group.device, cwd: group.repos.first?.rootPath) }
-                        Button("Shell (zsh)") { store.launchAgent(agent: "zsh", on: group.device, cwd: group.repos.first?.rootPath) }
+                        Divider()
+                        Button("Shell") { store.launchAgent(agent: "shell", on: group.device, cwd: group.repos.first?.rootPath) }
                     } label: {
                         Image(systemName: "plus")
                             .font(.system(size: 11, weight: .semibold))
@@ -469,6 +470,34 @@ public struct CodaAdaptiveRootView: View {
                     .buttonStyle(.plain)
 
                     if isExpanded {
+                        if repo.branches.count > 1 {
+                            ForEach(repo.branches) { b in
+                                HStack(spacing: 6) {
+                                    Text(b.branch)
+                                        .font(.system(size: 10.5, design: .monospaced))
+                                        .foregroundStyle(CodaHerdrTheme.textSecondary)
+                                    if b.diffAdded > 0 || b.diffDeleted > 0 {
+                                        Text("+\(b.diffAdded)/-\(b.diffDeleted)")
+                                            .font(.system(size: 9.5, design: .monospaced))
+                                            .foregroundStyle(CodaHerdrTheme.greenDiff)
+                                    }
+                                    Spacer()
+                                    if group.device.isOnline {
+                                        Button {
+                                            store.launchAgent(agent: "shell", on: group.device, cwd: b.worktreePath)
+                                        } label: {
+                                            Image(systemName: "plus.circle")
+                                                .font(.system(size: 11))
+                                                .foregroundStyle(CodaHerdrTheme.cyanWorking)
+                                        }
+                                        .buttonStyle(.plain)
+                                    }
+                                }
+                                .padding(.leading, 16)
+                                .padding(.trailing, 8)
+                                .padding(.vertical, 2)
+                            }
+                        }
                         ForEach(matching) { sib in
                             sidebarSessionRow(sib)
                                 .padding(.leading, 12)
@@ -557,6 +586,24 @@ public struct CodaAdaptiveRootView: View {
                     .frame(maxWidth: 400)
 
                 HStack(spacing: 10) {
+                    if store.isSignedIn, let onlineHost = store.remoteMachines.first(where: { $0.isOnline }) {
+                        Menu {
+                            let defaultCwd = store.workspacesByDevice[onlineHost.id]?.first?.rootPath
+                            Button("Claude Code") { store.launchAgent(agent: "claude", on: onlineHost, cwd: defaultCwd) }
+                            Button("Codex") { store.launchAgent(agent: "codex", on: onlineHost, cwd: defaultCwd) }
+                            Button("Gemini CLI") { store.launchAgent(agent: "gemini", on: onlineHost, cwd: defaultCwd) }
+                            Divider()
+                            Button("Shell") { store.launchAgent(agent: "shell", on: onlineHost, cwd: defaultCwd) }
+                        } label: {
+                            Label(tr("New Terminal", "新建终端", locale: store.locale), systemImage: "terminal")
+                                .font(.system(size: 13, weight: .semibold))
+                                .foregroundStyle(.black)
+                                .padding(.horizontal, 16)
+                                .padding(.vertical, 9)
+                                .background(Capsule().fill(CodaHerdrTheme.cyanWorking))
+                        }
+                    }
+
                     Button {
                         store.settingsInitialFocusPairing = store.isSignedIn
                         store.showSettingsSheet = true

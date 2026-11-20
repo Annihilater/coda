@@ -530,7 +530,7 @@ public struct CodaMobileSpacesTabView: View {
                                 Text(repo.repoName)
                                     .font(.system(size: 14, weight: .semibold))
                                     .foregroundStyle(CodaHerdrTheme.textPrimary)
-                                if let b = repo.branches.first {
+                                ForEach(repo.branches) { b in
                                     HStack(spacing: 6) {
                                         Text(b.branch)
                                             .font(.system(size: 11, design: .monospaced))
@@ -542,6 +542,17 @@ public struct CodaMobileSpacesTabView: View {
                                             Text("-\(b.diffDeleted)")
                                                 .font(.system(size: 11, design: .monospaced))
                                                 .foregroundStyle(CodaHerdrTheme.redDiff)
+                                        }
+                                        if repo.branches.count > 1 && group.device.isOnline {
+                                            Spacer(minLength: 4)
+                                            Button {
+                                                store.launchAgent(agent: "shell", on: group.device, cwd: b.worktreePath)
+                                            } label: {
+                                                Image(systemName: "terminal")
+                                                    .font(.system(size: 10))
+                                                    .foregroundStyle(CodaHerdrTheme.cyanWorking)
+                                            }
+                                            .buttonStyle(.plain)
                                         }
                                     }
                                 }
@@ -631,7 +642,7 @@ public struct CodaMobileSpacesTabView: View {
             Button("Codex") { store.launchAgent(agent: "codex", on: device, cwd: cwd) }
             Button("Gemini CLI") { store.launchAgent(agent: "gemini", on: device, cwd: cwd) }
             Divider()
-            Button("Shell (zsh)") { store.launchAgent(agent: "zsh", on: device, cwd: cwd) }
+            Button("Shell") { store.launchAgent(agent: "shell", on: device, cwd: cwd) }
         } label: {
             Image(systemName: "plus")
                 .font(.system(size: 12, weight: .semibold))

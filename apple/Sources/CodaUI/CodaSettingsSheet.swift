@@ -9,7 +9,16 @@ private final class SettingsFormModel: ObservableObject {
     @Published var emailInput: String = ""
     @Published var handleInput: String = ""
     @Published var passwordInput: String = ""
+    @Published var inviteCodeInput: String = ""
     @Published var suggestedHostName: String = ""
+    @Published var approveUserCodeInput: String = ""
+    @Published var renamingDeviceId: UUID? = nil
+    @Published var renameDeviceInput: String = ""
+    @Published var showPasswordEditor: Bool = false
+    @Published var currentPasswordInput: String = ""
+    @Published var newPasswordInput: String = ""
+    @Published var showDeleteAccount: Bool = false
+    @Published var deletePasswordInput: String = ""
     @Published var copiedFlag: Bool = false
 }
 
@@ -150,6 +159,122 @@ public struct CodaSettingsAndPairingSheet: View {
                         }
                         .buttonStyle(.plain)
                     }
+
+                    if let status = store.accountStatusMessage {
+                        Text(status)
+                            .font(.system(size: 12))
+                            .foregroundStyle(CodaHerdrTheme.greenDiff)
+                    }
+                    if let err = store.authError {
+                        Text(err)
+                            .font(.system(size: 12))
+                            .foregroundStyle(CodaHerdrTheme.redDiff)
+                    }
+
+                    Divider().background(CodaHerdrTheme.borderHairline)
+
+                    HStack(spacing: 8) {
+                        Button {
+                            form.showPasswordEditor.toggle()
+                        } label: {
+                            Text(tr("Change Password", "修改密码", locale: store.locale))
+                                .font(.system(size: 11.5, weight: .medium))
+                                .foregroundStyle(CodaHerdrTheme.textPrimary)
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 6)
+                                .background(RoundedRectangle(cornerRadius: 7).fill(CodaHerdrTheme.canvasBG))
+                        }
+                        .buttonStyle(.plain)
+
+                        Button {
+                            Task { await store.resetLocalIdentity() }
+                        } label: {
+                            Text(tr("Rotate Local Key", "重置本机密钥", locale: store.locale))
+                                .font(.system(size: 11.5, weight: .medium))
+                                .foregroundStyle(CodaHerdrTheme.amberNeedsYou)
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 6)
+                                .background(RoundedRectangle(cornerRadius: 7).fill(CodaHerdrTheme.amberNeedsYou.opacity(0.12)))
+                        }
+                        .buttonStyle(.plain)
+
+                        Spacer()
+
+                        Button {
+                            form.showDeleteAccount.toggle()
+                        } label: {
+                            Text(tr("Delete Account", "注销账户", locale: store.locale))
+                                .font(.system(size: 11.5, weight: .medium))
+                                .foregroundStyle(CodaHerdrTheme.redDiff)
+                        }
+                        .buttonStyle(.plain)
+                    }
+
+                    if form.showPasswordEditor {
+                        VStack(spacing: 8) {
+                            SecureField(tr("Current password", "当前密码", locale: store.locale), text: $form.currentPasswordInput)
+                                .font(.system(size: 12))
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 7)
+                                .background(RoundedRectangle(cornerRadius: 8).fill(CodaHerdrTheme.canvasBG))
+                            SecureField(tr("New password (min 8 chars)", "新密码（至少 8 位）", locale: store.locale), text: $form.newPasswordInput)
+                                .font(.system(size: 12))
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 7)
+                                .background(RoundedRectangle(cornerRadius: 8).fill(CodaHerdrTheme.canvasBG))
+                            Button {
+                                Task {
+                                    let ok = await store.changePassword(
+                                        current: form.currentPasswordInput,
+                                        new: form.newPasswordInput
+                                    )
+                                    if ok {
+                                        form.currentPasswordInput = ""
+                                        form.newPasswordInput = ""
+                                        form.showPasswordEditor = false
+                                    }
+                                }
+                            } label: {
+                                Text(tr("Update Password", "确认修改密码", locale: store.locale))
+                                    .font(.system(size: 12, weight: .semibold))
+                                    .foregroundStyle(.black)
+                                    .frame(maxWidth: .infinity)
+                                    .padding(.vertical, 8)
+                                    .background(RoundedRectangle(cornerRadius: 8).fill(CodaHerdrTheme.textPrimary))
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+
+                    if form.showDeleteAccount {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text(tr("This permanently deletes your account, paired devices, and sessions.", "此操作将永久删除你的账户、全部已配对设备与会话。", locale: store.locale))
+                                .font(.system(size: 11))
+                                .foregroundStyle(CodaHerdrTheme.redDiff)
+                            SecureField(tr("Confirm current password", "输入当前密码确认注销", locale: store.locale), text: $form.deletePasswordInput)
+                                .font(.system(size: 12))
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 7)
+                                .background(RoundedRectangle(cornerRadius: 8).fill(CodaHerdrTheme.canvasBG))
+                            Button(role: .destructive) {
+                                Task {
+                                    let ok = await store.deleteAccount(currentPassword: form.deletePasswordInput)
+                                    if ok {
+                                        form.deletePasswordInput = ""
+                                        form.showDeleteAccount = false
+                                    }
+                                }
+                            } label: {
+                                Text(tr("Permanently Delete Account", "永久注销账户", locale: store.locale))
+                                    .font(.system(size: 12, weight: .semibold))
+                                    .foregroundStyle(.white)
+                                    .frame(maxWidth: .infinity)
+                                    .padding(.vertical, 8)
+                                    .background(RoundedRectangle(cornerRadius: 8).fill(CodaHerdrTheme.redDiff))
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
                 }
             } else {
                 VStack(alignment: .leading, spacing: 12) {
@@ -240,6 +365,13 @@ public struct CodaSettingsAndPairingSheet: View {
                                     .padding(.vertical, 8)
                                     .background(RoundedRectangle(cornerRadius: 8).fill(CodaHerdrTheme.canvasBG))
                                     .codaNoAutocapAndSpelling()
+
+                                TextField(tr("Invite Code (optional)", "邀请码（如服务器要求）", locale: store.locale), text: $form.inviteCodeInput)
+                                    .font(.system(size: 13, design: .monospaced))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 8)
+                                    .background(RoundedRectangle(cornerRadius: 8).fill(CodaHerdrTheme.canvasBG))
+                                    .codaNoAutocapAndSpelling()
                             }
 
                             SecureField(tr("Password", "密码", locale: store.locale), text: $form.passwordInput)
@@ -251,7 +383,12 @@ public struct CodaSettingsAndPairingSheet: View {
                             Button {
                                 Task {
                                     if form.authMode == 2 {
-                                        await store.registerAccount(email: form.emailInput, handle: form.handleInput, password: form.passwordInput)
+                                        await store.registerAccount(
+                                            email: form.emailInput,
+                                            handle: form.handleInput,
+                                            password: form.passwordInput,
+                                            inviteCode: form.inviteCodeInput
+                                        )
                                     } else {
                                         await store.signInWithPassword(emailOrHandle: form.emailInput, password: form.passwordInput)
                                     }
@@ -333,28 +470,109 @@ public struct CodaSettingsAndPairingSheet: View {
                     }
                 }
 
+                Divider().background(CodaHerdrTheme.borderHairline)
+
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(tr("Approve Host Login Code (RFC 8628)", "批准主机授权码（如 ABCD-2345）", locale: store.locale))
+                        .font(.system(size: 11.5, weight: .medium))
+                        .foregroundStyle(CodaHerdrTheme.textSecondary)
+                    HStack(spacing: 8) {
+                        TextField("ABCD-2345", text: $form.approveUserCodeInput)
+                            .font(.system(size: 13, design: .monospaced))
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 8)
+                            .background(RoundedRectangle(cornerRadius: 8).fill(CodaHerdrTheme.canvasBG))
+                            .codaNoAutocapAndSpelling()
+
+                        Button {
+                            let code = form.approveUserCodeInput
+                            form.approveUserCodeInput = ""
+                            Task { await store.approveHostDeviceCode(code) }
+                        } label: {
+                            Text(tr("Approve", "批准入网", locale: store.locale))
+                                .font(.system(size: 12, weight: .semibold))
+                                .foregroundStyle(.black)
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 8)
+                                .background(RoundedRectangle(cornerRadius: 8).fill(CodaHerdrTheme.cyanWorking))
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(form.approveUserCodeInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    }
+                }
+
                 if !store.remoteMachines.isEmpty {
                     Divider().background(CodaHerdrTheme.borderHairline)
                     ForEach(store.remoteMachines) { dev in
-                        HStack(spacing: 8) {
-                            Circle()
-                                .fill(dev.isOnline ? CodaHerdrTheme.greenDiff : CodaHerdrTheme.textDim)
-                                .frame(width: 8, height: 8)
-                            Text(dev.name)
-                                .font(.system(size: 13, weight: .medium))
-                                .foregroundStyle(CodaHerdrTheme.textPrimary)
-                            Text(dev.platform)
-                                .font(.system(size: 11, design: .monospaced))
-                                .foregroundStyle(CodaHerdrTheme.textSecondary)
-                            Spacer()
-                            if let route = store.machineRouteModes[dev.id] {
-                                Text(route.rawValue)
-                                    .font(.system(size: 10, design: .monospaced))
-                                    .foregroundStyle(CodaHerdrTheme.cyanWorking)
-                            } else {
-                                Text(dev.isOnline ? tr("Online", "在线", locale: store.locale) : tr("Offline", "离线", locale: store.locale))
-                                    .font(.system(size: 11))
-                                    .foregroundStyle(dev.isOnline ? CodaHerdrTheme.greenDiff : CodaHerdrTheme.textDim)
+                        VStack(alignment: .leading, spacing: 6) {
+                            HStack(spacing: 8) {
+                                Circle()
+                                    .fill(dev.isOnline ? CodaHerdrTheme.greenDiff : CodaHerdrTheme.textDim)
+                                    .frame(width: 8, height: 8)
+                                Text(dev.name)
+                                    .font(.system(size: 13, weight: .medium))
+                                    .foregroundStyle(CodaHerdrTheme.textPrimary)
+                                Text(dev.platform)
+                                    .font(.system(size: 11, design: .monospaced))
+                                    .foregroundStyle(CodaHerdrTheme.textSecondary)
+                                Spacer()
+                                if let route = store.machineRouteModes[dev.id] {
+                                    Text(route.rawValue)
+                                        .font(.system(size: 10, design: .monospaced))
+                                        .foregroundStyle(CodaHerdrTheme.cyanWorking)
+                                } else {
+                                    Text(dev.isOnline ? tr("Online", "在线", locale: store.locale) : tr("Offline", "离线", locale: store.locale))
+                                        .font(.system(size: 11))
+                                        .foregroundStyle(dev.isOnline ? CodaHerdrTheme.greenDiff : CodaHerdrTheme.textDim)
+                                }
+
+                                Button {
+                                    if form.renamingDeviceId == dev.id {
+                                        form.renamingDeviceId = nil
+                                    } else {
+                                        form.renamingDeviceId = dev.id
+                                        form.renameDeviceInput = dev.name
+                                    }
+                                } label: {
+                                    Image(systemName: "pencil")
+                                        .font(.system(size: 11))
+                                        .foregroundStyle(CodaHerdrTheme.textSecondary)
+                                        .padding(5)
+                                        .background(RoundedRectangle(cornerRadius: 6).fill(CodaHerdrTheme.canvasBG))
+                                }
+                                .buttonStyle(.plain)
+
+                                Button(role: .destructive) {
+                                    Task { await store.deleteRemoteMachine(dev) }
+                                } label: {
+                                    Image(systemName: "trash")
+                                        .font(.system(size: 11))
+                                        .foregroundStyle(CodaHerdrTheme.redDiff)
+                                        .padding(5)
+                                        .background(RoundedRectangle(cornerRadius: 6).fill(CodaHerdrTheme.redDiff.opacity(0.12)))
+                                }
+                                .buttonStyle(.plain)
+                            }
+
+                            if form.renamingDeviceId == dev.id {
+                                HStack(spacing: 6) {
+                                    TextField(tr("New host name", "新主机名称", locale: store.locale), text: $form.renameDeviceInput)
+                                        .font(.system(size: 12))
+                                        .padding(.horizontal, 8)
+                                        .padding(.vertical, 6)
+                                        .background(RoundedRectangle(cornerRadius: 7).fill(CodaHerdrTheme.canvasBG))
+                                    Button(tr("Save", "保存", locale: store.locale)) {
+                                        let nextName = form.renameDeviceInput
+                                        form.renamingDeviceId = nil
+                                        Task { await store.renameRemoteMachine(dev, to: nextName) }
+                                    }
+                                    .font(.system(size: 11.5, weight: .semibold))
+                                    .foregroundStyle(.black)
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(RoundedRectangle(cornerRadius: 7).fill(CodaHerdrTheme.textPrimary))
+                                    .buttonStyle(.plain)
+                                }
                             }
                         }
                     }

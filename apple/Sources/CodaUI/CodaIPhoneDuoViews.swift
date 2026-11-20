@@ -666,18 +666,54 @@ public struct CodaDuoDirectoryPane: View {
                         .font(.system(size: 10, design: .monospaced))
                         .foregroundStyle(CodaHerdrTheme.cyanWorking)
                 }
+                if group.device.isOnline {
+                    Menu {
+                        Button("Claude Code") { store.launchAgent(agent: "claude", on: group.device, cwd: group.repos.first?.rootPath) }
+                        Button("Codex") { store.launchAgent(agent: "codex", on: group.device, cwd: group.repos.first?.rootPath) }
+                        Button("Gemini CLI") { store.launchAgent(agent: "gemini", on: group.device, cwd: group.repos.first?.rootPath) }
+                        Divider()
+                        Button("Shell") { store.launchAgent(agent: "shell", on: group.device, cwd: group.repos.first?.rootPath) }
+                    } label: {
+                        Image(systemName: "plus.circle.fill")
+                            .font(.system(size: 13))
+                            .foregroundStyle(CodaHerdrTheme.cyanWorking)
+                    }
+                }
             }
             ForEach(group.repos) { repo in
-                HStack(spacing: 8) {
-                    CodaWorkspaceAvatar(name: repo.repoName, size: 22)
-                    Text(repo.repoName)
-                        .font(.system(size: 12, weight: .medium))
-                        .foregroundStyle(CodaHerdrTheme.textPrimary)
-                    Spacer()
-                    if let b = repo.branches.first {
-                        Text("\(b.branch) +\(b.diffAdded)/-\(b.diffDeleted)")
-                            .font(.system(size: 10, design: .monospaced))
-                            .foregroundStyle(CodaHerdrTheme.greenDiff)
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 8) {
+                        CodaWorkspaceAvatar(name: repo.repoName, size: 22)
+                        Text(repo.repoName)
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundStyle(CodaHerdrTheme.textPrimary)
+                        Spacer()
+                        if group.device.isOnline {
+                            Menu {
+                                Button("Claude Code") { store.launchAgent(agent: "claude", on: group.device, cwd: repo.rootPath) }
+                                Button("Codex") { store.launchAgent(agent: "codex", on: group.device, cwd: repo.rootPath) }
+                                Button("Gemini CLI") { store.launchAgent(agent: "gemini", on: group.device, cwd: repo.rootPath) }
+                                Divider()
+                                Button("Shell") { store.launchAgent(agent: "shell", on: group.device, cwd: repo.rootPath) }
+                            } label: {
+                                Image(systemName: "plus")
+                                    .font(.system(size: 10, weight: .semibold))
+                                    .foregroundStyle(CodaHerdrTheme.textSecondary)
+                            }
+                        }
+                    }
+                    ForEach(repo.branches) { b in
+                        HStack(spacing: 6) {
+                            Text(b.branch)
+                                .font(.system(size: 10, design: .monospaced))
+                                .foregroundStyle(CodaHerdrTheme.textSecondary)
+                            Spacer()
+                            if b.diffAdded > 0 || b.diffDeleted > 0 {
+                                Text("+\(b.diffAdded)/-\(b.diffDeleted)")
+                                    .font(.system(size: 10, design: .monospaced))
+                                    .foregroundStyle(CodaHerdrTheme.greenDiff)
+                            }
+                        }
                     }
                 }
                 .padding(.horizontal, 8)
@@ -701,18 +737,38 @@ public struct CodaDuoDirectoryPane: View {
                 .font(.system(size: 13, weight: .semibold))
                 .foregroundStyle(CodaHerdrTheme.textPrimary)
 
-            Button {
-                store.settingsInitialFocusPairing = store.isSignedIn
-                store.showSettingsSheet = true
-            } label: {
-                Text(store.isSignedIn ? tr("Add machine", "添加主机", locale: store.locale) : tr("Open Settings", "打开设置", locale: store.locale))
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(.black)
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 6)
-                    .background(Capsule().fill(CodaHerdrTheme.textPrimary))
+            HStack(spacing: 8) {
+                if store.isSignedIn, let onlineHost = store.remoteMachines.first(where: { $0.isOnline }) {
+                    Menu {
+                        let defaultCwd = store.workspacesByDevice[onlineHost.id]?.first?.rootPath
+                        Button("Claude Code") { store.launchAgent(agent: "claude", on: onlineHost, cwd: defaultCwd) }
+                        Button("Codex") { store.launchAgent(agent: "codex", on: onlineHost, cwd: defaultCwd) }
+                        Button("Gemini CLI") { store.launchAgent(agent: "gemini", on: onlineHost, cwd: defaultCwd) }
+                        Divider()
+                        Button("Shell") { store.launchAgent(agent: "shell", on: onlineHost, cwd: defaultCwd) }
+                    } label: {
+                        Text(tr("New Terminal", "新建终端", locale: store.locale))
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(.black)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 6)
+                            .background(Capsule().fill(CodaHerdrTheme.cyanWorking))
+                    }
+                }
+
+                Button {
+                    store.settingsInitialFocusPairing = store.isSignedIn
+                    store.showSettingsSheet = true
+                } label: {
+                    Text(store.isSignedIn ? tr("Add machine", "添加主机", locale: store.locale) : tr("Open Settings", "打开设置", locale: store.locale))
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(.black)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 6)
+                        .background(Capsule().fill(CodaHerdrTheme.textPrimary))
+                }
+                .buttonStyle(.plain)
             }
-            .buttonStyle(.plain)
         }
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)

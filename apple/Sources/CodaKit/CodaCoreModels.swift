@@ -222,6 +222,14 @@ public struct CodaDeviceIdentity: Codable, Sendable, Equatable {
         UserDefaults.standard.removeObject(forKey: persistedDefaultsKey)
     }
 
+    public static func resetPersisted(defaultName: String) -> CodaDeviceIdentity {
+        CodaSecretStore.delete(account: secretStoreAccount)
+        UserDefaults.standard.removeObject(forKey: persistedDefaultsKey)
+        let fresh = generate(name: defaultName)
+        savePersisted(fresh)
+        return fresh
+    }
+
     public func sign(message: Data) throws -> String {
         guard let raw = Data(base64Encoded: ed25519SecretB64) else {
             throw CodaCryptoError.invalidKeyEncoding
@@ -244,6 +252,31 @@ public struct CodaDeviceIdentity: Codable, Sendable, Equatable {
             return false
         }
         return vk.isValidSignature(sigRaw, for: message)
+    }
+}
+
+public enum CodaAPIError: Error, LocalizedError, Sendable {
+    case httpError(statusCode: Int, message: String)
+    case invalidResponse
+
+    public var errorDescription: String? {
+        switch self {
+        case .httpError(_, let message): return message
+        case .invalidResponse: return "Unexpected server response"
+        }
+    }
+
+    public static func fromResponse(data: Data, response: URLResponse, fallback: String) -> CodaAPIError {
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let err = json["error"] as? String, !err.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return .httpError(statusCode: status, message: err)
+        }
+        if let txt = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !txt.isEmpty, txt.count < 240 {
+            return .httpError(statusCode: status, message: txt)
+        }
+        return .httpError(statusCode: status, message: status > 0 ? "\(fallback) (HTTP \(status))" : fallback)
     }
 }
 
@@ -359,27 +392,40 @@ private final class CodaFFILoader: @unchecked Sendable {
 
     private func candidateDylibPaths() -> [String] {
         var candidates: [String] = []
-        if let env = ProcessInfo.processInfo.environment["CODA_FFI_DYLIB_PATH"], !env.isEmpty {
-            candidates.append(env)
-        }
         if let execURL = Bundle.main.executableURL {
             let execDir = execURL.deletingLastPathComponent()
             candidates.append(execDir.appendingPathComponent("libcoda_apple_ffi.dylib").path)
             candidates.append(execDir.appendingPathComponent("../Frameworks/libcoda_apple_ffi.dylib").path)
         }
-        let cwd = FileManager.default.currentDirectoryPath
-        candidates.append("\(cwd)/target/release/libcoda_apple_ffi.dylib")
-        candidates.append("\(cwd)/../target/release/libcoda_apple_ffi.dylib")
-        candidates.append("\(cwd)/target/debug/libcoda_apple_ffi.dylib")
-        candidates.append("\(cwd)/../target/debug/libcoda_apple_ffi.dylib")
-        // Derive workspace root relative to source file if executed inside SwiftPM test runner.
-        let sourceRoot = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent() // CodaKit
-            .deletingLastPathComponent() // Sources
-            .deletingLastPathComponent() // apple
-            .deletingLastPathComponent() // repo root
-        candidates.append(sourceRoot.appendingPathComponent("target/release/libcoda_apple_ffi.dylib").path)
-        candidates.append(sourceRoot.appendingPathComponent("target/debug/libcoda_apple_ffi.dylib").path)
+        // Only allow developer / test-runner dylib search paths outside signed production .app bundles.
+        #if DEBUG
+        let allowDevSearch = true
+        #else
+        let allowDevSearch = Bundle.main.bundleURL.pathExtension != "app"
+        #endif
+        if allowDevSearch {
+            if let env = ProcessInfo.processInfo.environment["CODA_FFI_DYLIB_PATH"], !env.isEmpty {
+                candidates.append(env)
+            }
+            if let execURL = Bundle.main.executableURL {
+                // Locate Cargo target/ relative to SwiftPM .build/<cfg>/ binary without leaking #filePath in Release.
+                var dir = execURL.deletingLastPathComponent()
+                for _ in 0..<5 {
+                    candidates.append(dir.appendingPathComponent("target/release/libcoda_apple_ffi.dylib").path)
+                    candidates.append(dir.appendingPathComponent("target/debug/libcoda_apple_ffi.dylib").path)
+                    dir = dir.deletingLastPathComponent()
+                }
+            }
+            #if DEBUG
+            let sourceRoot = URL(fileURLWithPath: #filePath)
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+            candidates.append(sourceRoot.appendingPathComponent("target/release/libcoda_apple_ffi.dylib").path)
+            candidates.append(sourceRoot.appendingPathComponent("target/debug/libcoda_apple_ffi.dylib").path)
+            #endif
+        }
         return candidates
     }
 }
