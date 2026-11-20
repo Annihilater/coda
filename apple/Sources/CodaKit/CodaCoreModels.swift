@@ -350,6 +350,127 @@ public struct CodaHostHealthSnapshot: Codable, Sendable, Equatable {
     }
 }
 
+public struct CodaRemoteFileEntry: Codable, Sendable, Equatable, Identifiable {
+    public var id: String { relPath }
+    public let name: String
+    public let relPath: String
+    public let isDir: Bool
+    public let sizeBytes: UInt64
+
+    enum CodingKeys: String, CodingKey {
+        case name
+        case relPath = "rel_path"
+        case isDir = "is_dir"
+        case sizeBytes = "size_bytes"
+    }
+
+    public var formattedSize: String {
+        if isDir { return "" }
+        if sizeBytes < 1024 { return "\(sizeBytes) B" }
+        if sizeBytes < 1024 * 1024 { return String(format: "%.1f KB", Double(sizeBytes) / 1024.0) }
+        return String(format: "%.1f MB", Double(sizeBytes) / (1024.0 * 1024.0))
+    }
+}
+
+public struct CodaDirectoryListingResult: Sendable, Equatable {
+    public let rootPath: String
+    public let subPath: String
+    public let entries: [CodaRemoteFileEntry]
+    public let error: String?
+
+    public init(rootPath: String, subPath: String, entries: [CodaRemoteFileEntry], error: String?) {
+        self.rootPath = rootPath
+        self.subPath = subPath
+        self.entries = entries
+        self.error = error
+    }
+}
+
+public struct CodaFilePreviewResult: Sendable, Equatable {
+    public let path: String
+    public let content: String
+    public let error: String?
+
+    public init(path: String, content: String, error: String?) {
+        self.path = path
+        self.content = content
+        self.error = error
+    }
+}
+
+public struct CodaPortPreviewResult: Sendable, Equatable {
+    public let statusCode: Int
+    public let contentType: String
+    public let bodyText: String
+
+    public init(statusCode: Int, contentType: String, bodyText: String) {
+        self.statusCode = statusCode
+        self.contentType = contentType
+        self.bodyText = bodyText
+    }
+}
+
+public enum CodaTerminalTranscriptHelper {
+    public static let quickPreviewPorts: [Int] = [3000, 5173, 8000, 8080, 4321]
+
+    public static func findMatchingLineIndices(in lines: [String], query: String) -> [Int] {
+        let needle = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !needle.isEmpty else { return [] }
+        var out: [Int] = []
+        for (idx, line) in lines.enumerated() where line.lowercased().contains(needle) {
+            out.append(idx)
+            if out.count >= 2000 { break }
+        }
+        return out
+    }
+
+    public static func buildMarkdown(
+        title: String,
+        cwd: String,
+        hostName: String,
+        lines: [String],
+        exportedISO: String = ISO8601DateFormatter().string(from: Date())
+    ) -> String {
+        var end = lines.count
+        while end > 0 && lines[end - 1].trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            end -= 1
+        }
+        let body = lines.prefix(end).map { line in
+            var s = line
+            while s.last?.isWhitespace == true { s.removeLast() }
+            return s
+        }.joined(separator: "\n")
+
+        return """
+        # Coda Session Transcript — \(title.isEmpty ? "Terminal" : title)
+
+        - **Exported**: `\(exportedISO)`
+        - **Host**: `\(hostName)`
+        - **Working Directory**: `\(cwd.isEmpty ? "~" : cwd)`
+        - **Lines**: `\(end)`
+
+        ```text
+        \(body)
+        ```
+        """
+    }
+
+    public static func parentSubPath(_ subPath: String) -> String {
+        let clean = subPath.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        guard !clean.isEmpty, let slash = clean.lastIndex(of: "/") else { return "" }
+        return String(clean[..<slash])
+    }
+
+    public static func joinRootAndRel(rootPath: String, relPath: String) -> String {
+        var root = rootPath
+        while root.count > 1 && root.hasSuffix("/") { root.removeLast() }
+        if root.isEmpty { root = "/" }
+        let rel = relPath.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        if rel.isEmpty { return root }
+        return root == "/" ? "/\(rel)" : "\(root)/\(rel)"
+    }
+}
+
 public struct CodaEncryptedPayload: Codable, Sendable {
     public let seq: UInt64
     public let compressed: Bool

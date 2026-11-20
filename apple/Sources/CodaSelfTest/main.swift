@@ -1036,6 +1036,23 @@ struct CodaSelfTest {
                      "Unexpected compactSummary: \(healthSnap.compactSummary)")
         precondition(CodaHostHealthSnapshot.quickTerminalCommands.contains("/compact"))
         precondition(CodaHostHealthSnapshot.quickTerminalCommands.contains("git status"))
+
+        // 8k. v0.8.0 Apple parity helpers: terminal search, Markdown export & remote file paths
+        let hits = CodaTerminalTranscriptHelper.findMatchingLineIndices(
+            in: ["$ cargo test", "ERROR: failed", "test error ok", ""],
+            query: "error"
+        )
+        precondition(hits == [1, 2], "Unexpected search hits: \(hits)")
+        let md = CodaTerminalTranscriptHelper.buildMarkdown(
+            title: "coda · agy",
+            cwd: "/opt/coda",
+            hostName: "linux-box",
+            lines: ["$ cargo test", "ok", "   "],
+            exportedISO: "2026-11-21T00:00:00Z"
+        )
+        precondition(md.contains("# Coda Session Transcript — coda · agy") && md.contains("$ cargo test\nok\n```"))
+        precondition(CodaTerminalTranscriptHelper.parentSubPath("crates/coda-daemon/src") == "crates/coda-daemon")
+        precondition(CodaTerminalTranscriptHelper.joinRootAndRel(rootPath: "/opt/coda/", relPath: "/src/lib.rs") == "/opt/coda/src/lib.rs")
     }
 
     private static func readFramed(conn: NWConnection, completion: @escaping @Sendable ([String: Any]?) -> Void) {

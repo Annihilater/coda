@@ -67,6 +67,18 @@ public final class CodaWorkspaceStore: ObservableObject {
     @Published public var showComposeSheet: Bool = false
     @Published public var showPaneMinimapSheet: Bool = false
     @Published public var showGitDiffSheet: Bool = false
+    @Published public var showRemoteFilesSheet: Bool = false
+    @Published public var inspectorSheetMode: CodaInspectorSheetMode = .files
+    @Published public var remoteFileRootPath: String = ""
+    @Published public var remoteFileSubPath: String = ""
+    @Published public var remoteFileEntries: [CodaRemoteFileEntry] = []
+    @Published public var remoteFileSelectedRel: String? = nil
+    @Published public var remoteFilePreviewText: String = ""
+    @Published public var remoteFileLoading: Bool = false
+    @Published public var remoteFileError: String? = nil
+    @Published public var portPreviewResult: CodaPortPreviewResult? = nil
+    @Published public var portPreviewLoading: Bool = false
+    @Published public var portPreviewError: String? = nil
     @Published public var searchQuery: String = ""
     @Published public var expandedWorkspaces: Set<String> = []
 
@@ -1206,6 +1218,13 @@ public final class CodaWorkspaceStore: ObservableObject {
         secondarySessionID = nil
         gitDiffResult = nil
         gitDiffLoading = false
+        showRemoteFilesSheet = false
+        remoteFileEntries = []
+        remoteFileSelectedRel = nil
+        remoteFilePreviewText = ""
+        remoteFileError = nil
+        portPreviewResult = nil
+        portPreviewError = nil
         composeText = ""
         activeToast = nil
         voiceConfigSyncMessage = nil
@@ -2324,6 +2343,148 @@ public final class CodaWorkspaceStore: ObservableObject {
 
     public func loadGitDiffForSelected(presentModal: Bool = true) {
         loadGitDiff(for: selectedSession, presentModal: presentModal)
+    }
+
+    public func sessionMarkdownTranscript(for session: CodaAgentSession) -> String {
+        let styled = terminalLinesBySession[session.id] ?? []
+        let plainLines: [String]
+        if !styled.isEmpty {
+            plainLines = styled.map { $0.spans.map(\.text).joined() }
+        } else if let raw = rawScreenTextBySession[session.id], !raw.isEmpty {
+            plainLines = raw.components(separatedBy: "\n")
+        } else {
+            plainLines = session.screenPreview.components(separatedBy: "\n")
+        }
+        return CodaTerminalTranscriptHelper.buildMarkdown(
+            title: session.taskTitle,
+            cwd: session.cwd,
+            hostName: session.hostName,
+            lines: plainLines
+        )
+    }
+
+    public func openRemoteInspector(
+        for targetSession: CodaAgentSession?,
+        mode: CodaInspectorSheetMode = .files
+    ) {
+        guard let session = targetSession ?? selectedSession else { return }
+        activeSheetSessionID = session.id
+        inspectorSheetMode = mode
+        showRemoteFilesSheet = true
+        if mode == .files {
+            let root = session.cwd.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "." : session.cwd
+            remoteFileRootPath = root
+            remoteFileSelectedRel = nil
+            remoteFilePreviewText = ""
+            browseRemoteSubPath("", for: session)
+        }
+    }
+
+    public func browseRemoteSubPath(_ subPath: String, for session: CodaAgentSession) {
+        guard let client = networkClient,
+              let devId = session.deviceId,
+              let dev = remoteMachines.first(where: { $0.id == devId }),
+              let clientDevId = localIdentity.deviceId else { return }
+        let epoch = workspaceEpoch
+        let root = remoteFileRootPath.isEmpty ? (session.cwd.isEmpty ? "." : session.cwd) : remoteFileRootPath
+        remoteFileRootPath = root
+        remoteFileSubPath = subPath
+        remoteFileSelectedRel = nil
+        remoteFilePreviewText = ""
+        remoteFileError = nil
+        remoteFileLoading = true
+        Task { [weak self] in
+            guard let self else { return }
+            defer {
+                if self.workspaceEpoch == epoch { self.remoteFileLoading = false }
+            }
+            do {
+                let res = try await client.listRemoteDirectory(
+                    on: dev,
+                    clientIdentity: self.localIdentity,
+                    clientDeviceId: clientDevId,
+                    rootPath: root,
+                    subPath: subPath
+                )
+                guard self.workspaceEpoch == epoch else { return }
+                self.remoteFileRootPath = res.rootPath
+                self.remoteFileSubPath = res.subPath
+                self.remoteFileEntries = res.entries
+                self.remoteFileError = res.error
+            } catch {
+                if self.workspaceEpoch == epoch {
+                    self.remoteFileError = error.localizedDescription
+                }
+            }
+        }
+    }
+
+    public func previewRemoteFile(_ relPath: String, for session: CodaAgentSession) {
+        guard let client = networkClient,
+              let devId = session.deviceId,
+              let dev = remoteMachines.first(where: { $0.id == devId }),
+              let clientDevId = localIdentity.deviceId else { return }
+        let epoch = workspaceEpoch
+        let fullPath = CodaTerminalTranscriptHelper.joinRootAndRel(rootPath: remoteFileRootPath, relPath: relPath)
+        remoteFileSelectedRel = relPath
+        remoteFilePreviewText = ""
+        remoteFileError = nil
+        remoteFileLoading = true
+        Task { [weak self] in
+            guard let self else { return }
+            defer {
+                if self.workspaceEpoch == epoch { self.remoteFileLoading = false }
+            }
+            do {
+                let res = try await client.readRemoteFilePreview(
+                    on: dev,
+                    clientIdentity: self.localIdentity,
+                    clientDeviceId: clientDevId,
+                    path: fullPath
+                )
+                guard self.workspaceEpoch == epoch else { return }
+                if let err = res.error {
+                    self.remoteFileError = err
+                } else {
+                    self.remoteFilePreviewText = res.content
+                }
+            } catch {
+                if self.workspaceEpoch == epoch {
+                    self.remoteFileError = error.localizedDescription
+                }
+            }
+        }
+    }
+
+    public func loadRemotePortPreview(port: Int, path: String, for session: CodaAgentSession) {
+        guard let client = networkClient,
+              let devId = session.deviceId,
+              let dev = remoteMachines.first(where: { $0.id == devId }),
+              let clientDevId = localIdentity.deviceId else { return }
+        let epoch = workspaceEpoch
+        portPreviewError = nil
+        portPreviewLoading = true
+        Task { [weak self] in
+            guard let self else { return }
+            defer {
+                if self.workspaceEpoch == epoch { self.portPreviewLoading = false }
+            }
+            do {
+                let res = try await client.fetchLocalPortPreview(
+                    on: dev,
+                    clientIdentity: self.localIdentity,
+                    clientDeviceId: clientDevId,
+                    port: port,
+                    path: path
+                )
+                guard self.workspaceEpoch == epoch else { return }
+                self.portPreviewResult = res
+            } catch {
+                if self.workspaceEpoch == epoch {
+                    self.portPreviewError = error.localizedDescription
+                }
+            }
+        }
     }
 }
 

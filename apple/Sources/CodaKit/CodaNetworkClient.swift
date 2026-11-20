@@ -2756,4 +2756,129 @@ public actor CodaNetworkClient {
         let decoded = try JSONDecoder().decode(Resp.self, from: respData)
         return decoded.config
     }
+
+    public func listRemoteDirectory(
+        on device: CodaRemoteDevice,
+        clientIdentity: CodaDeviceIdentity,
+        clientDeviceId: UUID,
+        rootPath: String,
+        subPath: String = ""
+    ) async throws -> CodaDirectoryListingResult {
+        let reqData = try JSONSerialization.data(withJSONObject: [
+            "op": "list_directory",
+            "req_id": nextRequestID(),
+            "root_path": rootPath,
+            "sub_path": subPath,
+        ])
+        let respData = try await sendPeerMessageData(
+            reqData,
+            to: device,
+            clientIdentity: clientIdentity,
+            clientDeviceId: clientDeviceId,
+            lane: "bulk_p1"
+        )
+        struct Resp: Decodable {
+            let rootPath: String
+            let subPath: String
+            let entries: [CodaRemoteFileEntry]
+            let error: String?
+            enum CodingKeys: String, CodingKey {
+                case rootPath = "root_path"
+                case subPath = "sub_path"
+                case entries
+                case error
+            }
+        }
+        let decoded = try JSONDecoder().decode(Resp.self, from: respData)
+        return CodaDirectoryListingResult(
+            rootPath: decoded.rootPath,
+            subPath: decoded.subPath,
+            entries: decoded.entries,
+            error: decoded.error
+        )
+    }
+
+    public func readRemoteFilePreview(
+        on device: CodaRemoteDevice,
+        clientIdentity: CodaDeviceIdentity,
+        clientDeviceId: UUID,
+        path: String,
+        maxBytes: Int = 65536
+    ) async throws -> CodaFilePreviewResult {
+        let reqData = try JSONSerialization.data(withJSONObject: [
+            "op": "read_file_preview",
+            "req_id": nextRequestID(),
+            "path": path,
+            "max_bytes": maxBytes,
+        ])
+        let respData = try await sendPeerMessageData(
+            reqData,
+            to: device,
+            clientIdentity: clientIdentity,
+            clientDeviceId: clientDeviceId,
+            lane: "bulk_p1"
+        )
+        struct Resp: Decodable {
+            let path: String
+            let content: String
+            let error: String?
+        }
+        let decoded = try JSONDecoder().decode(Resp.self, from: respData)
+        return CodaFilePreviewResult(path: decoded.path, content: decoded.content, error: decoded.error)
+    }
+
+    public func fetchLocalPortPreview(
+        on device: CodaRemoteDevice,
+        clientIdentity: CodaDeviceIdentity,
+        clientDeviceId: UUID,
+        port: Int,
+        path: String = "/"
+    ) async throws -> CodaPortPreviewResult {
+        let clampedPort = max(1024, min(65535, port))
+        let cleanPath = path.hasPrefix("/") ? path : "/\(path)"
+        let reqData = try JSONSerialization.data(withJSONObject: [
+            "op": "http_local_preview_request",
+            "req_id": nextRequestID(),
+            "port": clampedPort,
+            "path": cleanPath,
+        ])
+        let respData = try await sendPeerMessageData(
+            reqData,
+            to: device,
+            clientIdentity: clientIdentity,
+            clientDeviceId: clientDeviceId,
+            lane: "bulk_p1"
+        )
+        struct Resp: Decodable {
+            let statusCode: Int
+            let contentType: String
+            let bodyB64: String
+            enum CodingKeys: String, CodingKey {
+                case statusCode = "status_code"
+                case contentType = "content_type"
+                case bodyB64 = "body_b64"
+            }
+        }
+        let decoded = try JSONDecoder().decode(Resp.self, from: respData)
+        let rawBytes = Data(base64Encoded: decoded.bodyB64) ?? Data()
+        let ctLower = decoded.contentType.lowercased()
+        let text: String
+        if ctLower.hasPrefix("image/") || ctLower.hasPrefix("audio/") || ctLower.hasPrefix("video/") {
+            text = "(Binary payload: \(rawBytes.count) bytes, Content-Type: \(decoded.contentType))"
+        } else {
+            let utf8 = String(decoding: rawBytes, as: UTF8.self)
+            if ctLower.contains("json"),
+               let jsonObj = try? JSONSerialization.jsonObject(with: rawBytes),
+               let pretty = try? JSONSerialization.data(withJSONObject: jsonObj, options: [.prettyPrinted, .sortedKeys]) {
+                text = String(decoding: pretty, as: UTF8.self)
+            } else {
+                text = utf8.count > 65536 ? String(utf8.prefix(65536)) + "\n… [truncated at 64 KB]" : utf8
+            }
+        }
+        return CodaPortPreviewResult(
+            statusCode: decoded.statusCode,
+            contentType: decoded.contentType,
+            bodyText: text
+        )
+    }
 }

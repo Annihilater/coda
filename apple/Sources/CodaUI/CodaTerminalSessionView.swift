@@ -9,6 +9,9 @@ import UniformTypeIdentifiers
 private final class TerminalViewportLocalState: ObservableObject {
     @Published var directInputBuffer: String = ""
     @Published var showDirectInputBar: Bool = false
+    @Published var showSearchBar: Bool = false
+    @Published var searchQuery: String = ""
+    @Published var searchMatchIndex: Int = 0
     @Published var baseFontScale: CGFloat = 1.0
     @Published var atBottom: Bool = true
     var lastHandledRevision: UInt64 = 0
@@ -64,6 +67,12 @@ public struct CodaTerminalSessionView: View {
 
             Divider()
                 .background(CodaHerdrTheme.borderHairline)
+
+            if local.showSearchBar {
+                terminalSearchBar
+                    .padding(.horizontal, 12)
+                    .padding(.top, 6)
+            }
 
             if session.state == .needsYou {
                 blockedActionBanner
@@ -143,6 +152,12 @@ public struct CodaTerminalSessionView: View {
             set: { if !isSecondaryLeaf { store.showGitDiffSheet = $0 } }
         )) {
             CodaGitDiffSheet(store: store, session: store.activeSheetSession ?? session)
+        }
+        .sheet(isPresented: Binding(
+            get: { !isSecondaryLeaf && store.showRemoteFilesSheet },
+            set: { if !isSecondaryLeaf { store.showRemoteFilesSheet = $0 } }
+        )) {
+            CodaRemoteFilesSheet(store: store, session: store.activeSheetSession ?? session)
         }
     }
 
@@ -299,6 +314,30 @@ public struct CodaTerminalSessionView: View {
 
                 Menu {
                     Button {
+                        withAnimation(.snappy(duration: 0.16)) {
+                            local.showSearchBar.toggle()
+                        }
+                    } label: {
+                        Label(tr("Find in Terminal", "终端内搜索", locale: store.locale), systemImage: "magnifyingglass")
+                    }
+                    Button {
+                        store.openRemoteInspector(for: session, mode: .files)
+                    } label: {
+                        Label(tr("Workspace Files (E2EE)", "工作区文件浏览", locale: store.locale), systemImage: "folder")
+                    }
+                    Button {
+                        store.openRemoteInspector(for: session, mode: .portPreview)
+                    } label: {
+                        Label(tr("Localhost Port Preview", "本地端口加密预览", locale: store.locale), systemImage: "globe")
+                    }
+                    ShareLink(
+                        item: store.sessionMarkdownTranscript(for: session),
+                        subject: Text("Coda Session — \(session.taskTitle)")
+                    ) {
+                        Label(tr("Export Session (.md)", "导出会话日志 (.md)", locale: store.locale), systemImage: "square.and.arrow.up")
+                    }
+                    Divider()
+                    Button {
                         Task { await store.refreshTerminalScreen(for: session, forceSnapshot: true) }
                     } label: {
                         Label(tr("Refresh Screen", "刷新屏幕", locale: store.locale), systemImage: "arrow.clockwise")
@@ -398,9 +437,89 @@ public struct CodaTerminalSessionView: View {
 
     // MARK: - Styled ANSI / Git Diff Terminal Scrollback
 
+    private var currentSearchMatchIndices: [Int] {
+        guard local.showSearchBar else { return [] }
+        let lines = store.terminalLinesBySession[session.id] ?? []
+        let plain = lines.map { $0.spans.map(\.text).joined() }
+        return CodaTerminalTranscriptHelper.findMatchingLineIndices(in: plain, query: local.searchQuery)
+    }
+
+    private var terminalSearchBar: some View {
+        let matches = currentSearchMatchIndices
+        let activeOrd = matches.isEmpty ? 0 : (local.searchMatchIndex % matches.count) + 1
+        return HStack(spacing: 8) {
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 12))
+                .foregroundStyle(CodaHerdrTheme.textSecondary)
+
+            TextField(
+                tr("Find in scrollback…", "在终端滚动缓存中搜索…", locale: store.locale),
+                text: $local.searchQuery
+            )
+            .font(.system(size: 12.5, design: .monospaced))
+            .foregroundStyle(CodaHerdrTheme.textPrimary)
+            .codaNoAutocapAndSpelling()
+            .onChange(of: local.searchQuery) { _, _ in
+                local.searchMatchIndex = 0
+            }
+
+            Text("\(activeOrd)/\(matches.count)")
+                .font(.system(size: 11, design: .monospaced))
+                .foregroundStyle(CodaHerdrTheme.textDim)
+
+            Button {
+                if !matches.isEmpty {
+                    local.searchMatchIndex = (local.searchMatchIndex + matches.count - 1) % matches.count
+                }
+            } label: {
+                Image(systemName: "chevron.up")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(CodaHerdrTheme.textPrimary)
+                    .padding(5)
+            }
+            .buttonStyle(.plain)
+
+            Button {
+                if !matches.isEmpty {
+                    local.searchMatchIndex = (local.searchMatchIndex + 1) % matches.count
+                }
+            } label: {
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(CodaHerdrTheme.textPrimary)
+                    .padding(5)
+            }
+            .buttonStyle(.plain)
+
+            Button {
+                withAnimation(.snappy(duration: 0.16)) {
+                    local.showSearchBar = false
+                }
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(CodaHerdrTheme.textSecondary)
+                    .padding(5)
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .fill(CodaHerdrTheme.elevatedBG)
+                .overlay(RoundedRectangle(cornerRadius: 9, style: .continuous).strokeBorder(CodaHerdrTheme.borderHairline, lineWidth: 1))
+        )
+    }
+
     private var terminalScrollViewport: some View {
         let lines = store.terminalLinesBySession[session.id] ?? []
         let renderRevision = store.terminalRenderRevisionBySession[session.id] ?? 0
+        let matchIndices = currentSearchMatchIndices
+        let matchSet = Set(matchIndices)
+        let activeMatchLineIdx: Int? = matchIndices.isEmpty
+            ? nil
+            : matchIndices[local.searchMatchIndex % matchIndices.count]
 
         return ScrollViewReader { proxy in
             ScrollView(.vertical, showsIndicators: true) {
@@ -423,9 +542,13 @@ public struct CodaTerminalSessionView: View {
                         }
                         .padding(14)
                     } else {
-                        ForEach(lines) { line in
-                            styledLineRow(line)
-                                .id(line.id)
+                        ForEach(Array(lines.enumerated()), id: \.element.id) { idx, line in
+                            styledLineRow(
+                                line,
+                                isSearchHit: matchSet.contains(idx),
+                                isActiveMatch: activeMatchLineIdx == idx
+                            )
+                            .id(line.id)
                         }
                     }
 
@@ -468,6 +591,22 @@ public struct CodaTerminalSessionView: View {
                     proxy.scrollTo("terminal_bottom_anchor", anchor: .bottom)
                 }
             }
+            .onChange(of: local.searchMatchIndex) { _, _ in
+                if let targetIdx = activeMatchLineIdx, targetIdx < lines.count {
+                    local.atBottom = false
+                    withAnimation(.easeOut(duration: 0.15)) {
+                        proxy.scrollTo(lines[targetIdx].id, anchor: .center)
+                    }
+                }
+            }
+            .onChange(of: local.searchQuery) { _, _ in
+                if let firstIdx = matchIndices.first, firstIdx < lines.count {
+                    local.atBottom = false
+                    withAnimation(.easeOut(duration: 0.15)) {
+                        proxy.scrollTo(lines[firstIdx].id, anchor: .center)
+                    }
+                }
+            }
             .onAppear {
                 local.atBottom = true
                 local.lastHandledRevision = renderRevision
@@ -505,14 +644,24 @@ public struct CodaTerminalSessionView: View {
         }
     }
 
-    private func styledLineRow(_ line: GhosttyStyledLine) -> some View {
+    private func styledLineRow(
+        _ line: GhosttyStyledLine,
+        isSearchHit: Bool = false,
+        isActiveMatch: Bool = false
+    ) -> some View {
         let rowBG: Color
-        switch line.kind {
-        case .diffAdded: rowBG = CodaHerdrTheme.greenDiff.opacity(0.11)
-        case .diffRemoved: rowBG = CodaHerdrTheme.redDiff.opacity(0.11)
-        case .diffHunk: rowBG = CodaHerdrTheme.cyanWorking.opacity(0.08)
-        case .promptChoice: rowBG = CodaHerdrTheme.elevatedBG.opacity(0.75)
-        case .normal: rowBG = .clear
+        if isActiveMatch {
+            rowBG = CodaHerdrTheme.amberNeedsYou.opacity(0.36)
+        } else if isSearchHit {
+            rowBG = CodaHerdrTheme.amberNeedsYou.opacity(0.18)
+        } else {
+            switch line.kind {
+            case .diffAdded: rowBG = CodaHerdrTheme.greenDiff.opacity(0.11)
+            case .diffRemoved: rowBG = CodaHerdrTheme.redDiff.opacity(0.11)
+            case .diffHunk: rowBG = CodaHerdrTheme.cyanWorking.opacity(0.08)
+            case .promptChoice: rowBG = CodaHerdrTheme.elevatedBG.opacity(0.75)
+            case .normal: rowBG = .clear
+            }
         }
 
         return Text(buildAttributedLine(line))
