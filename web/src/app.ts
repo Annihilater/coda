@@ -49,6 +49,7 @@ import {
   TerminalNotificationTracker,
   dispatchBrowserNotification,
   getBrowserNotificationPermission,
+  isNeedsYouState,
   requestBrowserNotificationPermission,
 } from "./notify";
 import { SmartPathBackoffPolicy, collectDirectWsCandidates } from "./smart_path";
@@ -82,7 +83,9 @@ if (typeof window !== "undefined" && typeof document !== "undefined") {
   }
 }
 
-const MAX_UPLOAD_BYTES = 8 * 1024 * 1024;
+// V3-21: Browser sends `compressed: false` so raw bytes expand by (4/3)^2 (~1.78x) via
+// upload base64 + E2EE ciphertext base64; 4 MiB keeps wire frames safely under MAX_WIRE_FRAME_BYTES (8 MiB).
+const MAX_UPLOAD_BYTES = 4 * 1024 * 1024;
 
 export class CodaTerminalWebApp {
   private token: string | null = readSessionOrLegacyToken();
@@ -145,7 +148,9 @@ export class CodaTerminalWebApp {
   private directWsPeerId: string | null = null;
   private activeTransportMode: TransportMode = "relay_ws";
   private negotiatingPeerId: string | null = null;
+  private directProbeGeneration = 0;
   private relayGeneration = 0;
+  private uploadCounter = 0;
   private relayKeepAliveTimer: ReturnType<typeof setInterval> | null = null;
   private relayReconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private eventsReconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -156,6 +161,8 @@ export class CodaTerminalWebApp {
   private notificationsEnabled: boolean = readLocalPref("coda_notify_enabled", "0") === "1";
   private notifyTracker = new TerminalNotificationTracker(20_000);
   private termPaintRafId: number | null = null;
+  private pendingSelectionCatchup = false;
+  private lastRenderedTermKey = "";
   private termResizeObserver: ResizeObserver | null = null;
   private resizeDebounceTimer: ReturnType<typeof setTimeout> | null = null;
   private e2eeSessions = new Map<string, { session: BrowserE2EESession; auth: RelaySessionAuth; confirmed: boolean }>();
@@ -319,7 +326,14 @@ export class CodaTerminalWebApp {
     });
 
     window.addEventListener("keydown", (e) => {
-      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+      // V3-24: Only intercept ⌘K / Ctrl+K on home & console (not login/register/activate forms),
+      // and never double-handle events already consumed by `#term-box` (e.g. Ctrl+K kill-line).
+      if (
+        !e.defaultPrevented &&
+        (e.metaKey || e.ctrlKey) &&
+        e.key.toLowerCase() === "k" &&
+        (this.route === "home" || this.route === "console")
+      ) {
         e.preventDefault();
         this.showCmdPalette = !this.showCmdPalette;
         if (this.showCmdPalette) {
@@ -335,6 +349,26 @@ export class CodaTerminalWebApp {
       } else if (e.key === "Escape" && this.showCmdPalette) {
         this.showCmdPalette = false;
         this.render();
+      }
+    });
+
+    // V3-23: Schedule catch-up paint as soon as user clears/collapses a text selection that deferred row patches.
+    document.addEventListener("selectionchange", () => {
+      if (!this.pendingSelectionCatchup || this.route !== "console") return;
+      const sel = window.getSelection();
+      const boxEl = document.getElementById("term-box");
+      const screenEl = document.getElementById("term-screen-output");
+      const stillSelectingInside = Boolean(
+        sel &&
+          !sel.isCollapsed &&
+          sel.rangeCount > 0 &&
+          (boxEl?.contains(sel.anchorNode) ||
+            boxEl?.contains(sel.focusNode) ||
+            (screenEl && typeof sel.containsNode === "function" && sel.containsNode(screenEl, true)))
+      );
+      if (!stillSelectingInside) {
+        this.pendingSelectionCatchup = false;
+        this.scheduleTerminalPaint();
       }
     });
 
@@ -466,8 +500,16 @@ export class CodaTerminalWebApp {
       headers,
       body: body ? JSON.stringify(body) : undefined,
     });
-    const data = await resp.json();
-    if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+    const rawText = await resp.text();
+    let data: any = {};
+    if (rawText) {
+      try {
+        data = JSON.parse(rawText);
+      } catch {
+        data = { error: rawText.slice(0, 180) };
+      }
+    }
+    if (!resp.ok) throw new Error(data?.error || `HTTP ${resp.status}`);
     return data;
   }
 
@@ -503,16 +545,57 @@ export class CodaTerminalWebApp {
   }
 
   private isNeedsYouStatus(status: HerdrTerminal["status"] | null | undefined): boolean {
-    const s = String(status?.state || "").trim().toLowerCase();
-    return (
-      s === "needs_you" ||
-      s === "needsyou" ||
-      s === "needs-you" ||
-      s === "blocked" ||
-      s === "waiting" ||
-      s === "permission" ||
-      s === "attention"
-    );
+    return isNeedsYouState(status?.state);
+  }
+
+  private renderConsoleNoticeHtml(): string {
+    if (!this.consoleNotice) return "";
+    return `<div style="margin-bottom:10px;padding:8px 10px;border-radius:8px;font-size:12px;border:1px solid ${
+      this.consoleNotice.kind === "err" ? "var(--rose-bd, rgba(244,63,94,0.35))" : "var(--emerald-bd)"
+    };background:${
+      this.consoleNotice.kind === "err" ? "rgba(244,63,94,0.1)" : "var(--emerald-bg)"
+    };color:${this.consoleNotice.kind === "err" ? "var(--rose)" : "var(--emerald)"};">${this.escapeHtml(
+      this.consoleNotice.text
+    )}</div>`;
+  }
+
+  private updateConsoleNoticeInPlace(): boolean {
+    const slot = typeof document !== "undefined" ? document.getElementById("console-notice-slot") : null;
+    if (!slot) return false;
+    slot.innerHTML = this.renderConsoleNoticeHtml();
+    return true;
+  }
+
+  private renderDraftPreviewHtml(): string {
+    if (!this.draftInput) return "";
+    return `<div style="margin-top:14px;border-top:1px solid var(--border-primary);padding-top:6px;border-bottom:1px solid var(--border-primary);padding-bottom:6px;">&gt; ${this.formatCursorDraft(
+      this.draftInput
+    )}</div>`;
+  }
+
+  private updateDraftPreviewInPlace(): boolean {
+    const slot = typeof document !== "undefined" ? document.getElementById("term-draft-slot") : null;
+    if (!slot) return false;
+    slot.innerHTML = this.renderDraftPreviewHtml();
+    return true;
+  }
+
+  private syncVoiceButtonInPlace() {
+    if (typeof document === "undefined") return;
+    const micLabel = this.isTranscribingVoice
+      ? this.tr("Transcribing…", "转写中…")
+      : this.isRecordingVoice
+        ? this.tr("Stop", "停止")
+        : "";
+    const desktopBtn = document.getElementById("btn-voice-mic-desktop");
+    if (desktopBtn) {
+      desktopBtn.classList.toggle("is-recording", this.isRecordingVoice);
+      desktopBtn.innerHTML = `${svgIcon("mic", 14)}${micLabel ? ` <span>${this.escapeHtml(micLabel)}</span>` : ""}`;
+    }
+    const mobileBtn = document.getElementById("btn-voice-mic");
+    if (mobileBtn) {
+      mobileBtn.classList.toggle("is-recording", this.isRecordingVoice);
+    }
   }
 
   private syncNeedsYouBarInPlace(term: HerdrTerminal | undefined) {
@@ -547,23 +630,40 @@ export class CodaTerminalWebApp {
     const boxEl = document.getElementById("term-box");
     if (screenEl && vt && this.vtStreamActive.has(key)) {
       // Preserve user text selection inside the terminal viewport during live output:
-      // row-level dirty-diff skips selected rows while keeping non-selected rows streaming at 60fps.
+      // row-level dirty-diff skips selected rows (including partial-outside selections) while keeping
+      // non-selected rows streaming at 60fps.
       const sel = typeof window !== "undefined" ? window.getSelection() : null;
       const selectingInside = Boolean(
         sel &&
           !sel.isCollapsed &&
           sel.rangeCount > 0 &&
-          (boxEl?.contains(sel.anchorNode) || boxEl?.contains(sel.focusNode))
+          (boxEl?.contains(sel.anchorNode) ||
+            boxEl?.contains(sel.focusNode) ||
+            (typeof sel.containsNode === "function" && sel.containsNode(screenEl, true)))
       );
       const prevScrollTop = boxEl ? boxEl.scrollTop : 0;
       const wasNearBottom = boxEl
         ? boxEl.scrollHeight - boxEl.scrollTop - boxEl.clientHeight <= 28
         : true;
-      vt.patchDom(
+      const stats = vt.patchDom(
         screenEl,
         true,
-        selectingInside && sel ? { anchorNode: sel.anchorNode, focusNode: sel.focusNode } : null
+        selectingInside && sel
+          ? {
+              anchorNode: sel.anchorNode,
+              focusNode: sel.focusNode,
+              containsNode:
+                typeof sel.containsNode === "function"
+                  ? (node) => sel.containsNode(node as unknown as Node, true)
+                  : undefined,
+            }
+          : null
       );
+      if (stats.skippedProtected) {
+        this.pendingSelectionCatchup = true;
+      } else if (!selectingInside) {
+        this.pendingSelectionCatchup = false;
+      }
       if (boxEl && !selectingInside) {
         boxEl.scrollTop = wasNearBottom ? boxEl.scrollHeight : prevScrollTop;
       }
@@ -657,7 +757,67 @@ export class CodaTerminalWebApp {
     }
   }
 
+  /** V3-08 / V3-25: Tears down active Direct LAN WebSocket & cancels in-flight LAN probes. */
+  private teardownDirectWs() {
+    this.directProbeGeneration += 1;
+    if (this.directProbeTimer) {
+      clearTimeout(this.directProbeTimer);
+      this.directProbeTimer = null;
+    }
+    if (this.directWs) {
+      this.directWs.onopen = null;
+      this.directWs.onmessage = null;
+      this.directWs.onerror = null;
+      this.directWs.onclose = null;
+      try { this.directWs.close(); } catch {}
+      this.directWs = null;
+    }
+    this.directWsPeerId = null;
+    this.directE2eeSessions.clear();
+    this.activeTransportMode = "relay_ws";
+    this.negotiatingPeerId = null;
+  }
+
+  /** V3-08: Single centralized daemon switch ensuring clean detach + directWs teardown before switching. */
+  private selectDaemon(peer: Device | null, opts: { initialTerminalAddr?: string | null } = {}) {
+    const prevId = this.selectedDaemon?.id ?? null;
+    const nextId = peer?.id ?? null;
+    if (prevId && prevId !== nextId) {
+      this.detachActiveTerminal();
+      this.teardownDirectWs();
+    } else if (!nextId) {
+      this.teardownDirectWs();
+    }
+    this.selectedDaemon = peer;
+    if (peer) {
+      writeLocalPref("coda_last_daemon_id", peer.id);
+    }
+    if (prevId !== nextId) {
+      this.terminals = [];
+      this.repos = [];
+      this.activeTerminalAddr = opts.initialTerminalAddr ?? null;
+      this.rttMs = null;
+      this.lastWorkspacesQueryAt = 0;
+      this.pendingSelectionCatchup = false;
+      if (this.activeTerminalAddr) {
+        writeLocalPref("coda_last_terminal_addr", this.activeTerminalAddr);
+      }
+      if (peer?.is_online) {
+        this.queryDaemonOverview(peer, true);
+        void this.tryNegotiateDirectLanWs(peer);
+      }
+    } else if (peer?.is_online) {
+      if (opts.initialTerminalAddr) {
+        this.activeTerminalAddr = opts.initialTerminalAddr;
+        writeLocalPref("coda_last_terminal_addr", this.activeTerminalAddr);
+      }
+      this.queryDaemonOverview(peer, true);
+      void this.tryNegotiateDirectLanWs(peer);
+    }
+  }
+
   private stopAllTransportsAndTimers() {
+    this.relayGeneration += 1;
     if (this.relayKeepAliveTimer) {
       clearInterval(this.relayKeepAliveTimer);
       this.relayKeepAliveTimer = null;
@@ -670,10 +830,7 @@ export class CodaTerminalWebApp {
       clearTimeout(this.eventsReconnectTimer);
       this.eventsReconnectTimer = null;
     }
-    if (this.directProbeTimer) {
-      clearTimeout(this.directProbeTimer);
-      this.directProbeTimer = null;
-    }
+    this.teardownDirectWs();
     this.notifyTracker.reset();
     if (this.resizeDebounceTimer) {
       clearTimeout(this.resizeDebounceTimer);
@@ -695,14 +852,6 @@ export class CodaTerminalWebApp {
       try { this.eventsWs.close(); } catch {}
       this.eventsWs = null;
     }
-    if (this.directWs) {
-      this.directWs.onopen = null;
-      this.directWs.onmessage = null;
-      this.directWs.onerror = null;
-      this.directWs.onclose = null;
-      try { this.directWs.close(); } catch {}
-      this.directWs = null;
-    }
     if (this.ws) {
       this.ws.onopen = null;
       this.ws.onmessage = null;
@@ -711,9 +860,6 @@ export class CodaTerminalWebApp {
       try { this.ws.close(); } catch {}
       this.ws = null;
     }
-    this.directWsPeerId = null;
-    this.activeTransportMode = "relay_ws";
-    this.negotiatingPeerId = null;
   }
 
   private async bootstrapMesh() {
@@ -729,7 +875,10 @@ export class CodaTerminalWebApp {
   }
 
   private async refreshDevices() {
+    const reqToken = this.token;
+    if (!reqToken) return;
     const all: Device[] = await this.api("/api/v1/devices");
+    if (!this.token || this.token !== reqToken) return;
     this.allDevices = all;
     this.devices = all.filter((d) => d.role === "daemon" || d.role === "hybrid");
     if (!this.selectedDaemon && this.devices.length > 0) {
@@ -741,7 +890,13 @@ export class CodaTerminalWebApp {
         restored ||
         this.devices[0];
     } else if (this.selectedDaemon) {
-      this.selectedDaemon = this.devices.find((d) => d.id === this.selectedDaemon!.id) || null;
+      const stillPresent = this.devices.find((d) => d.id === this.selectedDaemon!.id) || null;
+      if (!stillPresent) {
+        const fallback = this.devices.find((d) => d.is_online) || this.devices[0] || null;
+        this.selectDaemon(fallback);
+      } else {
+        this.selectedDaemon = stillPresent;
+      }
     }
   }
 
@@ -804,6 +959,7 @@ export class CodaTerminalWebApp {
           const prevSelectedId = this.selectedDaemon?.id;
           const wasOnline = this.selectedDaemon?.is_online ?? false;
           await this.refreshDevices();
+          if (!this.token) return;
           if (this.selectedDaemon?.is_online && (this.selectedDaemon.id !== prevSelectedId || !wasOnline)) {
             this.queryDaemonOverview(this.selectedDaemon);
             void this.tryNegotiateDirectLanWs(this.selectedDaemon);
@@ -871,12 +1027,29 @@ export class CodaTerminalWebApp {
     return out;
   }
 
+  private enrollBackgroundDaemonsForNotifications(onlyPeerId?: string) {
+    if (!this.notificationsEnabled || !this.token) return;
+    for (const dev of this.devices) {
+      if (!dev.is_online || dev.id === this.selectedDaemon?.id) continue;
+      if (onlyPeerId && dev.id.toLowerCase() !== onlyPeerId.toLowerCase()) continue;
+      this.sendEncryptedViaRelay(dev, {
+        op: "list_terminals",
+        req_id: `bg-ls-${Date.now()}-${dev.id.slice(0, 6)}`,
+        include_finished: false,
+      });
+    }
+  }
+
   private async connectRelayWebSocket() {
     if (!this.myClientDevice || !this.token || typeof WebSocket === "undefined") return;
     if (this.relayReconnectTimer) {
       clearTimeout(this.relayReconnectTimer);
       this.relayReconnectTimer = null;
     }
+
+    const gen = Math.max(this.relayGeneration + 1, Date.now());
+    this.relayGeneration = gen;
+    const reqToken = this.token;
 
     let ticketRes: { ticket: string; relays?: RelayNodeInfo[] };
     try {
@@ -885,17 +1058,18 @@ export class CodaTerminalWebApp {
         peer_device_id: null,
       });
     } catch {
-      this.scheduleRelayReconnect();
+      if (this.token === reqToken && gen === this.relayGeneration) {
+        this.scheduleRelayReconnect();
+      }
       return;
     }
 
+    if (!this.token || this.token !== reqToken || gen !== this.relayGeneration) return;
     const candidates = this.collectRelayWsCandidates(ticketRes.relays);
-    const gen = Math.max(this.relayGeneration + 1, Date.now());
-    this.relayGeneration = gen;
 
     let connected = false;
     for (const wsUrl of candidates) {
-      if (!this.token) return;
+      if (!this.token || this.token !== reqToken || gen !== this.relayGeneration) return;
       const ok = await this.tryOpenRelayCandidate(wsUrl, ticketRes.ticket, gen);
       if (ok) {
         connected = true;
@@ -903,7 +1077,7 @@ export class CodaTerminalWebApp {
       }
     }
 
-    if (!connected && this.token) {
+    if (!connected && this.token === reqToken && gen === this.relayGeneration) {
       this.scheduleRelayReconnect();
     }
   }
@@ -934,6 +1108,10 @@ export class CodaTerminalWebApp {
       const authTimer = setTimeout(failCandidate, 5000);
 
       sock.onopen = () => {
+        if (!this.token || gen !== this.relayGeneration) {
+          failCandidate();
+          return;
+        }
         sock.send(
           JSON.stringify({
             frame_type: "auth_bind",
@@ -954,6 +1132,10 @@ export class CodaTerminalWebApp {
 
         if (!settled) {
           if (frame.frame_type === "auth_ack" && frame.ok) {
+            if (!this.token || gen !== this.relayGeneration) {
+              failCandidate();
+              return;
+            }
             settled = true;
             clearTimeout(authTimer);
             this.relayBackoffMs = 1000;
@@ -982,6 +1164,8 @@ export class CodaTerminalWebApp {
               this.queryDaemonOverview(this.selectedDaemon);
               void this.tryNegotiateDirectLanWs(this.selectedDaemon);
             }
+            // V3-32: Enroll online background daemons for OSC 7501 status notifications.
+            this.enrollBackgroundDaemonsForNotifications();
             resolve(true);
           } else {
             failCandidate();
@@ -1058,10 +1242,14 @@ export class CodaTerminalWebApp {
       } catch {
         // ignore transient refresh failure
       }
+      if (!this.token) return;
       if (frame.is_online) {
         // Host reconnected or restarted: always clear stale E2EE session state and re-handshake/re-attach.
         if (!wasOnline || this.e2eeSessions.has(devId)) {
           this.resetPeerE2eeAndReattach(devId);
+          if (this.selectedDaemon?.id !== devId) {
+            this.enrollBackgroundDaemonsForNotifications(devId);
+          }
         } else if (this.selectedDaemon?.is_online) {
           void this.tryNegotiateDirectLanWs(this.selectedDaemon);
         }
@@ -1094,6 +1282,15 @@ export class CodaTerminalWebApp {
       ) {
         const msg = existing.session.openMessage(frame.e2ee);
         existing.confirmed = true;
+        // V3-01: Drop duplicate Relay PTY output chunks once LAN Direct WS is active for this peer.
+        if (
+          msg?.op === "pty_output_chunk" &&
+          this.activeTransportMode === "lan_ws" &&
+          this.directWsPeerId === peer.id &&
+          this.directWs?.readyState === WebSocket.OPEN
+        ) {
+          return;
+        }
         this.handlePeerMessage(peer.id, msg);
         return;
       }
@@ -1117,6 +1314,14 @@ export class CodaTerminalWebApp {
         });
         const msg = fresh.openMessage(frame.e2ee);
         this.e2eeSessions.set(peer.id, { session: fresh, auth: incomingAuth, confirmed: true });
+        if (
+          msg?.op === "pty_output_chunk" &&
+          this.activeTransportMode === "lan_ws" &&
+          this.directWsPeerId === peer.id &&
+          this.directWs?.readyState === WebSocket.OPEN
+        ) {
+          return;
+        }
         this.handlePeerMessage(peer.id, msg);
       }
     } catch {
@@ -1187,7 +1392,7 @@ export class CodaTerminalWebApp {
   }
 
   private async tryNegotiateDirectLanWs(peer: Device, manual = false) {
-    if (!peer.is_online || !this.myClientDevice || !peer.ed25519_pubkey) return;
+    if (!this.token || !peer.is_online || !this.myClientDevice || !peer.ed25519_pubkey) return;
     if (this.directWs && this.directWs.readyState === WebSocket.OPEN && this.directWsPeerId === peer.id) {
       return;
     }
@@ -1197,21 +1402,33 @@ export class CodaTerminalWebApp {
     }
     if (this.negotiatingPeerId === peer.id) return;
     this.negotiatingPeerId = peer.id;
+    const probeGen = this.directProbeGeneration;
 
     try {
       const candidates = collectDirectWsCandidates(peer, location);
       let upgraded = false;
       for (const wsUrl of candidates) {
-        const ok = await this.probeSingleDirectWs(peer, wsUrl);
+        if (!this.token || probeGen !== this.directProbeGeneration || this.selectedDaemon?.id !== peer.id) {
+          return;
+        }
+        const ok = await this.probeSingleDirectWs(peer, wsUrl, probeGen);
         if (ok) {
+          if (!this.token || probeGen !== this.directProbeGeneration || this.selectedDaemon?.id !== peer.id) {
+            return;
+          }
           upgraded = true;
           this.smartPath.recordUpgradeSuccess(peer.id);
           if (this.directProbeTimer) {
             clearTimeout(this.directProbeTimer);
             this.directProbeTimer = null;
           }
-          // Seamlessly re-attach live PTY over Direct LAN without clearing the VT buffer.
+          // V3-01: Detach old Relay PTY subscription BEFORE attaching on LAN Direct to prevent dual streaming.
           if (this.selectedDaemon?.id === peer.id && this.activeTerminalAddr) {
+            this.sendEncryptedViaRelay(peer, {
+              op: "pty_detach",
+              req_id: `hdet-${Date.now()}`,
+              terminal: this.activeTerminalAddr,
+            });
             this.reattachActiveTerminalPreserveScreen();
           }
           this.sendEncrypted(peer, {
@@ -1223,11 +1440,19 @@ export class CodaTerminalWebApp {
             kind: "ok",
             text: this.tr("Hot-switched seamlessly to LAN Direct", "已无感热切至局域网直连"),
           };
+          this.updateConsoleNoticeInPlace();
           this.updateTransportFooterInPlace();
           break;
         }
       }
-      if (!upgraded && this.selectedDaemon?.id === peer.id && peer.is_online) {
+      const livePeer = this.devices.find((d) => d.id === peer.id);
+      if (
+        !upgraded &&
+        this.token &&
+        probeGen === this.directProbeGeneration &&
+        this.selectedDaemon?.id === peer.id &&
+        livePeer?.is_online
+      ) {
         const plan = this.smartPath.recordProbeFailure(peer.id);
         this.scheduleDirectLanProbe(plan.delayMs);
         if (manual) {
@@ -1238,17 +1463,26 @@ export class CodaTerminalWebApp {
               "当前网络暂无法直连该主机，继续通过智能中继稳定传输"
             ),
           };
-          this.render();
+          if (!this.updateConsoleNoticeInPlace()) this.render();
         }
       }
     } finally {
-      this.negotiatingPeerId = null;
+      if (this.negotiatingPeerId === peer.id && probeGen === this.directProbeGeneration) {
+        this.negotiatingPeerId = null;
+      }
     }
   }
 
-  private probeSingleDirectWs(peer: Device, wsUrl: string): Promise<boolean> {
+  private probeSingleDirectWs(peer: Device, wsUrl: string, probeGen: number): Promise<boolean> {
     return new Promise((resolve) => {
-      if (!this.myClientDevice || !peer.ed25519_pubkey || !peer.x25519_pubkey) {
+      if (
+        !this.token ||
+        probeGen !== this.directProbeGeneration ||
+        this.selectedDaemon?.id !== peer.id ||
+        !this.myClientDevice ||
+        !peer.ed25519_pubkey ||
+        !peer.x25519_pubkey
+      ) {
         resolve(false);
         return;
       }
@@ -1286,6 +1520,15 @@ export class CodaTerminalWebApp {
       }, 1200);
 
       sock.onopen = () => {
+        if (!this.token || probeGen !== this.directProbeGeneration || this.selectedDaemon?.id !== peer.id) {
+          sock.onopen = null;
+          sock.onmessage = null;
+          sock.onerror = null;
+          sock.onclose = null;
+          try { sock.close(); } catch {}
+          done(false);
+          return;
+        }
         const tsMs = Date.now();
         const signedMsg = p2pHelloV2SigningTextWithZstd(
           myDevId,
@@ -1321,6 +1564,9 @@ export class CodaTerminalWebApp {
 
         if (!settled) {
           try {
+            if (!this.token || probeGen !== this.directProbeGeneration || this.selectedDaemon?.id !== peer.id) {
+              throw new Error("stale direct probe");
+            }
             if (frame.frame_type !== "direct_p2p_ack" || !frame.ok) {
               throw new Error("rejected");
             }
@@ -1392,8 +1638,9 @@ export class CodaTerminalWebApp {
           this.activeTransportMode = "relay_ws";
           this.updateTransportFooterInPlace();
           const plan = this.smartPath.recordDirectDrop(peer.id);
+          const livePeer = this.devices.find((d) => d.id === peer.id);
           // Seamless failover back to Smart Relay without clearing VT screen buffer.
-          if (this.selectedDaemon?.id === peer.id && this.ws?.readyState === WebSocket.OPEN) {
+          if (this.selectedDaemon?.id === peer.id && livePeer?.is_online && this.ws?.readyState === WebSocket.OPEN) {
             if (this.activeTerminalAddr) {
               this.reattachActiveTerminalPreserveScreen();
             }
@@ -1404,8 +1651,9 @@ export class CodaTerminalWebApp {
                 "局域网直连断开，已无缝切回智能中继"
               ),
             };
+            this.updateConsoleNoticeInPlace();
           }
-          if (this.selectedDaemon?.id === peer.id && peer.is_online) {
+          if (this.selectedDaemon?.id === peer.id && livePeer?.is_online) {
             this.scheduleDirectLanProbe(plan.delayMs);
           }
         }
@@ -1442,6 +1690,23 @@ export class CodaTerminalWebApp {
     return state;
   }
 
+  private sendEncryptedViaRelay(peer: Device, msg: unknown) {
+    if (!this.myClientDevice || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    const state = this.getOrCreateRelaySessionState(peer);
+    const e2ee = state.session.sealMessage(msg);
+    this.ws.send(
+      JSON.stringify({
+        frame_type: "route_packet",
+        src_device_id: this.myClientDevice.id,
+        dst_device_id: peer.id,
+        lane: "control_p0",
+        e2ee,
+        sender_x25519_pub_b64: this.webIdentity.x25519PublicB64,
+        session_auth: state.confirmed ? undefined : state.auth,
+      })
+    );
+  }
+
   private sendEncrypted(peer: Device, msg: unknown) {
     if (!this.myClientDevice) return;
 
@@ -1466,33 +1731,14 @@ export class CodaTerminalWebApp {
       }
     }
 
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
-    const state = this.getOrCreateRelaySessionState(peer);
-    const e2ee = state.session.sealMessage(msg);
-    this.ws.send(
-      JSON.stringify({
-        frame_type: "route_packet",
-        src_device_id: this.myClientDevice.id,
-        dst_device_id: peer.id,
-        lane: "control_p0",
-        e2ee,
-        sender_x25519_pub_b64: this.webIdentity.x25519PublicB64,
-        session_auth: state.confirmed ? undefined : state.auth,
-      })
-    );
+    this.sendEncryptedViaRelay(peer, msg);
   }
 
   private focusNotifiedTerminal(daemonId: string, terminalAddr: string) {
     const peer = this.devices.find((d) => d.id === daemonId);
-    if (peer && this.selectedDaemon?.id !== peer.id) {
-      this.detachActiveTerminal();
-      this.selectedDaemon = peer;
-      writeLocalPref("coda_last_daemon_id", peer.id);
-      this.terminals = [];
-      this.activeTerminalAddr = terminalAddr;
-      writeLocalPref("coda_last_terminal_addr", terminalAddr);
-      this.queryDaemonOverview(peer, true);
-      void this.tryNegotiateDirectLanWs(peer);
+    if (!peer) return;
+    if (this.selectedDaemon?.id !== peer.id) {
+      this.selectDaemon(peer, { initialTerminalAddr: terminalAddr });
     } else {
       if (this.activeTerminalAddr && this.activeTerminalAddr !== terminalAddr) {
         this.detachActiveTerminal();
@@ -1536,13 +1782,17 @@ export class CodaTerminalWebApp {
   }
 
   private handlePeerMessage(peerId: string, msg: any) {
+    const isSelected = this.selectedDaemon?.id === peerId;
+
     if (msg.op === "pong") {
+      if (!isSelected) return;
       this.rttMs = Math.max(1, Date.now() - Number(msg.sent_ms || Date.now()));
       this.updateTransportFooterInPlace();
       return;
     }
 
     if (msg.op === "workspaces_snapshot") {
+      if (!isSelected) return;
       this.repos = msg.repos || [];
       if (msg.voice_config) {
         const incomingKey = String(msg.voice_config.api_key || "");
@@ -1558,6 +1808,7 @@ export class CodaTerminalWebApp {
     }
 
     if (msg.op === "voice_config_ack" && msg.config) {
+      if (!isSelected) return;
       this.voiceConfig = {
         ...msg.config,
         api_key: this.voiceApiKeyLocal || msg.config.api_key || "",
@@ -1573,25 +1824,39 @@ export class CodaTerminalWebApp {
     }
 
     if (msg.op === "terminals_snapshot") {
-      this.terminals = msg.terminals || [];
-      for (const term of this.terminals) {
-        this.observeTerminalStatusNotification(peerId, term);
+      const incomingTerms: HerdrTerminal[] = msg.terminals || [];
+      if (!isSelected) {
+        // V3-08 / V3-32: Observe notifications for background daemons without polluting active daemon UI.
+        for (const term of incomingTerms) {
+          this.observeTerminalStatusNotification(peerId, term);
+        }
+        return;
       }
+      this.terminals = incomingTerms;
       if (this.activeTerminalAddr && !this.terminals.some((t) => t.address === this.activeTerminalAddr)) {
         this.activeTerminalAddr = null;
       }
+      let newlyRestoredAddr: string | null = null;
       if (!this.activeTerminalAddr && this.terminals.length > 0) {
         const savedTerm = readLocalPref("coda_last_terminal_addr", "");
         const restored = savedTerm ? this.terminals.find((t) => t.address === savedTerm) : undefined;
         this.activeTerminalAddr = restored ? restored.address : this.terminals[0].address;
         writeLocalPref("coda_last_terminal_addr", this.activeTerminalAddr);
-        this.attachAndReadTerminal(this.activeTerminalAddr);
+        newlyRestoredAddr = this.activeTerminalAddr;
+      }
+      // V3-32: Observe notifications AFTER activeTerminalAddr is restored so switching back does not false-alert.
+      for (const term of this.terminals) {
+        this.observeTerminalStatusNotification(peerId, term);
+      }
+      if (newlyRestoredAddr) {
+        this.attachAndReadTerminal(newlyRestoredAddr);
       }
       if (!this.isTypingIntoInput() && !this.showSettingsModal) this.render();
       return;
     }
 
     if (msg.op === "launch_agent_result") {
+      if (!isSelected) return;
       if (msg.ok && msg.terminal) {
         this.detachActiveTerminal();
         this.terminals = [msg.terminal, ...this.terminals.filter((t) => t.address !== msg.terminal.address)];
@@ -1599,7 +1864,7 @@ export class CodaTerminalWebApp {
         writeLocalPref("coda_last_terminal_addr", msg.terminal.address);
         this.render();
         setTimeout(() => {
-          if (this.activeTerminalAddr === msg.terminal.address) {
+          if (this.selectedDaemon?.id === peerId && this.activeTerminalAddr === msg.terminal.address) {
             this.attachAndReadTerminal(msg.terminal.address);
           }
         }, 180);
@@ -1608,12 +1873,13 @@ export class CodaTerminalWebApp {
           kind: "err",
           text: msg.error || this.tr("Failed spawning terminal", "新建终端失败"),
         };
-        this.render();
+        if (!this.updateConsoleNoticeInPlace()) this.render();
       }
       return;
     }
 
     if (msg.op === "terminal_screen_snapshot") {
+      if (!isSelected) return;
       const addr = String(msg.terminal || this.activeTerminalAddr || "");
       if (!addr) return;
       const key = this.vtKey(peerId, addr);
@@ -1643,20 +1909,22 @@ export class CodaTerminalWebApp {
         const vt = this.getOrCreateVt(peerId, addr);
         this.vtStreamActive.add(key);
         vt.feedBytes(fromB64(String(msg.data_b64 || "")));
-        if (vt.latestStatus) {
+        // V3-10: Consume ONLY newly parsed OSC 7501 status so cleared NeedsYou never resurrects on plain output.
+        const freshStatus = vt.consumeLatestStatus();
+        if (freshStatus && isSelected) {
           const term = this.terminals.find((t) => t.address === addr);
           if (term) {
             term.status = {
-              state: vt.latestStatus.state,
-              kind: vt.latestStatus.kind || null,
-              app: vt.latestStatus.app || null,
-              title: vt.latestStatus.title || null,
-              msg: vt.latestStatus.msg || null,
+              state: freshStatus.state,
+              kind: freshStatus.kind || null,
+              app: freshStatus.app || null,
+              title: freshStatus.title || null,
+              msg: freshStatus.msg || null,
             };
             this.observeTerminalStatusNotification(peerId, term);
           }
         }
-        if (peerId === this.selectedDaemon?.id && addr === this.activeTerminalAddr) {
+        if (isSelected && addr === this.activeTerminalAddr) {
           this.scheduleTerminalPaint();
         }
       } catch {
@@ -1667,12 +1935,14 @@ export class CodaTerminalWebApp {
 
     if (msg.op === "herdr_live_event") {
       if (msg.terminal) {
-        const idx = this.terminals.findIndex((t) => t.address === msg.terminal.address);
-        if (idx >= 0) {
-          this.terminals[idx] = msg.terminal;
+        if (isSelected) {
+          const idx = this.terminals.findIndex((t) => t.address === msg.terminal.address);
+          if (idx >= 0) {
+            this.terminals[idx] = msg.terminal;
+          }
         }
         this.observeTerminalStatusNotification(peerId, msg.terminal);
-        if (msg.terminal.address === this.activeTerminalAddr) {
+        if (isSelected && msg.terminal.address === this.activeTerminalAddr) {
           this.scheduleTerminalPaint();
         }
       }
@@ -1680,28 +1950,36 @@ export class CodaTerminalWebApp {
     }
 
     if (msg.op === "upload_terminal_file_result") {
+      if (!isSelected) return;
       if (msg.ok && msg.remote_path) {
         this.draftInput = this.draftInput ? `${this.draftInput} ${msg.remote_path}` : msg.remote_path;
         this.consoleNotice = {
           kind: "ok",
           text: this.tr(`Uploaded to ${msg.remote_path}`, `已上传至 ${msg.remote_path}`),
         };
+        const desktopInp = document.getElementById("desktop-prompt-input") as HTMLInputElement | null;
+        const kbInp = document.getElementById("kb-input") as HTMLInputElement | null;
+        if (desktopInp) desktopInp.value = this.draftInput;
+        else if (kbInp) kbInp.value = this.draftInput;
+        this.updateDraftPreviewInPlace();
       } else {
         this.consoleNotice = {
           kind: "err",
           text: msg.error || this.tr("Upload failed", "上传失败"),
         };
       }
-      this.render();
+      // V3-33: Update notice & composer in-place without full re-render so focus & scroll stay intact.
+      if (!this.updateConsoleNoticeInPlace()) this.render();
       return;
     }
 
     if (msg.op === "action_ack" && !msg.ok) {
+      if (!isSelected) return;
       this.consoleNotice = {
         kind: "err",
         text: msg.detail || this.tr("Host action failed", "远端操作失败"),
       };
-      this.render();
+      if (!this.updateConsoleNoticeInPlace()) this.render();
     }
   }
 
@@ -1755,8 +2033,14 @@ export class CodaTerminalWebApp {
     });
   }
 
-  private async uploadSingleFileToHost(file: File) {
-    if (!this.selectedDaemon || !this.activeTerminalAddr) {
+  private async uploadSingleFileToHost(
+    file: File,
+    pinnedDaemon?: Device | null,
+    pinnedTerminal?: string | null
+  ) {
+    const targetDaemon = pinnedDaemon ?? this.selectedDaemon;
+    const targetTerminal = pinnedTerminal ?? this.activeTerminalAddr;
+    if (!targetDaemon || !targetTerminal) {
       this.consoleNotice = {
         kind: "err",
         text: this.tr("Select an online host and terminal before uploading.", "请先选择一个在线主机和终端再上传文件。"),
@@ -1768,27 +2052,33 @@ export class CodaTerminalWebApp {
       this.consoleNotice = {
         kind: "err",
         text: this.tr(
-          `File too large (${Math.ceil(file.size / (1024 * 1024))} MiB > 8 MiB limit)`,
-          `文件过大（超过 8 MiB 单次上传限制）`
+          `File too large (${(file.size / (1024 * 1024)).toFixed(1)} MiB > 4 MiB browser wire limit)`,
+          `文件过大（${(file.size / (1024 * 1024)).toFixed(1)} MiB 超过浏览器 4 MiB 单次上传限制）`
         ),
       };
-      this.render();
+      if (!this.updateConsoleNoticeInPlace()) this.render();
       return;
     }
+    const seq = ++this.uploadCounter;
+    const reqToken = this.token;
     const safeName =
       (file.name || "").trim() ||
-      `screenshot-${Date.now()}.${(file.type.split("/")[1] || "png").replace(/[^a-z0-9]/gi, "") || "png"}`;
+      `screenshot-${Date.now()}-${seq}.${(file.type.split("/")[1] || "png").replace(/[^a-z0-9]/gi, "") || "png"}`;
     try {
       const bytes = new Uint8Array(await file.arrayBuffer());
+      if (!this.token || this.token !== reqToken || this.selectedDaemon?.id !== targetDaemon.id) {
+        return;
+      }
       const b64 = toB64(bytes);
       this.consoleNotice = {
         kind: "ok",
         text: this.tr(`Uploading ${safeName}…`, `正在上传 ${safeName}…`),
       };
-      this.sendEncrypted(this.selectedDaemon, {
+      this.updateConsoleNoticeInPlace();
+      this.sendEncrypted(targetDaemon, {
         op: "upload_terminal_file",
-        req_id: `up-${Date.now()}`,
-        terminal: this.activeTerminalAddr,
+        req_id: `up-${Date.now()}-${seq}`,
+        terminal: targetTerminal,
         filename: safeName,
         data_b64: b64,
       });
@@ -1797,7 +2087,7 @@ export class CodaTerminalWebApp {
         kind: "err",
         text: String(err?.message || this.tr("Failed reading upload file", "读取上传文件失败")),
       };
-      this.render();
+      if (!this.updateConsoleNoticeInPlace()) this.render();
     }
   }
 
@@ -1818,19 +2108,7 @@ export class CodaTerminalWebApp {
         label: dev.name,
         hint: `${dev.platform} · ${dev.is_online ? this.tr("Online", "在线") : this.tr("Offline", "离线")}`,
         action: () => {
-          if (this.selectedDaemon && this.selectedDaemon.id !== dev.id) {
-            this.detachActiveTerminal();
-          }
-          this.selectedDaemon = dev;
-          writeLocalPref("coda_last_daemon_id", dev.id);
-          this.terminals = [];
-          this.repos = [];
-          this.activeTerminalAddr = null;
-          this.lastWorkspacesQueryAt = 0;
-          if (dev.is_online) {
-            this.queryDaemonOverview(dev);
-            void this.tryNegotiateDirectLanWs(dev);
-          }
+          this.selectDaemon(dev);
         },
       });
     }
@@ -1946,8 +2224,8 @@ export class CodaTerminalWebApp {
   private renderConsoleCommandPaletteModal(): string {
     const items = this.getConsolePaletteItems(this.cmdPaletteQuery);
     return `
-      <div class="cmd-mask" id="console-cmd-mask">
-        <div class="cmd-card" style="max-width:540px;">
+      <div class="modal-mask" id="console-cmd-mask">
+        <div class="modal-card" style="max-width:540px;">
           <div style="display:flex;align-items:center;gap:8px;padding-bottom:10px;border-bottom:1px solid var(--border-primary);">
             ${svgIcon("search", 15)}
             <input id="console-cmd-input" class="pm-input" style="margin:0;border:none;background:transparent;padding:4px 0;flex:1;box-shadow:none;" value="${this.escapeHtml(
@@ -1997,14 +2275,23 @@ export class CodaTerminalWebApp {
   }
 
   private stopVoiceCaptureResources() {
+    this.voiceChunks = [];
     if (this.speechRecognition) {
+      this.speechRecognition.onresult = null;
+      this.speechRecognition.onerror = null;
+      this.speechRecognition.onend = null;
       try { this.speechRecognition.stop(); } catch {}
       this.speechRecognition = null;
     }
-    if (this.mediaRecorder && this.mediaRecorder.state !== "inactive") {
-      try { this.mediaRecorder.stop(); } catch {}
+    if (this.mediaRecorder) {
+      this.mediaRecorder.ondataavailable = null;
+      this.mediaRecorder.onstop = null;
+      this.mediaRecorder.onerror = null;
+      if (this.mediaRecorder.state !== "inactive") {
+        try { this.mediaRecorder.stop(); } catch {}
+      }
+      this.mediaRecorder = null;
     }
-    this.mediaRecorder = null;
     if (this.mediaStream) {
       for (const track of this.mediaStream.getTracks()) {
         try { track.stop(); } catch {}
@@ -2014,21 +2301,32 @@ export class CodaTerminalWebApp {
   }
 
   private insertTranscribedText(text: string) {
+    if (!this.token) return;
     const cleaned = text.trim();
-    if (!cleaned) return;
+    if (!cleaned) {
+      this.syncVoiceButtonInPlace();
+      return;
+    }
     this.draftInput = this.draftInput ? `${this.draftInput} ${cleaned}` : cleaned;
     this.consoleNotice = {
       kind: "ok",
       text: this.tr(`Voice transcribed: "${cleaned}"`, `语音识别完成：「${cleaned}」`),
     };
+    this.syncVoiceButtonInPlace();
+    this.updateDraftPreviewInPlace();
     const desktopInp = document.getElementById("desktop-prompt-input") as HTMLInputElement | null;
     const kbInp = document.getElementById("kb-input") as HTMLInputElement | null;
     if (desktopInp) {
       desktopInp.value = this.draftInput;
       desktopInp.focus();
-    } else if (kbInp) {
+      this.updateConsoleNoticeInPlace();
+      return;
+    }
+    if (kbInp) {
       kbInp.value = this.draftInput;
       kbInp.focus();
+      this.updateConsoleNoticeInPlace();
+      return;
     }
     this.render();
   }
@@ -2140,6 +2438,8 @@ export class CodaTerminalWebApp {
   }
 
   private async transcribeAudioBlob(blob: Blob, apiKey: string, mimeType: string) {
+    if (!this.token) return;
+    const reqToken = this.token;
     if (!this.isSafeVoiceBaseUrl(this.voiceConfig.base_url)) {
       this.consoleNotice = {
         kind: "err",
@@ -2168,6 +2468,10 @@ export class CodaTerminalWebApp {
         body: form,
       });
       const textBody = await resp.text();
+      if (!this.token || this.token !== reqToken) {
+        this.isTranscribingVoice = false;
+        return;
+      }
       if (!resp.ok) {
         throw new Error(`HTTP ${resp.status}: ${textBody.slice(0, 160)}`);
       }
@@ -2605,6 +2909,7 @@ export class CodaTerminalWebApp {
   }
 
   render() {
+    this.imeComposing = false;
     const root = document.getElementById("app")!;
     const baseUrl = this.siteInfo?.public_base_url || window.location.origin;
     const installCmd = this.siteInfo?.install_command || `curl -fsSL ${baseUrl}/install.sh | sh`;
@@ -3823,10 +4128,9 @@ export class CodaTerminalWebApp {
           `已授权设备 ${dev.name} (${dev.platform})`
         );
         await this.refreshDevices();
-        this.selectedDaemon = this.devices.find((d) => d.id === dev.id) || this.selectedDaemon;
-        if (this.selectedDaemon?.is_online) {
-          this.queryDaemonOverview(this.selectedDaemon);
-          void this.tryNegotiateDirectLanWs(this.selectedDaemon);
+        const approved = this.devices.find((d) => d.id === dev.id) || null;
+        if (approved) {
+          this.selectDaemon(approved);
         }
         this.navigate("/console");
       } catch (err: any) {
@@ -3838,6 +4142,12 @@ export class CodaTerminalWebApp {
 
   private renderConsoleView(root: HTMLElement, installCmd: string) {
     if (!this.user) return;
+    // V3-22: Capture previous #term-box scroll position BEFORE tearing down DOM with root.innerHTML.
+    const prevTermBox = document.getElementById("term-box");
+    const prevScrollTop = prevTermBox ? prevTermBox.scrollTop : 0;
+    const prevWasNearBottom = prevTermBox
+      ? prevTermBox.scrollHeight - prevTermBox.scrollTop - prevTermBox.clientHeight <= 28
+      : true;
     const activeTerm = this.terminals.find((t) => t.address === this.activeTerminalAddr) || this.terminals[0];
     const nowTime = new Date().toTimeString().slice(0, 5);
     const isNarrowViewport = window.innerWidth < 900;
@@ -3854,6 +4164,8 @@ export class CodaTerminalWebApp {
     const activeBranch = branchForTerm(activeTerm);
     const selectedVtKey =
       this.selectedDaemon && activeTerm ? this.vtKey(this.selectedDaemon.id, activeTerm.address) : "";
+    const switchedTerminal = selectedVtKey !== this.lastRenderedTermKey;
+    this.lastRenderedTermKey = selectedVtKey;
     const activeVt = selectedVtKey ? this.vtTerminals.get(selectedVtKey) : undefined;
     const isVtStream = Boolean(activeVt && this.vtStreamActive.has(selectedVtKey));
     const initialVtHtml = isVtStream && activeVt
@@ -4047,22 +4359,8 @@ export class CodaTerminalWebApp {
 
           <!-- Live Terminal Viewport (focusable for direct keyboard input, supports drag-drop & paste upload) -->
           <div class="term-viewport-wrap">
-            <div class="term-viewport" id="term-box" tabindex="0" aria-label="${this.tr("Interactive Terminal Viewport", "交互式终端视口")}">${
-              this.consoleNotice
-                ? `<div style="margin-bottom:10px;padding:8px 10px;border-radius:8px;font-size:12px;border:1px solid ${
-                    this.consoleNotice.kind === "err" ? "var(--rose-bd, rgba(244,63,94,0.35))" : "var(--emerald-bd)"
-                  };background:${
-                    this.consoleNotice.kind === "err" ? "rgba(244,63,94,0.1)" : "var(--emerald-bg)"
-                  };color:${this.consoleNotice.kind === "err" ? "var(--rose)" : "var(--emerald)"};">${this.escapeHtml(this.consoleNotice.text)}</div>`
-                : ""
-            }<div id="term-screen-output" data-vt-mode="${isVtStream ? "rows" : "placeholder"}" style="white-space:pre;overflow-x:auto;">${initialVtHtml}</div>
-${
-  this.draftInput
-    ? `<div style="margin-top:14px;border-top:1px solid var(--border-primary);padding-top:6px;border-bottom:1px solid var(--border-primary);padding-bottom:6px;">&gt; ${this.formatCursorDraft(
-        this.draftInput
-      )}</div>`
-    : ""
-}
+            <div class="term-viewport" id="term-box" tabindex="0" aria-label="${this.tr("Interactive Terminal Viewport", "交互式终端视口")}"><div id="console-notice-slot">${this.renderConsoleNoticeHtml()}</div><div id="term-screen-output" data-vt-mode="${isVtStream ? "rows" : "placeholder"}" data-vt-evictions="${activeVt?.getScrollbackEvictions() ?? 0}" data-vt-alt="${activeVt?.isUsingAltScreen() ? "1" : "0"}" style="white-space:pre;overflow-x:auto;">${initialVtHtml}</div>
+<div id="term-draft-slot">${this.renderDraftPreviewHtml()}</div>
 <div id="term-footer-meta" style="font-size:12px;color:var(--text-tertiary);margin-top:8px;">${this.escapeHtml(footerTransport)} &middot; E2EE X25519 + ChaCha20 &middot; ${this.termCols}&times;${this.termRows} &middot; ${this.terminals.length} PTY &middot; ${this.tr("Click for keys · Drop/paste image to upload", "点击直连按键 · 拖拽/粘贴截图自动上传")}</div></div>
             <button type="button" id="btn-scroll-bottom" class="term-scroll-bottom-btn" title="${this.tr("Jump to latest output", "回到底部最新输出")}">
               ↓ ${this.tr("Latest", "回到最新")}
@@ -4178,7 +4476,7 @@ ${
           </div>
 
           <div class="rail-capsule">
-            <input type="file" id="rail-file-input" style="display:none;" />
+            <input type="file" id="rail-file-input" multiple style="display:none;" />
             <button id="rail-refresh-btn" title="${this.tr("Upload file/image via hc put", "通过 hc put 上传图片/附件至远端终端")}">${svgIcon("paperclip", 14)}</button>
             <span style="width:16px;height:1px;background:var(--border-primary);"></span>
             <button id="rail-paste-btn" title="${this.tr("Paste clipboard", "粘贴剪贴板")}">${svgIcon("clipboard", 14)}</button>
@@ -4480,6 +4778,18 @@ ${
       this.selectedDaemon = null;
       this.terminals = [];
       this.repos = [];
+      this.voiceApiKeyLocal = "";
+      this.voiceConfig = {
+        provider: "openai",
+        base_url: "https://api.openai.com/v1",
+        api_key: "",
+        model: "gpt-4o-mini-transcribe",
+      };
+      this.smartPath.resetForNetworkChange();
+      this.pendingSelectionCatchup = false;
+      this.imeComposing = false;
+      this.activationSuccessMsg = "";
+      this.lastRenderedTermKey = "";
       this.activeTerminalAddr = null;
       this.draftInput = "";
       this.pairCommand = null;
@@ -4532,10 +4842,9 @@ ${
         );
         window.history.replaceState({}, "", "/console");
         await this.refreshDevices();
-        this.selectedDaemon = this.devices.find((d) => d.id === dev.id) || this.selectedDaemon;
-        if (this.selectedDaemon?.is_online) {
-          this.queryDaemonOverview(this.selectedDaemon);
-          void this.tryNegotiateDirectLanWs(this.selectedDaemon);
+        const approved = this.devices.find((d) => d.id === dev.id) || null;
+        if (approved) {
+          this.selectDaemon(approved);
         }
         this.render();
       } catch (err: any) {
@@ -4611,6 +4920,9 @@ ${
           await this.api(`/api/v1/devices/${encodeURIComponent(id)}`, "DELETE");
           this.e2eeSessions.delete(id);
           this.directE2eeSessions.delete(id);
+          if (this.directWsPeerId === id) {
+            this.teardownDirectWs();
+          }
           this.settingsFeedback = { kind: "ok", text: this.tr("Device removed.", "设备已移除。") };
           await this.refreshDevices();
           this.render();
@@ -4701,8 +5013,9 @@ ${
       }
       const fd = Object.fromEntries(new FormData(e.target as HTMLFormElement).entries()) as any;
       try {
+        // V3-09: Backend `DeleteAccountRequest` expects `{ password }`.
         await this.api("/api/v1/auth/me", "DELETE", {
-          current_password: String(fd.current_password || ""),
+          password: String(fd.current_password || ""),
         });
         performLocalSignOut();
       } catch (err: any) {
@@ -4761,6 +5074,7 @@ ${
       if (perm === "granted") {
         this.notificationsEnabled = true;
         writeLocalPref("coda_notify_enabled", "1");
+        this.enrollBackgroundDaemonsForNotifications();
         this.settingsFeedback = {
           kind: "ok",
           text: this.tr("Browser notifications enabled for OSC 7501 alerts.", "已开启 OSC 7501 系统通知。"),
@@ -4800,6 +5114,11 @@ ${
       this.termResizeObserver = null;
     }
     const termBox = document.getElementById("term-box");
+    if (termBox) {
+      // V3-22: Restore scroll position across console re-renders (pin to bottom on terminal switch or if already near bottom).
+      termBox.scrollTop = switchedTerminal || prevWasNearBottom ? termBox.scrollHeight : prevScrollTop;
+      this.syncScrollBottomPill(termBox);
+    }
     if (termBox && typeof ResizeObserver !== "undefined") {
       this.termResizeObserver = new ResizeObserver(() => {
         this.scheduleTerminalResizeSync();
@@ -4817,6 +5136,8 @@ ${
       });
       if (seq !== null) {
         e.preventDefault();
+        // V3-24: Prevent terminal keys like Ctrl+K from bubbling up to window ⌘K palette handler.
+        e.stopPropagation();
         this.sendPtyInputBytes(seq);
       }
     });
@@ -4824,18 +5145,25 @@ ${
     const handleClipboardImagePaste = (e: ClipboardEvent): boolean => {
       const items = e.clipboardData?.items;
       if (!items) return false;
+      const imageFiles: File[] = [];
       for (let i = 0; i < items.length; i++) {
         const item = items[i];
         if (item.kind === "file" && item.type.startsWith("image/")) {
           const imgFile = item.getAsFile();
-          if (imgFile) {
-            e.preventDefault();
-            void this.uploadSingleFileToHost(imgFile);
-            return true;
-          }
+          if (imgFile) imageFiles.push(imgFile);
         }
       }
-      return false;
+      if (imageFiles.length === 0) return false;
+      e.preventDefault();
+      const pinnedDaemon = this.selectedDaemon;
+      const pinnedTerminal = this.activeTerminalAddr;
+      // V3-33: Upload every pasted image sequentially instead of silently dropping 2..N.
+      void (async () => {
+        for (const f of imageFiles) {
+          await this.uploadSingleFileToHost(f, pinnedDaemon, pinnedTerminal);
+        }
+      })();
+      return true;
     };
 
     termBox?.addEventListener("paste", (e) => {
@@ -4849,27 +5177,41 @@ ${
       this.sendPtyInputBytes(payload);
     });
 
+    const dragHasFiles = (e: DragEvent): boolean => {
+      const types = e.dataTransfer?.types;
+      return Boolean(types && Array.from(types).includes("Files"));
+    };
     let dropDepth = 0;
     termBox?.addEventListener("dragenter", (e) => {
+      if (!dragHasFiles(e)) return;
       e.preventDefault();
       dropDepth += 1;
       termBox.classList.add("term-drop-active");
     });
     termBox?.addEventListener("dragover", (e) => {
+      if (!dragHasFiles(e)) return;
       e.preventDefault();
       if (e.dataTransfer) e.dataTransfer.dropEffect = "copy";
     });
     termBox?.addEventListener("dragleave", () => {
+      if (dropDepth <= 0) return;
       dropDepth = Math.max(0, dropDepth - 1);
       if (dropDepth === 0) termBox.classList.remove("term-drop-active");
     });
     termBox?.addEventListener("drop", (e) => {
+      if (!dragHasFiles(e)) return;
       e.preventDefault();
       dropDepth = 0;
       termBox.classList.remove("term-drop-active");
-      const file = e.dataTransfer?.files?.[0];
-      if (file) {
-        void this.uploadSingleFileToHost(file);
+      const files = Array.from(e.dataTransfer?.files || []);
+      if (files.length > 0) {
+        const pinnedDaemon = this.selectedDaemon;
+        const pinnedTerminal = this.activeTerminalAddr;
+        void (async () => {
+          for (const f of files) {
+            await this.uploadSingleFileToHost(f, pinnedDaemon, pinnedTerminal);
+          }
+        })();
       }
     });
 
@@ -4894,8 +5236,16 @@ ${
         } else if (action === "deny") {
           this.sendPtyInputBytes("\x1b");
         }
-        const bar = document.getElementById("needs-you-bar");
-        bar?.classList.remove("visible");
+        // V3-10: Optimistically transition active terminal out of NeedsYou so bar stays dismissed.
+        const active = this.terminals.find((t) => t.address === this.activeTerminalAddr);
+        if (active) {
+          active.status = {
+            ...(active.status || {}),
+            state: "working",
+            msg: null,
+          };
+        }
+        this.syncNeedsYouBarInPlace(active);
       });
     });
 
@@ -4932,6 +5282,15 @@ ${
     };
     bindConsolePaletteRows();
     const consoleCmdInput = document.getElementById("console-cmd-input") as HTMLInputElement | null;
+    consoleCmdInput?.addEventListener("compositionstart", () => {
+      this.imeComposing = true;
+    });
+    consoleCmdInput?.addEventListener("compositionend", () => {
+      this.imeComposing = false;
+    });
+    consoleCmdInput?.addEventListener("blur", () => {
+      this.imeComposing = false;
+    });
     consoleCmdInput?.addEventListener("input", () => {
       this.cmdPaletteQuery = consoleCmdInput.value;
       const listEl = document.getElementById("console-cmd-list");
@@ -4957,7 +5316,8 @@ ${
       bindConsolePaletteRows();
     });
     consoleCmdInput?.addEventListener("keydown", (e) => {
-      if (e.key === "Enter") {
+      // V3-24: Guard Enter with IME composition check so CJK candidate selection does not execute command.
+      if (e.key === "Enter" && !e.isComposing && !this.imeComposing) {
         e.preventDefault();
         runConsolePaletteIdx(0);
       } else if (e.key === "Escape") {
@@ -5008,6 +5368,9 @@ ${
       this.imeComposing = false;
       this.draftInput = kbInput.value;
     });
+    kbInput?.addEventListener("blur", () => {
+      this.imeComposing = false;
+    });
     kbInput?.addEventListener("input", () => {
       this.draftInput = kbInput.value;
     });
@@ -5048,6 +5411,9 @@ ${
       this.imeComposing = false;
       this.draftInput = desktopInput.value;
     });
+    desktopInput?.addEventListener("blur", () => {
+      this.imeComposing = false;
+    });
     desktopInput?.addEventListener("input", () => {
       this.draftInput = desktopInput.value;
     });
@@ -5081,8 +5447,15 @@ ${
         }
       }
       this.draftInput = "";
-      if (inp) inp.value = "";
-      this.render();
+      this.updateDraftPreviewInPlace();
+      if (inp) {
+        inp.value = "";
+        inp.focus();
+      }
+      if (termBox) {
+        termBox.scrollTop = termBox.scrollHeight;
+        this.syncScrollBottomPill(termBox);
+      }
     });
 
     document.getElementById("rail-spawn-btn")?.addEventListener("click", () => {
@@ -5142,10 +5515,14 @@ ${
 
     document.getElementById("rail-file-input")?.addEventListener("change", async (ev) => {
       const inp = ev.target as HTMLInputElement;
-      const file = inp.files?.[0];
+      const files = Array.from(inp.files || []);
       inp.value = "";
-      if (!file) return;
-      await this.uploadSingleFileToHost(file);
+      if (files.length === 0) return;
+      const pinnedDaemon = this.selectedDaemon;
+      const pinnedTerminal = this.activeTerminalAddr;
+      for (const file of files) {
+        await this.uploadSingleFileToHost(file, pinnedDaemon, pinnedTerminal);
+      }
     });
 
     document.getElementById("rail-paste-btn")?.addEventListener("click", async () => {
@@ -5161,6 +5538,7 @@ ${
         const clip = await navigator.clipboard.readText();
         if (!clip) return;
         this.draftInput = this.draftInput ? `${this.draftInput}${clip}` : clip;
+        this.updateDraftPreviewInPlace();
         const desktopInp = document.getElementById("desktop-prompt-input") as HTMLInputElement | null;
         if (desktopInp) {
           desktopInp.value = this.draftInput;
@@ -5241,19 +5619,7 @@ ${
         const devId = (el as HTMLElement).dataset.dev!;
         const peer = this.devices.find((d) => d.id === devId);
         if (!peer) return;
-        if (this.selectedDaemon && this.selectedDaemon.id !== peer.id) {
-          this.detachActiveTerminal();
-        }
-        this.selectedDaemon = peer;
-        writeLocalPref("coda_last_daemon_id", peer.id);
-        this.terminals = [];
-        this.repos = [];
-        this.activeTerminalAddr = null;
-        this.lastWorkspacesQueryAt = 0;
-        if (peer.is_online) {
-          this.queryDaemonOverview(peer);
-          void this.tryNegotiateDirectLanWs(peer);
-        }
+        this.selectDaemon(peer);
         if (isNarrowViewport) this.showSidebar = false;
         this.render();
       });

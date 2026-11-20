@@ -27,7 +27,7 @@ import {
   type VtRowNodeLike,
 } from "./vt";
 import { encodeTerminalKeyEvent, wrapBracketedPaste } from "./terminal_keys";
-import { TerminalNotificationTracker } from "./notify";
+import { TerminalNotificationTracker, isNeedsYouState } from "./notify";
 import { SmartPathBackoffPolicy, collectDirectWsCandidates } from "./smart_path";
 
 function makeTestIdentity(name: string): WebDeviceIdentity {
@@ -416,24 +416,24 @@ describe("WebVtTerminal 2D VT100 engine", () => {
 
     // 1. Initial mount patches all 3 rows via DocumentFragment
     const s1 = vt.patchDom(container, true);
-    expect(s1).toEqual({ patched: 3, reused: 0, total: 3 });
+    expect(s1).toEqual({ patched: 3, reused: 0, total: 3, skippedProtected: false });
     expect(container.getAttribute("data-vt-mode")).toBe("rows");
     expect(container.rows.length).toBe(3);
 
     // 2. Identical frame reuses 100% of DOM rows (0 patches)
     const s2 = vt.patchDom(container, true);
-    expect(s2).toEqual({ patched: 0, reused: 3, total: 3 });
+    expect(s2).toEqual({ patched: 0, reused: 3, total: 3, skippedProtected: false });
 
     // 3. Appending to line 3 patches ONLY line 3 (reuses lines 1 & 2)
     vt.feedText("!");
     const s3 = vt.patchDom(container, true);
-    expect(s3).toEqual({ patched: 1, reused: 2, total: 3 });
+    expect(s3).toEqual({ patched: 1, reused: 2, total: 3, skippedProtected: false });
     expect(container.rows[2].innerHTML.includes("line-3!")).toBe(true);
 
     // 4. Cursor-only jump to line 1 patches ONLY old cursor row (3) & new cursor row (1)
     vt.feedText("\x1b[1;1H");
     const s4 = vt.patchDom(container, true);
-    expect(s4).toEqual({ patched: 2, reused: 1, total: 3 });
+    expect(s4).toEqual({ patched: 2, reused: 1, total: 3, skippedProtected: false });
 
     // 5. Protected multi-row selection (row 0 -> row 1) skips rows 0 & 1 while patching dirty row 2
     const row0Ref = container.rows[0];
@@ -442,35 +442,93 @@ describe("WebVtTerminal 2D VT100 engine", () => {
     const row1HtmlBefore = row1Ref.innerHTML;
     vt.feedText("EDIT0\x1b[2;1HEDIT1\x1b[3;1HSTREAM2");
     const s5 = vt.patchDom(container, true, { anchorNode: row0Ref, focusNode: row1Ref });
-    expect(s5).toEqual({ patched: 1, reused: 2, total: 3 });
+    expect(s5).toEqual({ patched: 1, reused: 2, total: 3, skippedProtected: true });
     expect(row0Ref.innerHTML).toBe(row0HtmlBefore);
     expect(row1Ref.innerHTML).toBe(row1HtmlBefore);
     expect(container.rows[2].innerHTML.includes("STREAM2")).toBe(true);
 
     // Once selection clears, deferred rows 0 & 1 catch up cleanly
     const s5After = vt.patchDom(container, true, null);
-    expect(s5After).toEqual({ patched: 2, reused: 1, total: 3 });
+    expect(s5After).toEqual({ patched: 2, reused: 1, total: 3, skippedProtected: false });
     expect(row0Ref.innerHTML.includes("EDIT0")).toBe(true);
     expect(row1Ref.innerHTML.includes("EDIT1")).toBe(true);
 
-    // 6. Alt-screen shrink trims trailing DOM rows cleanly, and exit restores primary buffer
+    // 6. Partial-outside selection via `containsNode` protects intersecting row even if anchor/focus lie outside
+    const row1BeforePartial = container.rows[1].innerHTML;
+    vt.feedText("\x1b[2;1HPARTIAL_EDIT");
+    const sPartial = vt.patchDom(container, true, {
+      containsNode: (node) => node === container.rows[1],
+    });
+    expect(sPartial.skippedProtected).toBe(true);
+    expect(container.rows[1].innerHTML).toBe(row1BeforePartial);
+    const sPartialCatchup = vt.patchDom(container, true, null);
+    expect(sPartialCatchup.skippedProtected).toBe(false);
+    expect(container.rows[1].innerHTML.includes("PARTIAL_EDIT")).toBe(true);
+
+    // 7. Alt-screen shrink trims trailing DOM rows cleanly, and exit restores primary buffer
     vt.feedText("\x1b[?1049h\x1b[2J\x1b[1;1HALT-ONLY");
     const sAlt = vt.patchDom(container, true);
-    expect(sAlt).toEqual({ patched: 1, reused: 0, total: 1 });
+    expect(sAlt).toEqual({ patched: 1, reused: 0, total: 1, skippedProtected: false });
     expect(container.rows.length).toBe(1);
     expect(container.rows[0].innerHTML.includes("ALT-ONLY")).toBe(true);
 
     vt.feedText("\x1b[?1049l");
     const sRestore = vt.patchDom(container, true);
-    expect(sRestore).toEqual({ patched: 3, reused: 0, total: 3 });
+    expect(sRestore).toEqual({ patched: 3, reused: 0, total: 3, skippedProtected: false });
     expect(container.rows.length).toBe(3);
 
-    // 7. Distinct WebVtTerminal instance on same container never collides on data-vt-key
+    // 8. Full-scrollback O(1) eviction stays O(1) instead of rewriting all scrollback rows
+    const vtFull = new WebVtTerminal(40, 6, 10);
+    const cFull = createMockContainer();
+    for (let i = 1; i <= 20; i++) {
+      vtFull.feedText(`row-${i}\r\n`);
+    }
+    vtFull.patchDom(cFull, true);
+    vtFull.feedText("row-21\r\n");
+    const sEvict = vtFull.patchDom(cFull, true);
+    // Only the previous cursor row + newly appended row are patched (<< 16 total rows)
+    expect(sEvict.patched).toBeLessThanOrEqual(3);
+    expect(sEvict.reused).toBeGreaterThanOrEqual(10);
+
+    // 9. Distinct WebVtTerminal instance on same container never collides on data-vt-key
     const vtOther = new WebVtTerminal(40, 8);
     vtOther.feedText("other-session");
     const sOther = vtOther.patchDom(container, true);
-    expect(sOther).toEqual({ patched: 1, reused: 0, total: 1 });
+    expect(sOther).toEqual({ patched: 1, reused: 0, total: 1, skippedProtected: false });
     expect(container.rows[0].innerHTML.includes("other-session")).toBe(true);
+
+    // 10. consumeLatestStatus delivers OSC 7501 once & reset() / loadSnapshot() clear pendingStatus
+    vtOther.feedText("\x1b]7501;state=needs_you;msg=Approve?\x07");
+    expect(vtOther.consumeLatestStatus()?.state).toBe("needs_you");
+    expect(vtOther.consumeLatestStatus()).toBeNull();
+    vtOther.loadSnapshot("\x1b]7501;state=needs_you;msg=OldSnapshot\x07line1\nline2\n");
+    expect(vtOther.consumeLatestStatus()).toBeNull();
+    vtOther.reset();
+    expect(vtOther.latestStatus).toBeNull();
+    expect(vtOther.windowTitle).toBeNull();
+
+    // 11. Selecting rows while scrollback evicts freezes viewport cleanly without row-index skew, then catches up in O(1)
+    const vtFreeze = new WebVtTerminal(40, 4, 6);
+    const cFreeze = createMockContainer();
+    for (let i = 1; i <= 12; i++) {
+      vtFreeze.feedText(`line-${i}\r\n`);
+    }
+    vtFreeze.patchDom(cFreeze, true);
+    const selectedEl = cFreeze.rows[3];
+    const selectedBefore = selectedEl.innerHTML;
+    vtFreeze.feedText("line-13\r\n");
+    const sFrozen = vtFreeze.patchDom(cFreeze, true, {
+      anchorNode: selectedEl,
+      focusNode: selectedEl,
+      containsNode: (el) => el === selectedEl,
+    });
+    expect(sFrozen.patched).toBe(0);
+    expect(sFrozen.skippedProtected).toBe(true);
+    expect(cFreeze.rows[3].innerHTML).toBe(selectedBefore);
+    // Selection cleared -> catches up cleanly
+    const sCatchup = vtFreeze.patchDom(cFreeze, true);
+    expect(sCatchup.skippedProtected).toBe(false);
+    expect(cFreeze.rows.some((r) => r.innerHTML.includes("line-13"))).toBe(true);
   });
 
   test("Relay v2 supports_zstd signature binding & RelayNonceReplayCache reject tampering/replays", () => {
@@ -499,9 +557,12 @@ describe("WebVtTerminal 2D VT100 engine", () => {
 });
 
 describe("Web modular engines: terminal_keys, OSC 7501 notifications & Smart-Path hot-switch", () => {
-  test("encodeTerminalKeyEvent handles Ctrl/DECCKM/Shift+Tab/F-keys/Alt & Cmd passthrough", () => {
+  test("encodeTerminalKeyEvent handles Ctrl/DECCKM/Shift+Tab/F-keys/Alt & all Cmd passthrough", () => {
     expect(encodeTerminalKeyEvent({ key: "c", ctrlKey: true })).toBe("\x03");
     expect(encodeTerminalKeyEvent({ key: "c", metaKey: true })).toBeNull();
+    expect(encodeTerminalKeyEvent({ key: "Backspace", metaKey: true })).toBeNull();
+    expect(encodeTerminalKeyEvent({ key: "ArrowLeft", metaKey: true })).toBeNull();
+    expect(encodeTerminalKeyEvent({ key: "k", metaKey: true })).toBeNull();
     expect(encodeTerminalKeyEvent({ key: "a", isComposing: true })).toBeNull();
     expect(encodeTerminalKeyEvent({ key: "Tab", shiftKey: true })).toBe("\x1b[Z");
     expect(encodeTerminalKeyEvent({ key: "ArrowUp" }, { appCursorKeys: false })).toBe("\x1b[A");
@@ -510,6 +571,10 @@ describe("Web modular engines: terminal_keys, OSC 7501 notifications & Smart-Pat
     expect(encodeTerminalKeyEvent({ key: "b", altKey: true })).toBe("\x1bb");
     expect(wrapBracketedPaste("hello", true)).toBe("\x1b[200~hello\x1b[201~");
     expect(wrapBracketedPaste("hello", false)).toBe("hello");
+    expect(isNeedsYouState("needs_you")).toBe(true);
+    expect(isNeedsYouState("permission")).toBe(true);
+    expect(isNeedsYouState("waiting")).toBe(true);
+    expect(isNeedsYouState("working")).toBe(false);
   });
 
   test("TerminalNotificationTracker is edge-triggered, suppresses visible active terminal & respects cooldown", () => {

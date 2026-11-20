@@ -29,9 +29,22 @@ function normalizeState(raw?: string | null): string {
   return String(raw || "idle").trim().toLowerCase();
 }
 
+export function isNeedsYouState(raw?: string | null): boolean {
+  const s = normalizeState(raw);
+  return (
+    s === "needs_you" ||
+    s === "needsyou" ||
+    s === "needs-you" ||
+    s === "blocked" ||
+    s === "waiting" ||
+    s === "permission" ||
+    s === "attention"
+  );
+}
+
 /**
  * Edge-triggered OSC 7501 notification tracker:
- * - Fires ONLY on state transitions into `needs_you`, `error`, or `working -> done`/`ready`.
+ * - Fires ONLY on state transitions into `needs_you` (including aliases), `error`, or `working -> done`/`ready`.
  * - Suppresses alerts when the page is visible AND the user is already viewing that exact terminal.
  * - Enforces a per-terminal cooldown so bursty agent output never spams OS notifications.
  */
@@ -54,7 +67,8 @@ export class TerminalNotificationTracker {
     ctx: NotifyObserveContext
   ): TerminalNotificationPayload | null {
     const key = `${input.daemonId}:${input.terminalAddr}`;
-    const nextState = normalizeState(input.status?.state);
+    const rawState = normalizeState(input.status?.state);
+    const nextState = isNeedsYouState(rawState) ? "needs_you" : rawState;
     const prevState = this.lastState.get(key);
     this.lastState.set(key, nextState);
 

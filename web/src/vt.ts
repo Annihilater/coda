@@ -60,6 +60,7 @@ export interface VtDomPatchStats {
   patched: number;
   reused: number;
   total: number;
+  skippedProtected: boolean;
 }
 
 export interface VtRowNodeLike {
@@ -223,6 +224,8 @@ export class WebVtTerminal {
   public bracketedPaste = false;
   public appCursorKeys = false;
   public latestStatus: VtHerdrStatus | null = null;
+  private pendingStatus: VtHerdrStatus | null = null;
+  private scrollbackEvictions = 0;
   public windowTitle: string | null = null;
 
   constructor(cols = 108, rows = 32, maxScrollback = 400) {
@@ -232,6 +235,17 @@ export class WebVtTerminal {
     this.scrollBottom = this.rows - 1;
     this.primaryGrid = this.createEmptyGrid(this.cols, this.rows);
     this.altGrid = this.createEmptyGrid(this.cols, this.rows);
+  }
+
+  /** Consumes any newly parsed OSC 7501 status since the previous call so stale NeedsYou never resurrects. */
+  consumeLatestStatus(): VtHerdrStatus | null {
+    const out = this.pendingStatus;
+    this.pendingStatus = null;
+    return out;
+  }
+
+  getScrollbackEvictions(): number {
+    return this.scrollbackEvictions;
   }
 
   private makeRow(cols: number): VtRow {
@@ -256,6 +270,7 @@ export class WebVtTerminal {
     this.primaryGrid = this.createEmptyGrid(this.cols, this.rows);
     this.altGrid = this.createEmptyGrid(this.cols, this.rows);
     this.primaryScrollback = [];
+    this.scrollbackEvictions = 0;
     this.usingAltScreen = false;
     this.cursorRow = 0;
     this.cursorCol = 0;
@@ -268,6 +283,9 @@ export class WebVtTerminal {
     this.cursorVisible = true;
     this.bracketedPaste = false;
     this.appCursorKeys = false;
+    this.latestStatus = null;
+    this.pendingStatus = null;
+    this.windowTitle = null;
     this.utf8Decoder = new TextDecoder("utf-8", { fatal: false });
     this.parserState = "ground";
     this.csiBuf = "";
@@ -279,6 +297,13 @@ export class WebVtTerminal {
     // Snapshots use '\n' line separators; normalize bare LF to CRLF while preserving explicit '\r'.
     const normalized = text.replace(/\r?\n/g, "\r\n");
     this.feedText(normalized);
+    // Clear edge-triggered pendingStatus after historical snapshot replay so subsequent plain stdout
+    // chunks do not re-emit an already-resolved OSC 7501 state.
+    this.pendingStatus = null;
+  }
+
+  isUsingAltScreen(): boolean {
+    return this.usingAltScreen;
   }
 
   feedBytes(bytes: Uint8Array): void {
@@ -559,6 +584,7 @@ export class WebVtTerminal {
         this.primaryScrollback.push(evicted);
         if (this.primaryScrollback.length > this.maxScrollback) {
           this.primaryScrollback.shift();
+          this.scrollbackEvictions += 1;
         }
       }
       grid.splice(this.scrollBottom, 0, this.makeRow(this.cols));
@@ -893,6 +919,7 @@ export class WebVtTerminal {
           const obj = JSON.parse(body) as VtHerdrStatus;
           if (obj && typeof obj.state === "string") {
             this.latestStatus = obj;
+            this.pendingStatus = obj;
           }
           return;
         } catch {
@@ -905,6 +932,7 @@ export class WebVtTerminal {
         next.state = body.slice(0, idx).trim();
         next.msg = body.slice(idx + 1).trim();
         this.latestStatus = next;
+        this.pendingStatus = next;
         return;
       }
       for (const kv of body.split(";")) {
@@ -920,6 +948,7 @@ export class WebVtTerminal {
         }
       }
       this.latestStatus = next;
+      this.pendingStatus = next;
     }
   }
 
@@ -1041,14 +1070,19 @@ export class WebVtTerminal {
 
   /**
    * Row-level dirty-diff DOM patcher (60fps zero-jitter):
-   * - Reuses unchanged `<div class="vt-row">` elements in O(1) without regenerating HTML.
-   * - Skips rows currently holding an active text selection anchor/focus node.
+   * - Pops evicted scrollback rows from the head in O(1) so streaming stays O(1) after scrollback fills.
+   * - Reuses unchanged `<div class="vt-row">` elements without regenerating HTML.
+   * - Skips rows overlapping an active text selection (including partial-outside selections via `containsNode`).
    * - Batches newly appended rows through a `DocumentFragment`.
    */
   patchDom(
     container: VtDomContainerLike,
     showCursor = true,
-    protectedSelection?: { anchorNode?: unknown; focusNode?: unknown } | null
+    protectedSelection?: {
+      anchorNode?: unknown;
+      focusNode?: unknown;
+      containsNode?: (node: VtRowNodeLike) => boolean;
+    } | null
   ): VtDomPatchStats {
     const drawCursor = showCursor && this.cursorVisible;
     const { rows, cursorVisRow } = this.visibleRows(drawCursor);
@@ -1057,46 +1091,98 @@ export class WebVtTerminal {
     if (container.getAttribute("data-vt-mode") !== "rows") {
       container.innerHTML = "";
       container.setAttribute("data-vt-mode", "rows");
+      container.setAttribute("data-vt-evictions", String(this.scrollbackEvictions));
+      container.setAttribute("data-vt-alt", this.usingAltScreen ? "1" : "0");
     }
 
-    // Compute protected row index range so active single- or multi-row text selections stay intact
-    // while non-selected rows continue streaming smoothly at 60fps.
+    let skippedProtected = false;
+    const prevEvictionsAttr = container.getAttribute("data-vt-evictions");
+    const prevAlt = container.getAttribute("data-vt-alt") === "1";
+
+    // Compute protected row index range FIRST so active selections inside `#term-screen-output`
+    // freeze head evictions cleanly without corrupting unshifted row indices.
     let protMin = -1;
     let protMax = -1;
-    if (protectedSelection && (protectedSelection.anchorNode || protectedSelection.focusNode)) {
-      const { anchorNode, focusNode } = protectedSelection;
-      if (anchorNode === container || focusNode === container) {
-        protMin = 0;
-        protMax = Math.max(0, container.childElementCount - 1);
-      } else {
-        let anchorIdx = -1;
-        let focusIdx = -1;
+    if (protectedSelection) {
+      const { anchorNode, focusNode, containsNode } = protectedSelection;
+      if (containsNode) {
         for (let i = 0; i < container.childElementCount; i++) {
           const child = container.children[i];
-          if (!child?.contains) continue;
-          if (anchorIdx < 0 && anchorNode && child.contains(anchorNode)) anchorIdx = i;
-          if (focusIdx < 0 && focusNode && child.contains(focusNode)) focusIdx = i;
-          if ((anchorIdx >= 0 || !anchorNode) && (focusIdx >= 0 || !focusNode)) break;
+          if (child && containsNode(child)) {
+            if (protMin < 0) protMin = i;
+            protMax = i;
+          }
         }
-        if (anchorIdx >= 0 && focusIdx >= 0) {
-          protMin = Math.min(anchorIdx, focusIdx);
-          protMax = Math.max(anchorIdx, focusIdx);
-        } else if (anchorIdx >= 0) {
-          protMin = anchorIdx;
-          protMax = anchorIdx;
-        } else if (focusIdx >= 0) {
-          protMin = focusIdx;
-          protMax = focusIdx;
+      }
+      if (protMin < 0 && (anchorNode || focusNode)) {
+        if (anchorNode === container || focusNode === container) {
+          protMin = 0;
+          protMax = Math.max(0, container.childElementCount - 1);
+        } else {
+          let anchorIdx = -1;
+          let focusIdx = -1;
+          for (let i = 0; i < container.childElementCount; i++) {
+            const child = container.children[i];
+            if (!child?.contains) continue;
+            if (anchorIdx < 0 && anchorNode && child.contains(anchorNode)) anchorIdx = i;
+            if (focusIdx < 0 && focusNode && child.contains(focusNode)) focusIdx = i;
+            if ((anchorIdx >= 0 || !anchorNode) && (focusIdx >= 0 || !focusNode)) break;
+          }
+          if (anchorIdx >= 0 && focusIdx >= 0) {
+            protMin = Math.min(anchorIdx, focusIdx);
+            protMax = Math.max(anchorIdx, focusIdx);
+          } else if (anchorIdx >= 0) {
+            protMin = anchorIdx;
+            protMax = anchorIdx;
+          } else if (focusIdx >= 0) {
+            protMin = focusIdx;
+            protMax = focusIdx;
+          }
         }
       }
     }
-    const isProtectedIdx = (idx: number): boolean => protMin >= 0 && idx >= protMin && idx <= protMax;
+    const hasProtectedRows = protMin >= 0;
+    const isProtectedIdx = (idx: number): boolean => hasProtectedRows && idx >= protMin && idx <= protMax;
+
+    // V3-23: Pop newly evicted primary scrollback rows from the front so remaining 400 rows keep exact
+    // positional alignment and reuse in O(1) instead of rewriting every row.
+    if (!this.usingAltScreen && !prevAlt && prevEvictionsAttr !== null) {
+      const prevEvictions = Number(prevEvictionsAttr);
+      if (Number.isFinite(prevEvictions) && this.scrollbackEvictions > prevEvictions) {
+        const delta = this.scrollbackEvictions - prevEvictions;
+        if (hasProtectedRows) {
+          // Freeze the entire viewport while rows are selected during scrollback eviction so row indices
+          // never shift or duplicate; `selectionchange` will catch up in O(1) once selection clears.
+          return {
+            patched: 0,
+            reused: container.childElementCount,
+            total: rows.length,
+            skippedProtected: true,
+          };
+        }
+        if (delta > 0 && delta < container.childElementCount) {
+          for (let i = 0; i < delta; i++) {
+            container.children[0]?.remove();
+          }
+        }
+        container.setAttribute("data-vt-evictions", String(this.scrollbackEvictions));
+      } else {
+        container.setAttribute("data-vt-evictions", String(this.scrollbackEvictions));
+      }
+    } else if (!hasProtectedRows) {
+      container.setAttribute("data-vt-evictions", String(this.scrollbackEvictions));
+    }
+    container.setAttribute("data-vt-alt", this.usingAltScreen ? "1" : "0");
 
     // Trim trailing rows when screen shrinks or switches into shorter alt-screen.
     while (container.childElementCount > rows.length) {
       const lastIdx = container.childElementCount - 1;
       const last = container.children[lastIdx];
-      if (!last || isProtectedIdx(lastIdx)) break;
+      if (!last) break;
+      if (isProtectedIdx(lastIdx)) {
+        skippedProtected = true;
+        break;
+      }
       last.remove();
     }
 
@@ -1118,6 +1204,7 @@ export class WebVtTerminal {
         }
         if (isProtectedIdx(rIdx)) {
           reused += 1;
+          skippedProtected = true;
           continue;
         }
         existing.innerHTML = this.renderSingleRowHtml(row.cells, cursorColHere);
@@ -1142,6 +1229,6 @@ export class WebVtTerminal {
       container.appendChild(frag);
     }
 
-    return { patched, reused, total: rows.length };
+    return { patched, reused, total: rows.length, skippedProtected };
   }
 }

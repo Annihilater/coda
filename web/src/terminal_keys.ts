@@ -16,10 +16,11 @@ export function encodeTerminalKeyEvent(
   opts: { appCursorKeys?: boolean; imeComposing?: boolean } = {}
 ): string | null {
   if (e.isComposing || opts.imeComposing) return null;
-  const lower = e.key.toLowerCase();
-  if (e.metaKey && (lower === "c" || lower === "v" || lower === "r" || lower === "l")) {
+  // V3-24: Never hijack macOS Cmd+* shortcuts (Cmd+K, Cmd+C/V/R/L, Cmd+Backspace, Cmd+Arrows, etc.).
+  if (e.metaKey) {
     return null;
   }
+  const lower = e.key.toLowerCase();
 
   const appCursor = Boolean(opts.appCursorKeys);
 
