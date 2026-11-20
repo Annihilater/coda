@@ -2431,6 +2431,99 @@ impl RemoteMeshHub {
             hub.ui_dirty.store(true, Ordering::Release);
         });
     }
+
+    pub fn request_remote_port_preview(self: &Arc<Self>, host_id: Uuid, port: u16, path: String) {
+        let hub = Arc::clone(self);
+        self.spawn_bg(async move {
+            let Ok(cfg) = load_desktop_daemon_config(&DaemonConfig::default_path()) else {
+                if let Ok(mut g) = hub.state.lock() {
+                    g.port_preview.loading = false;
+                    g.port_preview.status_code = Some(401);
+                    g.port_preview.content_type = "text/plain".to_string();
+                    g.port_preview.body_preview =
+                        "Sign in required before previewing remote ports.".to_string();
+                }
+                hub.ui_dirty.store(true, Ordering::Release);
+                return;
+            };
+            let host_opt = hub
+                .state
+                .lock()
+                .ok()
+                .and_then(|g| g.remote_hosts.iter().find(|h| h.id == host_id).cloned());
+            let Some(host) = host_opt else {
+                if let Ok(mut g) = hub.state.lock() {
+                    g.port_preview.loading = false;
+                    g.port_preview.status_code = Some(404);
+                    g.port_preview.content_type = "text/plain".to_string();
+                    g.port_preview.body_preview = "Remote host not found.".to_string();
+                }
+                hub.ui_dirty.store(true, Ordering::Release);
+                return;
+            };
+            match hub.get_or_connect_peer(&cfg, &host).await {
+                Ok(peer) => {
+                    let reply = peer
+                        .request(
+                            PeerMessage::HttpLocalPreviewRequest {
+                                req_id: format!("pp-{}", Uuid::new_v4().simple()),
+                                port,
+                                path,
+                            },
+                            TrafficLane::BulkP1,
+                            Duration::from_secs(10),
+                        )
+                        .await;
+                    match reply {
+                        Ok(PeerMessage::HttpLocalPreviewResponse {
+                            status_code,
+                            content_type,
+                            body_b64,
+                            ..
+                        }) => {
+                            let (sc, ct, body) = crate::port_preview::decode_remote_preview_response(
+                                status_code,
+                                &content_type,
+                                &body_b64,
+                            );
+                            if let Ok(mut g) = hub.state.lock() {
+                                g.port_preview.loading = false;
+                                g.port_preview.status_code = Some(sc);
+                                g.port_preview.content_type = ct;
+                                g.port_preview.body_preview = body;
+                            }
+                        }
+                        Ok(_) => {
+                            if let Ok(mut g) = hub.state.lock() {
+                                g.port_preview.loading = false;
+                                g.port_preview.status_code = Some(502);
+                                g.port_preview.content_type = "text/plain".to_string();
+                                g.port_preview.body_preview =
+                                    "Unexpected E2EE response from host.".to_string();
+                            }
+                        }
+                        Err(err) => {
+                            if let Ok(mut g) = hub.state.lock() {
+                                g.port_preview.loading = false;
+                                g.port_preview.status_code = Some(502);
+                                g.port_preview.content_type = "text/plain".to_string();
+                                g.port_preview.body_preview = format!("Preview error: {err}");
+                            }
+                        }
+                    }
+                }
+                Err(err) => {
+                    if let Ok(mut g) = hub.state.lock() {
+                        g.port_preview.loading = false;
+                        g.port_preview.status_code = Some(502);
+                        g.port_preview.content_type = "text/plain".to_string();
+                        g.port_preview.body_preview = format!("Host unreachable: {err}");
+                    }
+                }
+            }
+            hub.ui_dirty.store(true, Ordering::Release);
+        });
+    }
 }
 
 pub(crate) fn spawn_device_login(

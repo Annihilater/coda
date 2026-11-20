@@ -13,6 +13,7 @@ pub mod git_inspector;
 pub mod helpers;
 pub mod modals;
 pub mod notify;
+pub mod port_preview;
 pub mod pty;
 pub mod remote_mesh;
 pub mod search_export;
@@ -118,6 +119,8 @@ pub enum ActiveInputTarget {
     VoiceBaseUrl,
     VoiceModel,
     VoiceApiKey,
+    PreviewPort,
+    PreviewPath,
 }
 
 /// Primary or Secondary split terminal pane.
@@ -133,6 +136,7 @@ pub enum SplitPane {
 pub enum RightDrawerTab {
     Changes,
     Files,
+    Preview,
     Mesh,
 }
 
@@ -326,6 +330,7 @@ pub struct CodaDesktopState {
     pub voice_api_key: String,
     pub voice_recording: bool,
     pub voice_transcribing: bool,
+    pub port_preview: crate::port_preview::PortPreviewState,
     pub status_notice: Option<String>,
 }
 
@@ -395,6 +400,7 @@ impl Default for CodaDesktopState {
             voice_api_key: String::new(),
             voice_recording: false,
             voice_transcribing: false,
+            port_preview: crate::port_preview::PortPreviewState::default(),
             status_notice: None,
         }
     }
@@ -576,6 +582,17 @@ impl CodaDesktopState {
             label: tr(self.locale, "Toggle Git Changes Panel", "打开 Git 变更侧栏").to_string(),
             detail: "Side panel".to_string(),
             action: PaletteAction::OpenDrawer(RightDrawerTab::Changes),
+        });
+        items.push(PaletteItem {
+            kind_tag: "ACTION",
+            label: tr(
+                self.locale,
+                "Toggle Localhost Port Preview Panel",
+                "打开本地/远端端口加密预览侧栏",
+            )
+            .to_string(),
+            detail: "127.0.0.1:PORT · E2EE".to_string(),
+            action: PaletteAction::OpenDrawer(RightDrawerTab::Preview),
         });
         items.push(PaletteItem {
             kind_tag: "ACTION",
@@ -1243,6 +1260,14 @@ impl CodaGpuWorkspaceView {
                 ActiveInputTarget::VoiceModel => {
                     (!g.voice_model.is_empty()).then(|| (g.voice_model.clone(), false))
                 }
+                ActiveInputTarget::PreviewPort => {
+                    (!g.port_preview.port_input.is_empty())
+                        .then(|| (g.port_preview.port_input.clone(), false))
+                }
+                ActiveInputTarget::PreviewPath => {
+                    (!g.port_preview.path_input.is_empty())
+                        .then(|| (g.port_preview.path_input.clone(), false))
+                }
                 ActiveInputTarget::AuthPassword
                 | ActiveInputTarget::ChangePwCurrent
                 | ActiveInputTarget::ChangePwNew
@@ -1343,6 +1368,8 @@ impl CodaGpuWorkspaceView {
                         | ActiveInputTarget::RenameDeviceInput
                         | ActiveInputTarget::VoiceBaseUrl
                         | ActiveInputTarget::VoiceModel
+                        | ActiveInputTarget::PreviewPort
+                        | ActiveInputTarget::PreviewPath
                 ) {
                 txt.trim().to_string()
             } else if matches!(
@@ -1506,6 +1533,28 @@ impl CodaGpuWorkspaceView {
                     g.voice_api_key.push_str(text);
                 }
             }
+            ActiveInputTarget::PreviewPort => {
+                if let Ok(mut g) = self.state.lock() {
+                    if g.input_selected_all {
+                        g.port_preview.port_input.clear();
+                        g.input_selected_all = false;
+                    }
+                    for ch in text.chars() {
+                        if ch.is_ascii_digit() && g.port_preview.port_input.len() < 5 {
+                            g.port_preview.port_input.push(ch);
+                        }
+                    }
+                }
+            }
+            ActiveInputTarget::PreviewPath => {
+                if let Ok(mut g) = self.state.lock() {
+                    if g.input_selected_all {
+                        g.port_preview.path_input.clear();
+                        g.input_selected_all = false;
+                    }
+                    g.port_preview.path_input.push_str(text);
+                }
+            }
             ActiveInputTarget::CommandPalette => {}
         }
     }
@@ -1554,6 +1603,8 @@ impl CodaGpuWorkspaceView {
                                 ActiveInputTarget::VoiceBaseUrl => g.voice_base_url.clear(),
                                 ActiveInputTarget::VoiceModel => g.voice_model.clear(),
                                 ActiveInputTarget::VoiceApiKey => g.voice_api_key.clear(),
+                                ActiveInputTarget::PreviewPort => g.port_preview.port_input.clear(),
+                                ActiveInputTarget::PreviewPath => g.port_preview.path_input.clear(),
                                 _ => {}
                             }
                         }
@@ -2036,6 +2087,70 @@ impl CodaGpuWorkspaceView {
                 }
                 "enter" | "return" => {
                     self.save_voice_preferences();
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                "escape" => {
+                    if let Ok(mut g) = self.state.lock() {
+                        g.input_selected_all = false;
+                        g.input_target = ActiveInputTarget::TerminalDirect;
+                    }
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                _ => {}
+            },
+            ActiveInputTarget::PreviewPort => match key {
+                "backspace" => {
+                    if let Ok(mut g) = self.state.lock() {
+                        if g.input_selected_all {
+                            g.port_preview.port_input.clear();
+                            g.input_selected_all = false;
+                        } else {
+                            g.port_preview.port_input.pop();
+                        }
+                    }
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                "tab" => {
+                    if let Ok(mut g) = self.state.lock() {
+                        g.input_selected_all = false;
+                        g.input_target = ActiveInputTarget::PreviewPath;
+                    }
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                "enter" | "return" => {
+                    self.trigger_active_port_preview();
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                "escape" => {
+                    if let Ok(mut g) = self.state.lock() {
+                        g.input_selected_all = false;
+                        g.input_target = ActiveInputTarget::TerminalDirect;
+                    }
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                _ => {}
+            },
+            ActiveInputTarget::PreviewPath => match key {
+                "backspace" => {
+                    if let Ok(mut g) = self.state.lock() {
+                        if g.input_selected_all {
+                            g.port_preview.path_input.clear();
+                            g.input_selected_all = false;
+                        } else {
+                            g.port_preview.path_input.pop();
+                        }
+                    }
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                "enter" | "return" => {
+                    self.trigger_active_port_preview();
                     cx.notify();
                     cx.stop_propagation();
                 }
@@ -3516,6 +3631,65 @@ impl CodaGpuWorkspaceView {
                     ));
                 }
             }
+        }
+        self.ui_dirty.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn trigger_active_port_preview(&self) {
+        let parsed = {
+            let Ok(mut g) = self.state.lock() else {
+                return;
+            };
+            match crate::port_preview::parse_preview_port_and_path(
+                &g.port_preview.port_input,
+                &g.port_preview.path_input,
+            ) {
+                Ok((port, path)) => {
+                    g.port_preview.loading = true;
+                    g.port_preview.path_input = path.clone();
+                    g.input_selected_all = false;
+                    g.input_target = ActiveInputTarget::TerminalDirect;
+                    let remote_hid = g
+                        .active_space()
+                        .filter(|sp| sp.is_remote)
+                        .and_then(|sp| Uuid::parse_str(&sp.machine_id).ok());
+                    Some((port, path, remote_hid))
+                }
+                Err(err) => {
+                    g.port_preview.loading = false;
+                    g.port_preview.status_code = Some(400);
+                    g.port_preview.content_type = "text/plain".to_string();
+                    g.port_preview.body_preview = err;
+                    None
+                }
+            }
+        };
+        let Some((port, path, remote_hid)) = parsed else {
+            self.ui_dirty.store(true, Ordering::Release);
+            return;
+        };
+        if let Some(hid) = remote_hid {
+            self.mesh_hub.request_remote_port_preview(hid, port, path);
+        } else {
+            let state_bg = Arc::clone(&self.state);
+            let ui_dirty_bg = Arc::clone(&self.ui_dirty);
+            std::thread::spawn(move || {
+                let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                else {
+                    return;
+                };
+                let (sc, ct, body) =
+                    rt.block_on(crate::port_preview::fetch_local_port_preview(port, &path));
+                if let Ok(mut g) = state_bg.lock() {
+                    g.port_preview.loading = false;
+                    g.port_preview.status_code = Some(sc);
+                    g.port_preview.content_type = ct;
+                    g.port_preview.body_preview = body;
+                }
+                ui_dirty_bg.store(true, Ordering::Release);
+            });
         }
         self.ui_dirty.store(true, Ordering::Release);
     }
@@ -5026,6 +5200,12 @@ impl CodaGpuWorkspaceView {
                     ))
                     .child(self.render_drawer_toggle_btn(
                         st,
+                        RightDrawerTab::Preview,
+                        tr(loc, "Port", "端口"),
+                        cx,
+                    ))
+                    .child(self.render_drawer_toggle_btn(
+                        st,
                         RightDrawerTab::Mesh,
                         &nodes_label,
                         cx,
@@ -6277,6 +6457,10 @@ impl CodaGpuWorkspaceView {
                 };
                 (tr(loc, "Changes", "变更").to_string(), Some(sub))
             }
+            RightDrawerTab::Preview => (
+                tr(loc, "Port Preview", "端口预览").to_string(),
+                Some(format!("127.0.0.1:{}", st.port_preview.port_input)),
+            ),
             RightDrawerTab::Mesh => (
                 tr(loc, "Remote Nodes", "远端节点").to_string(),
                 Some(format!("{online_hosts}/{}", st.remote_hosts.len())),
@@ -6286,7 +6470,7 @@ impl CodaGpuWorkspaceView {
         let show_back = match tab {
             RightDrawerTab::Files => st.selected_file_rel.is_some(),
             RightDrawerTab::Changes => st.selected_change_path.is_some(),
-            RightDrawerTab::Mesh => false,
+            RightDrawerTab::Preview | RightDrawerTab::Mesh => false,
         };
 
         div()
@@ -6344,7 +6528,7 @@ impl CodaGpuWorkspaceView {
                                                     }
                                                     this.refresh_active_space_inspector();
                                                 }
-                                                RightDrawerTab::Mesh => {}
+                                                RightDrawerTab::Preview | RightDrawerTab::Mesh => {}
                                             }
                                             cx.notify();
                                         })),
@@ -6390,8 +6574,12 @@ impl CodaGpuWorkspaceView {
                                         .text_size(px(11.0))
                                         .text_color(rgb(palette::TEXT_MUTED))
                                         .child("↻")
-                                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                            this.refresh_active_space_inspector();
+                                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                            if tab == RightDrawerTab::Preview {
+                                                this.trigger_active_port_preview();
+                                            } else {
+                                                this.refresh_active_space_inspector();
+                                            }
                                             cx.notify();
                                         })),
                                 )
@@ -6716,6 +6904,9 @@ impl CodaGpuWorkspaceView {
                                     }))
                             }))
                         }
+                    })
+                    .when(tab == RightDrawerTab::Preview, |el| {
+                        self.render_port_preview_drawer_body(st, el, cx)
                     })
                     .when(tab == RightDrawerTab::Mesh, |el| {
                         self.render_mesh_drawer_body(st, el, cx)

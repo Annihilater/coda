@@ -12,6 +12,7 @@ use std::sync::Arc;
 #[derive(Debug, Parser)]
 #[command(
     name = "coda-desktop",
+    version,
     about = "Coda Native 120Hz GPU-Accelerated Workbench (Rust + GPUI for macOS, Windows & Linux)"
 )]
 struct Cli {
