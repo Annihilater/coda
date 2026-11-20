@@ -130,7 +130,10 @@ curl -fsSL https://codahub.dev/install.sh | sh
 # 查看当前绑定的设备状态、进程/锁健康、hc 可用性与票据有效期
 ~/.local/bin/coda-daemon status
 
-# 常用运维子命令（支持停服、重启、登出解绑与完整卸载）
+# 一键拉取最新 GitHub Release（含 SHA256SUMS 强校验）并向运行中守护进程发送 SIGUSR1 零中断热升级
+~/.local/bin/coda-daemon upgrade
+
+# 常用运维子命令（支持停服、重启、登出解绑与完整卸载；亦可在 Web / GPUI / iOS 端一键远程 E2EE OTA 升级）
 ~/.local/bin/coda-daemon restart
 ~/.local/bin/coda-daemon stop
 ~/.local/bin/coda-daemon logout
@@ -144,15 +147,15 @@ curl -fsSL https://codahub.dev/install.sh | sh
 ## 四、使用各端客户端连接开发（Windows/Mac/iOS 互控）
 
 1. **Web 终端 & iOS Safari PWA（零上架零安装）**：
-   用电脑浏览器或 iPhone Safari 访问 `https://codahub.dev`（支持终端直接原始键盘输入、多标签独立会话、Whisper 语音转写输入、账号/会话/设备全生命周期管理）；在 iPhone Safari 点击「分享 → 添加到主屏幕」即可全屏当原生 App 使用；如有 **TestFlight** 链接，可在 `.env` 中配置 `CODA_IOS_BETA_URL`。
+   用电脑浏览器或 iPhone Safari 访问 `https://codahub.dev`（支持终端原始键盘输入、多标签与双栏分屏会话、`⌘F` 搜索与 `.md` 导出、E2EE 远端文件树浏览与沙箱化 `localhost` 端口预览、Whisper 语音转写输入、主机健康遥测与一键 OTA 升级）；在 iPhone Safari 点击「分享 → 添加到主屏幕」即可全屏当原生 App 使用；如有 **TestFlight** 链接，可在 `.env` 中配置 `CODA_IOS_BETA_URL`。
 2. **macOS 桌面端（`.dmg` 双击安装，`Hybrid` 双向互控 + 显式被控开关）**：
    在官网下载中心直接点击下载 **`Coda-Desktop-macos-aarch64-<version>.dmg`** 并拖入 `Applications`；首次打开若提示未公证开发者，在终端执行一次：
    ```bash
    xattr -cr /Applications/Coda.app
    ```
-   打开 `Coda.app` 点击左侧「🔑 浏览器登录」即可绑定同一账号——支持在侧边抽屉与设置页一键开关 **「允许远端控制本机（Allow Remote Control）」**，开启后可被手机/网页/公司电脑远程接管，关闭则仅作为纯控制端，并与独立安装的 `coda-daemon` 自动共存互不冲突。
+   打开 `Coda.app` 点击左侧「🔑 浏览器登录」即可绑定同一账号——支持在侧边抽屉与设置页一键开关 **「允许远端控制本机（Allow Remote Control）」**，配备 Dock `Needs-You` 待审批角标、原生麦克风 Whisper 听写、`⌘F` 搜索 / `⌘+Click` 链接跳转 / `.md` 导出、E2EE 远端文件树与 `localhost` 端口预览，并与独立安装的 `coda-daemon` 自动共存互不冲突。
 3. **iPhone / iPhone Duo / iPad 原生 SwiftUI 客户端 (`apple/`)**：
-   使用 Xcode 打开 `apple/Package.swift`（或 `apple/project.yml`）编译到真机运行测试版，支持浏览器设备码授权、低延迟 PTY 实时输入、Whisper 语音录音转写与完整设备/账号管理。
+   使用 Xcode 打开 `apple/Package.swift`（或 `apple/project.yml`）编译到真机运行测试版，支持浏览器设备码授权、低延迟 PTY 实时输入、终端内联搜索与 `.md` 一键分享导出、E2EE 远端文件树与 `localhost` 端口预览、Whisper 语音录音转写与远程主机健康/OTA 管理。
 
 ---
 

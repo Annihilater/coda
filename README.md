@@ -4,7 +4,7 @@
 
 # CODA · Zero-Knowledge AI Agent Mesh
 
-**Coda** 是一套支持**多用户好友隔离、端到端零知识加密（Zero-Knowledge E2EE）**的跨设备 AI 远程开发云网，专为编排远端 **`herdr-core` (`hc`)** 中的 **Claude Code、Codex、Grok Build、Gemini CLI** 而打造。
+**Coda** 是一套支持**多用户好友隔离、端到端零知识加密（Zero-Knowledge E2EE）**的跨设备 AI 远程开发云网，专为编排远端 **`herdr-core` (`hc`)** 中的 **Claude Code、Codex、Grok CLI、Antigravity (AGY)、Gemini CLI** 而打造。
 
 ## 核心架构亮点
 
@@ -14,16 +14,16 @@
 2. **大陆免备案裸 IP 与海外 CDN 混合中继引擎 (`crates/coda-server`)**
    - **国内阿里云/腾讯云免备案极速通道 (`--raw-tcp-bind 0.0.0.0:24443`)**：纯二进制长度前缀帧 + `TCP_NODELAY`，**零 HTTP 头、零域名 SNI**，彻底规避国内未备案域名 80/443 阻断；支持 `--relay-only` 无数据库独立边缘节点部署，受控端 `coda-daemon` 可同时并发保活主控面与国内免备案中继！
    - **海外服务器 + CDN 边缘通道 (`/v1/tunnel/ws`)**：双轨优先级调度（`ControlP0` 按键与审批零排队 vs `BulkP1` 令牌桶租户公平限速）+ **75 秒预热无缝换轨（Make-Before-Break）**，免疫 CDN 100 秒断连。
-3. **原生对接 `herdr-core` 全双工 PTY 流、原生 Shell 兜底与工作区扫描 (`crates/coda-herdr` & `crates/coda-daemon`)**
+3. **原生对接 `herdr-core` 全双工 PTY 流、E2EE 远程运维与工作区透视 (`crates/coda-herdr` & `crates/coda-daemon`)**
    - **全双工 PTY 实时流 (`hc attach`)**：基于 Unix `openpty` + `TIOCSWINSZ` 动态重排，实时双向流式传输 24-bit ANSI/VT 终端画面与 Kitty Keyboard 按键序列，并在断开时通过 `0x1c` (`Ctrl+\`) 无损分离；未安装 `hc` 时自动回落内置原生 Unix PTY Shell。
-   - **Git 多仓库/Worktree 扫描 (`ListWorkspaces`)**：自动扫描主机 Git 仓库、`git worktree list --porcelain` 与 `+added / -deleted` 行数统计，并与运行中的 `herdr` 终端自动关联；提供完整运维子命令（`coda-daemon status|stop|restart|logout|uninstall`）与 30 天票据自动续签。
-   - **远端文件/截图直传 (`[ 📎 ]` -> `hc terminal.put`)** 与 **Web/Apple 真实语音录音 + Whisper 转写输入**。
+   - **Git 多仓库扫描、实时健康监控与零中断 OTA 升级**：自动扫描主机 Git 仓库、`git worktree list --porcelain` 与 `+added / -deleted` 行数统计，实时推送主机 CPU / 内存 / 负载 / 磁盘 / 运行时长遥测；提供完整本地子命令（`coda-daemon status|upgrade|stop|restart|logout|uninstall`）及 E2EE 远程一键 `SHA256SUMS` 校验 + `SIGUSR1` 零中断热重执升级。
+   - **E2EE 远端文件树浏览、加密本地端口预览 (`HttpLocalPreview`)、文件直传 (`[ 📎 ]`) 与全端 Whisper 语音转写**。
 4. **双栈局域网 IPv4 / 大陆原生公网 IPv6 直连打洞引擎 (`DirectP2pClient` & `spawn_direct_p2p_listener`)**
    - 双栈 `[::]:24444` 监听与 250ms Happy Eyeballs 竞速探测：同局域网（`< 2ms`）或三大运营商原生公网 IPv6（`2408:`/`2409:`/`240e:`，`< 12ms`）自动建立端到端加密点对点直连，**零服务器中继带宽消耗**；不通时毫秒级无感回退至 `:24443` 免备案裸 TCP 或 `:443` CDN WSS。
 5. **三大客户端矩阵：Rust + GPUI 极速桌面端 + 纯血 Apple 移动端 + 零安装 Web 端 (`crates/coda-desktop` & `apple/` & `web/`)**
-   - **`crates/coda-desktop` (Rust + GPUI 0.2.2)**：采用 **Rust + GPUI** 纯 GPU 加速框架（macOS `Metal`、Windows `DirectX 12`、Linux `Vulkan`/`Blade`），支持双向互控显式开关（`Allow Remote Control`）、macOS Keychain 凭据存储、鼠标单元格拖选复制与 Bracketed Paste、以及远程主机改名/移除与密码修改。
-   - **`apple/` (Swift 6 / SwiftUI Multiplatform)**：专为 **iPhone、iPhone Duo（5.4" 外屏单手终端态 ↔ 7.6" 展开双栏工作台态瞬时字符重排）、iPadOS** 打造，配备双排专属终端键盘、`AVAudioRecorder` + Whisper 语音转写输入、低延迟 `sendPtyInput` 与完整账号/设备管理。
-   - **`web/` (TypeScript + `@noble/ciphers` + `fzstd`)**：浏览器端零知识加密终端控制台，支持终端直输原始按键、多标签独立会话、手机端抽屉适配、Whisper 语音录音转写与完整设置中心。
+   - **`crates/coda-desktop` (Rust + GPUI 0.2.2)**：采用 **Rust + GPUI** 纯 GPU 加速框架（macOS `Metal`、Windows `DirectX 12`、Linux `Vulkan`/`Blade`），支持双向互控显式开关（`Allow Remote Control`）、Dock `Needs-You` 角标提醒、原生麦克风 + Whisper 语音输入、`⌘F` 历史搜索 / `⌘+Click` 链接跳转 / `.md` 会话导出、E2EE 远端文件树与 `localhost` 端口预览、以及一键守护进程 OTA 升级。
+   - **`apple/` (Swift 6 / SwiftUI Multiplatform)**：专为 **iPhone、iPhone Duo（5.4" 外屏单手终端态 ↔ 7.6" 展开双栏工作台态瞬时字符重排）、iPadOS** 打造，配备双排专属终端键盘、终端内联历史搜索、会话 `.md` 一键分享导出、E2EE 远端文件树与 `localhost` 端口预览、`AVAudioRecorder` + Whisper 语音转写输入与远程主机健康/OTA 管理。
+   - **`web/` (TypeScript + `@noble/ciphers` + `fzstd`)**：浏览器端零知识加密终端控制台，支持双栏分屏终端（Split View）、`⌘F` 搜索与 `.md` 导出、E2EE 远端文件树浏览、沙箱化 `localhost` 端口加密预览、Whisper 语音录音转写、主机实时健康徽章与一键 OTA 升级。
    - **`deploy/`**：提供 [完整生产环境极简部署指南 (`deploy/DEPLOY.md`)](deploy/DEPLOY.md)、`install-server.sh`、`install-relay-cn.sh`、`install-daemon.sh`（支持 `curl -fsSL https://codahub.dev/install.sh | sh` 一键安装并通过浏览器设备码授权配置 `launchd` / `systemd`）、`docker-compose.yml` 与国内免备案中继 `coda-relay-cn.service`。
 
 ---
