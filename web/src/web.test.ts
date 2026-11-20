@@ -29,6 +29,19 @@ import {
 import { encodeTerminalKeyEvent, wrapBracketedPaste } from "./terminal_keys";
 import { TerminalNotificationTracker, isNeedsYouState } from "./notify";
 import { SmartPathBackoffPolicy, collectDirectWsCandidates } from "./smart_path";
+import {
+  MOBILE_QUICK_CHIPS,
+  buildWebSessionMarkdown,
+  extractSafeTerminalUrls,
+  findWebTerminalMatches,
+  formatWebHostHealth,
+} from "./terminal_extras";
+import {
+  createInitialFileBrowserState,
+  joinRootAndRel,
+  parentSubPath,
+  renderRemoteFileBrowserModal,
+} from "./file_browser";
 
 function makeTestIdentity(name: string): WebDeviceIdentity {
   const edPriv = ed25519.utils.randomPrivateKey();
@@ -686,5 +699,49 @@ describe("Web modular engines: terminal_keys, OSC 7501 notifications & Smart-Pat
     policy.recordDirectDrop("d-1", 50_000);
     expect(policy.canProbeNow("d-1", "relay_ws", 52_000)).toBe(false);
     expect(policy.canProbeNow("d-1", "relay_ws", 55_000)).toBe(true);
+  });
+
+  test("v0.7.0 terminal search, safe URL extraction, Markdown export, health telemetry & file browser", () => {
+    const plain = "$ cargo test\nERROR: failed at https://codahub.dev/docs/ota?v=1)，重试\ntest error ok\n   \n";
+    const matches = findWebTerminalMatches(plain, "error");
+    expect(matches.length).toBe(2);
+    expect(matches[0].rowIdx).toBe(1);
+    expect(matches[1].rowIdx).toBe(2);
+
+    const urls = extractSafeTerminalUrls("详见 (https://codahub.dev/docs/ota?v=1)，以及 https://example.com/a(b).");
+    expect(urls).toEqual(["https://codahub.dev/docs/ota?v=1", "https://example.com/a(b)"]);
+
+    const md = buildWebSessionMarkdown("coda · agy", "/opt/coda", plain, "2026-11-20T00:00:00Z");
+    expect(md).toContain("# Coda Session Transcript — coda · agy");
+    expect(md).toContain("test error ok\n```");
+
+    expect(MOBILE_QUICK_CHIPS).toContain("/compact");
+    expect(MOBILE_QUICK_CHIPS).toContain("git status");
+
+    const hh = formatWebHostHealth({
+      daemon_version: "0.7.0",
+      os: "linux",
+      arch: "x86_64",
+      cpu_cores: 8,
+      load_avg_1m: 0.42,
+      mem_used_mb: 6144,
+      mem_total_mb: 16384,
+      daemon_uptime_secs: 120,
+      ota_supported: true,
+    });
+    expect(hh).toBe("v0.7.0 · 8c · load 0.42 · 6.0/16.0G");
+
+    expect(parentSubPath("crates/coda-server/src")).toBe("crates/coda-server");
+    expect(parentSubPath("crates")).toBe("");
+    expect(joinRootAndRel("/opt/coda/", "/src/lib.rs")).toBe("/opt/coda/src/lib.rs");
+
+    const st = createInitialFileBrowserState();
+    st.open = true;
+    st.rootPath = "/opt/coda";
+    st.entries = [{ name: "<img onerror=1>", rel_path: "bad", is_dir: false, size_bytes: 2048 }];
+    const html = renderRemoteFileBrowserModal(st, ["/opt/coda"], (en) => en);
+    expect(html).toContain("&lt;img onerror=1&gt;");
+    expect(html).not.toContain("<img onerror=1>");
+    expect(html).toContain("2.0 KB");
   });
 });

@@ -53,6 +53,22 @@ import {
   requestBrowserNotificationPermission,
 } from "./notify";
 import { SmartPathBackoffPolicy, collectDirectWsCandidates } from "./smart_path";
+import {
+  type HostHealthSnapshot,
+  MOBILE_QUICK_CHIPS,
+  buildWebSessionMarkdown,
+  findWebTerminalMatches,
+  firstSafeTerminalUrlInLine,
+  formatWebHostHealth,
+  triggerMarkdownDownload,
+} from "./terminal_extras";
+import {
+  type RemoteFileBrowserState,
+  createInitialFileBrowserState,
+  joinRootAndRel,
+  parentSubPath,
+  renderRemoteFileBrowserModal,
+} from "./file_browser";
 
 if (typeof window !== "undefined" && typeof document !== "undefined") {
   try {
@@ -123,6 +139,13 @@ export class CodaTerminalWebApp {
   };
   private voiceApiKeyLocal = "";
   private activeTerminalAddr: string | null = null;
+  private splitMode = false;
+  private secondaryTerminalAddr: string | null = null;
+  private showTermSearch = false;
+  private termSearchQuery = "";
+  private termSearchIdx = 0;
+  private hostHealthByPeer = new Map<string, HostHealthSnapshot>();
+  private fileBrowser: RemoteFileBrowserState = createInitialFileBrowserState();
   private draftInput = "";
   private imeComposing = false;
   private showSidebar = typeof window === "undefined" ? true : window.innerWidth >= 900;
@@ -346,8 +369,27 @@ export class CodaTerminalWebApp {
             inp?.focus();
           }, 0);
         }
+      } else if (
+        !e.defaultPrevented &&
+        (e.metaKey || e.ctrlKey) &&
+        e.key.toLowerCase() === "f" &&
+        this.route === "console" &&
+        !this.showSettingsModal &&
+        !this.showCmdPalette
+      ) {
+        e.preventDefault();
+        this.showTermSearch = true;
+        this.render();
+        setTimeout(() => {
+          const inp = document.getElementById("term-search-input") as HTMLInputElement | null;
+          inp?.focus();
+          inp?.select();
+        }, 0);
       } else if (e.key === "Escape" && this.showCmdPalette) {
         this.showCmdPalette = false;
+        this.render();
+      } else if (e.key === "Escape" && this.fileBrowser.open) {
+        this.fileBrowser.open = false;
         this.render();
       }
     });
@@ -668,7 +710,26 @@ export class CodaTerminalWebApp {
         boxEl.scrollTop = wasNearBottom ? boxEl.scrollHeight : prevScrollTop;
       }
       this.syncScrollBottomPill(boxEl);
+      this.applySearchHighlightsInPlace(screenEl, vt);
     }
+
+    if (this.splitMode && this.secondaryTerminalAddr && this.secondaryTerminalAddr !== this.activeTerminalAddr) {
+      const secKey = this.vtKey(this.selectedDaemon.id, this.secondaryTerminalAddr);
+      const secVt = this.vtTerminals.get(secKey);
+      const secScreen = document.getElementById("term-screen-output-secondary");
+      const secBox = document.getElementById("term-box-secondary");
+      if (secScreen && secVt && this.vtStreamActive.has(secKey)) {
+        const secNearBottom = secBox
+          ? secBox.scrollHeight - secBox.scrollTop - secBox.clientHeight <= 28
+          : true;
+        const secPrevTop = secBox ? secBox.scrollTop : 0;
+        secVt.patchDom(secScreen, false, null);
+        if (secBox) {
+          secBox.scrollTop = secNearBottom ? secBox.scrollHeight : secPrevTop;
+        }
+      }
+    }
+
     const activeTerm = this.terminals.find((t) => t.address === this.activeTerminalAddr);
     const titleEl = document.getElementById("active-term-title");
     if (titleEl && activeTerm) {
@@ -796,6 +857,8 @@ export class CodaTerminalWebApp {
       this.terminals = [];
       this.repos = [];
       this.activeTerminalAddr = opts.initialTerminalAddr ?? null;
+      this.secondaryTerminalAddr = null;
+      this.fileBrowser = createInitialFileBrowserState();
       this.rttMs = null;
       this.lastWorkspacesQueryAt = 0;
       this.pendingSelectionCatchup = false;
@@ -1792,6 +1855,9 @@ export class CodaTerminalWebApp {
     }
 
     if (msg.op === "workspaces_snapshot") {
+      if (msg.host_health) {
+        this.hostHealthByPeer.set(peerId, msg.host_health as HostHealthSnapshot);
+      }
       if (!isSelected) return;
       this.repos = msg.repos || [];
       if (msg.voice_config) {
@@ -1804,6 +1870,66 @@ export class CodaTerminalWebApp {
         };
       }
       if (!this.isTypingIntoInput() && !this.showSettingsModal) this.render();
+      return;
+    }
+
+    if (msg.op === "host_health_result") {
+      if (msg.health) {
+        this.hostHealthByPeer.set(peerId, msg.health as HostHealthSnapshot);
+        if (!this.isTypingIntoInput()) this.render();
+      }
+      return;
+    }
+
+    if (msg.op === "upgrade_daemon_result") {
+      const peerDev = this.devices.find((d) => d.id === peerId);
+      const label = peerDev?.name || "Host";
+      const summary = msg.ok
+        ? `${label}: v${msg.previous_version} -> v${msg.target_version || "latest"} (${msg.message})`
+        : `${label} OTA failed: ${msg.message || "error"}`;
+      this.consoleNotice = { kind: msg.ok ? "ok" : "err", text: summary };
+      if (this.showSettingsModal) {
+        this.settingsFeedback = { kind: msg.ok ? "ok" : "err", text: summary };
+      }
+      if (msg.ok) {
+        this.e2eeSessions.delete(peerId);
+        this.directE2eeSessions.delete(peerId);
+        if (this.directWsPeerId === peerId) {
+          this.teardownDirectWs();
+        }
+        setTimeout(() => {
+          const live = this.devices.find((d) => d.id === peerId);
+          if (live && this.token) {
+            this.queryDaemonOverview(live, true);
+          }
+        }, 1600);
+      }
+      this.render();
+      return;
+    }
+
+    if (msg.op === "directory_listing") {
+      if (!isSelected || !this.fileBrowser.open) return;
+      this.fileBrowser.loading = false;
+      this.fileBrowser.rootPath = String(msg.root_path || this.fileBrowser.rootPath);
+      this.fileBrowser.subPath = String(msg.sub_path || "");
+      this.fileBrowser.entries = Array.isArray(msg.entries) ? msg.entries : [];
+      this.fileBrowser.error = msg.error ? String(msg.error) : null;
+      this.render();
+      return;
+    }
+
+    if (msg.op === "file_preview_response") {
+      if (!isSelected || !this.fileBrowser.open) return;
+      this.fileBrowser.loading = false;
+      if (msg.error) {
+        this.fileBrowser.error = String(msg.error);
+      } else {
+        this.fileBrowser.error = null;
+        this.fileBrowser.previewContent = String(msg.content || "");
+        this.fileBrowser.previewTruncated = Boolean(msg.truncated);
+      }
+      this.render();
       return;
     }
 
@@ -1835,6 +1961,16 @@ export class CodaTerminalWebApp {
       this.terminals = incomingTerms;
       if (this.activeTerminalAddr && !this.terminals.some((t) => t.address === this.activeTerminalAddr)) {
         this.activeTerminalAddr = null;
+      }
+      if (this.secondaryTerminalAddr && !this.terminals.some((t) => t.address === this.secondaryTerminalAddr)) {
+        this.secondaryTerminalAddr = null;
+      }
+      if (this.splitMode && !this.secondaryTerminalAddr && this.terminals.length > 1) {
+        const alt = this.terminals.find((t) => t.address !== this.activeTerminalAddr);
+        if (alt) {
+          this.secondaryTerminalAddr = alt.address;
+          this.attachAndReadTerminal(alt.address);
+        }
       }
       let newlyRestoredAddr: string | null = null;
       if (!this.activeTerminalAddr && this.terminals.length > 0) {
@@ -1894,7 +2030,7 @@ export class CodaTerminalWebApp {
             this.observeTerminalStatusNotification(peerId, term);
           }
         }
-        if (addr === this.activeTerminalAddr) {
+        if (addr === this.activeTerminalAddr || (this.splitMode && addr === this.secondaryTerminalAddr)) {
           this.scheduleTerminalPaint();
         }
       }
@@ -1924,7 +2060,7 @@ export class CodaTerminalWebApp {
             this.observeTerminalStatusNotification(peerId, term);
           }
         }
-        if (isSelected && addr === this.activeTerminalAddr) {
+        if (isSelected && (addr === this.activeTerminalAddr || (this.splitMode && addr === this.secondaryTerminalAddr))) {
           this.scheduleTerminalPaint();
         }
       } catch {
@@ -2020,6 +2156,166 @@ export class CodaTerminalWebApp {
       terminal: addr,
       history_lines: 120,
     });
+  }
+
+  private applySearchHighlightsInPlace(screenEl: HTMLElement, vt: WebVtTerminal) {
+    const q = this.showTermSearch ? this.termSearchQuery.trim() : "";
+    const children = screenEl.children;
+    if (!q) {
+      for (let i = 0; i < children.length; i++) {
+        children[i].classList.remove("vt-search-hit", "vt-search-active");
+      }
+      return;
+    }
+    const matches = findWebTerminalMatches(vt.renderPlainText(), q);
+    const activeMatch = matches.length > 0 ? matches[this.termSearchIdx % matches.length] : null;
+    const hitRows = new Set(matches.map((m) => m.rowIdx));
+    for (let i = 0; i < children.length; i++) {
+      const el = children[i];
+      const isHit = hitRows.has(i);
+      const isActive = Boolean(activeMatch && activeMatch.rowIdx === i);
+      el.classList.toggle("vt-search-hit", isHit && !isActive);
+      el.classList.toggle("vt-search-active", isActive);
+    }
+    const cntEl = document.getElementById("term-search-count");
+    if (cntEl) {
+      cntEl.textContent =
+        matches.length === 0 ? "0/0" : `${(this.termSearchIdx % matches.length) + 1}/${matches.length}`;
+    }
+  }
+
+  private stepWebTerminalSearch(forward: boolean) {
+    if (!this.selectedDaemon || !this.activeTerminalAddr) return;
+    const vt = this.vtTerminals.get(this.vtKey(this.selectedDaemon.id, this.activeTerminalAddr));
+    const screenEl = document.getElementById("term-screen-output");
+    if (!vt || !screenEl) return;
+    const matches = findWebTerminalMatches(vt.renderPlainText(), this.termSearchQuery);
+    if (matches.length === 0) {
+      this.termSearchIdx = 0;
+      this.applySearchHighlightsInPlace(screenEl, vt);
+      return;
+    }
+    const cur = this.termSearchIdx % matches.length;
+    this.termSearchIdx = forward
+      ? (cur + 1) % matches.length
+      : (cur + matches.length - 1) % matches.length;
+    this.applySearchHighlightsInPlace(screenEl, vt);
+    const targetRow = screenEl.children[matches[this.termSearchIdx].rowIdx] as HTMLElement | undefined;
+    targetRow?.scrollIntoView({ block: "center", behavior: "smooth" });
+  }
+
+  private exportActiveSessionMarkdown() {
+    if (!this.selectedDaemon || !this.activeTerminalAddr) return;
+    const term = this.terminals.find((t) => t.address === this.activeTerminalAddr);
+    const vt = this.vtTerminals.get(this.vtKey(this.selectedDaemon.id, this.activeTerminalAddr));
+    const plain = vt ? vt.renderPlainText() : "";
+    const title = term?.status?.title || term?.name || this.activeTerminalAddr;
+    const md = buildWebSessionMarkdown(title, term?.cwd || "~", plain);
+    triggerMarkdownDownload(title, md);
+    this.consoleNotice = {
+      kind: "ok",
+      text: this.tr("Exported session transcript (.md)", "已导出当前终端会话日志 (.md)"),
+    };
+    if (!this.updateConsoleNoticeInPlace()) this.render();
+  }
+
+  private toggleSplitTerminals() {
+    this.splitMode = !this.splitMode;
+    if (this.splitMode) {
+      const alt = this.terminals.find((t) => t.address !== this.activeTerminalAddr);
+      this.secondaryTerminalAddr = alt ? alt.address : null;
+      if (this.secondaryTerminalAddr) {
+        this.attachAndReadTerminal(this.secondaryTerminalAddr);
+      }
+    } else if (this.secondaryTerminalAddr && this.selectedDaemon) {
+      this.sendEncrypted(this.selectedDaemon, {
+        op: "pty_detach",
+        req_id: `det2-${Date.now()}`,
+        terminal: this.secondaryTerminalAddr,
+      });
+      this.secondaryTerminalAddr = null;
+    }
+  }
+
+  private openRemoteFileBrowser(rootOverride?: string) {
+    if (!this.selectedDaemon?.is_online) {
+      this.consoleNotice = {
+        kind: "err",
+        text: this.tr("Select an online host first.", "请先选择一台在线主机。"),
+      };
+      this.render();
+      return;
+    }
+    const activeTerm = this.terminals.find((t) => t.address === this.activeTerminalAddr);
+    const defaultRoot =
+      rootOverride ||
+      activeTerm?.cwd ||
+      this.repos[0]?.root_path ||
+      ".";
+    this.fileBrowser = {
+      open: true,
+      rootPath: defaultRoot,
+      subPath: "",
+      entries: [],
+      selectedRelPath: null,
+      previewContent: "",
+      previewTruncated: false,
+      loading: true,
+      error: null,
+    };
+    this.sendEncrypted(this.selectedDaemon, {
+      op: "list_directory",
+      req_id: `lsdir-${Date.now()}`,
+      root_path: defaultRoot,
+      sub_path: "",
+    });
+    this.render();
+  }
+
+  private browseRemoteSubPath(subPath: string) {
+    if (!this.selectedDaemon?.is_online || !this.fileBrowser.rootPath) return;
+    this.fileBrowser.subPath = subPath;
+    this.fileBrowser.loading = true;
+    this.fileBrowser.error = null;
+    this.sendEncrypted(this.selectedDaemon, {
+      op: "list_directory",
+      req_id: `lsdir-${Date.now()}`,
+      root_path: this.fileBrowser.rootPath,
+      sub_path: subPath,
+    });
+    this.render();
+  }
+
+  private previewRemoteFile(relPath: string) {
+    if (!this.selectedDaemon?.is_online || !this.fileBrowser.rootPath) return;
+    this.fileBrowser.selectedRelPath = relPath;
+    this.fileBrowser.loading = true;
+    this.fileBrowser.error = null;
+    this.sendEncrypted(this.selectedDaemon, {
+      op: "read_file_preview",
+      req_id: `rfp-${Date.now()}`,
+      path: joinRootAndRel(this.fileBrowser.rootPath, relPath),
+      max_bytes: 65536,
+    });
+    this.render();
+  }
+
+  private upgradeRemoteDaemon(dev: Device) {
+    if (!dev.is_online) return;
+    const msg = this.tr(
+      `Upgrading coda-daemon on ${dev.name} (zero-downtime OTA)…`,
+      `正在为 ${dev.name} 无感升级 coda-daemon…`
+    );
+    this.consoleNotice = { kind: "ok", text: msg };
+    if (this.showSettingsModal) {
+      this.settingsFeedback = { kind: "ok", text: msg };
+    }
+    this.sendEncrypted(dev, {
+      op: "upgrade_daemon",
+      req_id: `ota-${Date.now()}`,
+      target_version: null,
+    });
+    this.render();
   }
 
   private sendPtyInputBytes(bytes: Uint8Array | string) {
@@ -2177,6 +2473,47 @@ export class CodaTerminalWebApp {
           void this.tryNegotiateDirectLanWs(this.selectedDaemon, true);
         },
       });
+      items.push(
+        {
+          id: "action:files",
+          group: this.tr("Actions", "快捷操作"),
+          label: this.tr("Browse Remote Workspace Files", "浏览远端工作区文件树"),
+          hint: "E2EE · 64KB preview",
+          action: () => this.openRemoteFileBrowser(),
+        },
+        {
+          id: "action:split",
+          group: this.tr("Actions", "快捷操作"),
+          label: this.tr("Toggle Split Terminals", "切换双栏分屏终端"),
+          hint: this.splitMode ? "ON" : "OFF",
+          action: () => this.toggleSplitTerminals(),
+        },
+        {
+          id: "action:search",
+          group: this.tr("Actions", "快捷操作"),
+          label: this.tr("Find in Terminal…", "终端内搜索…"),
+          hint: "⌘F / Ctrl+F",
+          action: () => {
+            this.showTermSearch = true;
+          },
+        },
+        {
+          id: "action:export-md",
+          group: this.tr("Actions", "快捷操作"),
+          label: this.tr("Export Session Log (.md)", "导出当前会话日志 (.md)"),
+          hint: "Markdown",
+          action: () => this.exportActiveSessionMarkdown(),
+        },
+        {
+          id: "action:ota-host",
+          group: this.tr("Actions", "快捷操作"),
+          label: this.tr(`Upgrade ${this.selectedDaemon.name} Daemon (Zero-Downtime OTA)`, `一键无感升级 ${this.selectedDaemon.name} 守护进程`),
+          hint: formatWebHostHealth(this.hostHealthByPeer.get(this.selectedDaemon.id)) || "E2EE OTA",
+          action: () => {
+            if (this.selectedDaemon) this.upgradeRemoteDaemon(this.selectedDaemon);
+          },
+        }
+      );
     }
 
     items.push(
@@ -4256,6 +4593,11 @@ export class CodaTerminalWebApp {
                       <span>&middot; ${this.escapeHtml(d.name)}</span>
                     </div>
                     ${
+                      this.hostHealthByPeer.has(d.id)
+                        ? `<div class="coda-mono" style="padding:0 6px 4px 19px;font-size:10.5px;color:var(--text-tertiary);">${this.escapeHtml(formatWebHostHealth(this.hostHealthByPeer.get(d.id)))}</div>`
+                        : ""
+                    }
+                    ${
                       this.selectedDaemon?.id === d.id && this.terminals.length > 0
                         ? this.terminals
                             .map((t) => {
@@ -4340,7 +4682,23 @@ export class CodaTerminalWebApp {
                 ${this.escapeHtml(activeTerm?.cwd || "~")} &middot; ${this.escapeHtml(activeBranch?.branch || "main")} &middot; ${this.escapeHtml(this.selectedDaemon?.name || this.tr("Unselected", "未选择主机"))}
               </div>
             </div>
-            <div style="display:flex;align-items:center;gap:8px;">
+            <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+              ${
+                !isNarrowViewport
+                  ? `<button type="button" id="btn-console-split" class="pm-cmd-trigger" style="height:30px;padding:0 9px;${this.splitMode ? "border-color:var(--signal-blue);color:var(--text-primary);" : ""}" title="${this.tr("Toggle Dual-Pane Split Terminal", "切换双栏分屏终端")}">
+                      <span>◫</span>
+                      <span class="pm-cmd-label">${this.tr("Split", "分屏")}</span>
+                    </button>`
+                  : ""
+              }
+              <button type="button" id="btn-console-files" class="pm-cmd-trigger" style="height:30px;padding:0 9px;" title="${this.tr("Browse Remote Workspace Files (E2EE)", "远端工作区文件树 (端到端加密)")}">
+                ${svgIcon("layers", 13)}
+                <span class="pm-cmd-label">${this.tr("Files", "文件")}</span>
+              </button>
+              <button type="button" id="btn-console-search" class="pm-cmd-trigger" style="height:30px;padding:0 9px;${this.showTermSearch ? "border-color:var(--amber);color:var(--text-primary);" : ""}" title="${this.tr("Find in Terminal & Export .md (⌘F)", "终端内搜索与导出 .md (⌘F)")}">
+                ${svgIcon("search", 13)}
+                <span class="pm-kbd">⌘F</span>
+              </button>
               <button type="button" id="btn-console-cmd-k" class="pm-cmd-trigger" style="height:30px;padding:0 9px;" title="${this.tr("Quick Jump & Actions (⌘K / Ctrl+K)", "全局快捷跳转面板 (⌘K / Ctrl+K)")}">
                 ${svgIcon("search", 13)}
                 <span class="pm-kbd">⌘K</span>
@@ -4359,14 +4717,76 @@ export class CodaTerminalWebApp {
             </div>
           </div>
 
-          <!-- Live Terminal Viewport (focusable for direct keyboard input, supports drag-drop & paste upload) -->
-          <div class="term-viewport-wrap">
-            <div class="term-viewport" id="term-box" tabindex="0" aria-label="${this.tr("Interactive Terminal Viewport", "交互式终端视口")}"><div id="console-notice-slot">${this.renderConsoleNoticeHtml()}</div><div id="term-screen-output" data-vt-mode="${isVtStream ? "rows" : "placeholder"}" data-vt-evictions="${activeVt?.getScrollbackEvictions() ?? 0}" data-vt-alt="${activeVt?.isUsingAltScreen() ? "1" : "0"}" style="white-space:pre;overflow-x:auto;">${initialVtHtml}</div>
+          ${
+            this.showTermSearch
+              ? `<div class="term-search-strip" id="term-search-strip">
+                  ${svgIcon("search", 13)}
+                  <input id="term-search-input" class="pm-input" style="margin:0;border:none;background:transparent;padding:2px 4px;flex:1;min-width:90px;box-shadow:none;height:24px;" value="${this.escapeHtml(this.termSearchQuery)}" placeholder="${this.tr("Find in scrollback…", "在滚动缓存中搜索…")}" autocomplete="off" />
+                  <span id="term-search-count" class="coda-mono" style="font-size:11px;color:var(--text-tertiary);">0/0</span>
+                  <button type="button" id="term-search-prev" class="pm-btn pm-btn-secondary pm-btn-sm" style="height:24px;padding:0 7px;" title="${this.tr("Previous match", "上一个匹配")}">&uarr;</button>
+                  <button type="button" id="term-search-next" class="pm-btn pm-btn-secondary pm-btn-sm" style="height:24px;padding:0 7px;" title="${this.tr("Next match", "下一个匹配")}">&darr;</button>
+                  <button type="button" id="btn-export-session-md" class="pm-btn pm-btn-secondary pm-btn-sm" style="height:24px;padding:0 8px;">${this.tr("Export .md", "导出 .md")}</button>
+                  <button type="button" id="term-search-close" class="pm-btn pm-btn-ghost pm-btn-sm" style="height:24px;padding:0 6px;">&times;</button>
+                </div>`
+              : ""
+          }
+
+          <!-- Live Terminal Viewport (focusable for direct keyboard input, supports drag-drop & paste upload, optional desktop split) -->
+          <div class="term-split-grid ${this.splitMode && !isNarrowViewport ? "is-split" : ""}">
+            <div class="term-viewport-wrap">
+              <div class="term-viewport pane-focused" id="term-box" tabindex="0" aria-label="${this.tr("Interactive Terminal Viewport", "交互式终端视口")}"><div id="console-notice-slot">${this.renderConsoleNoticeHtml()}</div><div id="term-screen-output" data-vt-mode="${isVtStream ? "rows" : "placeholder"}" data-vt-evictions="${activeVt?.getScrollbackEvictions() ?? 0}" data-vt-alt="${activeVt?.isUsingAltScreen() ? "1" : "0"}" style="white-space:pre;overflow-x:auto;">${initialVtHtml}</div>
 <div id="term-draft-slot">${this.renderDraftPreviewHtml()}</div>
-<div id="term-footer-meta" style="font-size:12px;color:var(--text-tertiary);margin-top:8px;">${this.escapeHtml(footerTransport)} &middot; E2EE X25519 + ChaCha20 &middot; ${this.termCols}&times;${this.termRows} &middot; ${this.terminals.length} PTY &middot; ${this.tr("Click for keys · Drop/paste image to upload", "点击直连按键 · 拖拽/粘贴截图自动上传")}</div></div>
-            <button type="button" id="btn-scroll-bottom" class="term-scroll-bottom-btn" title="${this.tr("Jump to latest output", "回到底部最新输出")}">
-              ↓ ${this.tr("Latest", "回到最新")}
-            </button>
+<div id="term-footer-meta" style="font-size:12px;color:var(--text-tertiary);margin-top:8px;">${this.escapeHtml(footerTransport)} &middot; E2EE X25519 + ChaCha20 &middot; ${this.termCols}&times;${this.termRows} &middot; ${this.terminals.length} PTY &middot; ${this.tr("⌘+Click URL · Drop/paste image to upload", "⌘+点击打开链接 · 拖拽/粘贴截图自动上传")}</div></div>
+              <button type="button" id="btn-scroll-bottom" class="term-scroll-bottom-btn" title="${this.tr("Jump to latest output", "回到底部最新输出")}">
+                ↓ ${this.tr("Latest", "回到最新")}
+              </button>
+            </div>
+            ${
+              this.splitMode && !isNarrowViewport
+                ? (() => {
+                    const secTerm = this.terminals.find((t) => t.address === this.secondaryTerminalAddr);
+                    const secKey = this.selectedDaemon && secTerm ? this.vtKey(this.selectedDaemon.id, secTerm.address) : "";
+                    const secVt = secKey ? this.vtTerminals.get(secKey) : undefined;
+                    const secIsStream = Boolean(secVt && this.vtStreamActive.has(secKey));
+                    const secHtml = secIsStream && secVt
+                      ? secVt.renderInitialRowsHtml(false)
+                      : this.escapeHtml(
+                          secTerm
+                            ? this.tr("Connecting secondary split terminal…", "正在连接副分屏终端…")
+                            : this.tr("Launch a second terminal ('+' on right rail) to view side-by-side.", "点击右侧「+」新建第二个终端即可并排对比查看。")
+                        );
+                    return `
+            <div class="term-viewport-wrap">
+              <div class="term-viewport" id="term-box-secondary" tabindex="0" aria-label="${this.tr("Secondary Split Terminal", "副分屏终端")}">
+                <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;padding-bottom:6px;margin-bottom:6px;border-bottom:1px solid var(--border-primary);font-size:11.5px;">
+                  <span class="coda-mono" style="color:var(--text-secondary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${this.escapeHtml(secTerm?.name || secTerm?.address || this.tr("Secondary Pane", "副分屏"))}</span>
+                  <div style="display:flex;gap:6px;align-items:center;">
+                    ${
+                      this.terminals.filter((t) => t.address !== this.activeTerminalAddr).length > 1
+                        ? `<select id="split-secondary-select" class="pm-input coda-mono" style="margin:0;height:22px;padding:0 6px;font-size:11px;width:auto;">
+                            ${this.terminals
+                              .filter((t) => t.address !== this.activeTerminalAddr)
+                              .map(
+                                (t) =>
+                                  `<option value="${this.escapeHtml(t.address)}" ${t.address === this.secondaryTerminalAddr ? "selected" : ""}>${this.escapeHtml(t.name || t.address)}</option>`
+                              )
+                              .join("")}
+                          </select>`
+                        : ""
+                    }
+                    ${
+                      secTerm
+                        ? `<button type="button" id="btn-swap-split" class="pm-btn pm-btn-secondary pm-btn-sm" style="height:22px;padding:0 7px;font-size:11px;">&harr; ${this.tr("Focus", "主焦点")}</button>`
+                        : ""
+                    }
+                  </div>
+                </div>
+                <div id="term-screen-output-secondary" data-vt-mode="${secIsStream ? "rows" : "placeholder"}" data-vt-evictions="${secVt?.getScrollbackEvictions() ?? 0}" data-vt-alt="${secVt?.isUsingAltScreen() ? "1" : "0"}" style="white-space:pre;overflow-x:auto;">${secHtml}</div>
+              </div>
+            </div>`;
+                  })()
+                : ""
+            }
           </div>
 
           <!-- OSC 7501 Needs-You One-Tap Approval Bar -->
@@ -4402,7 +4822,13 @@ export class CodaTerminalWebApp {
           ${
             renderTouchKeypad
               ? `
-          <!-- Mobile 2-Row Tactile Keypad + Tall Enter -->
+          <!-- Mobile Quick-Command Chips + 2-Row Tactile Keypad + Tall Enter -->
+          <div class="quick-chip-strip" role="toolbar" aria-label="${this.tr("Quick terminal commands", "快捷终端指令")}">
+            ${MOBILE_QUICK_CHIPS.map(
+              (chip) =>
+                `<button type="button" class="quick-chip-btn" data-quick-cmd="${this.escapeHtml(chip)}">${this.escapeHtml(chip)}</button>`
+            ).join("")}
+          </div>
           ${
             !isNarrowViewport && this.showMobileKeypadOnDesktop
               ? `<div style="display:flex;justify-content:flex-end;margin-bottom:4px;">
@@ -4603,21 +5029,33 @@ export class CodaTerminalWebApp {
               <div style="display:flex;flex-direction:column;gap:6px;max-height:240px;overflow-y:auto;">
                 ${this.allDevices
                   .map(
-                    (dev) => `
+                    (dev) => {
+                      const hh = this.hostHealthByPeer.get(dev.id);
+                      const canOta =
+                        dev.is_online &&
+                        (dev.role === "daemon" || dev.role === "hybrid") &&
+                        (hh ? hh.ota_supported : true);
+                      return `
                   <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 10px;border-radius:8px;background:var(--bg-elevated);border:1px solid var(--border-primary);">
                     <div style="min-width:0;flex:1;">
                       <div style="font-size:12.5px;font-weight:500;display:flex;align-items:center;gap:6px;">
                         <span style="width:7px;height:7px;border-radius:99px;background:${dev.is_online ? "var(--emerald)" : "var(--text-quaternary)"};flex-shrink:0;"></span>
                         <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${this.escapeHtml(dev.name)}</span>
                       </div>
-                      <div class="coda-mono" style="font-size:10.5px;color:var(--text-tertiary);margin-top:2px;">${this.escapeHtml(dev.platform)} &middot; ${this.escapeHtml(dev.role)}${dev.id === this.myClientDevice?.id ? " (this tab)" : ""}</div>
+                      <div class="coda-mono" style="font-size:10.5px;color:var(--text-tertiary);margin-top:2px;">${this.escapeHtml(dev.platform)} &middot; ${this.escapeHtml(dev.role)}${dev.id === this.myClientDevice?.id ? " (this tab)" : ""}${hh ? ` &middot; ${this.escapeHtml(formatWebHostHealth(hh))}` : ""}</div>
                     </div>
                     <div style="display:flex;gap:6px;flex-shrink:0;">
+                      ${
+                        canOta
+                          ? `<button type="button" class="pm-btn pm-btn-secondary pm-btn-sm" data-ota-dev="${this.escapeHtml(dev.id)}">${this.tr("Upgrade", "无感升级")}</button>`
+                          : ""
+                      }
                       <button type="button" class="pm-btn pm-btn-ghost pm-btn-sm" data-rename-dev="${this.escapeHtml(dev.id)}" data-dev-name="${this.escapeHtml(dev.name)}">${this.tr("Rename", "重命名")}</button>
                       <button type="button" class="pm-btn pm-btn-ghost pm-btn-sm" style="color:var(--rose);" data-delete-dev="${this.escapeHtml(dev.id)}">${this.tr("Remove", "移除")}</button>
                     </div>
                   </div>
-                `
+                `;
+                    }
                   )
                   .join("")}
               </div>
@@ -4753,6 +5191,15 @@ export class CodaTerminalWebApp {
           : ""
       }
       ${this.showCmdPalette ? this.renderConsoleCommandPaletteModal() : ""}
+      ${renderRemoteFileBrowserModal(
+        this.fileBrowser,
+        [
+          ...(activeTerm?.cwd ? [activeTerm.cwd] : []),
+          ...this.repos.map((r) => r.root_path),
+          ...allBranches.map((b) => b.worktree_path),
+        ],
+        (en, zh) => this.tr(en, zh)
+      )}
     `;
 
     this.bindCommonNavigation(root);
@@ -4795,6 +5242,13 @@ export class CodaTerminalWebApp {
       this.activationSuccessMsg = "";
       this.lastRenderedTermKey = "";
       this.activeTerminalAddr = null;
+      this.splitMode = false;
+      this.secondaryTerminalAddr = null;
+      this.showTermSearch = false;
+      this.termSearchQuery = "";
+      this.termSearchIdx = 0;
+      this.hostHealthByPeer.clear();
+      this.fileBrowser = createInitialFileBrowserState();
       this.draftInput = "";
       this.pairCommand = null;
       this.latestInviteCode = null;
@@ -4891,6 +5345,14 @@ export class CodaTerminalWebApp {
         };
         this.render();
       }
+    });
+
+    root.querySelectorAll<HTMLElement>("[data-ota-dev]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const id = btn.dataset.otaDev!;
+        const peer = this.devices.find((d) => d.id === id) || this.allDevices.find((d) => d.id === id);
+        if (peer) this.upgradeRemoteDaemon(peer);
+      });
     });
 
     root.querySelectorAll<HTMLElement>("[data-rename-dev]").forEach((btn) => {
@@ -5250,6 +5712,154 @@ export class CodaTerminalWebApp {
           };
         }
         this.syncNeedsYouBarInPlace(active);
+      });
+    });
+
+    // Split View, ⌘F Search, Markdown Export, ⌘+Click URL, Remote File Browser & Mobile Quick Chips
+    document.getElementById("btn-console-split")?.addEventListener("click", () => {
+      this.toggleSplitTerminals();
+      this.render();
+      this.scheduleTerminalResizeSync();
+    });
+    document.getElementById("btn-console-files")?.addEventListener("click", () => {
+      this.openRemoteFileBrowser();
+    });
+    document.getElementById("btn-console-search")?.addEventListener("click", () => {
+      this.showTermSearch = !this.showTermSearch;
+      this.render();
+      if (this.showTermSearch) {
+        setTimeout(() => {
+          (document.getElementById("term-search-input") as HTMLInputElement | null)?.focus();
+        }, 0);
+      }
+    });
+
+    const termSearchInput = document.getElementById("term-search-input") as HTMLInputElement | null;
+    if (termSearchInput && activeVt) {
+      const screenEl = document.getElementById("term-screen-output");
+      if (screenEl) this.applySearchHighlightsInPlace(screenEl, activeVt);
+    }
+    termSearchInput?.addEventListener("input", () => {
+      this.termSearchQuery = termSearchInput.value;
+      this.termSearchIdx = 0;
+      if (this.selectedDaemon && this.activeTerminalAddr) {
+        const vt = this.vtTerminals.get(this.vtKey(this.selectedDaemon.id, this.activeTerminalAddr));
+        const screenEl = document.getElementById("term-screen-output");
+        if (vt && screenEl) {
+          this.applySearchHighlightsInPlace(screenEl, vt);
+          const matches = findWebTerminalMatches(vt.renderPlainText(), this.termSearchQuery);
+          if (matches.length > 0) {
+            (screenEl.children[matches[0].rowIdx] as HTMLElement | undefined)?.scrollIntoView({
+              block: "center",
+              behavior: "smooth",
+            });
+          }
+        }
+      }
+    });
+    termSearchInput?.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        this.stepWebTerminalSearch(!e.shiftKey);
+      } else if (e.key === "Escape") {
+        e.preventDefault();
+        this.showTermSearch = false;
+        this.render();
+      }
+    });
+    document.getElementById("term-search-prev")?.addEventListener("click", () => {
+      this.stepWebTerminalSearch(false);
+    });
+    document.getElementById("term-search-next")?.addEventListener("click", () => {
+      this.stepWebTerminalSearch(true);
+    });
+    document.getElementById("btn-export-session-md")?.addEventListener("click", () => {
+      this.exportActiveSessionMarkdown();
+    });
+    document.getElementById("term-search-close")?.addEventListener("click", () => {
+      this.showTermSearch = false;
+      this.render();
+    });
+
+    // ⌘+Click / Ctrl+Click URL opener on primary & secondary terminal panes
+    const handleTermUrlClick = (ev: MouseEvent) => {
+      if (!ev.metaKey && !ev.ctrlKey) return;
+      const row = (ev.target as HTMLElement | null)?.closest(".vt-row");
+      if (!row) return;
+      const foundUrl = firstSafeTerminalUrlInLine(row.textContent || "");
+      if (foundUrl) {
+        ev.preventDefault();
+        window.open(foundUrl, "_blank", "noopener,noreferrer");
+      }
+    };
+    termBox?.addEventListener("click", handleTermUrlClick);
+    document.getElementById("term-box-secondary")?.addEventListener("click", handleTermUrlClick);
+
+    const secSelect = document.getElementById("split-secondary-select") as HTMLSelectElement | null;
+    secSelect?.addEventListener("change", () => {
+      const next = secSelect.value;
+      if (!next) return;
+      if (this.secondaryTerminalAddr && this.secondaryTerminalAddr !== next && this.selectedDaemon) {
+        this.sendEncrypted(this.selectedDaemon, {
+          op: "pty_detach",
+          req_id: `det2-${Date.now()}`,
+          terminal: this.secondaryTerminalAddr,
+        });
+      }
+      this.secondaryTerminalAddr = next;
+      this.attachAndReadTerminal(next);
+      this.render();
+    });
+    document.getElementById("btn-swap-split")?.addEventListener("click", () => {
+      if (!this.secondaryTerminalAddr || !this.activeTerminalAddr) return;
+      const prevPrimary = this.activeTerminalAddr;
+      this.activeTerminalAddr = this.secondaryTerminalAddr;
+      this.secondaryTerminalAddr = prevPrimary;
+      writeLocalPref("coda_last_terminal_addr", this.activeTerminalAddr);
+      this.render();
+    });
+
+    // Remote File Browser modal bindings
+    document.getElementById("btn-close-file-browser")?.addEventListener("click", () => {
+      this.fileBrowser.open = false;
+      this.render();
+    });
+    document.getElementById("file-browser-mask")?.addEventListener("click", (e) => {
+      if ((e.target as HTMLElement).id === "file-browser-mask") {
+        this.fileBrowser.open = false;
+        this.render();
+      }
+    });
+    const fbRootSelect = document.getElementById("fb-root-select") as HTMLSelectElement | null;
+    fbRootSelect?.addEventListener("change", () => {
+      if (fbRootSelect.value) this.openRemoteFileBrowser(fbRootSelect.value);
+    });
+    document.getElementById("fb-up-btn")?.addEventListener("click", () => {
+      this.browseRemoteSubPath(parentSubPath(this.fileBrowser.subPath));
+    });
+    root.querySelectorAll<HTMLElement>("[data-fb-rel]").forEach((row) => {
+      row.addEventListener("click", () => {
+        const rel = row.dataset.fbRel || "";
+        const isDir = row.dataset.fbDir === "1";
+        if (isDir) {
+          this.browseRemoteSubPath(rel);
+        } else {
+          this.previewRemoteFile(rel);
+        }
+      });
+    });
+
+    // Mobile Quick-Command Chips
+    root.querySelectorAll<HTMLButtonElement>("[data-quick-cmd]").forEach((chipBtn) => {
+      chipBtn.addEventListener("click", () => {
+        const cmd = chipBtn.dataset.quickCmd || "";
+        if (!cmd || !this.selectedDaemon || !this.activeTerminalAddr) return;
+        this.sendEncrypted(this.selectedDaemon, {
+          op: "send_terminal_text",
+          req_id: `qcmd-${Date.now()}`,
+          terminal: this.activeTerminalAddr,
+          text: cmd,
+        });
       });
     });
 
