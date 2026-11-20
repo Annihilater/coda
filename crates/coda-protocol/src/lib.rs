@@ -25,12 +25,34 @@ type HmacSha256 = Hmac<Sha256>;
 const ZSTD_COMPRESS_THRESHOLD: usize = 256;
 /// Maximum raw TCP frame size (8 MiB) to prevent memory exhaustion on stateless relays.
 pub const MAX_WIRE_FRAME_BYTES: usize = 8 * 1024 * 1024;
+/// Maximum permitted pre-authentication handshake frame size (16 KiB) to prevent pre-auth OOM.
+pub const MAX_AUTH_FRAME_BYTES: usize = 16 * 1024;
 /// Maximum permitted decompressed E2EE payload size (16 MiB) to prevent zstd zip-bombs.
 pub const MAX_DECOMPRESSED_BYTES: usize = MAX_WIRE_FRAME_BYTES * 2;
+/// Maximum permitted base64 length for an encoded wire/compressed blob.
+const MAX_B64_PAYLOAD_LEN: usize = (MAX_WIRE_FRAME_BYTES * 4) / 3 + 256;
 /// Length in bytes of per-session relay AEAD/HKDF salt nonces.
 pub const RELAY_SESSION_NONCE_LEN: usize = 16;
 /// Default clock-skew / freshness tolerance for P2P and Relay session handshakes (2 minutes).
 pub const HANDSHAKE_MAX_SKEW_MS: u64 = 120_000;
+
+/// Overwrites sensitive byte slice in place with zeroes using volatile writes.
+#[inline]
+pub fn zeroize_bytes(bytes: &mut [u8]) {
+    for b in bytes.iter_mut() {
+        unsafe { std::ptr::write_volatile(b, 0) };
+    }
+    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+}
+
+#[inline]
+fn zeroize_string(s: &mut String) {
+    // SAFETY: writing ASCII NUL bytes keeps valid UTF-8.
+    unsafe {
+        zeroize_bytes(s.as_bytes_mut());
+    }
+    s.clear();
+}
 
 fn default_true() -> bool {
     true
@@ -47,6 +69,17 @@ pub fn current_unix_ms() -> u64 {
 /// Checks whether a peer-supplied handshake timestamp falls within `max_skew_ms` of `now_ms`.
 pub fn is_timestamp_fresh(ts_ms: u64, now_ms: u64, max_skew_ms: u64) -> bool {
     now_ms.abs_diff(ts_ms) <= max_skew_ms
+}
+
+/// Derives a stable Ed25519 server public key deterministically from `relay_secret` so
+/// coordinator restarts never mutate `server_pubkey`.
+pub fn deterministic_server_pubkey_b64(relay_secret: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"coda-server-node-identity-v1:");
+    hasher.update(relay_secret);
+    let seed: [u8; 32] = hasher.finalize().into();
+    let signing = SigningKey::from_bytes(&seed);
+    B64.encode(signing.verifying_key().to_bytes())
 }
 
 /// Validates and decodes a canonical 32-byte Base64 public/secret key.
@@ -106,6 +139,13 @@ impl std::fmt::Debug for StoredDeviceIdentity {
             .field("x25519_public_b64", &self.x25519_public_b64)
             .field("secrets", &"[REDACTED]")
             .finish()
+    }
+}
+
+impl Drop for StoredDeviceIdentity {
+    fn drop(&mut self) {
+        zeroize_string(&mut self.ed25519_secret_b64);
+        zeroize_string(&mut self.x25519_secret_b64);
     }
 }
 
@@ -228,7 +268,7 @@ pub struct RelaySessionAuth {
     pub signature_b64: String,
 }
 
-/// Canonical signing payload for `RelaySessionAuth` v2.
+/// Canonical signing payload for `RelaySessionAuth` v2 (legacy format without `supports_zstd`).
 pub fn relay_session_auth_signing_bytes(
     client_device_id: Uuid,
     daemon_device_id: Uuid,
@@ -247,7 +287,28 @@ pub fn relay_session_auth_signing_bytes(
     .into_bytes()
 }
 
-/// Canonical signing payload for `DirectP2pHello` v2.
+/// Canonical signing payload for `RelaySessionAuth` v2 binding `supports_zstd` against relay tampering.
+pub fn relay_session_auth_signing_bytes_with_zstd(
+    client_device_id: Uuid,
+    daemon_device_id: Uuid,
+    sender_x25519_pub_b64: &str,
+    session_nonce_b64: &str,
+    init_ts_ms: u64,
+    supports_zstd: bool,
+) -> Vec<u8> {
+    format!(
+        "relay-sess-v2:{}:{}:{}:{}:{}:zstd={}",
+        client_device_id.hyphenated(),
+        daemon_device_id.hyphenated(),
+        sender_x25519_pub_b64,
+        session_nonce_b64,
+        init_ts_ms,
+        if supports_zstd { 1 } else { 0 }
+    )
+    .into_bytes()
+}
+
+/// Canonical signing payload for `DirectP2pHello` v2 (legacy format without `supports_zstd`).
 pub fn p2p_hello_v2_signing_bytes(
     client_device_id: Uuid,
     target_device_id: Uuid,
@@ -264,6 +325,32 @@ pub fn p2p_hello_v2_signing_bytes(
         timestamp_ms
     )
     .into_bytes()
+}
+
+/// Canonical signing payload for `DirectP2pHello` v2 binding `supports_zstd` against MITM tampering.
+pub fn p2p_hello_v2_signing_bytes_with_zstd(
+    client_device_id: Uuid,
+    target_device_id: Uuid,
+    client_static_x25519_pub_b64: &str,
+    client_eph_x25519_pub_b64: &str,
+    timestamp_ms: u64,
+    supports_zstd: bool,
+) -> Vec<u8> {
+    format!(
+        "p2p-hello-v2:{}:{}:{}:{}:{}:zstd={}",
+        client_device_id.hyphenated(),
+        target_device_id.hyphenated(),
+        client_static_x25519_pub_b64,
+        client_eph_x25519_pub_b64,
+        timestamp_ms,
+        if supports_zstd { 1 } else { 0 }
+    )
+    .into_bytes()
+}
+
+/// Canonical signing payload for Ed25519-authenticated Relay Ticket self-renewal (`POST /api/v1/relay/renew-ticket`).
+pub fn relay_ticket_renew_signing_bytes(device_id: Uuid, timestamp_ms: u64) -> Vec<u8> {
+    format!("coda-renew-ticket-v1:{}:{}", device_id.hyphenated(), timestamp_ms).into_bytes()
 }
 
 /// Canonical signing payload for `DirectP2pAck` v2.
@@ -286,7 +373,7 @@ pub fn p2p_ack_v2_signing_bytes(
 }
 
 impl RelaySessionAuth {
-    /// Creates a newly signed `RelaySessionAuth` with a random 16-byte nonce.
+    /// Creates a newly signed `RelaySessionAuth` with a random 16-byte nonce and signed `supports_zstd`.
     pub fn create(
         identity: &StoredDeviceIdentity,
         dst_daemon_id: Uuid,
@@ -299,12 +386,13 @@ impl RelaySessionAuth {
         let mut nonce = [0u8; RELAY_SESSION_NONCE_LEN];
         OsRng.fill_bytes(&mut nonce);
         let session_nonce_b64 = B64.encode(nonce);
-        let payload = relay_session_auth_signing_bytes(
+        let payload = relay_session_auth_signing_bytes_with_zstd(
             client_id,
             dst_daemon_id,
             &identity.x25519_public_b64,
             &session_nonce_b64,
             now_ms,
+            supports_zstd,
         );
         let signature_b64 = identity.sign(&payload)?;
         Ok(Self {
@@ -317,7 +405,7 @@ impl RelaySessionAuth {
         })
     }
 
-    /// Verifies signature, nonce format, timestamp freshness, and pinned peer identity keys.
+    /// Verifies signature, nonce format, timestamp freshness, `supports_zstd` integrity, and pinned peer identity keys.
     pub fn verify(
         &self,
         src_client_id: Uuid,
@@ -350,18 +438,37 @@ impl RelaySessionAuth {
         let nonce_arr: [u8; RELAY_SESSION_NONCE_LEN] = nonce_raw
             .try_into()
             .map_err(|_| anyhow!("invalid relay session nonce length (expected 16 bytes)"))?;
-        let signing_bytes = relay_session_auth_signing_bytes(
+        let signing_bytes_zstd = relay_session_auth_signing_bytes_with_zstd(
             src_client_id,
             dst_daemon_id,
             &self.sender_x25519_pub_b64,
             &self.session_nonce_b64,
             self.init_ts_ms,
+            self.supports_zstd,
         );
-        StoredDeviceIdentity::verify_signature(
+        if StoredDeviceIdentity::verify_signature(
             expected_ed25519_pub_b64,
-            &signing_bytes,
+            &signing_bytes_zstd,
             &self.signature_b64,
-        )?;
+        )
+        .is_err()
+        {
+            // Backward-compatible verification for v0.4.0 peers that did not append `:zstd={0|1}`.
+            // Note: A signature created with `:zstd=0` will NOT verify under the legacy format,
+            // so tampering `supports_zstd` on new clients is cryptographically rejected.
+            let legacy_bytes = relay_session_auth_signing_bytes(
+                src_client_id,
+                dst_daemon_id,
+                &self.sender_x25519_pub_b64,
+                &self.session_nonce_b64,
+                self.init_ts_ms,
+            );
+            StoredDeviceIdentity::verify_signature(
+                expected_ed25519_pub_b64,
+                &legacy_bytes,
+                &self.signature_b64,
+            )?;
+        }
         Ok(nonce_arr)
     }
 }
@@ -421,15 +528,21 @@ impl E2eeSession {
         hk.expand(b"coda-daemon-to-client-aead", &mut d2c_key)
             .map_err(|_| anyhow!("hkdf expand failed"))?;
 
-        let (tx_raw, rx_raw, tx_dir_tag, rx_dir_tag) = if is_client_initiator {
+        let (mut tx_raw, mut rx_raw, tx_dir_tag, rx_dir_tag) = if is_client_initiator {
             (c2d_key, d2c_key, 0x01, 0x02)
         } else {
             (d2c_key, c2d_key, 0x02, 0x01)
         };
+        let tx_cipher = ChaCha20Poly1305::new(Key::from_slice(&tx_raw));
+        let rx_cipher = ChaCha20Poly1305::new(Key::from_slice(&rx_raw));
+        zeroize_bytes(&mut tx_raw);
+        zeroize_bytes(&mut rx_raw);
+        zeroize_bytes(&mut c2d_key);
+        zeroize_bytes(&mut d2c_key);
 
         Ok(Self {
-            tx_cipher: ChaCha20Poly1305::new(Key::from_slice(&tx_raw)),
-            rx_cipher: ChaCha20Poly1305::new(Key::from_slice(&rx_raw)),
+            tx_cipher,
+            rx_cipher,
             tx_dir_tag,
             rx_dir_tag,
             next_tx_seq: 1,
@@ -491,18 +604,25 @@ impl E2eeSession {
         hk.expand(info_d2c.as_bytes(), &mut d2c_key)
             .map_err(|_| anyhow!("hkdf expand failed"))?;
 
-        let (tx_raw, rx_raw, tx_dir_tag, rx_dir_tag) = if is_client_initiator {
+        let (mut tx_raw, mut rx_raw, tx_dir_tag, rx_dir_tag) = if is_client_initiator {
             (c2d_key, d2c_key, 0x01, 0x02)
         } else {
             (d2c_key, c2d_key, 0x02, 0x01)
         };
+        let tx_cipher = ChaCha20Poly1305::new(Key::from_slice(&tx_raw));
+        let rx_cipher = ChaCha20Poly1305::new(Key::from_slice(&rx_raw));
+        zeroize_bytes(&mut tx_raw);
+        zeroize_bytes(&mut rx_raw);
+        zeroize_bytes(&mut c2d_key);
+        zeroize_bytes(&mut d2c_key);
+        zeroize_bytes(&mut ikm);
 
         let mut binding = [0u8; 16];
         binding.copy_from_slice(&salt[..16]);
 
         Ok(Self {
-            tx_cipher: ChaCha20Poly1305::new(Key::from_slice(&tx_raw)),
-            rx_cipher: ChaCha20Poly1305::new(Key::from_slice(&rx_raw)),
+            tx_cipher,
+            rx_cipher,
             tx_dir_tag,
             rx_dir_tag,
             next_tx_seq: 1,
@@ -530,7 +650,7 @@ impl E2eeSession {
             .try_into()
             .map_err(|_| anyhow!("invalid relay session nonce length (expected 16 bytes)"))?;
         let canonical_nonce_b64 = B64.encode(nonce_arr);
-        let (static_shared, _) = x25519_dh_checked(
+        let (mut static_shared, _) = x25519_dh_checked(
             my_static_secret,
             peer_static_public_b64,
             "peer static x25519 public key",
@@ -548,15 +668,22 @@ impl E2eeSession {
         hk.expand(info_d2c.as_bytes(), &mut d2c_key)
             .map_err(|_| anyhow!("hkdf expand failed"))?;
 
-        let (tx_raw, rx_raw, tx_dir_tag, rx_dir_tag) = if is_client_initiator {
+        let (mut tx_raw, mut rx_raw, tx_dir_tag, rx_dir_tag) = if is_client_initiator {
             (c2d_key, d2c_key, 0x01, 0x02)
         } else {
             (d2c_key, c2d_key, 0x02, 0x01)
         };
+        let tx_cipher = ChaCha20Poly1305::new(Key::from_slice(&tx_raw));
+        let rx_cipher = ChaCha20Poly1305::new(Key::from_slice(&rx_raw));
+        zeroize_bytes(&mut tx_raw);
+        zeroize_bytes(&mut rx_raw);
+        zeroize_bytes(&mut c2d_key);
+        zeroize_bytes(&mut d2c_key);
+        zeroize_bytes(&mut static_shared);
 
         Ok(Self {
-            tx_cipher: ChaCha20Poly1305::new(Key::from_slice(&tx_raw)),
-            rx_cipher: ChaCha20Poly1305::new(Key::from_slice(&rx_raw)),
+            tx_cipher,
+            rx_cipher,
             tx_dir_tag,
             rx_dir_tag,
             next_tx_seq: 1,
@@ -631,11 +758,12 @@ impl E2eeSession {
 
     pub fn open_message(&mut self, payload: &EncryptedPayload) -> Result<PeerMessage> {
         if let Some(expected_nonce) = self.session_nonce_b64.as_deref() {
-            if let Some(actual_nonce) = payload.session_nonce_b64.as_deref() {
-                if actual_nonce != expected_nonce {
-                    bail!("mismatched relay session_nonce_b64 in encrypted payload");
-                }
+            if payload.session_nonce_b64.as_deref() != Some(expected_nonce) {
+                bail!("missing or mismatched relay session_nonce_b64 in encrypted payload");
             }
+        }
+        if payload.ciphertext_b64.len() > MAX_B64_PAYLOAD_LEN {
+            bail!("encrypted payload exceeds maximum wire size");
         }
         self.rx_window.check(payload.seq)?;
         let ct = B64.decode(&payload.ciphertext_b64)?;
@@ -649,6 +777,12 @@ impl E2eeSession {
         let json_bytes = if payload.compressed {
             zstd_decode_bounded(&pt, MAX_DECOMPRESSED_BYTES)?
         } else {
+            if pt.len() > MAX_DECOMPRESSED_BYTES {
+                bail!(
+                    "uncompressed E2EE payload exceeds limit ({} bytes)",
+                    MAX_DECOMPRESSED_BYTES
+                );
+            }
             pt
         };
         let msg: PeerMessage = serde_json::from_slice(&json_bytes)?;
@@ -678,6 +812,9 @@ pub fn zstd_decode_bounded(raw: &[u8], max_bytes: usize) -> Result<Vec<u8>> {
 
 /// Decodes base64-encoded `zstd` payload into raw bytes with zip-bomb protection.
 pub fn zstd_decompress_b64_to_bytes(compressed_b64: &str) -> Result<Vec<u8>> {
+    if compressed_b64.len() > MAX_B64_PAYLOAD_LEN {
+        bail!("base64 zstd payload exceeds maximum wire size");
+    }
     let raw = B64.decode(compressed_b64)?;
     zstd_decode_bounded(&raw, MAX_DECOMPRESSED_BYTES)
 }
@@ -702,6 +839,7 @@ pub fn seal_opaque_secret(wrapping_secret: &[u8], plaintext: &str) -> Result<Str
     hk.expand(b"coda-db-token-wrap-aead", &mut key_bytes)
         .map_err(|_| anyhow!("hkdf expand failed"))?;
     let cipher = ChaCha20Poly1305::new(Key::from_slice(&key_bytes));
+    zeroize_bytes(&mut key_bytes);
     let mut nonce_bytes = [0u8; 12];
     OsRng.fill_bytes(&mut nonce_bytes);
     let ct = cipher
@@ -734,6 +872,7 @@ pub fn open_opaque_secret(wrapping_secret: &[u8], sealed: &str) -> Result<String
     hk.expand(b"coda-db-token-wrap-aead", &mut key_bytes)
         .map_err(|_| anyhow!("hkdf expand failed"))?;
     let cipher = ChaCha20Poly1305::new(Key::from_slice(&key_bytes));
+    zeroize_bytes(&mut key_bytes);
     let pt = cipher
         .decrypt(
             Nonce::from_slice(&nonce_arr),
@@ -876,6 +1015,15 @@ pub enum RelayWireFrame {
     KeepAlive {
         ts_ms: u64,
     },
+    /// Unencrypted control signal routed from target back to sender when the target restarted or
+    /// reconnected and no longer holds the sender's Relay v2 E2EE session state.
+    SessionReset {
+        src_device_id: Uuid,
+        dst_device_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_nonce_b64: Option<String>,
+        reason: String,
+    },
     Error {
         code: String,
         message: String,
@@ -904,6 +1052,47 @@ impl RelayWireFrame {
 pub struct NetworkEndpointCandidate {
     pub kind: String, // "lan_ipv4" | "lan_ws" | "cn_public_ipv6" | "ipv6_ws" | "stun_ipv4"
     pub addr: String,
+}
+
+/// Validates a peer-advertised Direct P2P endpoint candidate to prevent SSRF / arbitrary URL probing.
+pub fn is_valid_network_endpoint(ep: &NetworkEndpointCandidate) -> bool {
+    let kind = ep.kind.trim();
+    let addr = ep.addr.trim();
+    if addr.is_empty() || addr.len() > 128 || addr.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return false;
+    }
+    match kind {
+        "lan_ipv4" | "cn_public_ipv6" | "lan_ipv6" | "stun_ipv4" => {
+            addr.parse::<std::net::SocketAddr>()
+                .map(|sa| sa.port() > 0 && !sa.ip().is_unspecified())
+                .unwrap_or(false)
+        }
+        "lan_ws" | "ipv6_ws" => {
+            let rest = addr
+                .strip_prefix("ws://")
+                .or_else(|| addr.strip_prefix("wss://"));
+            let Some(host_port_path) = rest else {
+                return false;
+            };
+            let host_port = host_port_path.strip_suffix('/').unwrap_or(host_port_path);
+            if host_port.contains('/') || host_port.contains('?') || host_port.contains('#') || host_port.contains('@') {
+                return false;
+            }
+            host_port
+                .parse::<std::net::SocketAddr>()
+                .map(|sa| sa.port() > 0 && !sa.ip().is_unspecified())
+                .unwrap_or(false)
+        }
+        _ => false,
+    }
+}
+
+/// Filters and bounds a list of peer endpoint candidates (at most 16 valid entries).
+pub fn sanitize_network_endpoints(eps: Vec<NetworkEndpointCandidate>) -> Vec<NetworkEndpointCandidate> {
+    eps.into_iter()
+        .filter(is_valid_network_endpoint)
+        .take(16)
+        .collect()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1564,5 +1753,47 @@ mod tests {
         let compressed = zstd::stream::encode_all(Cursor::new(&zeros), 3).unwrap();
         assert!(zstd_decode_bounded(&compressed, 1024).is_err());
         assert_eq!(zstd_decode_bounded(&compressed, 4096).unwrap().len(), 2048);
+
+        // Tampering `supports_zstd` on RelaySessionAuth must fail Ed25519 verification
+        let mut tampered_auth = RelaySessionAuth::create(&client_id, did, false, now).unwrap();
+        tampered_auth.supports_zstd = true;
+        assert!(tampered_auth
+            .verify(
+                cid,
+                did,
+                &client_id.ed25519_public_b64,
+                &client_id.x25519_public_b64,
+                now,
+                HANDSHAKE_MAX_SKEW_MS,
+            )
+            .is_err());
+
+        // Stripping session_nonce_b64 from Relay v2 payload must fail open_message
+        let mut missing_nonce_rf = rel_c
+            .seal_message(&PeerMessage::Ping {
+                req_id: "rel-2".into(),
+                sent_ms: 10,
+            })
+            .unwrap();
+        missing_nonce_rf.session_nonce_b64 = None;
+        assert!(rel_d.open_message(&missing_nonce_rf).is_err());
+
+        // Endpoint validator allows valid LAN/IPv6 addresses and rejects SSRF URLs
+        assert!(is_valid_network_endpoint(&NetworkEndpointCandidate {
+            kind: "lan_ipv4".into(),
+            addr: "192.168.1.20:24444".into(),
+        }));
+        assert!(is_valid_network_endpoint(&NetworkEndpointCandidate {
+            kind: "ipv6_ws".into(),
+            addr: "ws://[2408:8207::1]:24444".into(),
+        }));
+        assert!(!is_valid_network_endpoint(&NetworkEndpointCandidate {
+            kind: "lan_ws".into(),
+            addr: "ws://evil.example.com/steal?x=1".into(),
+        }));
+        assert!(!is_valid_network_endpoint(&NetworkEndpointCandidate {
+            kind: "lan_ipv4".into(),
+            addr: "0.0.0.0:24444".into(),
+        }));
     }
 }

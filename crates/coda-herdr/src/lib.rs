@@ -22,12 +22,99 @@ use coda_protocol::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::{Child, Command},
     sync::{mpsc, oneshot, Mutex},
 };
 use tracing::{debug, warn};
+
+/// Builds a clean, deduplicated `PATH` covering macOS LaunchServices / systemd non-login shells
+/// as well as Homebrew, Cargo, Bun, NVM, Volta, FNM, PNPM, Mise, ASDF, Nix, Pyenv, and Go.
+pub fn build_augmented_path() -> String {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    let mut push_unique = |p: PathBuf| {
+        if !p.as_os_str().is_empty() && !dirs.contains(&p) {
+            dirs.push(p);
+        }
+    };
+
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        for rel in [
+            ".local/bin",
+            ".cargo/bin",
+            ".bun/bin",
+            ".volta/bin",
+            ".fnm/current/bin",
+            ".local/share/mise/shims",
+            ".mise/shims",
+            ".asdf/shims",
+            ".local/share/pnpm",
+            "Library/pnpm",
+            ".npm-global/bin",
+            ".nix-profile/bin",
+            ".pyenv/shims",
+            "go/bin",
+        ] {
+            let p = home.join(rel);
+            if p.is_dir() {
+                push_unique(p);
+            }
+        }
+        // Scan ~/.nvm/versions/node/*/bin (newest version first)
+        let nvm_dir = home.join(".nvm/versions/node");
+        if let Ok(entries) = std::fs::read_dir(&nvm_dir) {
+            let mut vers: Vec<PathBuf> = entries
+                .filter_map(|e| e.ok().map(|x| x.path().join("bin")))
+                .filter(|p| p.is_dir())
+                .collect();
+            vers.sort();
+            for p in vers.into_iter().rev() {
+                push_unique(p);
+            }
+        }
+        // Scan ~/.fnm/node-versions/*/installation/bin (newest version first)
+        let fnm_dir = home.join(".fnm/node-versions");
+        if let Ok(entries) = std::fs::read_dir(&fnm_dir) {
+            let mut vers: Vec<PathBuf> = entries
+                .filter_map(|e| e.ok().map(|x| x.path().join("installation/bin")))
+                .filter(|p| p.is_dir())
+                .collect();
+            vers.sort();
+            for p in vers.into_iter().rev() {
+                push_unique(p);
+            }
+        }
+    }
+
+    for sys in [
+        "/opt/homebrew/bin",
+        "/opt/homebrew/sbin",
+        "/usr/local/bin",
+        "/usr/local/sbin",
+        "/nix/var/nix/profiles/default/bin",
+        "/usr/bin",
+        "/bin",
+        "/usr/sbin",
+        "/sbin",
+    ] {
+        let p = PathBuf::from(sys);
+        if p.is_dir() {
+            push_unique(p);
+        }
+    }
+
+    if let Some(existing) = std::env::var_os("PATH") {
+        for p in std::env::split_paths(&existing) {
+            push_unique(p);
+        }
+    }
+
+    std::env::join_paths(dirs)
+        .map(|os| os.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".into()))
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HerdrHelloInfo {
@@ -93,10 +180,41 @@ impl From<RawTerminal> for HerdrTerminalSummary {
     }
 }
 
+fn is_valid_herdr_binary(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    let is_bare_hc = path.file_name().and_then(|s| s.to_str()) == Some("hc");
+    if !is_bare_hc {
+        return true;
+    }
+    // Verify bare `hc` is actually `herdr-core` and not `herbstclient` (herbstluftwm).
+    let out = std::process::Command::new(path)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output();
+    match out {
+        Ok(o) => {
+            let combined = format!(
+                "{} {}",
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr)
+            )
+            .to_ascii_lowercase();
+            if combined.contains("herbstclient") || combined.contains("herbstluftwm") {
+                return false;
+            }
+            o.status.success() && (combined.contains("herdr") || combined.contains("hc "))
+        }
+        Err(_) => false,
+    }
+}
+
 /// Locates the `herdr-core` / `hc` binary across standard macOS & Linux install paths.
 ///
-/// Prefers `herdr-core` over bare `hc` to avoid collisions with unrelated binaries such as
-/// the `herbstclient` (`hc`) window manager tool.
+/// Prefers `herdr-core` over bare `hc` and verifies bare `hc` is not `herbstclient`.
 pub fn discover_hc_binary() -> Option<PathBuf> {
     for var in ["HERDR_CORE_BIN", "HC_BIN"] {
         if let Ok(custom) = std::env::var(var) {
@@ -108,10 +226,14 @@ pub fn discover_hc_binary() -> Option<PathBuf> {
     }
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let path_var = std::env::var_os("PATH");
-    discover_hc_binary_in(home.as_deref(), path_var.as_deref())
+    discover_hc_binary_in(home.as_deref(), path_var.as_deref(), true)
 }
 
-fn discover_hc_binary_in(home: Option<&Path>, path_var: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+fn discover_hc_binary_in(
+    home: Option<&Path>,
+    path_var: Option<&std::ffi::OsStr>,
+    verify_exec: bool,
+) -> Option<PathBuf> {
     let mut base_dirs: Vec<PathBuf> = Vec::new();
     if let Some(home) = home {
         base_dirs.push(home.join(".local/bin"));
@@ -131,7 +253,7 @@ fn discover_hc_binary_in(home: Option<&Path>, path_var: Option<&std::ffi::OsStr>
     for binary_name in ["herdr-core", "hc"] {
         for dir in &base_dirs {
             let candidate = dir.join(binary_name);
-            if candidate.is_file() {
+            if candidate.is_file() && (!verify_exec || is_valid_herdr_binary(&candidate)) {
                 return Some(candidate);
             }
         }
@@ -141,7 +263,8 @@ fn discover_hc_binary_in(home: Option<&Path>, path_var: Option<&std::ffi::OsStr>
 
 static HC_INSTALL_LOCK: Mutex<()> = Mutex::const_new(());
 
-/// Ensures `herdr-core` (`hc`) is installed locally, running the official install script if missing.
+/// Ensures `herdr-core` (`hc`) is installed locally, running the official install script if missing
+/// and permitted by environment configuration (`CODA_SKIP_HC_INSTALL`, `CODA_HC_INSTALL_SHA256`).
 pub async fn ensure_or_install_hc_binary() -> Result<PathBuf> {
     if let Some(existing) = discover_hc_binary() {
         return Ok(existing);
@@ -150,8 +273,10 @@ pub async fn ensure_or_install_hc_binary() -> Result<PathBuf> {
     if let Some(existing) = discover_hc_binary() {
         return Ok(existing);
     }
-    if std::env::var("CODA_SKIP_HC_INSTALL").as_deref() == Ok("1") {
-        bail!("herdr-core binary not found and CODA_SKIP_HC_INSTALL=1 is set");
+    if std::env::var("CODA_SKIP_HC_INSTALL").as_deref() == Ok("1")
+        || std::env::var("CODA_AUTO_INSTALL_HC").as_deref() == Ok("0")
+    {
+        bail!("herdr-core binary not found and automatic install is disabled (CODA_SKIP_HC_INSTALL=1 / CODA_AUTO_INSTALL_HC=0)");
     }
 
     tracing::info!("`herdr-core` binary not found; installing via https://releases.herdr.dev/core/install.sh");
@@ -194,6 +319,16 @@ pub async fn ensure_or_install_hc_binary() -> Result<PathBuf> {
             if !head.starts_with(b"#!") {
                 let _ = std::fs::remove_file(&tmp_script);
                 bail!("herdr-core installer download did not return a shell script (#! header missing)");
+            }
+            if let Ok(expected_sha) = std::env::var("CODA_HC_INSTALL_SHA256") {
+                let expected = expected_sha.trim().to_ascii_lowercase();
+                if !expected.is_empty() {
+                    let actual = hex::encode(Sha256::digest(&head));
+                    if actual != expected {
+                        let _ = std::fs::remove_file(&tmp_script);
+                        bail!("herdr-core installer SHA-256 mismatch (expected {expected}, got {actual})");
+                    }
+                }
             }
             true
         }
@@ -322,6 +457,8 @@ impl HerdrClient {
     async fn spawn_transport(hc_path: &Path) -> Result<HerdrTransport> {
         let mut child = Command::new(hc_path)
             .arg("connect")
+            .env("PATH", build_augmented_path())
+            .env("GIT_TERMINAL_PROMPT", "0")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -759,6 +896,8 @@ impl HerdrClient {
     pub async fn subscribe_live_events(&self) -> Result<mpsc::Receiver<Value>> {
         let mut child = Command::new(&self.hc_path)
             .arg("connect")
+            .env("PATH", build_augmented_path())
+            .env("GIT_TERMINAL_PROMPT", "0")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -814,27 +953,47 @@ pub struct PtyOutputEvent {
 pub struct PtyBridgeHandle {
     pub terminal: String,
     master_fd: std::os::unix::io::RawFd,
-    _child_pid: u32,
+    stop_pipe_w: std::os::unix::io::RawFd,
+    send_detach_on_drop: bool,
+    child_pid: u32,
 }
 
 impl Drop for PtyBridgeHandle {
     fn drop(&mut self) {
         unsafe {
-            // Send 0x1c (Ctrl+\) so `hc attach` detaches cleanly without killing the terminal
-            let detach_byte: [u8; 1] = [0x1c];
+            if self.send_detach_on_drop {
+                // Send 0x1c (Ctrl+\) so `hc attach` detaches cleanly without killing the terminal
+                let detach_byte: [u8; 1] = [0x1c];
+                let _ = libc::write(
+                    self.master_fd,
+                    detach_byte.as_ptr() as *const libc::c_void,
+                    1,
+                );
+            } else if self.child_pid > 0 {
+                // Native fallback shell owned by Coda: terminate its process group on drop.
+                let _ = libc::kill(-(self.child_pid as libc::pid_t), libc::SIGHUP);
+                let _ = libc::kill(self.child_pid as libc::pid_t, libc::SIGTERM);
+            }
+            // Wake the reader thread immediately out of poll() so reader_fd never leaks
+            let wake: [u8; 1] = [1];
             let _ = libc::write(
-                self.master_fd,
-                detach_byte.as_ptr() as *const libc::c_void,
+                self.stop_pipe_w,
+                wake.as_ptr() as *const libc::c_void,
                 1,
             );
+            libc::close(self.stop_pipe_w);
             libc::close(self.master_fd);
         }
     }
 }
 
 impl PtyBridgeHandle {
+    pub fn child_pid(&self) -> u32 {
+        self.child_pid
+    }
+
     /// Writes all bytes (keystrokes, Kitty Keyboard sequences, bracketed paste) into the attached PTY,
-    /// handling partial writes and `EINTR` / `EAGAIN`.
+    /// handling partial writes and `EINTR` / `EAGAIN` with bounded non-blocking retries.
     pub fn write_raw(&self, bytes: &[u8]) -> Result<()> {
         let mut offset = 0usize;
         let mut eagain_spins = 0u32;
@@ -858,10 +1017,17 @@ impl PtyBridgeHandle {
                     Some(libc::EINTR) => continue,
                     Some(e) if e == libc::EAGAIN || e == libc::EWOULDBLOCK => {
                         eagain_spins += 1;
-                        if eagain_spins > 1000 {
+                        if eagain_spins > 200 {
                             bail!("PTY write timed out with EAGAIN");
                         }
-                        std::thread::sleep(std::time::Duration::from_millis(2));
+                        let mut pfd = libc::pollfd {
+                            fd: self.master_fd,
+                            events: libc::POLLOUT,
+                            revents: 0,
+                        };
+                        unsafe {
+                            let _ = libc::poll(&mut pfd, 1, 5);
+                        }
                     }
                     _ => bail!("PTY write failed: {err}"),
                 }
@@ -898,13 +1064,21 @@ fn set_cloexec(fd: libc::c_int) {
     }
 }
 
-/// Spawns `hc attach <terminal>` inside a real Unix pseudo-terminal (`openpty`),
-/// streaming raw 24-bit ANSI/VT output chunks asynchronously into `out_tx`.
-pub fn spawn_pty_attach(
-    hc_path: &Path,
-    terminal: &str,
+fn set_nonblock(fd: libc::c_int) {
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags >= 0 {
+            let _ = libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+    }
+}
+
+fn spawn_command_in_pty(
+    mut cmd: std::process::Command,
+    terminal_label: &str,
     cols: u16,
     rows: u16,
+    send_detach_on_drop: bool,
     out_tx: mpsc::Sender<PtyOutputEvent>,
 ) -> Result<PtyBridgeHandle> {
     use std::os::unix::io::FromRawFd;
@@ -931,11 +1105,30 @@ pub fn spawn_pty_attach(
         bail!("openpty failed: {}", std::io::Error::last_os_error());
     }
     set_cloexec(master_fd);
+    set_nonblock(master_fd);
+
+    let mut stop_pipe = [-1 as libc::c_int; 2];
+    if unsafe { libc::pipe(stop_pipe.as_mut_ptr()) } != 0 {
+        let err = std::io::Error::last_os_error();
+        unsafe {
+            libc::close(slave_fd);
+            libc::close(master_fd);
+        }
+        bail!("pipe() for PTY shutdown failed: {err}");
+    }
+    let stop_pipe_r = stop_pipe[0];
+    let stop_pipe_w = stop_pipe[1];
+    set_cloexec(stop_pipe_r);
+    set_cloexec(stop_pipe_w);
+    set_nonblock(stop_pipe_r);
+    set_nonblock(stop_pipe_w);
 
     let slave_out_fd = unsafe { libc::dup(slave_fd) };
     if slave_out_fd < 0 {
         let err = std::io::Error::last_os_error();
         unsafe {
+            libc::close(stop_pipe_r);
+            libc::close(stop_pipe_w);
             libc::close(slave_fd);
             libc::close(master_fd);
         }
@@ -945,6 +1138,8 @@ pub fn spawn_pty_attach(
     if slave_err_fd < 0 {
         let err = std::io::Error::last_os_error();
         unsafe {
+            libc::close(stop_pipe_r);
+            libc::close(stop_pipe_w);
             libc::close(slave_out_fd);
             libc::close(slave_fd);
             libc::close(master_fd);
@@ -955,6 +1150,8 @@ pub fn spawn_pty_attach(
     if reader_fd < 0 {
         let err = std::io::Error::last_os_error();
         unsafe {
+            libc::close(stop_pipe_r);
+            libc::close(stop_pipe_w);
             libc::close(slave_err_fd);
             libc::close(slave_out_fd);
             libc::close(slave_fd);
@@ -968,10 +1165,9 @@ pub fn spawn_pty_attach(
     let slave_out = unsafe { Stdio::from_raw_fd(slave_out_fd) };
     let slave_err = unsafe { Stdio::from_raw_fd(slave_err_fd) };
 
-    let mut cmd = std::process::Command::new(hc_path);
-    cmd.args(["attach", terminal])
-        .env("TERM", "xterm-256color")
+    cmd.env("TERM", "xterm-256color")
         .env("COLORTERM", "truecolor")
+        .env("PATH", build_augmented_path())
         .stdin(slave_in)
         .stdout(slave_out)
         .stderr(slave_err);
@@ -987,59 +1183,177 @@ pub fn spawn_pty_attach(
         Ok(c) => c,
         Err(e) => {
             unsafe {
+                libc::close(stop_pipe_r);
+                libc::close(stop_pipe_w);
                 libc::close(reader_fd);
                 libc::close(master_fd);
             }
-            return Err(e).with_context(|| format!("failed to spawn `hc attach {terminal}` in PTY"));
+            return Err(e).with_context(|| format!("failed to spawn PTY command for `{terminal_label}`"));
         }
     };
     let child_pid = child.id();
-    let term_name = terminal.to_string();
+    let term_name = terminal_label.to_string();
 
     std::thread::spawn(move || {
         let mut seq = 1u64;
         let mut buf = [0u8; 8192];
-        loop {
-            let n = unsafe {
-                libc::read(
-                    reader_fd,
-                    buf.as_mut_ptr() as *mut libc::c_void,
-                    buf.len(),
-                )
-            };
-            if n == 0 {
-                break;
-            }
-            if n < 0 {
+        let mut stopped = false;
+        while !stopped {
+            let mut fds = [
+                libc::pollfd {
+                    fd: reader_fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: stop_pipe_r,
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
+            let prc = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
+            if prc < 0 {
                 if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
                     continue;
                 }
                 break;
             }
-            let chunk_b64 = B64.encode(&buf[..n as usize]);
-            if out_tx
-                .blocking_send(PtyOutputEvent {
-                    terminal: term_name.clone(),
-                    seq,
-                    data_b64: chunk_b64,
-                })
-                .is_err()
-            {
+            if (fds[1].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)) != 0 {
                 break;
             }
-            seq += 1;
+            if (fds[0].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR)) != 0 {
+                loop {
+                    let n = unsafe {
+                        libc::read(
+                            reader_fd,
+                            buf.as_mut_ptr() as *mut libc::c_void,
+                            buf.len(),
+                        )
+                    };
+                    if n > 0 {
+                        let chunk_b64 = B64.encode(&buf[..n as usize]);
+                        if out_tx
+                            .blocking_send(PtyOutputEvent {
+                                terminal: term_name.clone(),
+                                seq,
+                                data_b64: chunk_b64,
+                            })
+                            .is_err()
+                        {
+                            stopped = true;
+                            break;
+                        }
+                        seq += 1;
+                    } else if n == 0 {
+                        stopped = true;
+                        break;
+                    } else {
+                        match std::io::Error::last_os_error().raw_os_error() {
+                            Some(libc::EINTR) => continue,
+                            Some(e) if e == libc::EAGAIN || e == libc::EWOULDBLOCK => break,
+                            _ => {
+                                stopped = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (fds[0].revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)) != 0 {
+                    break;
+                }
+            }
         }
         unsafe {
             libc::close(reader_fd);
+            libc::close(stop_pipe_r);
         }
-        let _ = child.wait();
+        // Gracefully reap child so neither `hc attach` nor fallback shells leak zombies.
+        let mut exited = false;
+        for _ in 0..10 {
+            if let Ok(Some(_)) = child.try_wait() {
+                exited = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        if !exited {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     });
 
     Ok(PtyBridgeHandle {
-        terminal: terminal.to_string(),
+        terminal: terminal_label.to_string(),
         master_fd,
-        _child_pid: child_pid,
+        stop_pipe_w,
+        send_detach_on_drop,
+        child_pid,
     })
+}
+
+/// Spawns `hc attach <terminal>` inside a real Unix pseudo-terminal (`openpty`),
+/// streaming raw 24-bit ANSI/VT output chunks asynchronously into `out_tx`.
+pub fn spawn_pty_attach(
+    hc_path: &Path,
+    terminal: &str,
+    cols: u16,
+    rows: u16,
+    out_tx: mpsc::Sender<PtyOutputEvent>,
+) -> Result<PtyBridgeHandle> {
+    let mut cmd = std::process::Command::new(hc_path);
+    cmd.args(["attach", terminal]);
+    spawn_command_in_pty(cmd, terminal, cols, rows, true, out_tx)
+}
+
+/// Spawns a native Unix interactive shell or agent directly inside an `openpty` pseudo-terminal
+/// as a zero-dependency fallback when `herdr-core` (`hc`) is unavailable on a host.
+pub fn spawn_native_shell_pty(
+    terminal_label: &str,
+    agent: &str,
+    cwd: Option<&str>,
+    initial_prompt: Option<&str>,
+    cols: u16,
+    rows: u16,
+    out_tx: mpsc::Sender<PtyOutputEvent>,
+) -> Result<(PtyBridgeHandle, Vec<String>, String)> {
+    let default_shell = std::env::var("SHELL")
+        .ok()
+        .filter(|s| !s.trim().is_empty() && Path::new(s).is_file())
+        .or_else(|| {
+            ["/bin/zsh", "/bin/bash", "/bin/sh"]
+                .into_iter()
+                .find(|p| Path::new(p).is_file())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "/bin/sh".to_string());
+
+    let mut argv: Vec<String> = match agent {
+        "claude" | "claude-code" => vec!["claude".into()],
+        "codex" => vec!["codex".into()],
+        "grok" | "grok-build" => vec!["grok".into()],
+        "gemini" | "gemini-cli" => vec!["gemini".into()],
+        "shell" | "" => vec![default_shell.clone(), "-i".into()],
+        other => vec![other.to_string()],
+    };
+    if let Some(prompt) = initial_prompt.filter(|s| !s.trim().is_empty()) {
+        if agent != "shell" && !agent.is_empty() {
+            argv.push(prompt.to_string());
+        }
+    }
+
+    let resolved_cwd = cwd
+        .filter(|s| !s.trim().is_empty() && Path::new(s).is_dir())
+        .map(str::to_string)
+        .or_else(|| std::env::var("HOME").ok().filter(|s| Path::new(s).is_dir()))
+        .unwrap_or_else(|| "/".to_string());
+
+    let mut cmd = std::process::Command::new(&argv[0]);
+    if argv.len() > 1 {
+        cmd.args(&argv[1..]);
+    }
+    cmd.current_dir(&resolved_cwd);
+    let handle = spawn_command_in_pty(cmd, terminal_label, cols, rows, false, out_tx)?;
+    Ok((handle, argv, resolved_cwd))
 }
 
 // ============================================================================
@@ -1081,7 +1395,14 @@ pub async fn scan_git_workspaces(
             candidate_dirs.push(cwd);
         }
     }
-    collect_home_git_candidates(&mut candidate_dirs, 16);
+    // Reserve independent $HOME git scan quota so >=15 open terminals never starve repo discovery (#47).
+    let mut home_candidates: Vec<PathBuf> = Vec::new();
+    collect_home_git_candidates(&mut home_candidates, 16);
+    for hc_dir in home_candidates {
+        if !candidate_dirs.contains(&hc_dir) {
+            candidate_dirs.push(hc_dir);
+        }
+    }
 
     let mut seen_repo_roots: HashMap<String, RepoWorkspaceSummary> = HashMap::new();
 
@@ -1282,8 +1603,12 @@ fn compute_branch_status_summary(terminals: &[HerdrTerminalSummary]) -> String {
 
 async fn git_capture(cwd: &Path, args: &[&str]) -> Option<String> {
     let mut cmd = Command::new("git");
-    cmd.arg("-c")
+    cmd.env("PATH", build_augmented_path())
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .arg("-c")
         .arg("core.quotePath=false")
+        .arg("-c")
+        .arg("core.fsmonitor=false")
         .arg("-C")
         .arg(cwd)
         .args(args)
@@ -1412,9 +1737,32 @@ mod tests {
         let herdr_path = bin_dir.join("herdr-core");
         std::fs::write(&herdr_path, "#!/bin/sh\n").unwrap();
 
-        let found = discover_hc_binary_in(Some(&dir), Some(std::ffi::OsStr::new("")));
+        let found = discover_hc_binary_in(Some(&dir), Some(std::ffi::OsStr::new("")), false);
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(found.as_deref(), Some(herdr_path.as_path()));
+    }
+
+    #[tokio::test]
+    async fn test_native_fallback_shell_pty_and_clean_drop() {
+        let (tx, mut rx) = mpsc::channel(64);
+        let (pty, _argv, _cwd) =
+            spawn_native_shell_pty("fallback-1", "shell", None, None, 80, 24, tx).unwrap();
+        pty.resize(100, 30).unwrap();
+        pty.write_raw(b"echo FALLBACK_PTY_OK\r").unwrap();
+
+        let mut out = String::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        while tokio::time::Instant::now() < deadline && !out.contains("FALLBACK_PTY_OK") {
+            if let Ok(Some(ev)) =
+                tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await
+            {
+                if let Ok(bytes) = B64.decode(&ev.data_b64) {
+                    out.push_str(&String::from_utf8_lossy(&bytes));
+                }
+            }
+        }
+        assert!(out.contains("FALLBACK_PTY_OK"), "got: {out:?}");
+        drop(pty);
     }
 
     #[tokio::test]

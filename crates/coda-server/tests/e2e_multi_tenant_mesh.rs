@@ -28,30 +28,35 @@ use tokio::{
 use tokio_tungstenite::{connect_async, tungstenite::Message as WsMsg};
 
 static DB_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+const TEST_DB_ADVISORY_LOCK_KEY: i64 = 9_876_543;
+
+async fn acquire_clean_test_db(db_url: &str) -> tokio_postgres::Client {
+    let (pg, conn) = tokio_postgres::connect(db_url, tokio_postgres::NoTls)
+        .await
+        .expect("PostgreSQL coda_test should be running");
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    pg.query_one("SELECT pg_advisory_lock($1)", &[&TEST_DB_ADVISORY_LOCK_KEY])
+        .await
+        .expect("acquire cross-binary pg_advisory_lock");
+    let _ = coda_server::db::Db::connect_and_migrate(db_url)
+        .await
+        .expect("PostgreSQL coda_test should be reachable and migrate cleanly");
+    pg.batch_execute(
+        "TRUNCATE device_auth_requests, pairing_tokens, devices, auth_sessions, invite_codes, users RESTART IDENTITY CASCADE;",
+    )
+    .await
+    .unwrap();
+    pg
+}
 
 #[tokio::test]
 async fn test_multi_tenant_postgres_and_raw_tcp_e2ee_herdr_tunnel() {
     let _guard = DB_TEST_LOCK.get_or_init(|| Mutex::new(())).lock().await;
     let db_url = std::env::var("TEST_DATABASE_URL")
         .unwrap_or_else(|_| "postgres://vampire@localhost:5432/coda_test".to_string());
-
-    // Ensure schema migrations exist on a brand-new CI database BEFORE truncating tables
-    let _ = coda_server::db::Db::connect_and_migrate(&db_url)
-        .await
-        .expect("PostgreSQL coda_test should be reachable and migrate cleanly");
-
-    // Clean test tables before run
-    let (pg, conn) = tokio_postgres::connect(&db_url, tokio_postgres::NoTls)
-        .await
-        .expect("PostgreSQL coda_test should be running");
-    tokio::spawn(async move {
-        let _ = conn.await;
-    });
-    pg.batch_execute(
-        "TRUNCATE device_auth_requests, pairing_tokens, devices, auth_sessions, invite_codes, users RESTART IDENTITY CASCADE;",
-    )
-    .await
-    .unwrap();
+    let _pg_lock = acquire_clean_test_db(&db_url).await;
 
     let server = start_full_server(
         &db_url,
@@ -1006,22 +1011,7 @@ async fn test_open_portal_device_code_rfc8628_and_cloudflare_wss_mesh() {
     let _guard = DB_TEST_LOCK.get_or_init(|| Mutex::new(())).lock().await;
     let db_url = std::env::var("TEST_DATABASE_URL")
         .unwrap_or_else(|_| "postgres://vampire@localhost:5432/coda_test".to_string());
-
-    let _ = coda_server::db::Db::connect_and_migrate(&db_url)
-        .await
-        .expect("PostgreSQL coda_test should be reachable");
-
-    let (pg, conn) = tokio_postgres::connect(&db_url, tokio_postgres::NoTls)
-        .await
-        .unwrap();
-    tokio::spawn(async move {
-        let _ = conn.await;
-    });
-    pg.batch_execute(
-        "TRUNCATE device_auth_requests, pairing_tokens, devices, auth_sessions, invite_codes, users RESTART IDENTITY CASCADE;",
-    )
-    .await
-    .unwrap();
+    let _pg_lock = acquire_clean_test_db(&db_url).await;
 
     let temp_web_dist = std::env::temp_dir().join(format!("coda-e2e-web-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&temp_web_dist).unwrap();
@@ -1045,6 +1035,7 @@ async fn test_open_portal_device_code_rfc8628_and_cloudflare_wss_mesh() {
             release_version: "v99.99.99-unreleased".into(),
             github_repo: "Annihilater/coda".into(),
             ios_beta_url: Some("https://testflight.apple.com/join/CodaBeta".into()),
+            ..ServerOptions::default()
         },
     )
     .await
@@ -1406,21 +1397,7 @@ async fn test_security_hardening_regressions() {
     let _guard = DB_TEST_LOCK.get_or_init(|| Mutex::new(())).lock().await;
     let db_url = std::env::var("TEST_DATABASE_URL")
         .unwrap_or_else(|_| "postgres://vampire@localhost:5432/coda_test".to_string());
-
-    let _ = coda_server::db::Db::connect_and_migrate(&db_url)
-        .await
-        .expect("PostgreSQL coda_test should migrate");
-    let (pg, conn) = tokio_postgres::connect(&db_url, tokio_postgres::NoTls)
-        .await
-        .unwrap();
-    tokio::spawn(async move {
-        let _ = conn.await;
-    });
-    pg.batch_execute(
-        "TRUNCATE device_auth_requests, pairing_tokens, devices, auth_sessions, invite_codes, users RESTART IDENTITY CASCADE;",
-    )
-    .await
-    .unwrap();
+    let _pg_lock = acquire_clean_test_db(&db_url).await;
 
     let server = start_full_server_with_options(
         &db_url,
@@ -1766,4 +1743,343 @@ async fn test_security_hardening_regressions() {
     assert_eq!(after_logout.status(), 401);
 
     daemon_task.abort();
+}
+
+#[tokio::test]
+async fn test_v2_security_and_lifecycle_endpoints() {
+    let _guard = DB_TEST_LOCK.get_or_init(|| Mutex::new(())).lock().await;
+    let db_url = std::env::var("TEST_DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://vampire@localhost:5432/coda_test".to_string());
+    let _pg_lock = acquire_clean_test_db(&db_url).await;
+
+    let server = start_full_server_with_options(
+        &db_url,
+        "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+        "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+        b"v2-security-lifecycle-secret-2026".to_vec(),
+        None,
+        None,
+        ServerOptions {
+            open_registration: true,
+            ..ServerOptions::default()
+        },
+    )
+    .await
+    .unwrap();
+    let base = format!("http://{}", server.http_addr);
+    let http = reqwest::Client::new();
+
+    // 1. Register admin & non-admin user
+    let admin: AuthResponse = http
+        .post(format!("{base}/api/v1/auth/register"))
+        .json(&json!({
+            "email": "admin-v2@coda.dev",
+            "handle": "adminv2",
+            "display_name": "Admin V2",
+            "password": "password-one-123",
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(admin.user.is_admin);
+
+    let member: AuthResponse = http
+        .post(format!("{base}/api/v1/auth/register"))
+        .json(&json!({
+            "email": "member-v2@coda.dev",
+            "handle": "memberv2",
+            "display_name": "Member V2",
+            "password": "password-two-123",
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(!member.user.is_admin);
+
+    // Non-admin GET /api/v1/invites MUST return 403 (#45)
+    let member_invites = http
+        .get(format!("{base}/api/v1/invites"))
+        .bearer_auth(&member.token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(member_invites.status(), 403);
+
+    // Admin create + list + DELETE /api/v1/invites/{code}
+    let inv: InviteCodeRecord = http
+        .post(format!("{base}/api/v1/invites"))
+        .bearer_auth(&admin.token)
+        .json(&json!({ "note": "temp", "max_uses": 2, "valid_days": 7 }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let del_inv = http
+        .delete(format!("{base}/api/v1/invites/{}", inv.code))
+        .bearer_auth(&admin.token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(del_inv.status(), 200);
+
+    // 2. RFC 8628 daemon login -> session token gets scope = daemon_host (#1)
+    let start = start_device_login_flow(&base, "daemon", Some("scoped-linux-host".into()), None)
+        .await
+        .unwrap();
+    let approve_resp = http
+        .post(format!("{base}/api/v1/auth/device/approve"))
+        .bearer_auth(&admin.token)
+        .json(&json!({ "user_code": start.user_code }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(approve_resp.status(), 200);
+
+    let polled = poll_device_login_once(&start)
+        .await
+        .unwrap()
+        .expect("approved");
+    let daemon_tok = polled.session_token.as_deref().expect("daemon session token");
+
+    // daemon_host scope MUST be blocked (403) on controller/account endpoints
+    assert_eq!(
+        http.get(format!("{base}/api/v1/devices"))
+            .bearer_auth(daemon_tok)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403
+    );
+    assert_eq!(
+        http.post(format!("{base}/api/v1/devices/pair-token"))
+            .bearer_auth(daemon_tok)
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403
+    );
+    // daemon_host scope IS allowed on /api/v1/auth/me and /api/v1/relay/trusted-peers
+    assert_eq!(
+        http.get(format!("{base}/api/v1/auth/me"))
+            .bearer_auth(daemon_tok)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    assert_eq!(
+        http.get(format!("{base}/api/v1/relay/trusted-peers"))
+            .bearer_auth(daemon_tok)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+
+    // 3. PATCH /api/v1/devices/{id} renames device (#45)
+    let renamed: DeviceRecord = http
+        .patch(format!("{base}/api/v1/devices/{}", polled.device_id))
+        .bearer_auth(&admin.token)
+        .json(&json!({ "name": "renamed-prod-box" }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(renamed.name, "renamed-prod-box");
+
+    // 4. POST /api/v1/relay/renew-ticket (#28)
+    let ts_ms = current_unix_ms();
+    let sig = polled
+        .identity
+        .sign(&coda_protocol::relay_ticket_renew_signing_bytes(
+            polled.device_id,
+            ts_ms,
+        ))
+        .unwrap();
+    let renew: coda_server::RenewRelayTicketResponse = http
+        .post(format!("{base}/api/v1/relay/renew-ticket"))
+        .json(&json!({
+            "device_id": polled.device_id,
+            "timestamp_ms": ts_ms,
+            "signature_b64": sig,
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(!renew.daemon_relay_ticket.is_empty());
+    assert!(renew.expires_in_secs >= 29 * 86_400);
+
+    // Bad signature rejected
+    assert_eq!(
+        http.post(format!("{base}/api/v1/relay/renew-ticket"))
+            .json(&json!({
+                "device_id": polled.device_id,
+                "timestamp_ms": ts_ms,
+                "signature_b64": "AAAA",
+            }))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        401
+    );
+
+    // 5. DELETE /api/v1/devices/{id} cascades auth_sessions & rejects relay reconnect (#3)
+    assert_eq!(
+        http.delete(format!("{base}/api/v1/devices/{}", polled.device_id))
+            .bearer_auth(&admin.token)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    // Device-bound session token is immediately invalid (401)
+    assert_eq!(
+        http.get(format!("{base}/api/v1/auth/me"))
+            .bearer_auth(daemon_tok)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        401
+    );
+    // Reconnecting to Raw TCP relay with the old still-unexpired ticket MUST fail with device_revoked
+    let mut tcp = TcpStream::connect(server.raw_tcp_addr).await.unwrap();
+    tcp.write_all(
+        &RelayWireFrame::AuthBind {
+            ticket: renew.daemon_relay_ticket.clone(),
+            lane: TrafficLane::ControlP0,
+            generation: 1,
+        }
+        .encode_length_delimited()
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    let mut len_buf = [0u8; 4];
+    tcp.read_exact(&mut len_buf).await.unwrap();
+    let flen = u32::from_be_bytes(len_buf) as usize;
+    let mut payload = vec![0u8; flen];
+    tcp.read_exact(&mut payload).await.unwrap();
+    match serde_json::from_slice::<RelayWireFrame>(&payload).unwrap() {
+        RelayWireFrame::Error { code, .. } => assert_eq!(code, "device_revoked"),
+        other => panic!("expected device_revoked Error frame, got {other:?}"),
+    }
+
+    // 6. Cross-origin WebSocket rejected with 403 (#6)
+    let bad_origin_req = tokio_tungstenite::tungstenite::http::Request::builder()
+        .uri(format!("ws://{}/v1/tunnel/ws", server.http_addr))
+        .header("Host", server.http_addr.to_string())
+        .header("Origin", "https://evil.example")
+        .header("Connection", "Upgrade")
+        .header("Upgrade", "websocket")
+        .header("Sec-WebSocket-Version", "13")
+        .header("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .body(())
+        .unwrap();
+    assert!(connect_async(bad_origin_req).await.is_err());
+
+    // 7. Sessions list + change password + delete account (#45)
+    let second_login: AuthResponse = http
+        .post(format!("{base}/api/v1/auth/login"))
+        .json(&json!({
+            "email_or_handle": "memberv2",
+            "password": "password-two-123",
+            "client_label": "second-browser",
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let sessions: Vec<coda_server::db::AuthSessionRecord> = http
+        .get(format!("{base}/api/v1/auth/sessions"))
+        .bearer_auth(&member.token)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(sessions.len(), 2);
+    assert!(sessions.iter().any(|s| s.is_current));
+
+    // Change password invalidates other sessions
+    assert_eq!(
+        http.post(format!("{base}/api/v1/auth/password"))
+            .bearer_auth(&member.token)
+            .json(&json!({
+                "current_password": "password-two-123",
+                "new_password": "new-secure-password-456",
+            }))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    assert_eq!(
+        http.get(format!("{base}/api/v1/auth/me"))
+            .bearer_auth(&second_login.token)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        401
+    );
+
+    // Delete account
+    assert_eq!(
+        http.delete(format!("{base}/api/v1/auth/me"))
+            .bearer_auth(&member.token)
+            .json(&json!({ "password": "new-secure-password-456" }))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    assert_eq!(
+        http.get(format!("{base}/api/v1/auth/me"))
+            .bearer_auth(&member.token)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        401
+    );
 }

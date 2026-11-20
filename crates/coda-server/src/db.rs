@@ -1,4 +1,13 @@
-use std::sync::{Arc, Weak};
+use std::{
+    future::Future,
+    io,
+    pin::Pin,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Weak,
+    },
+    task::{Context as TaskContext, Poll},
+};
 
 use anyhow::{anyhow, bail, Context, Result};
 use argon2::{
@@ -11,15 +20,23 @@ use coda_protocol::{
     TrustedPeerEntry,
 };
 use rand::{Rng, RngCore};
+use rustls_pki_types::ServerName;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use tokio::sync::{Mutex, RwLock};
-use tokio_postgres::{Client, NoTls};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore};
+use tokio_postgres::{
+    tls::{ChannelBinding, MakeTlsConnect, TlsConnect, TlsStream},
+    Client, NoTls,
+};
+use tokio_rustls::{client::TlsStream as RustlsStream, TlsConnector};
 use tracing::{error, info};
 use uuid::Uuid;
 
 const INIT_SQL: &str = include_str!("../../../migrations/001_init.sql");
+const READ_POOL_SIZE: usize = 4;
+const TX_POOL_SIZE: usize = 4;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserRecord {
@@ -92,13 +109,58 @@ pub enum DeviceAuthPollState {
     Expired,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthSessionRecord {
+    pub id: Uuid,
+    pub device_id: Option<Uuid>,
+    pub scope: String,
+    pub client_label: String,
+    pub last_used_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+    pub is_current: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct AuthenticatedSession {
+    pub user: UserRecord,
+    pub scope: String,
+    pub token_sha256: String,
+}
+
 struct DbInner {
     database_url: String,
     token_wrap_key: Vec<u8>,
-    client: RwLock<Arc<Client>>,
+    read_pool: Vec<RwLock<Option<Arc<Client>>>>,
+    read_rr: AtomicUsize,
     reconnect_lock: Mutex<()>,
-    tx_client: Mutex<Option<Client>>,
+    tx_sem: Arc<Semaphore>,
+    tx_idle: Mutex<Vec<Client>>,
     dummy_password_hash: String,
+}
+
+struct PooledTxClient {
+    inner: Arc<DbInner>,
+    client: Option<Client>,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl PooledTxClient {
+    fn as_mut(&mut self) -> &mut Client {
+        self.client.as_mut().expect("pooled tx client present")
+    }
+}
+
+impl Drop for PooledTxClient {
+    fn drop(&mut self) {
+        if let Some(client) = self.client.take() {
+            if !client.is_closed() {
+                if let Ok(mut idle) = self.inner.tx_idle.try_lock() {
+                    idle.push(client);
+                }
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -109,11 +171,161 @@ pub struct Db {
 const ADMIN_BOOTSTRAP_ADVISORY_LOCK_KEY: i64 = 7_240_991;
 const MAX_PASSWORD_BYTES: usize = 1024;
 
+#[derive(Clone)]
+struct PgRustlsConnect {
+    config: Arc<rustls::ClientConfig>,
+}
+
+impl PgRustlsConnect {
+    fn new() -> Self {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let config = rustls::ClientConfig::builder_with_provider(
+            rustls::crypto::ring::default_provider().into(),
+        )
+        .with_safe_default_protocol_versions()
+        .expect("rustls default protocol versions")
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        Self {
+            config: Arc::new(config),
+        }
+    }
+}
+
+struct PgRustlsConnector {
+    connector: TlsConnector,
+    server_name: ServerName<'static>,
+}
+
+struct PgRustlsStream<S>(RustlsStream<S>);
+
+impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for PgRustlsStream<S> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.0).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for PgRustlsStream<S> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.0).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.0).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.0).poll_shutdown(cx)
+    }
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> TlsStream for PgRustlsStream<S> {
+    fn channel_binding(&self) -> ChannelBinding {
+        ChannelBinding::none()
+    }
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> MakeTlsConnect<S> for PgRustlsConnect {
+    type Stream = PgRustlsStream<S>;
+    type TlsConnect = PgRustlsConnector;
+    type Error = io::Error;
+
+    fn make_tls_connect(&mut self, hostname: &str) -> std::result::Result<Self::TlsConnect, Self::Error> {
+        let server_name = ServerName::try_from(hostname.to_string())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid TLS server name"))?;
+        Ok(PgRustlsConnector {
+            connector: TlsConnector::from(Arc::clone(&self.config)),
+            server_name,
+        })
+    }
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> TlsConnect<S> for PgRustlsConnector {
+    type Stream = PgRustlsStream<S>;
+    type Error = io::Error;
+    type Future = Pin<Box<dyn Future<Output = std::result::Result<Self::Stream, Self::Error>> + Send>>;
+
+    fn connect(self, stream: S) -> Self::Future {
+        Box::pin(async move {
+            let tls = self.connector.connect(self.server_name, stream).await?;
+            Ok(PgRustlsStream(tls))
+        })
+    }
+}
+
+fn redact_database_url(url: &str) -> String {
+    let Some((scheme_and_auth, rest)) = url.split_once('@') else {
+        return url.to_string();
+    };
+    if let Some((scheme_user, _pw)) = scheme_and_auth.rsplit_once(':') {
+        if scheme_user.contains("://") {
+            return format!("{scheme_user}:***@{rest}");
+        }
+    }
+    url.to_string()
+}
+
+fn wants_postgres_tls(database_url: &str) -> bool {
+    let lower = database_url.to_ascii_lowercase();
+    lower.contains("sslmode=require")
+        || lower.contains("sslmode=prefer")
+        || lower.contains("sslmode=verify-ca")
+        || lower.contains("sslmode=verify-full")
+}
+
+fn normalize_database_url_for_tokio_pg(database_url: &str) -> String {
+    database_url
+        .replace("sslmode=verify-full", "sslmode=require")
+        .replace("sslmode=verify-ca", "sslmode=require")
+}
+
 impl Db {
     async fn connect_raw(database_url: &str) -> Result<Client> {
-        let (client, connection) = tokio_postgres::connect(database_url, NoTls)
+        let redacted = redact_database_url(database_url);
+        let use_tls = wants_postgres_tls(database_url);
+        let normalized = if use_tls {
+            normalize_database_url_for_tokio_pg(database_url)
+        } else {
+            database_url.to_string()
+        };
+        let mut cfg: tokio_postgres::Config = normalized
+            .parse()
+            .with_context(|| format!("invalid PostgreSQL connection string: {redacted}"))?;
+        if cfg.get_password().is_none() {
+            if let Ok(pg_pw) = std::env::var("PGPASSWORD") {
+                if !pg_pw.is_empty() {
+                    cfg.password(pg_pw);
+                }
+            }
+        }
+
+        if use_tls {
+            let tls = PgRustlsConnect::new();
+            let (client, connection) = cfg
+                .connect(tls)
+                .await
+                .with_context(|| format!("failed connecting to PostgreSQL (TLS): {redacted}"))?;
+            tokio::spawn(async move {
+                if let Err(e) = connection.await {
+                    error!("PostgreSQL TLS connection error: {e}");
+                }
+            });
+            return Ok(client);
+        }
+
+        let (client, connection) = cfg
+            .connect(NoTls)
             .await
-            .with_context(|| format!("failed connecting to PostgreSQL: {database_url}"))?;
+            .with_context(|| format!("failed connecting to PostgreSQL: {redacted}"))?;
 
         tokio::spawn(async move {
             if let Err(e) = connection.await {
@@ -161,48 +373,79 @@ impl Db {
         })
         .await??;
 
+        let mut read_pool = Vec::with_capacity(READ_POOL_SIZE);
+        read_pool.push(RwLock::new(Some(Arc::new(client))));
+        for _ in 1..READ_POOL_SIZE {
+            read_pool.push(RwLock::new(None));
+        }
+
         let inner = Arc::new(DbInner {
             database_url: database_url.to_string(),
             token_wrap_key: token_wrap_secret.to_vec(),
-            client: RwLock::new(Arc::new(client)),
+            read_pool,
+            read_rr: AtomicUsize::new(0),
             reconnect_lock: Mutex::new(()),
-            tx_client: Mutex::new(None),
+            tx_sem: Arc::new(Semaphore::new(TX_POOL_SIZE)),
+            tx_idle: Mutex::new(Vec::with_capacity(TX_POOL_SIZE)),
             dummy_password_hash,
         });
 
         spawn_expiry_cleanup_task(Arc::downgrade(&inner));
 
-        info!("PostgreSQL connected and migrations verified");
+        info!("PostgreSQL connected (pool={READ_POOL_SIZE}r/{TX_POOL_SIZE}tx) and migrations verified");
         Ok(Self { inner })
     }
 
     async fn client(&self) -> Result<Arc<Client>> {
+        let idx = self.inner.read_rr.fetch_add(1, Ordering::Relaxed) % self.inner.read_pool.len();
         {
-            let guard = self.inner.client.read().await;
-            if !guard.is_closed() {
-                return Ok(Arc::clone(&guard));
+            let guard = self.inner.read_pool[idx].read().await;
+            if let Some(c) = guard.as_ref() {
+                if !c.is_closed() {
+                    return Ok(Arc::clone(c));
+                }
             }
         }
         let _reconn = self.inner.reconnect_lock.lock().await;
         {
-            let guard = self.inner.client.read().await;
-            if !guard.is_closed() {
-                return Ok(Arc::clone(&guard));
+            let guard = self.inner.read_pool[idx].read().await;
+            if let Some(c) = guard.as_ref() {
+                if !c.is_closed() {
+                    return Ok(Arc::clone(c));
+                }
             }
         }
         let fresh = Arc::new(Self::connect_raw(&self.inner.database_url).await?);
-        let mut guard = self.inner.client.write().await;
-        *guard = Arc::clone(&fresh);
+        let mut guard = self.inner.read_pool[idx].write().await;
+        *guard = Some(Arc::clone(&fresh));
         Ok(fresh)
     }
 
-    async fn acquire_tx_client(&self) -> Result<tokio::sync::MutexGuard<'_, Option<Client>>> {
-        let mut guard = self.inner.tx_client.lock().await;
-        let need_new = guard.as_ref().map_or(true, |c| c.is_closed());
-        if need_new {
-            *guard = Some(Self::connect_raw(&self.inner.database_url).await?);
-        }
-        Ok(guard)
+    async fn acquire_tx_client(&self) -> Result<PooledTxClient> {
+        let permit = Arc::clone(&self.inner.tx_sem)
+            .acquire_owned()
+            .await
+            .map_err(|_| anyhow!("tx connection pool closed"))?;
+        let existing = {
+            let mut idle = self.inner.tx_idle.lock().await;
+            let mut found = None;
+            while let Some(c) = idle.pop() {
+                if !c.is_closed() {
+                    found = Some(c);
+                    break;
+                }
+            }
+            found
+        };
+        let client = match existing {
+            Some(c) => c,
+            None => Self::connect_raw(&self.inner.database_url).await?,
+        };
+        Ok(PooledTxClient {
+            inner: Arc::clone(&self.inner),
+            client: Some(client),
+            _permit: permit,
+        })
     }
 
     /// Executes a lightweight query verifying live database reachability.
@@ -318,6 +561,39 @@ impl Db {
             bail!("password must be 6..={MAX_PASSWORD_BYTES} bytes");
         }
 
+        // Fast pre-check before spending Argon2 CPU when registration is invite-gated.
+        let trimmed_invite = invite_code.map(str::trim).filter(|s| !s.is_empty());
+        {
+            let pre_client = self.client().await?;
+            let has_users: bool = pre_client
+                .query_one("SELECT EXISTS(SELECT 1 FROM users)", &[])
+                .await?
+                .get(0);
+            if has_users {
+                if let Some(code) = trimmed_invite {
+                    let valid: bool = pre_client
+                        .query_one(
+                            r#"
+                            SELECT EXISTS(
+                                SELECT 1 FROM invite_codes
+                                WHERE code = $1
+                                  AND used_count < max_uses
+                                  AND (expires_at IS NULL OR expires_at > NOW())
+                            )
+                            "#,
+                            &[&code],
+                        )
+                        .await?
+                        .get(0);
+                    if !valid {
+                        bail!("invalid, expired, or exhausted invite code");
+                    }
+                } else if !open_registration {
+                    bail!("invite_code is required to register on this server");
+                }
+            }
+        }
+
         let pw_owned = password.to_string();
         let password_hash = tokio::task::spawn_blocking(move || {
             let salt = SaltString::generate(&mut OsRng);
@@ -329,10 +605,7 @@ impl Db {
         .await??;
 
         let mut tx_guard = self.acquire_tx_client().await?;
-        let tx_conn = tx_guard
-            .as_mut()
-            .ok_or_else(|| anyhow!("tx postgres client unavailable"))?;
-        let tx = tx_conn.transaction().await?;
+        let tx = tx_guard.as_mut().transaction().await?;
 
         // Serialize bootstrap count check so concurrent initial registrations cannot both become admin.
         tx.execute(
@@ -347,7 +620,6 @@ impl Db {
         let user_count: i64 = count_row.get(0);
         let is_first_admin = user_count == 0;
 
-        let trimmed_invite = invite_code.map(str::trim).filter(|s| !s.is_empty());
         if !is_first_admin {
             if let Some(code) = trimmed_invite {
                 let updated = tx
@@ -500,25 +772,26 @@ impl Db {
         Ok(raw_token)
     }
 
-    pub async fn delete_session(&self, raw_token: &str) -> Result<()> {
+    pub async fn delete_session(&self, raw_token: &str) -> Result<Option<(Uuid, String)>> {
         let client = self.client().await?;
         let token_sha256 = sha256_hex(raw_token.trim());
-        client
-            .execute(
-                "DELETE FROM auth_sessions WHERE token_sha256 = $1",
+        let row = client
+            .query_opt(
+                "DELETE FROM auth_sessions WHERE token_sha256 = $1 RETURNING user_id",
                 &[&token_sha256],
             )
             .await?;
-        Ok(())
+        Ok(row.map(|r| (r.get(0), token_sha256)))
     }
 
-    pub async fn authenticate_token(&self, raw_token: &str) -> Result<UserRecord> {
+    pub async fn authenticate_session(&self, raw_token: &str) -> Result<AuthenticatedSession> {
         let client = self.client().await?;
         let token_sha256 = sha256_hex(raw_token.trim());
         let row = client
             .query_opt(
                 r#"
-                SELECT u.id, u.email, u.handle, u.display_name, u.is_admin, u.bandwidth_quota_mbps, u.created_at
+                SELECT u.id, u.email, u.handle, u.display_name, u.is_admin, u.bandwidth_quota_mbps, u.created_at,
+                       s.scope, s.expires_at, s.last_used_at
                 FROM auth_sessions s
                 JOIN users u ON u.id = s.user_id
                 WHERE s.token_sha256 = $1 AND s.expires_at > NOW()
@@ -528,15 +801,197 @@ impl Db {
             .await?
             .ok_or_else(|| anyhow!("unauthorized or expired session token"))?;
 
-        Ok(UserRecord {
-            id: row.get(0),
-            email: row.get(1),
-            handle: row.get(2),
-            display_name: row.get(3),
-            is_admin: row.get(4),
-            bandwidth_quota_mbps: row.get(5),
-            created_at: row.get(6),
+        let scope: String = row.get(7);
+        let expires_at: DateTime<Utc> = row.get(8);
+        let last_used_at: DateTime<Utc> = row.get(9);
+        let now = Utc::now();
+
+        // Sliding renewal: refresh last_used_at at most hourly and extend active sessions with <15d left.
+        if now - last_used_at > Duration::hours(1) || expires_at - now < Duration::days(15) {
+            let renewed_exp = expires_at.max(now + Duration::days(30));
+            let _ = client
+                .execute(
+                    "UPDATE auth_sessions SET last_used_at = NOW(), expires_at = $2 WHERE token_sha256 = $1",
+                    &[&token_sha256, &renewed_exp],
+                )
+                .await;
+        }
+
+        Ok(AuthenticatedSession {
+            user: UserRecord {
+                id: row.get(0),
+                email: row.get(1),
+                handle: row.get(2),
+                display_name: row.get(3),
+                is_admin: row.get(4),
+                bandwidth_quota_mbps: row.get(5),
+                created_at: row.get(6),
+            },
+            scope,
+            token_sha256,
         })
+    }
+
+    pub async fn authenticate_token(&self, raw_token: &str) -> Result<UserRecord> {
+        Ok(self.authenticate_session(raw_token).await?.user)
+    }
+
+    pub async fn list_sessions(
+        &self,
+        user_id: Uuid,
+        current_token_sha256: &str,
+    ) -> Result<Vec<AuthSessionRecord>> {
+        let client = self.client().await?;
+        let rows = client
+            .query(
+                r#"
+                SELECT id, device_id, scope, client_label, last_used_at, expires_at, created_at, token_sha256
+                FROM auth_sessions
+                WHERE user_id = $1 AND expires_at > NOW()
+                ORDER BY last_used_at DESC
+                LIMIT 100
+                "#,
+                &[&user_id],
+            )
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                let sha: String = r.get(7);
+                AuthSessionRecord {
+                    id: r.get(0),
+                    device_id: r.get(1),
+                    scope: r.get(2),
+                    client_label: r.get(3),
+                    last_used_at: r.get(4),
+                    expires_at: r.get(5),
+                    created_at: r.get(6),
+                    is_current: sha == current_token_sha256,
+                }
+            })
+            .collect())
+    }
+
+    pub async fn delete_session_by_id(
+        &self,
+        user_id: Uuid,
+        session_id: Uuid,
+    ) -> Result<Option<String>> {
+        let client = self.client().await?;
+        let row = client
+            .query_opt(
+                "DELETE FROM auth_sessions WHERE id = $1 AND user_id = $2 RETURNING token_sha256",
+                &[&session_id, &user_id],
+            )
+            .await?;
+        Ok(row.map(|r| r.get(0)))
+    }
+
+    pub async fn delete_all_sessions(
+        &self,
+        user_id: Uuid,
+        except_token_sha256: Option<&str>,
+    ) -> Result<u64> {
+        let client = self.client().await?;
+        let deleted = if let Some(keep) = except_token_sha256 {
+            client
+                .execute(
+                    "DELETE FROM auth_sessions WHERE user_id = $1 AND token_sha256 <> $2",
+                    &[&user_id, &keep],
+                )
+                .await?
+        } else {
+            client
+                .execute("DELETE FROM auth_sessions WHERE user_id = $1", &[&user_id])
+                .await?
+        };
+        Ok(deleted)
+    }
+
+    pub async fn change_password(
+        &self,
+        user_id: Uuid,
+        current_password: &str,
+        new_password: &str,
+        keep_token_sha256: Option<&str>,
+    ) -> Result<()> {
+        if new_password.len() < 6 || new_password.len() > MAX_PASSWORD_BYTES {
+            bail!("new password must be 6..={MAX_PASSWORD_BYTES} bytes");
+        }
+        if current_password.is_empty() || current_password.len() > MAX_PASSWORD_BYTES {
+            bail!("invalid current password");
+        }
+        let client = self.client().await?;
+        let row = client
+            .query_opt("SELECT password_hash FROM users WHERE id = $1", &[&user_id])
+            .await?
+            .ok_or_else(|| anyhow!("user not found"))?;
+        let existing_hash: String = row.get(0);
+        let cur_pw = current_password.to_string();
+        let new_pw = new_password.to_string();
+        let new_hash = tokio::task::spawn_blocking(move || -> Result<String> {
+            let parsed =
+                PasswordHash::new(&existing_hash).map_err(|_| anyhow!("corrupted password hash"))?;
+            Argon2::default()
+                .verify_password(cur_pw.as_bytes(), &parsed)
+                .map_err(|_| anyhow!("current password is incorrect"))?;
+            let salt = SaltString::generate(&mut OsRng);
+            Argon2::default()
+                .hash_password(new_pw.as_bytes(), &salt)
+                .map(|h| h.to_string())
+                .map_err(|e| anyhow!("password hash error: {e}"))
+        })
+        .await??;
+
+        let mut tx_guard = self.acquire_tx_client().await?;
+        let tx = tx_guard.as_mut().transaction().await?;
+        tx.execute(
+            "UPDATE users SET password_hash = $2 WHERE id = $1",
+            &[&user_id, &new_hash],
+        )
+        .await?;
+        if let Some(keep) = keep_token_sha256 {
+            tx.execute(
+                "DELETE FROM auth_sessions WHERE user_id = $1 AND token_sha256 <> $2",
+                &[&user_id, &keep],
+            )
+            .await?;
+        } else {
+            tx.execute("DELETE FROM auth_sessions WHERE user_id = $1", &[&user_id])
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn delete_user_account(&self, user_id: Uuid, password: &str) -> Result<Vec<Uuid>> {
+        if password.is_empty() || password.len() > MAX_PASSWORD_BYTES {
+            bail!("invalid password");
+        }
+        let client = self.client().await?;
+        let row = client
+            .query_opt("SELECT password_hash FROM users WHERE id = $1", &[&user_id])
+            .await?
+            .ok_or_else(|| anyhow!("user not found"))?;
+        let existing_hash: String = row.get(0);
+        let pw = password.to_string();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let parsed =
+                PasswordHash::new(&existing_hash).map_err(|_| anyhow!("corrupted password hash"))?;
+            Argon2::default()
+                .verify_password(pw.as_bytes(), &parsed)
+                .map_err(|_| anyhow!("password is incorrect"))
+        })
+        .await??;
+
+        let dev_rows = client
+            .query("SELECT id FROM devices WHERE user_id = $1", &[&user_id])
+            .await?;
+        let dev_ids: Vec<Uuid> = dev_rows.into_iter().map(|r| r.get(0)).collect();
+        client
+            .execute("DELETE FROM users WHERE id = $1", &[&user_id])
+            .await?;
+        Ok(dev_ids)
     }
 
     pub async fn create_invite_code(
@@ -550,35 +1005,40 @@ impl Db {
             bail!("only admin accounts can generate new friend invite codes");
         }
         let client = self.client().await?;
-        let suffix: u32 = rand::thread_rng().gen_range(100_000..=999_999);
-        let code = format!("CODA-{suffix}");
-        let expires_at = Some(Utc::now() + Duration::days(valid_days.max(1)));
+        let expires_at = Some(Utc::now() + Duration::days(valid_days.clamp(1, 365)));
         let max_uses = max_uses.clamp(1, 500);
+        let clean_note: String = note.trim().chars().take(128).collect();
 
-        let row = client
-            .query_one(
-                r#"
-                INSERT INTO invite_codes (code, created_by, note, max_uses, expires_at)
-                VALUES ($1, $2, $3, $4, $5)
-                RETURNING code, note, max_uses, used_count, expires_at, created_at
-                "#,
-                &[&code, &creator.id, &note, &max_uses, &expires_at],
-            )
-            .await?;
-
-        Ok(InviteCodeRecord {
-            code: row.get(0),
-            note: row.get(1),
-            max_uses: row.get(2),
-            used_count: row.get(3),
-            expires_at: row.get(4),
-            created_at: row.get(5),
-        })
+        for _ in 0..10 {
+            let code = generate_invite_code();
+            let row = client
+                .query_opt(
+                    r#"
+                    INSERT INTO invite_codes (code, created_by, note, max_uses, expires_at)
+                    VALUES ($1, $2, $3, $4, $5)
+                    ON CONFLICT (code) DO NOTHING
+                    RETURNING code, note, max_uses, used_count, expires_at, created_at
+                    "#,
+                    &[&code, &creator.id, &clean_note, &max_uses, &expires_at],
+                )
+                .await?;
+            if let Some(row) = row {
+                return Ok(InviteCodeRecord {
+                    code: row.get(0),
+                    note: row.get(1),
+                    max_uses: row.get(2),
+                    used_count: row.get(3),
+                    expires_at: row.get(4),
+                    created_at: row.get(5),
+                });
+            }
+        }
+        bail!("failed allocating unique invite code after retries")
     }
 
     pub async fn list_invite_codes(&self, user: &UserRecord) -> Result<Vec<InviteCodeRecord>> {
         if !user.is_admin {
-            return Ok(vec![]);
+            bail!("only admin accounts can list invite codes");
         }
         let client = self.client().await?;
         let rows = client
@@ -598,6 +1058,20 @@ impl Db {
                 created_at: r.get(5),
             })
             .collect())
+    }
+
+    pub async fn delete_invite_code(&self, user: &UserRecord, code: &str) -> Result<bool> {
+        if !user.is_admin {
+            bail!("only admin accounts can revoke invite codes");
+        }
+        let client = self.client().await?;
+        let deleted = client
+            .execute(
+                "DELETE FROM invite_codes WHERE code = $1",
+                &[&code.trim().to_uppercase()],
+            )
+            .await?;
+        Ok(deleted > 0)
     }
 
     /// Generates a short 6-digit pairing code (`839-204`) valid for 10 minutes.
@@ -646,10 +1120,7 @@ impl Db {
         let normalized = code.trim();
 
         let mut tx_guard = self.acquire_tx_client().await?;
-        let tx_conn = tx_guard
-            .as_mut()
-            .ok_or_else(|| anyhow!("tx postgres client unavailable"))?;
-        let tx = tx_conn.transaction().await?;
+        let tx = tx_guard.as_mut().transaction().await?;
 
         let token_row = tx
             .query_opt(
@@ -832,6 +1303,47 @@ impl Db {
             .collect())
     }
 
+    pub async fn rename_device(
+        &self,
+        user_id: Uuid,
+        device_id: Uuid,
+        new_name: &str,
+    ) -> Result<Option<DeviceRecord>> {
+        let trimmed = new_name.trim();
+        if trimmed.is_empty() || trimmed.len() > 128 {
+            bail!("device name must be 1..=128 characters");
+        }
+        let client = self.client().await?;
+        let row = client
+            .query_opt(
+                r#"
+                UPDATE devices
+                SET name = $3
+                WHERE id = $1 AND user_id = $2
+                RETURNING id, user_id, name, role, platform, ed25519_pubkey, x25519_pubkey,
+                          endpoints_json, herdr_core_id, herdr_version, is_online, last_seen_at
+                "#,
+                &[&device_id, &user_id, &trimmed],
+            )
+            .await?;
+        Ok(row.as_ref().map(map_device_row))
+    }
+
+    pub async fn list_session_hashes_for_device(
+        &self,
+        user_id: Uuid,
+        device_id: Uuid,
+    ) -> Result<Vec<String>> {
+        let client = self.client().await?;
+        let rows = client
+            .query(
+                "SELECT token_sha256 FROM auth_sessions WHERE user_id = $1 AND device_id = $2",
+                &[&user_id, &device_id],
+            )
+            .await?;
+        Ok(rows.into_iter().map(|r| r.get(0)).collect())
+    }
+
     pub async fn delete_device(&self, user_id: Uuid, device_id: Uuid) -> Result<bool> {
         let client = self.client().await?;
         let deleted = client
@@ -1012,10 +1524,7 @@ impl Db {
     ) -> Result<DeviceRecord> {
         let normalized = normalize_user_code(user_code);
         let mut tx_guard = self.acquire_tx_client().await?;
-        let tx_conn = tx_guard
-            .as_mut()
-            .ok_or_else(|| anyhow!("tx postgres client unavailable"))?;
-        let tx = tx_conn.transaction().await?;
+        let tx = tx_guard.as_mut().transaction().await?;
 
         let row = tx
             .query_opt(
@@ -1104,12 +1613,17 @@ impl Db {
         let token_sha256 = sha256_hex(&token);
         let session_exp = Utc::now() + Duration::days(30);
         let label: String = format!("device:{}", device.name).chars().take(64).collect();
+        let scope = if device.role == "daemon" {
+            "daemon_host"
+        } else {
+            "full"
+        };
         tx.execute(
             r#"
-            INSERT INTO auth_sessions (token_sha256, user_id, client_label, expires_at)
-            VALUES ($1, $2, $3, $4)
+            INSERT INTO auth_sessions (token_sha256, user_id, device_id, scope, client_label, expires_at)
+            VALUES ($1, $2, $3, $4, $5, $6)
             "#,
-            &[&token_sha256, &user_id, &label, &session_exp],
+            &[&token_sha256, &user_id, &device.id, &scope, &label, &session_exp],
         )
         .await?;
 
@@ -1310,6 +1824,12 @@ async fn purge_expired_with_client(client: &Client) -> Result<()> {
             &[],
         )
         .await?;
+    let _ = client
+        .execute(
+            "DELETE FROM devices WHERE role = 'client' AND is_online = FALSE AND COALESCE(last_seen_at, created_at) < NOW() - INTERVAL '45 days'",
+            &[],
+        )
+        .await?;
     Ok(())
 }
 
@@ -1346,6 +1866,15 @@ pub fn normalize_user_code(raw: &str) -> String {
     }
 }
 
+fn generate_invite_code() -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    let mut rng = rand::thread_rng();
+    let suffix: String = (0..8)
+        .map(|_| ALPHABET[rng.gen_range(0..ALPHABET.len())] as char)
+        .collect();
+    format!("CODA-{suffix}")
+}
+
 fn generate_user_code() -> String {
     const ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
     let mut rng = rand::thread_rng();
@@ -1374,7 +1903,7 @@ fn map_device_row(row: &tokio_postgres::Row) -> DeviceRecord {
     }
 }
 
-fn sha256_hex(input: &str) -> String {
+pub(crate) fn sha256_hex(input: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(input.as_bytes());
     hex::encode(hasher.finalize())

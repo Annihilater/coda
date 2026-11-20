@@ -6,12 +6,13 @@ use std::{
     ffi::{CStr, CString},
     os::raw::c_char,
     panic::{catch_unwind, AssertUnwindSafe},
+    sync::Mutex,
 };
 
 use coda_protocol::{E2eeSession, EncryptedPayload, PeerMessage, StoredDeviceIdentity};
 
 pub struct CodaFfiSession {
-    inner: E2eeSession,
+    inner: Mutex<E2eeSession>,
 }
 
 fn to_c_string(s: String) -> *mut c_char {
@@ -73,7 +74,9 @@ pub unsafe extern "C" fn coda_ffi_session_new(
         let Ok(inner) = E2eeSession::derive(&secret, &peer_str, is_initiator) else {
             return std::ptr::null_mut();
         };
-        Box::into_raw(Box::new(CodaFfiSession { inner }))
+        Box::into_raw(Box::new(CodaFfiSession {
+            inner: Mutex::new(inner),
+        }))
     }))
     .unwrap_or(std::ptr::null_mut())
 }
@@ -127,7 +130,9 @@ pub unsafe extern "C" fn coda_ffi_session_new_relay_v2(
         ) else {
             return std::ptr::null_mut();
         };
-        Box::into_raw(Box::new(CodaFfiSession { inner }))
+        Box::into_raw(Box::new(CodaFfiSession {
+            inner: Mutex::new(inner),
+        }))
     }))
     .unwrap_or(std::ptr::null_mut())
 }
@@ -142,6 +147,7 @@ pub unsafe extern "C" fn coda_ffi_session_free(sess: *mut CodaFfiSession) {
 }
 
 /// Encrypts & optionally `zstd`-compresses a `PeerMessage` JSON string into an `EncryptedPayload` JSON string.
+/// Thread-safe: acquires an internal mutex so full-duplex Swift tasks never alias `&mut E2eeSession`.
 #[no_mangle]
 pub unsafe extern "C" fn coda_ffi_session_seal(
     sess: *mut CodaFfiSession,
@@ -151,12 +157,15 @@ pub unsafe extern "C" fn coda_ffi_session_seal(
         if sess.is_null() || peer_message_json.is_null() {
             return std::ptr::null_mut();
         }
-        let session = &mut *sess;
+        let session = &*sess;
         let raw = CStr::from_ptr(peer_message_json).to_string_lossy();
         let Ok(msg) = serde_json::from_str::<PeerMessage>(&raw) else {
             return std::ptr::null_mut();
         };
-        let Ok(sealed) = session.inner.seal_message(&msg) else {
+        let Ok(mut guard) = session.inner.lock() else {
+            return std::ptr::null_mut();
+        };
+        let Ok(sealed) = guard.seal_message(&msg) else {
             return std::ptr::null_mut();
         };
         let Ok(json) = serde_json::to_string(&sealed) else {
@@ -168,6 +177,7 @@ pub unsafe extern "C" fn coda_ffi_session_seal(
 }
 
 /// Decrypts & decompresses an `EncryptedPayload` JSON string back into a `PeerMessage` JSON string.
+/// Thread-safe: acquires an internal mutex so full-duplex Swift tasks never alias `&mut E2eeSession`.
 #[no_mangle]
 pub unsafe extern "C" fn coda_ffi_session_open(
     sess: *mut CodaFfiSession,
@@ -177,12 +187,15 @@ pub unsafe extern "C" fn coda_ffi_session_open(
         if sess.is_null() || encrypted_payload_json.is_null() {
             return std::ptr::null_mut();
         }
-        let session = &mut *sess;
+        let session = &*sess;
         let raw = CStr::from_ptr(encrypted_payload_json).to_string_lossy();
         let Ok(payload) = serde_json::from_str::<EncryptedPayload>(&raw) else {
             return std::ptr::null_mut();
         };
-        let Ok(msg) = session.inner.open_message(&payload) else {
+        let Ok(mut guard) = session.inner.lock() else {
+            return std::ptr::null_mut();
+        };
+        let Ok(msg) = guard.open_message(&payload) else {
             return std::ptr::null_mut();
         };
         let Ok(json) = serde_json::to_string(&msg) else {
@@ -315,6 +328,87 @@ mod tests {
 
             let bad = CString::new("not-valid-zstd!").unwrap();
             assert!(coda_ffi_zstd_decompress_b64_to_b64(bad.as_ptr()).is_null());
+        }
+    }
+
+    #[test]
+    fn test_ffi_concurrent_seal_and_open_is_thread_safe() {
+        let id1 = StoredDeviceIdentity::generate("Client");
+        let id2 = StoredDeviceIdentity::generate("Daemon");
+        let cid = "11111111-1111-4111-8111-111111111111".to_string();
+        let did = "22222222-2222-4222-8222-222222222222".to_string();
+        let nonce = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [42u8; 16]);
+        let c1 = CString::new(serde_json::to_string(&id1).unwrap()).unwrap();
+        let c2 = CString::new(serde_json::to_string(&id2).unwrap()).unwrap();
+        let p1 = CString::new(id1.x25519_public_b64.as_str()).unwrap();
+        let p2 = CString::new(id2.x25519_public_b64.as_str()).unwrap();
+        let n = CString::new(nonce).unwrap();
+        let cid_c = CString::new(cid).unwrap();
+        let did_c = CString::new(did).unwrap();
+
+        unsafe {
+            let sess_c = coda_ffi_session_new_relay_v2(
+                c1.as_ptr(),
+                p2.as_ptr(),
+                n.as_ptr(),
+                cid_c.as_ptr(),
+                did_c.as_ptr(),
+                true,
+                true,
+            ) as usize;
+            let sess_d = coda_ffi_session_new_relay_v2(
+                c2.as_ptr(),
+                p1.as_ptr(),
+                n.as_ptr(),
+                cid_c.as_ptr(),
+                did_c.as_ptr(),
+                false,
+                true,
+            ) as usize;
+            assert!(sess_c != 0 && sess_d != 0);
+
+            let t1 = std::thread::spawn(move || {
+                for i in 0..20u64 {
+                    let msg = CString::new(
+                        serde_json::to_string(&PeerMessage::Ping {
+                            req_id: format!("c-{i}"),
+                            sent_ms: i,
+                        })
+                        .unwrap(),
+                    )
+                    .unwrap();
+                    let sealed = coda_ffi_session_seal(sess_c as *mut CodaFfiSession, msg.as_ptr());
+                    assert!(!sealed.is_null());
+                    let opened = coda_ffi_session_open(sess_d as *mut CodaFfiSession, sealed);
+                    assert!(!opened.is_null());
+                    coda_ffi_string_free(sealed);
+                    coda_ffi_string_free(opened);
+                }
+            });
+            let t2 = std::thread::spawn(move || {
+                for i in 0..20u64 {
+                    let msg = CString::new(
+                        serde_json::to_string(&PeerMessage::Pong {
+                            req_id: format!("d-{i}"),
+                            sent_ms: i,
+                            daemon_hostname: "mac".into(),
+                            herdr_version: "0.1.20".into(),
+                        })
+                        .unwrap(),
+                    )
+                    .unwrap();
+                    let sealed = coda_ffi_session_seal(sess_d as *mut CodaFfiSession, msg.as_ptr());
+                    assert!(!sealed.is_null());
+                    let opened = coda_ffi_session_open(sess_c as *mut CodaFfiSession, sealed);
+                    assert!(!opened.is_null());
+                    coda_ffi_string_free(sealed);
+                    coda_ffi_string_free(opened);
+                }
+            });
+            t1.join().unwrap();
+            t2.join().unwrap();
+            coda_ffi_session_free(sess_c as *mut CodaFfiSession);
+            coda_ffi_session_free(sess_d as *mut CodaFfiSession);
         }
     }
 }

@@ -16,7 +16,7 @@ struct Args {
     env_file: Option<PathBuf>,
 
     /// PostgreSQL connection string (not required in --relay-only mode)
-    #[arg(long, env = "DATABASE_URL", default_value = "postgres://vampire@localhost:5432/coda_dev")]
+    #[arg(long, env = "DATABASE_URL", default_value = "postgres://postgres@localhost:5432/coda_dev")]
     database_url: String,
 
     /// HTTP / Overseas CDN WebSocket bind address
@@ -55,9 +55,9 @@ struct Args {
     #[arg(long, env = "CODA_RAW_TCP_PUBLIC_ENDPOINT")]
     raw_tcp_public_endpoint: Option<String>,
 
-    /// Release version advertised on the public download center (e.g. `v0.3.0`)
-    #[arg(long, env = "CODA_RELEASE_VERSION", default_value = concat!("v", env!("CARGO_PKG_VERSION")))]
-    release_version: String,
+    /// Optional pinned release version advertised on the public download center (e.g. `v0.4.0`)
+    #[arg(long, env = "CODA_RELEASE_VERSION")]
+    release_version: Option<String>,
 
     /// GitHub repository slug used to build download links
     #[arg(long, env = "CODA_GITHUB_REPO", default_value = "Annihilater/coda")]
@@ -67,9 +67,40 @@ struct Args {
     #[arg(long, env = "CODA_IOS_BETA_URL")]
     ios_beta_url: Option<String>,
 
+    /// Trust proxy forwarding headers (`CF-Connecting-IP`, `X-Real-IP`, `X-Forwarded-Host/Proto`) even from non-private peer IPs
+    #[arg(long, env = "CODA_TRUST_PROXY_HEADERS", default_value_t = false)]
+    trust_proxy_headers: bool,
+
+    /// Comma-separated additional allowed browser CORS/WebSocket origins (e.g. `https://app.example.com`)
+    #[arg(long, env = "CODA_ALLOWED_ORIGINS")]
+    allowed_origins: Option<String>,
+
     /// Run ONLY as a stateless domestic relay node (zero PostgreSQL needed!)
     #[arg(long, default_value_t = false)]
     relay_only: bool,
+}
+
+fn unescape_double_quoted(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            match chars.next() {
+                Some('"') => out.push('"'),
+                Some('\\') => out.push('\\'),
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
 }
 
 fn parse_dotenv_line(line: &str) -> Option<(String, String)> {
@@ -84,9 +115,9 @@ fn parse_dotenv_line(line: &str) -> Option<(String, String)> {
         return None;
     }
     let v = raw_val.trim();
-    let val = if (v.starts_with('"') && v.ends_with('"') && v.len() >= 2)
-        || (v.starts_with('\'') && v.ends_with('\'') && v.len() >= 2)
-    {
+    let val = if v.starts_with('"') && v.ends_with('"') && v.len() >= 2 {
+        unescape_double_quoted(&v[1..v.len() - 1])
+    } else if v.starts_with('\'') && v.ends_with('\'') && v.len() >= 2 {
         v[1..v.len() - 1].to_string()
     } else {
         v.split(" #").next().unwrap_or(v).trim().to_string()
@@ -151,14 +182,20 @@ fn resolve_relay_secret(
     const INSECURE_DEFAULTS: &[&str] = &[
         "coda-dev-hmac-secret-change-in-prod",
         "change-me-shared-hmac-relay-secret-2026",
+        "coda_shared_hmac_relay_secret_change_me_2026",
         "changeme",
         "secret",
         "default",
     ];
     if let Some(raw) = configured.map(str::trim).filter(|s| !s.is_empty()) {
+        let lower = raw.to_ascii_lowercase();
         if INSECURE_DEFAULTS
             .iter()
             .any(|d| d.eq_ignore_ascii_case(raw))
+            || lower.contains("change_me")
+            || lower.contains("change-me")
+            || lower.contains("changeme")
+            || lower.contains("placeholder")
         {
             anyhow::bail!(
                 "refusing to start with insecure placeholder CODA_RELAY_SECRET; generate a random secret with `openssl rand -hex 32`"
@@ -194,6 +231,30 @@ fn resolve_relay_secret(
     )
 }
 
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        if let Ok(mut sigterm) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        {
+            let _ = sigterm.recv().await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
+    info!("Shutdown signal received; stopping Coda server gracefully");
+}
+
 async fn async_main(args: Args) -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -218,9 +279,24 @@ async fn async_main(args: Args) -> Result<()> {
             "Stateless Relay-Only mode active on {addr} (region={}, no database required)",
             args.region_label
         );
-        tokio::signal::ctrl_c().await?;
+        shutdown_signal().await;
         return Ok(());
     }
+
+    let explicit_release_version = args
+        .release_version
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let has_explicit_release_version = explicit_release_version.is_some();
+    let release_version =
+        explicit_release_version.unwrap_or_else(|| format!("v{}", env!("CARGO_PKG_VERSION")));
+    let allowed_origins = args
+        .allowed_origins
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().trim_end_matches('/').to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect();
 
     let running = start_full_server_with_options(
         &args.database_url,
@@ -232,9 +308,12 @@ async fn async_main(args: Args) -> Result<()> {
         ServerOptions {
             open_registration: args.open_registration,
             raw_tcp_public_endpoint: args.raw_tcp_public_endpoint,
-            release_version: args.release_version,
+            release_version,
+            has_explicit_release_version,
             github_repo: args.github_repo,
             ios_beta_url: args.ios_beta_url,
+            trust_proxy_headers: args.trust_proxy_headers,
+            allowed_origins,
         },
     )
     .await?;
@@ -243,7 +322,7 @@ async fn async_main(args: Args) -> Result<()> {
         "Coda Coordinator & Web Console ready at http://{} | Domestic No-ICP Raw TCP Relay at {}",
         running.http_addr, running.raw_tcp_addr
     );
-    tokio::signal::ctrl_c().await?;
+    shutdown_signal().await;
     Ok(())
 }
 
@@ -269,6 +348,14 @@ mod tests {
         .is_err());
         assert!(resolve_relay_secret(
             Some("change-me-shared-hmac-relay-secret-2026"),
+            false,
+            false,
+            public,
+            public
+        )
+        .is_err());
+        assert!(resolve_relay_secret(
+            Some("coda_shared_hmac_relay_secret_change_me_2026"),
             false,
             false,
             public,
@@ -308,6 +395,10 @@ mod tests {
         assert_eq!(
             parse_dotenv_line("CODA_RAW_TCP_BIND=0.0.0.0:24443 # no-icp"),
             Some(("CODA_RAW_TCP_BIND".into(), "0.0.0.0:24443".into()))
+        );
+        assert_eq!(
+            parse_dotenv_line(r#"CODA_RELAY_SECRET="abc\"def\\ghi""#),
+            Some(("CODA_RELAY_SECRET".into(), "abc\"def\\ghi".into()))
         );
     }
 }

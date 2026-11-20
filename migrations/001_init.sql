@@ -34,8 +34,12 @@ CREATE TABLE IF NOT EXISTS invite_codes (
 -- 3. Auth Sessions (Bearer tokens hashed with SHA-256 at rest)
 CREATE TABLE IF NOT EXISTS auth_sessions (
     token_sha256 TEXT PRIMARY KEY,
+    id UUID NOT NULL DEFAULT gen_random_uuid(),
     user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    device_id UUID REFERENCES devices(id) ON DELETE CASCADE,
+    scope TEXT NOT NULL DEFAULT 'full' CHECK (scope IN ('full', 'daemon_host')),
     client_label TEXT NOT NULL DEFAULT 'web',
+    last_used_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     expires_at TIMESTAMPTZ NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -132,4 +136,32 @@ BEGIN
     ALTER TABLE device_auth_requests
         ADD CONSTRAINT device_auth_requests_platform_check
         CHECK (platform IN ('macos', 'ios', 'ipados', 'iphone_duo', 'linux', 'windows', 'web'));
+
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'auth_sessions' AND column_name = 'id'
+    ) THEN
+        ALTER TABLE auth_sessions ADD COLUMN id UUID NOT NULL DEFAULT gen_random_uuid();
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'auth_sessions' AND column_name = 'device_id'
+    ) THEN
+        ALTER TABLE auth_sessions ADD COLUMN device_id UUID REFERENCES devices(id) ON DELETE CASCADE;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'auth_sessions' AND column_name = 'scope'
+    ) THEN
+        ALTER TABLE auth_sessions ADD COLUMN scope TEXT NOT NULL DEFAULT 'full';
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'auth_sessions' AND column_name = 'last_used_at'
+    ) THEN
+        ALTER TABLE auth_sessions ADD COLUMN last_used_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+    END IF;
 END $$;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_auth_sessions_id ON auth_sessions (id);
+CREATE INDEX IF NOT EXISTS idx_auth_sessions_device ON auth_sessions (device_id);

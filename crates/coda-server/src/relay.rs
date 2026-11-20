@@ -7,7 +7,10 @@
 use std::{
     collections::HashMap,
     net::SocketAddr,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
@@ -15,14 +18,14 @@ use anyhow::{Context, Result};
 use axum::extract::ws::{Message as WsMessage, WebSocket};
 use chrono::Utc;
 use coda_protocol::{
-    AccountLiveEvent, NetworkEndpointCandidate, RelayTicketClaims, RelayWireFrame, TrafficLane,
-    MAX_WIRE_FRAME_BYTES,
+    sanitize_network_endpoints, AccountLiveEvent, NetworkEndpointCandidate, RelayTicketClaims,
+    RelayWireFrame, TrafficLane, MAX_AUTH_FRAME_BYTES, MAX_WIRE_FRAME_BYTES,
 };
 use futures_util::{SinkExt, StreamExt};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    sync::{broadcast, mpsc, Mutex, RwLock},
+    sync::{broadcast, mpsc, watch, Mutex, RwLock},
     task::AbortHandle,
     time::timeout,
 };
@@ -33,11 +36,22 @@ use crate::db::Db;
 
 const AUTH_BIND_TIMEOUT: Duration = Duration::from_secs(10);
 const TUNNEL_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+const STALE_GEN_GRACE_WINDOW: Duration = Duration::from_secs(5);
 
 struct ActiveLaneConn {
+    conn_id: u64,
     generation: u64,
+    connected_at: Instant,
     tx: mpsc::Sender<Arc<RelayWireFrame>>,
     abort_handle: AbortHandle,
+    shutdown_tx: watch::Sender<bool>,
+}
+
+impl ActiveLaneConn {
+    fn shutdown(&self) {
+        let _ = self.shutdown_tx.send(true);
+        self.abort_handle.abort();
+    }
 }
 
 struct DeviceSlots {
@@ -89,6 +103,8 @@ pub struct RelayHub {
     devices: RwLock<HashMap<Uuid, DeviceSlots>>,
     tenant_buckets: RwLock<HashMap<Uuid, TenantBucket>>,
     account_watchers: RwLock<HashMap<Uuid, broadcast::Sender<AccountLiveEvent>>>,
+    session_revocations: broadcast::Sender<(Uuid, Option<String>)>,
+    next_conn_id: AtomicU64,
     online_sync_lock: Mutex<()>,
     /// Optional DB handle when running co-located with `coda-coord` to sync `is_online`.
     /// When deployed as a standalone stateless Domestic Aliyun/Tencent relay (`--relay-only`), `db` is `None`!
@@ -97,15 +113,23 @@ pub struct RelayHub {
 
 impl RelayHub {
     pub fn new(relay_secret: Vec<u8>, region_label: impl Into<String>, db: Option<Db>) -> Arc<Self> {
+        let (rev_tx, _) = broadcast::channel(128);
         Arc::new(Self {
             relay_secret,
             region_label: region_label.into(),
             devices: RwLock::new(HashMap::new()),
             tenant_buckets: RwLock::new(HashMap::new()),
             account_watchers: RwLock::new(HashMap::new()),
+            session_revocations: rev_tx,
+            next_conn_id: AtomicU64::new(1),
             online_sync_lock: Mutex::new(()),
             db,
         })
+    }
+
+    /// Notifies live `/api/v1/events/ws` sockets to terminate when a token or all user sessions are revoked.
+    pub fn notify_session_revoked(&self, user_id: Uuid, token_sha256: Option<String>) {
+        let _ = self.session_revocations.send((user_id, token_sha256));
     }
 
     pub async fn subscribe_account_events(
@@ -178,16 +202,23 @@ impl RelayHub {
         if parsed.r#type != "auth" || parsed.token.trim().is_empty() {
             return;
         }
-        let Ok(user) = db.authenticate_token(parsed.token.trim()).await else {
+        let Ok(session) = db.authenticate_session(parsed.token.trim()).await else {
             let _ = socket.send(WsMessage::Close(None)).await;
             return;
         };
-        self.handle_account_events_ws(socket, user.id).await;
+        self.handle_account_events_ws(socket, session.user.id, Some(session.token_sha256))
+            .await;
     }
 
     /// Streams real-time account events (`/api/v1/events/ws`) to a logged-in desktop/mobile client.
-    pub async fn handle_account_events_ws(&self, mut socket: WebSocket, user_id: Uuid) {
+    pub async fn handle_account_events_ws(
+        &self,
+        mut socket: WebSocket,
+        user_id: Uuid,
+        token_sha256: Option<String>,
+    ) {
         let mut rx = self.subscribe_account_events(user_id).await;
+        let mut rev_rx = self.session_revocations.subscribe();
         let hello = AccountLiveEvent {
             kind: "connected".to_string(),
             device_id: None,
@@ -210,6 +241,21 @@ impl RelayHub {
                 _ = keepalive.tick() => {
                     if socket.send(WsMessage::Ping(Vec::new().into())).await.is_err() {
                         break;
+                    }
+                }
+                rev = rev_rx.recv() => {
+                    if let Ok((rev_uid, rev_sha)) = rev {
+                        if rev_uid == user_id {
+                            let matches_token = match (&rev_sha, &token_sha256) {
+                                (None, _) => true,
+                                (Some(target), Some(ours)) => target == ours,
+                                _ => false,
+                            };
+                            if matches_token {
+                                let _ = socket.send(WsMessage::Close(None)).await;
+                                break;
+                            }
+                        }
                     }
                 }
                 recv = rx.recv() => {
@@ -294,12 +340,17 @@ impl RelayHub {
     ) -> Result<()> {
         let (mut reader, mut writer) = stream.into_split();
 
-        // First frame MUST be `AuthBind` within timeout to defeat slowloris attacks
-        let first_frame = match timeout(AUTH_BIND_TIMEOUT, read_length_delimited_frame(&mut reader)).await {
+        // First frame MUST be `AuthBind` within timeout and bounded to 16 KiB to defeat pre-auth OOM/slowloris.
+        let first_frame = match timeout(
+            AUTH_BIND_TIMEOUT,
+            read_length_delimited_frame_limited(&mut reader, MAX_AUTH_FRAME_BYTES),
+        )
+        .await
+        {
             Ok(Ok(f)) => f,
             _ => return Ok(()),
         };
-        let (claims, lane, generation) = match self.authenticate_bind_frame(first_frame) {
+        let (claims, lane, generation) = match self.authenticate_bind_frame(first_frame).await {
             Ok(tuple) => tuple,
             Err(err_frame) => {
                 let bytes = err_frame.encode_length_delimited()?;
@@ -308,15 +359,8 @@ impl RelayHub {
             }
         };
 
-        let ack = RelayWireFrame::AuthAck {
-            ok: true,
-            device_id: claims.device_id,
-            server_region: self.region_label.clone(),
-            message: "authenticated raw_tcp_no_sni lane".into(),
-        };
-        writer.write_all(&ack.encode_length_delimited()?).await?;
-
         let (tx, mut rx) = mpsc::channel::<Arc<RelayWireFrame>>(512);
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
         let write_task = tokio::spawn(async move {
             while let Some(frame) = rx.recv().await {
                 if let Ok(encoded) = frame.encode_length_delimited() {
@@ -327,14 +371,55 @@ impl RelayHub {
             }
         });
         let write_abort = write_task.abort_handle();
-        self.register_lane(&claims, lane, generation, tx, write_abort).await;
+        let conn_id = match self
+            .register_lane(&claims, lane, generation, tx.clone(), write_abort, shutdown_tx)
+            .await
+        {
+            Ok(id) => id,
+            Err(err_frame) => {
+                let _ = tx.try_send(Arc::new(err_frame));
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                write_task.abort();
+                return Ok(());
+            }
+        };
 
-        while let Ok(Ok(frame)) = timeout(TUNNEL_IDLE_TIMEOUT, read_length_delimited_frame(&mut reader)).await {
-            self.process_inbound_frame(&claims, frame).await;
+        let ack = Arc::new(RelayWireFrame::AuthAck {
+            ok: true,
+            device_id: claims.device_id,
+            server_region: self.region_label.clone(),
+            message: "authenticated raw_tcp_no_sni lane".into(),
+        });
+        if tx.send(ack).await.is_err() {
+            write_task.abort();
+            self.unregister_lane(claims.device_id, lane, conn_id).await;
+            return Ok(());
+        }
+
+        loop {
+            tokio::select! {
+                biased;
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        break;
+                    }
+                }
+                res = timeout(
+                    TUNNEL_IDLE_TIMEOUT,
+                    read_length_delimited_frame_limited(&mut reader, MAX_WIRE_FRAME_BYTES),
+                ) => {
+                    match res {
+                        Ok(Ok(frame)) => {
+                            self.process_inbound_frame(&claims, lane, frame).await;
+                        }
+                        _ => break,
+                    }
+                }
+            }
         }
 
         write_task.abort();
-        self.unregister_lane(claims.device_id, lane, generation).await;
+        self.unregister_lane(claims.device_id, lane, conn_id).await;
         Ok(())
     }
 
@@ -346,12 +431,13 @@ impl RelayHub {
             Ok(Some(Ok(m))) => m,
             _ => return,
         };
-        let first_frame: RelayWireFrame = match parse_ws_message(first_msg) {
-            Some(f) => f,
-            None => return,
-        };
+        let first_frame: RelayWireFrame =
+            match parse_ws_message_limited(first_msg, MAX_AUTH_FRAME_BYTES) {
+                Some(f) => f,
+                None => return,
+            };
 
-        let (claims, lane, generation) = match self.authenticate_bind_frame(first_frame) {
+        let (claims, lane, generation) = match self.authenticate_bind_frame(first_frame).await {
             Ok(t) => t,
             Err(err_frame) => {
                 if let Ok(txt) = serde_json::to_string(&err_frame) {
@@ -361,19 +447,8 @@ impl RelayHub {
             }
         };
 
-        let ack = RelayWireFrame::AuthAck {
-            ok: true,
-            device_id: claims.device_id,
-            server_region: self.region_label.clone(),
-            message: "authenticated cdn_wss lane".into(),
-        };
-        if let Ok(txt) = serde_json::to_string(&ack) {
-            if ws_sink.send(WsMessage::Text(txt.into())).await.is_err() {
-                return;
-            }
-        }
-
         let (tx, mut rx) = mpsc::channel::<Arc<RelayWireFrame>>(512);
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
         let write_task = tokio::spawn(async move {
             while let Some(frame) = rx.recv().await {
                 if let Ok(txt) = serde_json::to_string(&*frame) {
@@ -382,29 +457,63 @@ impl RelayHub {
                     }
                 }
             }
+            let _ = ws_sink.send(WsMessage::Close(None)).await;
         });
         let write_abort = write_task.abort_handle();
-        self.register_lane(&claims, lane, generation, tx, write_abort).await;
+        let conn_id = match self
+            .register_lane(&claims, lane, generation, tx.clone(), write_abort, shutdown_tx)
+            .await
+        {
+            Ok(id) => id,
+            Err(err_frame) => {
+                let _ = tx.try_send(Arc::new(err_frame));
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                write_task.abort();
+                return;
+            }
+        };
+
+        let ack = Arc::new(RelayWireFrame::AuthAck {
+            ok: true,
+            device_id: claims.device_id,
+            server_region: self.region_label.clone(),
+            message: "authenticated cdn_wss lane".into(),
+        });
+        if tx.send(ack).await.is_err() {
+            write_task.abort();
+            self.unregister_lane(claims.device_id, lane, conn_id).await;
+            return;
+        }
 
         loop {
-            match timeout(TUNNEL_IDLE_TIMEOUT, ws_stream.next()).await {
-                Ok(Some(Ok(msg))) => {
-                    if matches!(msg, WsMessage::Close(_)) {
+            tokio::select! {
+                biased;
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
                         break;
                     }
-                    if let Some(frame) = parse_ws_message(msg) {
-                        self.process_inbound_frame(&claims, frame).await;
+                }
+                res = timeout(TUNNEL_IDLE_TIMEOUT, ws_stream.next()) => {
+                    match res {
+                        Ok(Some(Ok(msg))) => {
+                            if matches!(msg, WsMessage::Close(_)) {
+                                break;
+                            }
+                            if let Some(frame) = parse_ws_message_limited(msg, MAX_WIRE_FRAME_BYTES) {
+                                self.process_inbound_frame(&claims, lane, frame).await;
+                            }
+                        }
+                        _ => break,
                     }
                 }
-                _ => break,
             }
         }
 
         write_task.abort();
-        self.unregister_lane(claims.device_id, lane, generation).await;
+        self.unregister_lane(claims.device_id, lane, conn_id).await;
     }
 
-    fn authenticate_bind_frame(
+    async fn authenticate_bind_frame(
         &self,
         frame: RelayWireFrame,
     ) -> std::result::Result<(RelayTicketClaims, TrafficLane, u64), RelayWireFrame> {
@@ -415,13 +524,30 @@ impl RelayHub {
                 generation,
             } => {
                 let now = Utc::now().timestamp();
-                match RelayTicketClaims::verify(&ticket, &self.relay_secret, now) {
-                    Ok(claims) => Ok((claims, lane, generation)),
-                    Err(e) => Err(RelayWireFrame::Error {
-                        code: "invalid_ticket".into(),
-                        message: e.to_string(),
-                    }),
+                let claims = match RelayTicketClaims::verify(&ticket, &self.relay_secret, now) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        return Err(RelayWireFrame::Error {
+                            code: "invalid_ticket".into(),
+                            message: e.to_string(),
+                        });
+                    }
+                };
+                if let Some(db) = &self.db {
+                    match db.get_device_by_id(claims.device_id).await {
+                        Ok(Some(dev)) if dev.user_id == claims.user_id => {}
+                        Ok(_) => {
+                            return Err(RelayWireFrame::Error {
+                                code: "device_revoked".into(),
+                                message: "device has been revoked or removed".into(),
+                            });
+                        }
+                        Err(e) => {
+                            warn!("relay auth_bind DB lookup failed: {e}");
+                        }
+                    }
                 }
+                Ok((claims, lane, generation))
             }
             _ => Err(RelayWireFrame::Error {
                 code: "expected_auth_bind".into(),
@@ -437,7 +563,8 @@ impl RelayHub {
         generation: u64,
         tx: mpsc::Sender<Arc<RelayWireFrame>>,
         abort_handle: AbortHandle,
-    ) {
+        shutdown_tx: watch::Sender<bool>,
+    ) -> std::result::Result<u64, RelayWireFrame> {
         {
             let mut buckets = self.tenant_buckets.write().await;
             buckets
@@ -445,7 +572,9 @@ impl RelayHub {
                 .or_insert_with(|| TenantBucket::new(claims.quota_mbps));
         }
 
-        let mut superseded_abort = None;
+        let conn_id = self.next_conn_id.fetch_add(1, Ordering::Relaxed);
+        let now = Instant::now();
+        let superseded_conn: Option<ActiveLaneConn>;
         let became_online = {
             let mut map = self.devices.write().await;
             let entry = map.entry(claims.device_id).or_insert_with(|| DeviceSlots {
@@ -459,41 +588,34 @@ impl RelayHub {
             let was_empty = entry.control_p0.is_none() && entry.bulk_p1.is_none();
 
             let conn = ActiveLaneConn {
+                conn_id,
                 generation,
+                connected_at: now,
                 tx,
                 abort_handle,
+                shutdown_tx,
             };
-            match lane {
-                TrafficLane::ControlP0 => {
-                    if entry
-                        .control_p0
-                        .as_ref()
-                        .map_or(true, |old| generation >= old.generation)
-                    {
-                        superseded_abort = entry.control_p0.take().map(|old| old.abort_handle);
-                        entry.control_p0 = Some(conn);
-                    } else {
-                        conn.abort_handle.abort();
-                    }
-                }
-                TrafficLane::BulkP1 => {
-                    if entry
-                        .bulk_p1
-                        .as_ref()
-                        .map_or(true, |old| generation >= old.generation)
-                    {
-                        superseded_abort = entry.bulk_p1.take().map(|old| old.abort_handle);
-                        entry.bulk_p1 = Some(conn);
-                    } else {
-                        conn.abort_handle.abort();
-                    }
-                }
+            let slot = match lane {
+                TrafficLane::ControlP0 => &mut entry.control_p0,
+                TrafficLane::BulkP1 => &mut entry.bulk_p1,
+            };
+            let accept = slot.as_ref().map_or(true, |old| {
+                generation >= old.generation
+                    || now.duration_since(old.connected_at) >= STALE_GEN_GRACE_WINDOW
+            });
+            if accept {
+                superseded_conn = slot.replace(conn);
+            } else {
+                return Err(RelayWireFrame::Error {
+                    code: "stale_generation".into(),
+                    message: "superseded by a newer connection generation".into(),
+                });
             }
             was_empty
         };
 
-        if let Some(old_abort) = superseded_abort {
-            old_abort.abort();
+        if let Some(old) = superseded_conn {
+            old.shutdown();
         }
 
         if became_online {
@@ -503,42 +625,28 @@ impl RelayHub {
                     .map(|s| s.endpoints.clone())
                     .filter(|eps| !eps.is_empty())
             };
-            self.sync_device_online_to_db(claims.device_id).await;
-            self.broadcast_presence_to_tenant(
+            self.sync_online_and_broadcast(
                 claims.user_id,
                 claims.device_id,
-                true,
                 cached_eps,
                 Some(claims.role.clone()),
             )
             .await;
         }
+        Ok(conn_id)
     }
 
-    async fn unregister_lane(&self, device_id: Uuid, lane: TrafficLane, generation: u64) {
+    async fn unregister_lane(&self, device_id: Uuid, lane: TrafficLane, conn_id: u64) {
         let mut went_offline_info = None;
         {
             let mut map = self.devices.write().await;
             if let Some(slots) = map.get_mut(&device_id) {
-                match lane {
-                    TrafficLane::ControlP0 => {
-                        if slots
-                            .control_p0
-                            .as_ref()
-                            .map_or(false, |c| c.generation == generation)
-                        {
-                            slots.control_p0 = None;
-                        }
-                    }
-                    TrafficLane::BulkP1 => {
-                        if slots
-                            .bulk_p1
-                            .as_ref()
-                            .map_or(false, |c| c.generation == generation)
-                        {
-                            slots.bulk_p1 = None;
-                        }
-                    }
+                let slot = match lane {
+                    TrafficLane::ControlP0 => &mut slots.control_p0,
+                    TrafficLane::BulkP1 => &mut slots.bulk_p1,
+                };
+                if slot.as_ref().map_or(false, |c| c.conn_id == conn_id) {
+                    *slot = None;
                 }
                 if slots.control_p0.is_none() && slots.bulk_p1.is_none() {
                     went_offline_info = Some((slots.user_id, slots.role.clone()));
@@ -548,8 +656,7 @@ impl RelayHub {
         }
 
         if let Some((user_id, role)) = went_offline_info {
-            self.sync_device_online_to_db(device_id).await;
-            self.broadcast_presence_to_tenant(user_id, device_id, false, None, Some(role))
+            self.sync_online_and_broadcast(user_id, device_id, None, Some(role))
                 .await;
             self.gc_idle_state(user_id).await;
         }
@@ -567,27 +674,49 @@ impl RelayHub {
         };
         if let Some(slots) = removed {
             if let Some(p0) = slots.control_p0 {
-                p0.abort_handle.abort();
+                p0.shutdown();
             }
             if let Some(p1) = slots.bulk_p1 {
-                p1.abort_handle.abort();
+                p1.shutdown();
             }
-            self.sync_device_online_to_db(device_id).await;
-            self.broadcast_presence_to_tenant(user_id, device_id, false, None, Some(slots.role))
+            self.sync_online_and_broadcast(user_id, device_id, None, Some(slots.role))
                 .await;
             self.gc_idle_state(user_id).await;
         }
     }
 
-    async fn sync_device_online_to_db(&self, device_id: Uuid) {
-        let Some(db) = &self.db else {
-            return;
-        };
-        // Serialize DB online writes and re-read authoritative in-memory presence under lock so
-        // rapid reconnect/disconnect cannot invert the persisted online flag.
+    async fn sync_online_and_broadcast(
+        &self,
+        user_id: Uuid,
+        device_id: Uuid,
+        endpoints_if_online: Option<Vec<NetworkEndpointCandidate>>,
+        role: Option<String>,
+    ) {
+        // Serialize BOTH DB online writes and presence broadcasts under `online_sync_lock`
+        // using authoritative re-read state so rapid reconnects cannot broadcast stale offline.
         let _guard = self.online_sync_lock.lock().await;
-        let is_online = self.devices.read().await.contains_key(&device_id);
-        let _ = db.set_device_online(device_id, is_online).await;
+        let (is_online, eps) = {
+            let map = self.devices.read().await;
+            if let Some(s) = map.get(&device_id) {
+                let e = endpoints_if_online.or_else(|| {
+                    if s.endpoints.is_empty() {
+                        None
+                    } else {
+                        Some(s.endpoints.clone())
+                    }
+                });
+                (true, e)
+            } else {
+                (false, None)
+            }
+        };
+        if let Some(db) = &self.db {
+            if let Err(e) = db.set_device_online(device_id, is_online).await {
+                warn!("failed syncing device {device_id} online={is_online} to DB: {e}");
+            }
+        }
+        self.broadcast_presence_to_tenant(user_id, device_id, is_online, eps, role)
+            .await;
     }
 
     async fn gc_idle_state(&self, user_id: Uuid) {
@@ -643,12 +772,39 @@ impl RelayHub {
         .await;
     }
 
-    async fn process_inbound_frame(&self, sender: &RelayTicketClaims, frame: RelayWireFrame) {
+    async fn process_inbound_frame(
+        &self,
+        sender: &RelayTicketClaims,
+        bound_lane: TrafficLane,
+        frame: RelayWireFrame,
+    ) {
         match frame {
             RelayWireFrame::KeepAlive { ts_ms } => {
                 let reply = Arc::new(RelayWireFrame::KeepAlive { ts_ms });
-                if let Some(tx) = self.pick_target_sender(sender.user_id, sender.device_id, TrafficLane::ControlP0).await {
+                if let Some((tx, _)) = self
+                    .pick_target_sender(sender.user_id, sender.device_id, TrafficLane::ControlP0)
+                    .await
+                {
                     let _ = tx.try_send(reply);
+                }
+            }
+            RelayWireFrame::SessionReset {
+                dst_device_id,
+                session_nonce_b64,
+                reason,
+                ..
+            } => {
+                if let Some((target_tx, _)) = self
+                    .pick_target_sender(sender.user_id, dst_device_id, TrafficLane::ControlP0)
+                    .await
+                {
+                    let forwarded = Arc::new(RelayWireFrame::SessionReset {
+                        src_device_id: sender.device_id,
+                        dst_device_id,
+                        session_nonce_b64,
+                        reason: reason.chars().take(128).collect(),
+                    });
+                    let _ = target_tx.try_send(forwarded);
                 }
             }
             RelayWireFrame::RoutePacket {
@@ -666,7 +822,18 @@ impl RelayHub {
                     }
                 }
 
-                // Fair-queue token bucket shaping ONLY for BulkP1; ControlP0 is 0ms fast-path!
+                // Prevent lateral movement: a `daemon`-only controlled host may NEVER initiate
+                // a brand-new client session (`session_auth.is_some()`).
+                if sender.role == "daemon" && session_auth.is_some() {
+                    warn!(
+                        "blocked daemon-role device {} attempting to initiate relay session to {}",
+                        sender.device_id, dst_device_id
+                    );
+                    return;
+                }
+
+                // Fair-queue token bucket shaping ONLY for BulkP1; never sleep inline on a ControlP0 socket
+                // so bulk traffic cannot head-of-line block interactive keystrokes (`ControlP0`).
                 if lane == TrafficLane::BulkP1 {
                     let delay_ms = {
                         let mut buckets = self.tenant_buckets.write().await;
@@ -675,16 +842,24 @@ impl RelayHub {
                             .map(|b| b.consume_and_delay_ms(e2ee.ciphertext_b64.len()))
                             .unwrap_or(0)
                     };
-                    if delay_ms > 0 {
+                    if delay_ms > 0 && bound_lane == TrafficLane::BulkP1 {
                         tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                     }
                 }
 
                 // Zero-knowledge blind forward: enforce `dst` belongs to SAME `user_id`!
-                if let Some(target_tx) = self
+                if let Some((target_tx, target_role)) = self
                     .pick_target_sender(sender.user_id, dst_device_id, lane)
                     .await
                 {
+                    // Prevent daemon-to-daemon lateral movement inside a tenant.
+                    if sender.role == "daemon" && target_role == "daemon" {
+                        warn!(
+                            "blocked daemon-to-daemon route from {} to {}",
+                            sender.device_id, dst_device_id
+                        );
+                        return;
+                    }
                     let forwarded = Arc::new(RelayWireFrame::RoutePacket {
                         src_device_id: sender.device_id,
                         dst_device_id,
@@ -695,7 +870,7 @@ impl RelayHub {
                     });
                     if let Err(err) = target_tx.try_send(forwarded) {
                         if matches!(err, mpsc::error::TrySendError::Full(_)) {
-                            if let Some(back_tx) = self
+                            if let Some((back_tx, _)) = self
                                 .pick_target_sender(
                                     sender.user_id,
                                     sender.device_id,
@@ -712,7 +887,7 @@ impl RelayHub {
                             }
                         }
                     }
-                } else if let Some(back_tx) = self
+                } else if let Some((back_tx, _)) = self
                     .pick_target_sender(sender.user_id, sender.device_id, TrafficLane::ControlP0)
                     .await
                 {
@@ -724,18 +899,11 @@ impl RelayHub {
                     }));
                 }
             }
-            RelayWireFrame::AdvertiseEndpoints { mut endpoints } => {
+            RelayWireFrame::AdvertiseEndpoints { endpoints } => {
                 if sender.role == "client" {
                     return;
                 }
-                endpoints.retain(|ep| {
-                    matches!(
-                        ep.kind.as_str(),
-                        "lan_ipv4" | "lan_ws" | "cn_public_ipv6" | "ipv6_ws" | "stun_ipv4"
-                    ) && !ep.addr.trim().is_empty()
-                        && ep.addr.len() <= 128
-                });
-                endpoints.truncate(16);
+                let endpoints = sanitize_network_endpoints(endpoints);
                 {
                     let mut map = self.devices.write().await;
                     if let Some(slots) = map.get_mut(&sender.device_id) {
@@ -746,10 +914,9 @@ impl RelayHub {
                     let val = serde_json::to_value(&endpoints).unwrap_or_default();
                     let _ = db.update_device_endpoints(sender.device_id, &val).await;
                 }
-                self.broadcast_presence_to_tenant(
+                self.sync_online_and_broadcast(
                     sender.user_id,
                     sender.device_id,
-                    true,
                     Some(endpoints),
                     Some(sender.role.clone()),
                 )
@@ -764,7 +931,7 @@ impl RelayHub {
         expected_user_id: Uuid,
         target_device_id: Uuid,
         preferred_lane: TrafficLane,
-    ) -> Option<mpsc::Sender<Arc<RelayWireFrame>>> {
+    ) -> Option<(mpsc::Sender<Arc<RelayWireFrame>>, String)> {
         let map = self.devices.read().await;
         let slots = map.get(&target_device_id)?;
         // Strict tenant boundary check!
@@ -779,32 +946,29 @@ impl RelayHub {
             TrafficLane::ControlP0 => slots.control_p0.as_ref().or(slots.bulk_p1.as_ref()),
             TrafficLane::BulkP1 => slots.bulk_p1.as_ref().or(slots.control_p0.as_ref()),
         };
-        chosen.map(|c| c.tx.clone())
+        chosen.map(|c| (c.tx.clone(), slots.role.clone()))
     }
 }
 
-async fn read_length_delimited_frame<R: AsyncReadExt + Unpin>(
+async fn read_length_delimited_frame_limited<R: AsyncReadExt + Unpin>(
     reader: &mut R,
+    max_bytes: usize,
 ) -> Result<RelayWireFrame> {
     let mut len_buf = [0u8; 4];
     reader.read_exact(&mut len_buf).await?;
     let len = u32::from_be_bytes(len_buf) as usize;
-    if len == 0 || len > MAX_WIRE_FRAME_BYTES {
-        anyhow::bail!("invalid wire frame length: {len}");
+    if len == 0 || len > max_bytes {
+        anyhow::bail!("invalid wire frame length: {len} (limit {max_bytes})");
     }
     let mut payload = vec![0u8; len];
     reader.read_exact(&mut payload).await?;
     Ok(serde_json::from_slice(&payload)?)
 }
 
-fn parse_ws_message(msg: WsMessage) -> Option<RelayWireFrame> {
+fn parse_ws_message_limited(msg: WsMessage, max_bytes: usize) -> Option<RelayWireFrame> {
     match msg {
-        WsMessage::Text(t) if t.len() <= MAX_WIRE_FRAME_BYTES => {
-            serde_json::from_str::<RelayWireFrame>(&t).ok()
-        }
-        WsMessage::Binary(b) if b.len() <= MAX_WIRE_FRAME_BYTES => {
-            serde_json::from_slice::<RelayWireFrame>(&b).ok()
-        }
+        WsMessage::Text(txt) if txt.len() <= max_bytes => serde_json::from_str(&txt).ok(),
+        WsMessage::Binary(bin) if bin.len() <= max_bytes => serde_json::from_slice(&bin).ok(),
         _ => None,
     }
 }

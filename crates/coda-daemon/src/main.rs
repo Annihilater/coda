@@ -10,13 +10,15 @@ use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use clap::{Parser, Subcommand};
 use coda_daemon::{
-    list_account_hosts, login_with_password_and_enroll, mint_peer_relay_config,
-    pair_daemon_with_code, poll_device_login_until_approved, register_client_identity,
+    active_daemon_lock_pid, list_account_hosts, login_with_password_and_enroll_with_identity,
+    logout_account_session, maybe_renew_daemon_config, mint_peer_relay_config,
+    pair_daemon_with_code_and_identity, parse_relay_ticket_exp_unix,
+    poll_device_login_until_approved, register_client_identity,
     run_daemon_once_with_p2p_and_peers, spawn_direct_p2p_listener_with_peers,
     start_device_login_flow, subscribe_account_events_ws, try_acquire_daemon_lock, DaemonConfig,
     LivePeerSession, PeerAsyncEvent, TrustedPeersStore,
 };
-use coda_protocol::{PeerMessage, TrafficLane};
+use coda_protocol::{current_unix_ms, PeerMessage, TrafficLane};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
@@ -70,17 +72,110 @@ enum Commands {
         #[arg(long)]
         name: Option<String>,
     },
-    /// Show current paired device & relay configuration status
+    /// Show current paired device, lock/process health, herdr-core & relay ticket expiry status
     Status,
+    /// Stop the running background coda-daemon service or locked process
+    Stop,
+    /// Restart the background coda-daemon service (or signal reload)
+    Restart,
+    /// Sign out locally, revoke session token if present, and remove daemon config
+    Logout,
+    /// Stop and remove the background launchd/systemd service definition
+    Uninstall,
     /// Run persistent encrypted mesh tunnel bridging local `herdr-core` (`hc`)
     Run {
         /// Optional preferred relay mode: `raw_tcp_no_sni` (Domestic Cloud) or `cdn_wss` (Overseas CDN)
         #[arg(long)]
         mode: Option<String>,
-        /// Direct P2P listener bind address for LAN IPv4 / Mainland China IPv6 zero-relay connections
-        #[arg(long, default_value = "0.0.0.0:24444")]
+        /// Direct P2P listener bind address (wildcard binds dual-stack IPv6 + IPv4 automatically)
+        #[arg(long, default_value = "[::]:24444")]
         p2p_bind: SocketAddr,
     },
+}
+
+fn signal_running_daemon(cfg_path: &std::path::Path, sig: libc::c_int) -> bool {
+    if let Some(pid) = active_daemon_lock_pid(cfg_path) {
+        if pid > 0 {
+            let rc = unsafe { libc::kill(pid as libc::pid_t, sig) };
+            return rc == 0;
+        }
+    }
+    false
+}
+
+fn stop_daemon_service_or_process(cfg_path: &std::path::Path) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let home = std::env::var("HOME").unwrap_or_default();
+        let plist = PathBuf::from(&home).join("Library/LaunchAgents/dev.coda.daemon.plist");
+        if plist.exists() {
+            let _ = std::process::Command::new("launchctl")
+                .args(["unload", &plist.to_string_lossy()])
+                .status();
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = std::process::Command::new("systemctl")
+            .args(["--user", "stop", "coda-daemon.service"])
+            .status();
+        let _ = std::process::Command::new("systemctl")
+            .args(["stop", "coda-daemon.service"])
+            .status();
+    }
+    if signal_running_daemon(cfg_path, libc::SIGTERM) {
+        println!("Sent SIGTERM to running coda-daemon.");
+    } else {
+        println!("No active coda-daemon process detected.");
+    }
+    Ok(())
+}
+
+fn restart_daemon_service_or_process(cfg_path: &std::path::Path) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let home = std::env::var("HOME").unwrap_or_default();
+        let plist = PathBuf::from(&home).join("Library/LaunchAgents/dev.coda.daemon.plist");
+        if plist.exists() {
+            let _ = std::process::Command::new("launchctl")
+                .args(["unload", &plist.to_string_lossy()])
+                .status();
+            let status = std::process::Command::new("launchctl")
+                .args(["load", "-w", &plist.to_string_lossy()])
+                .status()?;
+            if status.success() {
+                println!("Restarted launchd service dev.coda.daemon.");
+                return Ok(());
+            }
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(st) = std::process::Command::new("systemctl")
+            .args(["--user", "restart", "coda-daemon.service"])
+            .status()
+        {
+            if st.success() {
+                println!("Restarted user systemd service coda-daemon.service.");
+                return Ok(());
+            }
+        }
+        if let Ok(st) = std::process::Command::new("systemctl")
+            .args(["restart", "coda-daemon.service"])
+            .status()
+        {
+            if st.success() {
+                println!("Restarted system systemd service coda-daemon.service.");
+                return Ok(());
+            }
+        }
+    }
+    if signal_running_daemon(cfg_path, libc::SIGHUP) {
+        println!("Sent SIGHUP reload signal to running coda-daemon.");
+    } else {
+        println!("No service manager or running coda-daemon found; start via `coda-daemon run`.");
+    }
+    Ok(())
 }
 
 fn read_password_from_stdin() -> Result<String> {
@@ -124,9 +219,20 @@ async fn main() -> Result<()> {
                 password
             };
             if let (Some(email_val), Some(pass_val)) = (email, resolved_password) {
-                let cfg = login_with_password_and_enroll(&server, &email_val, &pass_val, &role, name)
-                    .await?;
+                let existing_identity = DaemonConfig::load(&cfg_path).ok().map(|c| c.identity);
+                let cfg = login_with_password_and_enroll_with_identity(
+                    &server,
+                    &email_val,
+                    &pass_val,
+                    &role,
+                    name,
+                    existing_identity,
+                )
+                .await?;
                 cfg.save(&cfg_path)?;
+                if signal_running_daemon(&cfg_path, libc::SIGHUP) {
+                    println!("Signaled running coda-daemon to reload updated credentials.");
+                }
                 println!(
                     "Authorized `{}` (device_id={}) under @{}! Saved config to {}",
                     cfg.identity.name,
@@ -151,6 +257,9 @@ async fn main() -> Result<()> {
 
             let cfg = poll_device_login_until_approved(&started).await?;
             cfg.save(&cfg_path)?;
+            if signal_running_daemon(&cfg_path, libc::SIGHUP) {
+                println!("Signaled running coda-daemon to reload updated credentials.");
+            }
             println!(
                 "Authorized `{}` (device_id={}) under @{}! Saved config to {}",
                 cfg.identity.name,
@@ -399,8 +508,13 @@ async fn main() -> Result<()> {
             );
         }
         Commands::Pair { server, code, name } => {
-            let cfg = pair_daemon_with_code(&server, &code, name).await?;
+            let existing_identity = DaemonConfig::load(&cfg_path).ok().map(|c| c.identity);
+            let cfg = pair_daemon_with_code_and_identity(&server, &code, name, existing_identity)
+                .await?;
             cfg.save(&cfg_path)?;
+            if signal_running_daemon(&cfg_path, libc::SIGHUP) {
+                info!("Signaled running coda-daemon to reload updated credentials.");
+            }
             info!(
                 "Successfully paired `{}` (device_id={}) to account @{}! Saved config to {}",
                 cfg.identity.name,
@@ -411,23 +525,100 @@ async fn main() -> Result<()> {
         }
         Commands::Status => {
             let cfg = DaemonConfig::load(&cfg_path)?;
+            let daemon_state = match active_daemon_lock_pid(&cfg_path) {
+                Some(pid) if pid > 0 => format!("running (pid={pid})"),
+                Some(_) => "running (lock held)".into(),
+                None => "stopped".into(),
+            };
+            let herdr_state = match coda_herdr::discover_hc_binary() {
+                Some(bin) => format!("available ({})", bin.display()),
+                None => "not installed (using built-in native PTY shell fallback)".into(),
+            };
+            let ticket_state = match parse_relay_ticket_exp_unix(&cfg.daemon_relay_ticket) {
+                Some(exp) => {
+                    let now = (current_unix_ms() / 1000) as i64;
+                    let rem = exp - now;
+                    if rem <= 0 {
+                        "EXPIRED (will auto-renew on run)".into()
+                    } else {
+                        let days = rem / 86_400;
+                        let hours = (rem % 86_400) / 3600;
+                        format!("valid ({days}d {hours}h remaining; auto-renews <7d)")
+                    }
+                }
+                None => "unknown".into(),
+            };
             println!("Config:     {}", cfg_path.display());
+            println!("Daemon:     {daemon_state}");
             println!("Device:     {} ({})", cfg.identity.name, cfg.device_id);
             println!("Account:    @{}", cfg.owner_handle);
             println!("Server URL: {}", cfg.server_url);
+            println!("Ticket:     {ticket_state}");
+            println!("Herdr-Core: {herdr_state}");
             println!("Relays:     {}", cfg.relays.len());
             for r in &cfg.relays {
                 println!("  - [{}] {} ({})", r.mode, r.endpoint, r.id);
             }
         }
+        Commands::Stop => {
+            stop_daemon_service_or_process(&cfg_path)?;
+        }
+        Commands::Restart => {
+            restart_daemon_service_or_process(&cfg_path)?;
+        }
+        Commands::Logout => {
+            let _ = stop_daemon_service_or_process(&cfg_path);
+            if let Ok(cfg) = DaemonConfig::load(&cfg_path) {
+                if let Some(tok) = cfg.session_token.as_deref() {
+                    let _ = logout_account_session(&cfg.server_url, tok).await;
+                }
+            }
+            if cfg_path.exists() {
+                std::fs::remove_file(&cfg_path)?;
+                println!("Removed daemon config at {}", cfg_path.display());
+            } else {
+                println!("No daemon config found at {}", cfg_path.display());
+            }
+            let tp = DaemonConfig::trusted_peers_path(&cfg_path);
+            let _ = std::fs::remove_file(&tp);
+        }
+        Commands::Uninstall => {
+            let _ = stop_daemon_service_or_process(&cfg_path);
+            #[cfg(target_os = "macos")]
+            {
+                let home = std::env::var("HOME").unwrap_or_default();
+                let plist = PathBuf::from(&home).join("Library/LaunchAgents/dev.coda.daemon.plist");
+                if plist.exists() {
+                    let _ = std::fs::remove_file(&plist);
+                    println!("Removed {}", plist.display());
+                }
+            }
+            #[cfg(target_os = "linux")]
+            {
+                let home = std::env::var("HOME").unwrap_or_default();
+                let user_unit = PathBuf::from(&home).join(".config/systemd/user/coda-daemon.service");
+                if user_unit.exists() {
+                    let _ = std::process::Command::new("systemctl")
+                        .args(["--user", "disable", "--now", "coda-daemon.service"])
+                        .status();
+                    let _ = std::fs::remove_file(&user_unit);
+                    let _ = std::process::Command::new("systemctl")
+                        .args(["--user", "daemon-reload"])
+                        .status();
+                    println!("Removed {}", user_unit.display());
+                }
+            }
+            println!("Uninstalled coda-daemon background service. Run `coda-daemon logout` to also remove credentials.");
+        }
         Commands::Run { mode, p2p_bind } => {
             let _daemon_lock = try_acquire_daemon_lock(&cfg_path)?
                 .context("another coda-daemon or embedded Coda host already holds the lock")?;
-            let cfg = DaemonConfig::load(&cfg_path)?;
+            let mut cfg = DaemonConfig::load(&cfg_path)?;
             let peers_store = TrustedPeersStore::from_daemon_config(
                 &cfg,
                 Some(DaemonConfig::trusted_peers_path(&cfg_path)),
             );
+            let _ = maybe_renew_daemon_config(&mut cfg, Some(&cfg_path), &peers_store, false).await;
             let _ = peers_store.refresh_from_server(true).await;
 
             let bound_p2p = match spawn_direct_p2p_listener_with_peers(
@@ -457,22 +648,80 @@ async fn main() -> Result<()> {
             };
             let bound_port = bound_p2p.map(|a| a.port());
             if let Some(port) = bound_port {
-                let udp_bind = SocketAddr::new(p2p_bind.ip(), coda_daemon::DEFAULT_DIRECT_P2P_PORT);
+                let udp_bind = SocketAddr::from(([0, 0, 0, 0], coda_daemon::DEFAULT_DIRECT_P2P_PORT));
                 if let Err(e) = coda_daemon::spawn_lan_udp_beacon(cfg.device_id, port, udp_bind).await {
                     warn!("UDP LAN discovery beacon not bound on {udp_bind} ({e})");
                 }
             }
+
+            let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
+            let mut sigterm =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+            let mut backoff_secs = 1u64;
+
             loop {
-                if let Err(e) = run_daemon_once_with_p2p_and_peers(
+                let _ = maybe_renew_daemon_config(&mut cfg, Some(&cfg_path), &peers_store, false)
+                    .await;
+                let started = tokio::time::Instant::now();
+                let run_fut = run_daemon_once_with_p2p_and_peers(
                     &cfg,
                     mode.as_deref(),
                     bound_port,
                     Arc::clone(&peers_store),
-                )
-                .await
-                {
-                    error!("tunnel disconnected ({e}); reconnecting in 2s...");
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                );
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {
+                        info!("coda-daemon received SIGINT; shutting down cleanly");
+                        break;
+                    }
+                    _ = sigterm.recv() => {
+                        info!("coda-daemon received SIGTERM; shutting down cleanly");
+                        break;
+                    }
+                    _ = sighup.recv() => {
+                        info!("coda-daemon received SIGHUP; reloading {}", cfg_path.display());
+                        if let Ok(reloaded) = DaemonConfig::load(&cfg_path) {
+                            cfg = reloaded;
+                            peers_store.update_relay_ticket(cfg.daemon_relay_ticket.clone()).await;
+                            let _ = peers_store.refresh_from_server(true).await;
+                        }
+                        backoff_secs = 1;
+                        continue;
+                    }
+                    res = run_fut => {
+                        match res {
+                            Ok(()) => {
+                                if started.elapsed() >= Duration::from_secs(10) {
+                                    backoff_secs = 1;
+                                }
+                                warn!("tunnel closed cleanly; reconnecting in {backoff_secs}s...");
+                            }
+                            Err(e) => {
+                                let msg = e.to_string().to_ascii_lowercase();
+                                if msg.contains("expired") || msg.contains("ticket") || msg.contains("unauthorized") {
+                                    let _ = maybe_renew_daemon_config(&mut cfg, Some(&cfg_path), &peers_store, true).await;
+                                }
+                                if started.elapsed() >= Duration::from_secs(10) {
+                                    backoff_secs = 1;
+                                }
+                                error!("tunnel disconnected ({e}); reconnecting in {backoff_secs}s...");
+                            }
+                        }
+                        tokio::select! {
+                            _ = tokio::time::sleep(Duration::from_secs(backoff_secs)) => {}
+                            _ = tokio::signal::ctrl_c() => break,
+                            _ = sigterm.recv() => break,
+                            _ = sighup.recv() => {
+                                if let Ok(reloaded) = DaemonConfig::load(&cfg_path) {
+                                    cfg = reloaded;
+                                    peers_store.update_relay_ticket(cfg.daemon_relay_ticket.clone()).await;
+                                }
+                                backoff_secs = 1;
+                                continue;
+                            }
+                        }
+                        backoff_secs = (backoff_secs * 2).min(30);
+                    }
                 }
             }
         }

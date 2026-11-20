@@ -3,7 +3,7 @@ pub mod relay;
 
 use std::{
     collections::HashMap,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
@@ -18,22 +18,26 @@ use axum::{
     },
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{delete, get, post},
+    routing::{delete, get, patch, post},
     Json, Router,
 };
 use chrono::Utc;
 use coda_protocol::{
-    validate_ed25519_pub_b64, validate_x25519_pub_b64, RelayTicketClaims, StoredDeviceIdentity,
-    TrustedPeerEntry, MAX_WIRE_FRAME_BYTES,
+    current_unix_ms, deterministic_server_pubkey_b64, is_timestamp_fresh,
+    relay_ticket_renew_signing_bytes, sanitize_network_endpoints, validate_ed25519_pub_b64,
+    validate_x25519_pub_b64, NetworkEndpointCandidate, RelayTicketClaims, StoredDeviceIdentity,
+    TrustedPeerEntry, HANDSHAKE_MAX_SKEW_MS, MAX_AUTH_FRAME_BYTES, MAX_WIRE_FRAME_BYTES,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::{Mutex, RwLock};
 use tower_http::{
-    cors::{Any, CorsLayer},
+    cors::{AllowOrigin, CorsLayer},
     services::{ServeDir, ServeFile},
 };
 use uuid::Uuid;
+
+const RATE_LIMITER_MAX_BUCKETS: usize = 8192;
 
 #[derive(Default)]
 pub struct RateLimiter {
@@ -44,8 +48,18 @@ impl RateLimiter {
     async fn check(&self, key: &str, max_requests: u32, window: Duration) -> Result<(), ApiError> {
         let now = Instant::now();
         let mut map = self.buckets.lock().await;
-        if map.len() > 2048 {
+        if map.len() > RATE_LIMITER_MAX_BUCKETS / 2 {
             map.retain(|_, (_, started)| now.duration_since(*started) < window * 2);
+        }
+        if map.len() >= RATE_LIMITER_MAX_BUCKETS && !map.contains_key(key) {
+            // Hard memory cap against IPv6 rotation flood: evict oldest 25% entries.
+            let mut entries: Vec<(String, Instant)> =
+                map.iter().map(|(k, (_, ts))| (k.clone(), *ts)).collect();
+            entries.sort_by_key(|(_, ts)| *ts);
+            let evict_count = (RATE_LIMITER_MAX_BUCKETS / 4).max(1);
+            for (old_k, _) in entries.into_iter().take(evict_count) {
+                map.remove(&old_k);
+            }
         }
         let entry = map.entry(key.to_string()).or_insert((0, now));
         if now.duration_since(entry.1) >= window {
@@ -65,8 +79,8 @@ impl RateLimiter {
 
 use crate::{
     db::{
-        Db, DeviceAuthPollState, DeviceAuthPublicInfo, DeviceRecord, InviteCodeRecord,
-        RelayNodeRecord, UserRecord,
+        AuthSessionRecord, AuthenticatedSession, Db, DeviceAuthPollState, DeviceAuthPublicInfo,
+        DeviceRecord, InviteCodeRecord, RelayNodeRecord, UserRecord,
     },
     relay::RelayHub,
 };
@@ -76,8 +90,11 @@ pub struct ServerOptions {
     pub open_registration: bool,
     pub raw_tcp_public_endpoint: Option<String>,
     pub release_version: String,
+    pub has_explicit_release_version: bool,
     pub github_repo: String,
     pub ios_beta_url: Option<String>,
+    pub trust_proxy_headers: bool,
+    pub allowed_origins: Vec<String>,
 }
 
 impl Default for ServerOptions {
@@ -86,8 +103,11 @@ impl Default for ServerOptions {
             open_registration: false,
             raw_tcp_public_endpoint: None,
             release_version: format!("v{}", env!("CARGO_PKG_VERSION")),
+            has_explicit_release_version: false,
             github_repo: "Annihilater/coda".to_string(),
             ios_beta_url: None,
+            trust_proxy_headers: false,
+            allowed_origins: Vec::new(),
         }
     }
 }
@@ -104,10 +124,13 @@ pub struct AppState {
     pub server_pubkey_b64: String,
     pub open_registration: bool,
     pub release_version: String,
+    pub has_explicit_release_version: bool,
     pub github_repo: String,
     pub ios_beta_url: Option<String>,
+    pub trust_proxy_headers: bool,
+    pub allowed_origins: Vec<String>,
     pub http_no_redirect: reqwest::Client,
-    pub latest_release_cache: Arc<RwLock<Option<(String, Instant)>>>,
+    pub latest_release_cache: Arc<RwLock<Option<(Option<String>, Instant)>>>,
     pub rate_limiter: Arc<RateLimiter>,
 }
 
@@ -273,6 +296,36 @@ pub struct PollDeviceAuthResponse {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct RenameDeviceRequest {
+    pub name: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ChangePasswordRequest {
+    pub current_password: String,
+    pub new_password: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DeleteAccountRequest {
+    pub password: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RenewRelayTicketRequest {
+    pub device_id: Uuid,
+    pub timestamp_ms: u64,
+    pub signature_b64: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RenewRelayTicketResponse {
+    pub daemon_relay_ticket: String,
+    pub expires_in_secs: i64,
+    pub relays: Vec<RelayNodeRecord>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct EnrollHostDeviceRequest {
     pub name: String,
     #[serde(default = "default_daemon_role")]
@@ -326,10 +379,51 @@ async fn cache_control_middleware(req: Request, next: Next) -> Response {
     resp
 }
 
+fn is_allowed_browser_origin(origin_raw: &str, state: &AppState, request_host: Option<&str>) -> bool {
+    let origin = origin_raw.trim().trim_end_matches('/').to_ascii_lowercase();
+    if origin.is_empty() {
+        return false;
+    }
+    if state.allowed_origins.iter().any(|o| o == &origin) {
+        return true;
+    }
+    let pub_origin = state
+        .public_base_url
+        .trim()
+        .trim_end_matches('/')
+        .to_ascii_lowercase();
+    if !pub_origin.is_empty() && origin == pub_origin {
+        return true;
+    }
+    if let Some(host) = request_host.map(str::trim).filter(|s| !s.is_empty()) {
+        let host_lower = host.to_ascii_lowercase();
+        if origin == format!("https://{host_lower}") || origin == format!("http://{host_lower}") {
+            return true;
+        }
+    }
+    false
+}
+
 pub fn build_router(state: AppState, web_dist_dir: Option<PathBuf>) -> Router {
+    let cors_state = state.clone();
     let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
+        .allow_origin(AllowOrigin::predicate(move |origin, parts| {
+            let Ok(origin_str) = origin.to_str() else {
+                return false;
+            };
+            let host = parts
+                .headers
+                .get(header::HOST)
+                .and_then(|v| v.to_str().ok());
+            is_allowed_browser_origin(origin_str, &cors_state, host)
+        }))
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PATCH,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
         .allow_headers([
             header::AUTHORIZATION,
             header::CONTENT_TYPE,
@@ -342,7 +436,17 @@ pub fn build_router(state: AppState, web_dist_dir: Option<PathBuf>) -> Router {
         .route("/api/v1/auth/register", post(register_handler))
         .route("/api/v1/auth/login", post(login_handler))
         .route("/api/v1/auth/logout", post(logout_handler))
-        .route("/api/v1/auth/me", get(me_handler))
+        .route("/api/v1/auth/logout-all", post(logout_all_handler))
+        .route("/api/v1/auth/password", post(change_password_handler))
+        .route("/api/v1/auth/sessions", get(list_sessions_handler))
+        .route(
+            "/api/v1/auth/sessions/{id}",
+            delete(delete_session_handler),
+        )
+        .route(
+            "/api/v1/auth/me",
+            get(me_handler).delete(delete_account_handler),
+        )
         .route("/api/v1/auth/device/start", post(start_device_auth_handler))
         .route("/api/v1/auth/device/info", get(device_auth_info_handler))
         .route(
@@ -354,8 +458,12 @@ pub fn build_router(state: AppState, web_dist_dir: Option<PathBuf>) -> Router {
             "/api/v1/invites",
             get(list_invites_handler).post(create_invite_handler),
         )
+        .route("/api/v1/invites/{code}", delete(delete_invite_handler))
         .route("/api/v1/devices", get(list_devices_handler))
-        .route("/api/v1/devices/{id}", delete(delete_device_handler))
+        .route(
+            "/api/v1/devices/{id}",
+            patch(rename_device_handler).delete(delete_device_handler),
+        )
         .route("/api/v1/devices/pair-token", post(create_pair_token_handler))
         .route("/api/v1/devices/claim-pair", post(claim_pair_handler))
         .route(
@@ -367,6 +475,7 @@ pub fn build_router(state: AppState, web_dist_dir: Option<PathBuf>) -> Router {
             post(enroll_host_device_handler),
         )
         .route("/api/v1/relay/ticket", post(mint_relay_ticket_handler))
+        .route("/api/v1/relay/renew-ticket", post(renew_relay_ticket_handler))
         .route("/api/v1/relay/trusted-peers", get(trusted_peers_handler))
         .route("/download/{artifact}", get(download_latest_artifact_handler))
         .route("/install.sh", get(install_script_handler))
@@ -440,7 +549,12 @@ pub async fn start_full_server_with_options(
         .map(|s| s.trim().trim_end_matches('/').to_string())
         .filter(|s| !s.is_empty());
     let has_explicit_public_url = explicit_public.is_some();
-    let base_url = explicit_public.unwrap_or_else(|| format!("http://{http_addr}"));
+    let fallback_host = if http_addr.ip().is_unspecified() {
+        SocketAddr::from(([127, 0, 0, 1], http_addr.port()))
+    } else {
+        http_addr
+    };
+    let base_url = explicit_public.unwrap_or_else(|| format!("http://{fallback_host}"));
     let wss_url = http_to_ws_url(&base_url) + "/v1/tunnel/ws";
 
     let explicit_raw_tcp = options
@@ -456,12 +570,12 @@ pub async fn start_full_server_with_options(
     let raw_tcp_endpoint =
         explicit_raw_tcp.unwrap_or_else(|| format!("127.0.0.1:{}", raw_tcp_addr.port()));
 
-    let node_id = StoredDeviceIdentity::generate("coda-relay-node");
+    let server_pubkey_b64 = deterministic_server_pubkey_b64(&relay_secret);
     db.seed_smart_relays(
         &raw_tcp_endpoint,
         raw_tcp_active,
         &wss_url,
-        &node_id.ed25519_public_b64,
+        &server_pubkey_b64,
     )
     .await?;
 
@@ -479,11 +593,14 @@ pub async fn start_full_server_with_options(
         has_explicit_public_url,
         raw_tcp_public_endpoint: raw_tcp_endpoint,
         raw_tcp_active,
-        server_pubkey_b64: node_id.ed25519_public_b64,
+        server_pubkey_b64,
         open_registration: options.open_registration,
         release_version: options.release_version,
+        has_explicit_release_version: options.has_explicit_release_version,
         github_repo: options.github_repo,
         ios_beta_url: options.ios_beta_url.filter(|s| !s.trim().is_empty()),
+        trust_proxy_headers: options.trust_proxy_headers,
+        allowed_origins: options.allowed_origins,
         http_no_redirect,
         latest_release_cache: Arc::new(RwLock::new(None)),
         rate_limiter: Arc::new(RateLimiter::default()),
@@ -610,39 +727,93 @@ fn is_shell_safe_base_url(url: &str) -> bool {
     !rest.contains('/') && is_valid_http_host_authority(rest)
 }
 
-fn effective_public_base_url(st: &AppState, headers: &HeaderMap) -> String {
+fn is_private_or_loopback_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || (v6.segments()[0] & 0xfe00) == 0xfc00
+                || (v6.segments()[0] & 0xffc0) == 0xfe80
+        }
+    }
+}
+
+fn should_trust_proxy_headers(
+    conn: Option<&Extension<ConnectInfo<SocketAddr>>>,
+    explicit_trust: bool,
+) -> bool {
+    if explicit_trust {
+        return true;
+    }
+    match conn {
+        Some(Extension(ConnectInfo(addr))) => is_private_or_loopback_ip(addr.ip()),
+        None => false,
+    }
+}
+
+fn sanitize_endpoints_value(val: &Value) -> Value {
+    if val.is_null() {
+        return json!([]);
+    }
+    let Ok(parsed) = serde_json::from_value::<Vec<NetworkEndpointCandidate>>(val.clone()) else {
+        return json!([]);
+    };
+    let clean = sanitize_network_endpoints(parsed);
+    serde_json::to_value(clean).unwrap_or_else(|_| json!([]))
+}
+
+fn effective_public_base_url(
+    st: &AppState,
+    conn: Option<&Extension<ConnectInfo<SocketAddr>>>,
+    headers: &HeaderMap,
+) -> String {
     if st.has_explicit_public_url {
         return st.public_base_url.clone();
     }
-    let host_raw = headers
-        .get("x-forwarded-host")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.split(',').next())
-        .or_else(|| headers.get(axum::http::header::HOST).and_then(|v| v.to_str().ok()))
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
+    let trust_proxy = should_trust_proxy_headers(conn, st.trust_proxy_headers);
+    let host_raw = if trust_proxy {
+        headers
+            .get("x-forwarded-host")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.split(',').next())
+            .or_else(|| headers.get(axum::http::header::HOST).and_then(|v| v.to_str().ok()))
+    } else {
+        headers
+            .get(axum::http::header::HOST)
+            .and_then(|v| v.to_str().ok())
+    }
+    .map(str::trim)
+    .filter(|s| !s.is_empty());
+
     let Some(host) = host_raw.filter(|h| is_valid_http_host_authority(h)) else {
         return st.public_base_url.clone();
     };
 
-    let cf_https = headers
-        .get("cf-visitor")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.contains("https"))
-        .unwrap_or(false);
-    let proto = headers
-        .get("x-forwarded-proto")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.split(',').next())
-        .map(|s| s.trim().to_ascii_lowercase())
-        .filter(|s| s == "http" || s == "https")
-        .unwrap_or_else(|| {
-            if cf_https || (!is_loopback_host_or_endpoint(host) && !host.contains(':')) {
-                "https".to_string()
-            } else {
-                "http".to_string()
-            }
-        });
+    let cf_https = trust_proxy
+        && headers
+            .get("cf-visitor")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.contains("https"))
+            .unwrap_or(false);
+    let forwarded_proto = if trust_proxy {
+        headers
+            .get("x-forwarded-proto")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.split(',').next())
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| s == "http" || s == "https")
+    } else {
+        None
+    };
+    let proto = forwarded_proto.unwrap_or_else(|| {
+        let host_lower = host.to_ascii_lowercase();
+        let is_hsts_tld = host_lower.ends_with(".dev") || host_lower.ends_with(".app");
+        if cf_https || (is_hsts_tld && !host_lower.contains(':')) {
+            "https".to_string()
+        } else {
+            "http".to_string()
+        }
+    });
     let candidate = format!("{proto}://{host}");
     if is_shell_safe_base_url(&candidate) {
         candidate
@@ -652,26 +823,35 @@ fn effective_public_base_url(st: &AppState, headers: &HeaderMap) -> String {
 }
 
 fn client_rate_key(
-    conn: Option<Extension<ConnectInfo<SocketAddr>>>,
+    st: &AppState,
+    conn: Option<&Extension<ConnectInfo<SocketAddr>>>,
     headers: &HeaderMap,
 ) -> String {
+    if should_trust_proxy_headers(conn, st.trust_proxy_headers) {
+        if let Some(ip) = headers
+            .get("cf-connecting-ip")
+            .or_else(|| headers.get("x-real-ip"))
+            .or_else(|| headers.get("x-forwarded-for"))
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.split(',').next())
+            .map(str::trim)
+            .filter(|s| s.parse::<IpAddr>().is_ok())
+        {
+            return ip.to_string();
+        }
+    }
     if let Some(Extension(ConnectInfo(addr))) = conn {
         return addr.ip().to_string();
     }
-    headers
-        .get("cf-connecting-ip")
-        .or_else(|| headers.get("x-real-ip"))
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "local".to_string())
+    "local".to_string()
 }
 
 async fn effective_relays_for_request(
     st: &AppState,
+    conn: Option<&Extension<ConnectInfo<SocketAddr>>>,
     headers: &HeaderMap,
 ) -> Result<Vec<RelayNodeRecord>, ApiError> {
-    let base_url = effective_public_base_url(st, headers);
+    let base_url = effective_public_base_url(st, conn, headers);
     let remote = is_remote_public_url(&base_url);
     let expected_wss = http_to_ws_url(&base_url) + "/v1/tunnel/ws";
     let mut relays = st
@@ -765,9 +945,9 @@ fn release_asset_filename(artifact: &str, tag: &str) -> Option<String> {
 async fn resolve_latest_github_tag(st: &AppState) -> Option<String> {
     {
         let cached = st.latest_release_cache.read().await;
-        if let Some((tag, fetched_at)) = cached.as_ref() {
+        if let Some((tag_opt, fetched_at)) = cached.as_ref() {
             if fetched_at.elapsed() < LATEST_RELEASE_CACHE_TTL {
-                return Some(tag.clone());
+                return tag_opt.clone();
             }
         }
     }
@@ -797,14 +977,16 @@ async fn resolve_latest_github_tag(st: &AppState) -> Option<String> {
         }
     }
 
+    let mut cached = st.latest_release_cache.write().await;
     if let Some(tag) = resolved {
-        let mut cached = st.latest_release_cache.write().await;
-        *cached = Some((tag.clone(), Instant::now()));
+        *cached = Some((Some(tag.clone()), Instant::now()));
         return Some(tag);
     }
 
-    let cached = st.latest_release_cache.read().await;
-    cached.as_ref().map(|(tag, _)| tag.clone())
+    // Negative-cache lookup failure for 5 minutes so offline/firewalled networks don't stall 8s per request.
+    let stale_tag = cached.as_ref().and_then(|(t, _)| t.clone());
+    *cached = Some((stale_tag.clone(), Instant::now()));
+    stale_tag
 }
 
 async fn download_latest_artifact_handler(
@@ -824,7 +1006,11 @@ async fn download_latest_artifact_handler(
     } else {
         format!("v{}", st.release_version)
     };
-    let tag = resolve_latest_github_tag(&st).await.unwrap_or(fallback_tag);
+    let tag = if st.has_explicit_release_version {
+        fallback_tag
+    } else {
+        resolve_latest_github_tag(&st).await.unwrap_or(fallback_tag)
+    };
     let filename = release_asset_filename(&artifact, &tag).expect("validated artifact key");
     let target_url = format!(
         "https://github.com/{}/releases/download/{tag}/{filename}",
@@ -836,11 +1022,12 @@ async fn download_latest_artifact_handler(
 
 async fn public_site_info_handler(
     State(st): State<AppState>,
+    conn: Option<Extension<ConnectInfo<SocketAddr>>>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
-    let base_url = effective_public_base_url(&st, &headers);
+    let base_url = effective_public_base_url(&st, conn.as_ref(), &headers);
     let has_any_users = st.db.has_any_users().await.map_err(ApiError::internal)?;
-    let relays = effective_relays_for_request(&st, &headers).await?;
+    let relays = effective_relays_for_request(&st, conn.as_ref(), &headers).await?;
     let tag = if st.release_version.starts_with('v') {
         st.release_version.clone()
     } else {
@@ -880,7 +1067,7 @@ async fn register_handler(
     headers: HeaderMap,
     Json(req): Json<RegisterRequest>,
 ) -> Result<Json<AuthResponse>, ApiError> {
-    let ip = client_rate_key(conn, &headers);
+    let ip = client_rate_key(&st, conn.as_ref(), &headers);
     st.rate_limiter
         .check(&format!("register:{ip}"), 20, Duration::from_secs(60))
         .await?;
@@ -905,7 +1092,7 @@ async fn login_handler(
     headers: HeaderMap,
     Json(req): Json<LoginRequest>,
 ) -> Result<Json<AuthResponse>, ApiError> {
-    let ip = client_rate_key(conn, &headers);
+    let ip = client_rate_key(&st, conn.as_ref(), &headers);
     st.rate_limiter
         .check(&format!("login:{ip}"), 30, Duration::from_secs(60))
         .await?;
@@ -925,18 +1112,120 @@ async fn logout_handler(
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
     {
-        let token = auth_hdr.strip_prefix("Bearer ").unwrap_or(auth_hdr);
-        let _ = st.db.delete_session(token).await;
+        let token = auth_hdr.strip_prefix("Bearer ").unwrap_or(auth_hdr).trim();
+        if let Ok(sess) = st.db.authenticate_session(token).await {
+            let _ = st.db.delete_session(token).await;
+            st.relay_hub
+                .notify_session_revoked(sess.user.id, Some(sess.token_sha256));
+        } else {
+            let _ = st.db.delete_session(token).await;
+        }
     }
     Ok(Json(json!({ "ok": true })))
+}
+
+async fn logout_all_handler(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let session = require_auth_session(&st, &headers).await?;
+    let deleted = st
+        .db
+        .delete_all_sessions(session.user.id, None)
+        .await
+        .map_err(ApiError::internal)?;
+    st.relay_hub.notify_session_revoked(session.user.id, None);
+    Ok(Json(json!({ "ok": true, "revoked_sessions": deleted })))
+}
+
+async fn change_password_handler(
+    State(st): State<AppState>,
+    conn: Option<Extension<ConnectInfo<SocketAddr>>>,
+    headers: HeaderMap,
+    Json(req): Json<ChangePasswordRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let ip = client_rate_key(&st, conn.as_ref(), &headers);
+    st.rate_limiter
+        .check(&format!("password:{ip}"), 15, Duration::from_secs(60))
+        .await?;
+    let session = require_auth_session(&st, &headers).await?;
+    st.db
+        .change_password(
+            session.user.id,
+            &req.current_password,
+            &req.new_password,
+            Some(&session.token_sha256),
+        )
+        .await
+        .map_err(ApiError::bad_request)?;
+    st.relay_hub.notify_session_revoked(session.user.id, None);
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn list_sessions_handler(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<AuthSessionRecord>>, ApiError> {
+    let session = require_auth_session(&st, &headers).await?;
+    let sessions = st
+        .db
+        .list_sessions(session.user.id, &session.token_sha256)
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(Json(sessions))
+}
+
+async fn delete_session_handler(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path(session_id): Path<Uuid>,
+) -> Result<Json<Value>, ApiError> {
+    let session = require_auth_session(&st, &headers).await?;
+    let deleted_sha = st
+        .db
+        .delete_session_by_id(session.user.id, session_id)
+        .await
+        .map_err(ApiError::internal)?;
+    let Some(sha) = deleted_sha else {
+        return Err(ApiError {
+            status: StatusCode::NOT_FOUND,
+            message: "session not found".into(),
+        });
+    };
+    st.relay_hub
+        .notify_session_revoked(session.user.id, Some(sha));
+    Ok(Json(json!({ "ok": true, "deleted": true, "session_id": session_id })))
+}
+
+async fn delete_account_handler(
+    State(st): State<AppState>,
+    conn: Option<Extension<ConnectInfo<SocketAddr>>>,
+    headers: HeaderMap,
+    Json(req): Json<DeleteAccountRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let ip = client_rate_key(&st, conn.as_ref(), &headers);
+    st.rate_limiter
+        .check(&format!("del_account:{ip}"), 10, Duration::from_secs(60))
+        .await?;
+    let session = require_auth_session(&st, &headers).await?;
+    let dev_ids = st
+        .db
+        .delete_user_account(session.user.id, &req.password)
+        .await
+        .map_err(ApiError::bad_request)?;
+    for dev_id in dev_ids {
+        st.relay_hub.disconnect_device(session.user.id, dev_id).await;
+    }
+    st.relay_hub.notify_session_revoked(session.user.id, None);
+    Ok(Json(json!({ "ok": true, "deleted": true })))
 }
 
 async fn me_handler(
     State(st): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<UserRecord>, ApiError> {
-    let user = require_auth(&st, &headers).await?;
-    Ok(Json(user))
+    let session = require_any_auth_session(&st, &headers).await?;
+    Ok(Json(session.user))
 }
 
 async fn create_invite_handler(
@@ -958,12 +1247,42 @@ async fn list_invites_handler(
     headers: HeaderMap,
 ) -> Result<Json<Vec<InviteCodeRecord>>, ApiError> {
     let user = require_auth(&st, &headers).await?;
+    if !user.is_admin {
+        return Err(ApiError::forbidden(anyhow::anyhow!(
+            "only admin accounts can list invite codes"
+        )));
+    }
     let list = st
         .db
         .list_invite_codes(&user)
         .await
         .map_err(ApiError::internal)?;
     Ok(Json(list))
+}
+
+async fn delete_invite_handler(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path(code): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let user = require_auth(&st, &headers).await?;
+    if !user.is_admin {
+        return Err(ApiError::forbidden(anyhow::anyhow!(
+            "only admin accounts can revoke invite codes"
+        )));
+    }
+    let deleted = st
+        .db
+        .delete_invite_code(&user, &code)
+        .await
+        .map_err(ApiError::internal)?;
+    if !deleted {
+        return Err(ApiError {
+            status: StatusCode::NOT_FOUND,
+            message: "invite code not found".into(),
+        });
+    }
+    Ok(Json(json!({ "ok": true, "deleted": true, "code": code })))
 }
 
 async fn list_devices_handler(
@@ -979,12 +1298,47 @@ async fn list_devices_handler(
     Ok(Json(devices))
 }
 
+async fn rename_device_handler(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path(device_id): Path<Uuid>,
+    Json(req): Json<RenameDeviceRequest>,
+) -> Result<Json<DeviceRecord>, ApiError> {
+    let user = require_auth(&st, &headers).await?;
+    let updated = st
+        .db
+        .rename_device(user.id, device_id, &req.name)
+        .await
+        .map_err(ApiError::bad_request)?;
+    let Some(device) = updated else {
+        return Err(ApiError {
+            status: StatusCode::NOT_FOUND,
+            message: "device not found".into(),
+        });
+    };
+    st.relay_hub
+        .notify_device_enrolled(
+            user.id,
+            device.id,
+            &device.name,
+            &device.role,
+            Some(device.is_online),
+        )
+        .await;
+    Ok(Json(device))
+}
+
 async fn delete_device_handler(
     State(st): State<AppState>,
     headers: HeaderMap,
     Path(device_id): Path<Uuid>,
 ) -> Result<Json<Value>, ApiError> {
     let user = require_auth(&st, &headers).await?;
+    let revoked_session_hashes = st
+        .db
+        .list_session_hashes_for_device(user.id, device_id)
+        .await
+        .unwrap_or_default();
     let deleted = st
         .db
         .delete_device(user.id, device_id)
@@ -997,6 +1351,10 @@ async fn delete_device_handler(
         });
     }
     st.relay_hub.disconnect_device(user.id, device_id).await;
+    for sha in revoked_session_hashes {
+        st.relay_hub
+            .notify_session_revoked(user.id, Some(sha));
+    }
     st.relay_hub
         .notify_device_enrolled(user.id, device_id, "", "device", Some(false))
         .await;
@@ -1008,7 +1366,7 @@ async fn trusted_peers_handler(
     headers: HeaderMap,
 ) -> Result<Json<Vec<TrustedPeerEntry>>, ApiError> {
     let user_id = if headers.contains_key(axum::http::header::AUTHORIZATION) {
-        require_auth(&st, &headers).await?.id
+        require_any_auth_session(&st, &headers).await?.user.id
     } else if let Some(ticket) = headers
         .get("x-coda-relay-ticket")
         .and_then(|v| v.to_str().ok())
@@ -1044,11 +1402,16 @@ async fn trusted_peers_handler(
 
 async fn create_pair_token_handler(
     State(st): State<AppState>,
+    conn: Option<Extension<ConnectInfo<SocketAddr>>>,
     headers: HeaderMap,
     Json(req): Json<CreatePairTokenRequest>,
 ) -> Result<Json<PairTokenResponse>, ApiError> {
+    let ip = client_rate_key(&st, conn.as_ref(), &headers);
+    st.rate_limiter
+        .check(&format!("pair_token:{ip}"), 30, Duration::from_secs(60))
+        .await?;
     let user = require_auth(&st, &headers).await?;
-    let base_url = effective_public_base_url(&st, &headers);
+    let base_url = effective_public_base_url(&st, conn.as_ref(), &headers);
     let (code, expires_at) = st
         .db
         .create_pairing_token(user.id, req.suggested_name.as_deref())
@@ -1067,11 +1430,19 @@ async fn create_pair_token_handler(
 
 async fn install_script_handler(
     State(st): State<AppState>,
+    conn: Option<Extension<ConnectInfo<SocketAddr>>>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let base_url = effective_public_base_url(&st, &headers);
+    let base_url = effective_public_base_url(&st, conn.as_ref(), &headers);
+    let pinned_ver = if st.has_explicit_release_version {
+        st.release_version.as_str()
+    } else {
+        ""
+    };
     let script = include_str!("../../../deploy/install-daemon.sh")
-        .replace("__CODA_DEFAULT_SERVER_URL__", &base_url);
+        .replace("__CODA_DEFAULT_SERVER_URL__", &base_url)
+        .replace("__CODA_GITHUB_REPO__", &st.github_repo)
+        .replace("__CODA_RELEASE_VERSION__", pinned_ver);
     (
         [(
             axum::http::header::CONTENT_TYPE,
@@ -1087,7 +1458,7 @@ async fn start_device_auth_handler(
     headers: HeaderMap,
     Json(req): Json<StartDeviceAuthRequest>,
 ) -> Result<Json<StartDeviceAuthResponse>, ApiError> {
-    let ip = client_rate_key(conn, &headers);
+    let ip = client_rate_key(&st, conn.as_ref(), &headers);
     st.rate_limiter
         .check(&format!("dev_start:{ip}"), 30, Duration::from_secs(60))
         .await?;
@@ -1101,11 +1472,7 @@ async fn start_device_auth_handler(
     };
     validate_ed25519_pub_b64(&req.ed25519_pubkey).map_err(ApiError::bad_request)?;
     validate_x25519_pub_b64(&req.x25519_pubkey).map_err(ApiError::bad_request)?;
-    let endpoints = if req.endpoints.is_null() {
-        json!([])
-    } else {
-        req.endpoints
-    };
+    let endpoints = sanitize_endpoints_value(&req.endpoints);
     let ttl_secs = 600i64;
     let (device_code, user_code, _expires_at) = st
         .db
@@ -1123,7 +1490,7 @@ async fn start_device_auth_handler(
         .await
         .map_err(ApiError::bad_request)?;
 
-    let base_url = effective_public_base_url(&st, &headers);
+    let base_url = effective_public_base_url(&st, conn.as_ref(), &headers);
     let verification_uri = format!("{base_url}/activate");
     let verification_uri_complete = format!("{verification_uri}?code={user_code}");
     Ok(Json(StartDeviceAuthResponse {
@@ -1138,8 +1505,14 @@ async fn start_device_auth_handler(
 
 async fn device_auth_info_handler(
     State(st): State<AppState>,
+    conn: Option<Extension<ConnectInfo<SocketAddr>>>,
+    headers: HeaderMap,
     Query(q): Query<DeviceAuthInfoQuery>,
 ) -> Result<Json<DeviceAuthPublicInfo>, ApiError> {
+    let ip = client_rate_key(&st, conn.as_ref(), &headers);
+    st.rate_limiter
+        .check(&format!("dev_info:{ip}"), 60, Duration::from_secs(60))
+        .await?;
     let info = st
         .db
         .get_device_auth_info(&q.code)
@@ -1155,7 +1528,7 @@ async fn approve_device_auth_handler(
     headers: HeaderMap,
     Json(req): Json<ApproveDeviceAuthRequest>,
 ) -> Result<Json<DeviceRecord>, ApiError> {
-    let ip = client_rate_key(conn, &headers);
+    let ip = client_rate_key(&st, conn.as_ref(), &headers);
     st.rate_limiter
         .check(&format!("dev_approve:{ip}"), 30, Duration::from_secs(60))
         .await?;
@@ -1183,7 +1556,7 @@ async fn poll_device_auth_handler(
     headers: HeaderMap,
     Json(req): Json<PollDeviceAuthRequest>,
 ) -> Result<Json<PollDeviceAuthResponse>, ApiError> {
-    let ip = client_rate_key(conn, &headers);
+    let ip = client_rate_key(&st, conn.as_ref(), &headers);
     st.rate_limiter
         .check(&format!("dev_poll:{ip}"), 90, Duration::from_secs(60))
         .await?;
@@ -1231,7 +1604,7 @@ async fn poll_device_auth_handler(
             let daemon_relay_ticket = claims
                 .sign(&st.relay_secret)
                 .map_err(ApiError::internal)?;
-            let relays = effective_relays_for_request(&st, &headers).await?;
+            let relays = effective_relays_for_request(&st, conn.as_ref(), &headers).await?;
             let owner_handle = user.handle.clone();
             st.relay_hub
                 .notify_device_enrolled(
@@ -1258,6 +1631,7 @@ async fn poll_device_auth_handler(
 
 async fn enroll_host_device_handler(
     State(st): State<AppState>,
+    conn: Option<Extension<ConnectInfo<SocketAddr>>>,
     headers: HeaderMap,
     Json(req): Json<EnrollHostDeviceRequest>,
 ) -> Result<Json<ClaimPairResponse>, ApiError> {
@@ -1270,11 +1644,7 @@ async fn enroll_host_device_handler(
             )))
         }
     };
-    let endpoints = if req.endpoints.is_null() {
-        json!([])
-    } else {
-        req.endpoints
-    };
+    let endpoints = sanitize_endpoints_value(&req.endpoints);
     let device = st
         .db
         .upsert_device(
@@ -1303,7 +1673,7 @@ async fn enroll_host_device_handler(
     let daemon_relay_ticket = claims
         .sign(&st.relay_secret)
         .map_err(ApiError::internal)?;
-    let relays = effective_relays_for_request(&st, &headers).await?;
+    let relays = effective_relays_for_request(&st, conn.as_ref(), &headers).await?;
 
     st.relay_hub
         .notify_device_enrolled(
@@ -1329,7 +1699,7 @@ async fn claim_pair_handler(
     headers: HeaderMap,
     Json(req): Json<ClaimPairRequest>,
 ) -> Result<Json<ClaimPairResponse>, ApiError> {
-    let ip = client_rate_key(conn, &headers);
+    let ip = client_rate_key(&st, conn.as_ref(), &headers);
     st.rate_limiter
         .check(&format!("claim_pair:{ip}"), 20, Duration::from_secs(60))
         .await?;
@@ -1342,11 +1712,7 @@ async fn claim_pair_handler(
     )
     .map_err(ApiError::bad_request)?;
 
-    let endpoints = if req.endpoints.is_null() {
-        json!([])
-    } else {
-        req.endpoints
-    };
+    let endpoints = sanitize_endpoints_value(&req.endpoints);
 
     let (device, owner) = st
         .db
@@ -1376,7 +1742,7 @@ async fn claim_pair_handler(
     let daemon_relay_ticket = claims
         .sign(&st.relay_secret)
         .map_err(ApiError::internal)?;
-    let relays = effective_relays_for_request(&st, &headers).await?;
+    let relays = effective_relays_for_request(&st, conn.as_ref(), &headers).await?;
 
     st.relay_hub
         .notify_device_enrolled(
@@ -1402,11 +1768,7 @@ async fn register_client_device_handler(
     Json(req): Json<RegisterClientDeviceRequest>,
 ) -> Result<Json<DeviceRecord>, ApiError> {
     let user = require_auth(&st, &headers).await?;
-    let endpoints = if req.endpoints.is_null() {
-        json!([])
-    } else {
-        req.endpoints
-    };
+    let endpoints = sanitize_endpoints_value(&req.endpoints);
     let dev = st
         .db
         .upsert_device(
@@ -1430,6 +1792,7 @@ async fn register_client_device_handler(
 
 async fn mint_relay_ticket_handler(
     State(st): State<AppState>,
+    conn: Option<Extension<ConnectInfo<SocketAddr>>>,
     headers: HeaderMap,
     Json(req): Json<MintRelayTicketRequest>,
 ) -> Result<Json<MintRelayTicketResponse>, ApiError> {
@@ -1473,7 +1836,7 @@ async fn mint_relay_ticket_handler(
     let ticket = claims
         .sign(&st.relay_secret)
         .map_err(ApiError::internal)?;
-    let relays = effective_relays_for_request(&st, &headers).await?;
+    let relays = effective_relays_for_request(&st, conn.as_ref(), &headers).await?;
 
     Ok(Json(MintRelayTicketResponse {
         ticket,
@@ -1482,22 +1845,100 @@ async fn mint_relay_ticket_handler(
     }))
 }
 
+async fn renew_relay_ticket_handler(
+    State(st): State<AppState>,
+    conn: Option<Extension<ConnectInfo<SocketAddr>>>,
+    headers: HeaderMap,
+    Json(req): Json<RenewRelayTicketRequest>,
+) -> Result<Json<RenewRelayTicketResponse>, ApiError> {
+    let ip = client_rate_key(&st, conn.as_ref(), &headers);
+    st.rate_limiter
+        .check(&format!("renew_ticket:{ip}"), 30, Duration::from_secs(60))
+        .await?;
+    if !is_timestamp_fresh(req.timestamp_ms, current_unix_ms(), HANDSHAKE_MAX_SKEW_MS) {
+        return Err(ApiError::unauthorized(anyhow::anyhow!(
+            "ticket renewal timestamp outside allowed skew window"
+        )));
+    }
+    let dev = st
+        .db
+        .get_device_by_id(req.device_id)
+        .await
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::unauthorized(anyhow::anyhow!("device revoked or unknown")))?;
+    let msg = relay_ticket_renew_signing_bytes(req.device_id, req.timestamp_ms);
+    StoredDeviceIdentity::verify_signature(&dev.ed25519_pubkey, &msg, &req.signature_b64)
+        .map_err(ApiError::unauthorized)?;
+
+    let quota_mbps = st
+        .db
+        .get_user_quota_mbps(dev.user_id)
+        .await
+        .map_err(ApiError::internal)?;
+    let ttl_secs = 30 * 86_400i64;
+    let claims = RelayTicketClaims {
+        user_id: dev.user_id,
+        device_id: dev.id,
+        peer_device_id: None,
+        role: dev.role,
+        quota_mbps: quota_mbps.max(1),
+        exp_unix: Utc::now().timestamp() + ttl_secs,
+    };
+    let daemon_relay_ticket = claims
+        .sign(&st.relay_secret)
+        .map_err(ApiError::internal)?;
+    let relays = effective_relays_for_request(&st, conn.as_ref(), &headers).await?;
+
+    Ok(Json(RenewRelayTicketResponse {
+        daemon_relay_ticket,
+        expires_in_secs: ttl_secs,
+        relays,
+    }))
+}
+
+fn check_ws_origin(st: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
+    if let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
+        let host = headers.get(header::HOST).and_then(|v| v.to_str().ok());
+        if !is_allowed_browser_origin(origin, st, host) {
+            return Err(ApiError::forbidden(anyhow::anyhow!(
+                "WebSocket Origin not allowed"
+            )));
+        }
+    }
+    Ok(())
+}
+
 async fn ws_tunnel_upgrade_handler(
     ws: WebSocketUpgrade,
     State(st): State<AppState>,
-) -> impl IntoResponse {
+    conn: Option<Extension<ConnectInfo<SocketAddr>>>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let ip = client_rate_key(&st, conn.as_ref(), &headers);
+    st.rate_limiter
+        .check(&format!("ws_tunnel:{ip}"), 60, Duration::from_secs(60))
+        .await?;
+    check_ws_origin(&st, &headers)?;
     let hub = Arc::clone(&st.relay_hub);
-    ws.max_message_size(MAX_WIRE_FRAME_BYTES)
+    Ok(ws
+        .max_message_size(MAX_WIRE_FRAME_BYTES)
         .max_frame_size(MAX_WIRE_FRAME_BYTES)
-        .on_upgrade(move |socket| hub.handle_ws_socket(socket))
+        .on_upgrade(move |socket| hub.handle_ws_socket(socket)))
 }
 
 async fn ws_account_events_handler(
     ws: WebSocketUpgrade,
     State(st): State<AppState>,
+    conn: Option<Extension<ConnectInfo<SocketAddr>>>,
     headers: HeaderMap,
     RawQuery(raw_query): RawQuery,
 ) -> Result<Response, ApiError> {
+    let ip = client_rate_key(&st, conn.as_ref(), &headers);
+    st.rate_limiter
+        .check(&format!("ws_events:{ip}"), 60, Duration::from_secs(60))
+        .await?;
+    check_ws_origin(&st, &headers)?;
+
     if let Some(q) = raw_query.as_deref() {
         let has_query_token = q.split('&').any(|pair| {
             pair.split_once('=')
@@ -1532,8 +1973,8 @@ async fn ws_account_events_handler(
         .map(str::to_string);
 
     let ws = ws
-        .max_message_size(MAX_WIRE_FRAME_BYTES)
-        .max_frame_size(MAX_WIRE_FRAME_BYTES);
+        .max_message_size(MAX_AUTH_FRAME_BYTES)
+        .max_frame_size(MAX_AUTH_FRAME_BYTES);
     let ws = if subproto_hdr.split(',').any(|p| p.trim() == "coda-auth") {
         ws.protocols(["coda-auth"])
     } else {
@@ -1541,14 +1982,15 @@ async fn ws_account_events_handler(
     };
 
     if let Some(token) = header_token.or(subproto_token) {
-        let user = st
+        let session = st
             .db
-            .authenticate_token(&token)
+            .authenticate_session(&token)
             .await
             .map_err(ApiError::unauthorized)?;
         let hub = Arc::clone(&st.relay_hub);
         return Ok(ws.on_upgrade(move |socket| async move {
-            hub.handle_account_events_ws(socket, user.id).await
+            hub.handle_account_events_ws(socket, session.user.id, Some(session.token_sha256))
+                .await
         }));
     }
 
@@ -1560,18 +2002,39 @@ async fn ws_account_events_handler(
     }))
 }
 
-async fn require_auth(st: &AppState, headers: &HeaderMap) -> Result<UserRecord, ApiError> {
+async fn require_any_auth_session(
+    st: &AppState,
+    headers: &HeaderMap,
+) -> Result<AuthenticatedSession, ApiError> {
     let auth_hdr = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .ok_or_else(|| ApiError::unauthorized(anyhow::anyhow!("missing Authorization header")))?;
     let token = auth_hdr
         .strip_prefix("Bearer ")
-        .unwrap_or(auth_hdr);
+        .unwrap_or(auth_hdr)
+        .trim();
     st.db
-        .authenticate_token(token)
+        .authenticate_session(token)
         .await
         .map_err(ApiError::unauthorized)
+}
+
+async fn require_auth_session(
+    st: &AppState,
+    headers: &HeaderMap,
+) -> Result<AuthenticatedSession, ApiError> {
+    let session = require_any_auth_session(st, headers).await?;
+    if session.scope != "full" {
+        return Err(ApiError::forbidden(anyhow::anyhow!(
+            "daemon host session token cannot access controller/account APIs"
+        )));
+    }
+    Ok(session)
+}
+
+async fn require_auth(st: &AppState, headers: &HeaderMap) -> Result<UserRecord, ApiError> {
+    Ok(require_auth_session(st, headers).await?.user)
 }
 
 pub struct ApiError {

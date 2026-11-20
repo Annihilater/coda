@@ -13,6 +13,7 @@ use tokio::sync::{broadcast, mpsc, Mutex};
 use uuid::Uuid;
 
 static DB_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+const TEST_DB_ADVISORY_LOCK_KEY: i64 = 9_876_543;
 
 async fn next_matching_account_event<F>(
     rx: &mut mpsc::Receiver<AccountLiveEvent>,
@@ -133,21 +134,26 @@ async fn test_realtime_ws_push_multiclient_pty_and_direct_p2p_mesh() {
     let db_url = std::env::var("TEST_DATABASE_URL")
         .unwrap_or_else(|_| "postgres://vampire@localhost:5432/coda_test".to_string());
 
-    let _ = coda_server::db::Db::connect_and_migrate(&db_url)
-        .await
-        .expect("PostgreSQL coda_test should be reachable and migrate cleanly");
-
     let (pg, conn) = tokio_postgres::connect(&db_url, tokio_postgres::NoTls)
         .await
         .expect("PostgreSQL coda_test should be running");
     tokio::spawn(async move {
         let _ = conn.await;
     });
+    pg.query_one("SELECT pg_advisory_lock($1)", &[&TEST_DB_ADVISORY_LOCK_KEY])
+        .await
+        .expect("acquire cross-binary pg_advisory_lock");
+
+    let _ = coda_server::db::Db::connect_and_migrate(&db_url)
+        .await
+        .expect("PostgreSQL coda_test should be reachable and migrate cleanly");
+
     pg.batch_execute(
         "TRUNCATE device_auth_requests, pairing_tokens, devices, auth_sessions, invite_codes, users RESTART IDENTITY CASCADE;",
     )
     .await
     .unwrap();
+    let _pg_lock = pg;
 
     let server = start_full_server_with_options(
         &db_url,
