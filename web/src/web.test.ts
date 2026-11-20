@@ -42,6 +42,12 @@ import {
   parentSubPath,
   renderRemoteFileBrowserModal,
 } from "./file_browser";
+import {
+  createInitialPortPreviewState,
+  decodePortPreviewBody,
+  parseWebPreviewPortAndPath,
+  renderPortPreviewModal,
+} from "./port_preview";
 
 function makeTestIdentity(name: string): WebDeviceIdentity {
   const edPriv = ed25519.utils.randomPrivateKey();
@@ -743,5 +749,25 @@ describe("Web modular engines: terminal_keys, OSC 7501 notifications & Smart-Pat
     expect(html).toContain("&lt;img onerror=1&gt;");
     expect(html).not.toContain("<img onerror=1>");
     expect(html).toContain("2.0 KB");
+
+    expect(parseWebPreviewPortAndPath("5173", "api/v1")).toEqual({ port: 5173, path: "/api/v1" });
+    expect("error" in parseWebPreviewPortAndPath("80", "/")).toBe(true);
+    expect("error" in parseWebPreviewPortAndPath("24444", "/")).toBe(true);
+
+    const jsonBody = decodePortPreviewBody(
+      toB64(new TextEncoder().encode('{"healthy":true}')),
+      "application/json"
+    );
+    expect(jsonBody).toContain('"healthy": true');
+
+    const pp = createInitialPortPreviewState();
+    pp.open = true;
+    pp.statusCode = 200;
+    pp.contentType = "text/html";
+    pp.viewTab = "render";
+    pp.bodyText = "<script>alert(1)</script><h1>OK</h1>";
+    const ppHtml = renderPortPreviewModal(pp, "dev-box", (en) => en);
+    expect(ppHtml).toContain('sandbox=""');
+    expect(ppHtml).toContain("&lt;script&gt;alert(1)&lt;/script&gt;");
   });
 });

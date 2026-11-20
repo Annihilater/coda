@@ -69,6 +69,13 @@ import {
   parentSubPath,
   renderRemoteFileBrowserModal,
 } from "./file_browser";
+import {
+  type PortPreviewState,
+  createInitialPortPreviewState,
+  decodePortPreviewBody,
+  parseWebPreviewPortAndPath,
+  renderPortPreviewModal,
+} from "./port_preview";
 
 if (typeof window !== "undefined" && typeof document !== "undefined") {
   try {
@@ -146,6 +153,7 @@ export class CodaTerminalWebApp {
   private termSearchIdx = 0;
   private hostHealthByPeer = new Map<string, HostHealthSnapshot>();
   private fileBrowser: RemoteFileBrowserState = createInitialFileBrowserState();
+  private portPreview: PortPreviewState = createInitialPortPreviewState();
   private draftInput = "";
   private imeComposing = false;
   private showSidebar = typeof window === "undefined" ? true : window.innerWidth >= 900;
@@ -390,6 +398,9 @@ export class CodaTerminalWebApp {
         this.render();
       } else if (e.key === "Escape" && this.fileBrowser.open) {
         this.fileBrowser.open = false;
+        this.render();
+      } else if (e.key === "Escape" && this.portPreview.open) {
+        this.portPreview.open = false;
         this.render();
       }
     });
@@ -859,6 +870,7 @@ export class CodaTerminalWebApp {
       this.activeTerminalAddr = opts.initialTerminalAddr ?? null;
       this.secondaryTerminalAddr = null;
       this.fileBrowser = createInitialFileBrowserState();
+      this.portPreview = createInitialPortPreviewState();
       this.rttMs = null;
       this.lastWorkspacesQueryAt = 0;
       this.pendingSelectionCatchup = false;
@@ -1933,6 +1945,20 @@ export class CodaTerminalWebApp {
       return;
     }
 
+    if (msg.op === "http_local_preview_response") {
+      if (!isSelected || !this.portPreview.open) return;
+      this.portPreview.loading = false;
+      this.portPreview.error = null;
+      this.portPreview.statusCode = Number(msg.status_code || 0);
+      this.portPreview.contentType = String(msg.content_type || "text/plain");
+      this.portPreview.bodyText = decodePortPreviewBody(
+        String(msg.body_b64 || ""),
+        this.portPreview.contentType
+      );
+      this.render();
+      return;
+    }
+
     if (msg.op === "voice_config_ack" && msg.config) {
       if (!isSelected) return;
       this.voiceConfig = {
@@ -2300,6 +2326,44 @@ export class CodaTerminalWebApp {
     this.render();
   }
 
+  private openRemotePortPreview() {
+    if (!this.selectedDaemon?.is_online) {
+      this.consoleNotice = {
+        kind: "err",
+        text: this.tr("Select an online host first.", "请先选择一台在线主机。"),
+      };
+      this.render();
+      return;
+    }
+    this.portPreview.open = true;
+    this.portPreview.error = null;
+    this.render();
+  }
+
+  private submitRemotePortPreview(portRaw?: string, pathRaw?: string) {
+    if (!this.selectedDaemon?.is_online) return;
+    const pStr = portRaw !== undefined ? portRaw : this.portPreview.portInput;
+    const pathStr = pathRaw !== undefined ? pathRaw : this.portPreview.pathInput;
+    const parsed = parseWebPreviewPortAndPath(pStr, pathStr);
+    if ("error" in parsed) {
+      this.portPreview.error = parsed.error;
+      this.portPreview.loading = false;
+      this.render();
+      return;
+    }
+    this.portPreview.portInput = String(parsed.port);
+    this.portPreview.pathInput = parsed.path;
+    this.portPreview.loading = true;
+    this.portPreview.error = null;
+    this.sendEncrypted(this.selectedDaemon, {
+      op: "http_local_preview_request",
+      req_id: `pp-${Date.now()}`,
+      port: parsed.port,
+      path: parsed.path,
+    });
+    this.render();
+  }
+
   private upgradeRemoteDaemon(dev: Device) {
     if (!dev.is_online) return;
     const msg = this.tr(
@@ -2480,6 +2544,13 @@ export class CodaTerminalWebApp {
           label: this.tr("Browse Remote Workspace Files", "浏览远端工作区文件树"),
           hint: "E2EE · 64KB preview",
           action: () => this.openRemoteFileBrowser(),
+        },
+        {
+          id: "action:port-preview",
+          group: this.tr("Actions", "快捷操作"),
+          label: this.tr("Preview Remote localhost Port", "探测远端本地开发端口 (localhost)"),
+          hint: "127.0.0.1:PORT · E2EE",
+          action: () => this.openRemotePortPreview(),
         },
         {
           id: "action:split",
@@ -4695,6 +4766,10 @@ export class CodaTerminalWebApp {
                 ${svgIcon("layers", 13)}
                 <span class="pm-cmd-label">${this.tr("Files", "文件")}</span>
               </button>
+              <button type="button" id="btn-console-port-preview" class="pm-cmd-trigger" style="height:30px;padding:0 9px;" title="${this.tr("Preview Remote localhost Port over E2EE", "远端 localhost 端口加密预览")}">
+                ${svgIcon("globe", 13)}
+                <span class="pm-cmd-label">${this.tr("Port", "端口")}</span>
+              </button>
               <button type="button" id="btn-console-search" class="pm-cmd-trigger" style="height:30px;padding:0 9px;${this.showTermSearch ? "border-color:var(--amber);color:var(--text-primary);" : ""}" title="${this.tr("Find in Terminal & Export .md (⌘F)", "终端内搜索与导出 .md (⌘F)")}">
                 ${svgIcon("search", 13)}
                 <span class="pm-kbd">⌘F</span>
@@ -5200,6 +5275,11 @@ export class CodaTerminalWebApp {
         ],
         (en, zh) => this.tr(en, zh)
       )}
+      ${renderPortPreviewModal(
+        this.portPreview,
+        this.selectedDaemon?.name || "Host",
+        (en, zh) => this.tr(en, zh)
+      )}
     `;
 
     this.bindCommonNavigation(root);
@@ -5249,6 +5329,7 @@ export class CodaTerminalWebApp {
       this.termSearchIdx = 0;
       this.hostHealthByPeer.clear();
       this.fileBrowser = createInitialFileBrowserState();
+      this.portPreview = createInitialPortPreviewState();
       this.draftInput = "";
       this.pairCommand = null;
       this.latestInviteCode = null;
@@ -5724,6 +5805,9 @@ export class CodaTerminalWebApp {
     document.getElementById("btn-console-files")?.addEventListener("click", () => {
       this.openRemoteFileBrowser();
     });
+    document.getElementById("btn-console-port-preview")?.addEventListener("click", () => {
+      this.openRemotePortPreview();
+    });
     document.getElementById("btn-console-search")?.addEventListener("click", () => {
       this.showTermSearch = !this.showTermSearch;
       this.render();
@@ -5846,6 +5930,40 @@ export class CodaTerminalWebApp {
         } else {
           this.previewRemoteFile(rel);
         }
+      });
+    });
+
+    // Remote Port Preview modal bindings
+    document.getElementById("btn-close-port-preview")?.addEventListener("click", () => {
+      this.portPreview.open = false;
+      this.render();
+    });
+    document.getElementById("port-preview-mask")?.addEventListener("click", (e) => {
+      if ((e.target as HTMLElement).id === "port-preview-mask") {
+        this.portPreview.open = false;
+        this.render();
+      }
+    });
+    document.getElementById("port-preview-form")?.addEventListener("submit", (e) => {
+      e.preventDefault();
+      const pInp = document.getElementById("pp-port-input") as HTMLInputElement | null;
+      const pathInp = document.getElementById("pp-path-input") as HTMLInputElement | null;
+      this.submitRemotePortPreview(
+        pInp ? pInp.value : this.portPreview.portInput,
+        pathInp ? pathInp.value : this.portPreview.pathInput
+      );
+    });
+    root.querySelectorAll<HTMLButtonElement>("[data-pp-port]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const p = btn.dataset.ppPort || "3000";
+        const pathInp = document.getElementById("pp-path-input") as HTMLInputElement | null;
+        this.submitRemotePortPreview(p, pathInp ? pathInp.value : this.portPreview.pathInput);
+      });
+    });
+    root.querySelectorAll<HTMLButtonElement>("[data-pp-tab]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        this.portPreview.viewTab = btn.dataset.ppTab === "render" ? "render" : "source";
+        this.render();
       });
     });
 
