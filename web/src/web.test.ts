@@ -2,6 +2,8 @@ import { describe, expect, test } from "bun:test";
 import { ed25519, x25519 } from "@noble/curves/ed25519";
 import {
   BrowserE2EESession,
+  MAX_HANDSHAKE_SKEW_MS,
+  RelayNonceReplayCache,
   ReplayWindow,
   type WebDeviceIdentity,
   createRelaySessionAuth,
@@ -11,6 +13,7 @@ import {
   loadOrCreateWebIdentity,
   p2pAckV2SigningText,
   p2pHelloV2SigningText,
+  p2pHelloV2SigningTextWithZstd,
   signWebMessage,
   toB64,
   verifyEd25519Signature,
@@ -279,5 +282,56 @@ describe("WebVtTerminal 2D VT100 engine", () => {
     const html = vtAlt.renderHtml();
     expect(html.includes("<script>")).toBe(false);
     expect(html.includes("&lt;script&gt;")).toBe(true);
+  });
+
+  test("handles strict CSI prefixes, colon truecolor SGR, DCS/APC skip, combining marks & alt-screen margins", () => {
+    const vt = new WebVtTerminal(40, 10);
+    // Non-`?` CSI private sequences & intermediates must not pollute SGR or cursor
+    vt.feedText("\x1b[>4;2m\x1b[>1u\x1b[2 qHello");
+    // DCS and APC strings must be skipped until ST
+    vt.feedText("\x1bP+q544e\x1b\\\x1b_Gf=24;AAAA\x1b\\ ");
+    // Colon truecolor SGR with empty colorspace `38:2::56:189:248`
+    vt.feedText("\x1b[38:2::56:189:248mBLUE\x1b[0m");
+    // Combining acute accent attaches to 'e' without advancing cursor
+    vt.feedText(" e\u0301");
+    expect(vt.renderPlainText()).toBe("Hello BLUE e\u0301");
+    const html = vt.renderHtml(true);
+    expect(html.includes("rgb(56,189,248)")).toBe(true);
+    expect(html.includes("term-cursor")).toBe(true);
+
+    // Hide cursor (?25l) removes cursor span; bracketed paste & DECCKM tracked
+    vt.feedText("\x1b[?25l\x1b[?2004h\x1b[?1h");
+    expect(vt.cursorVisible).toBe(false);
+    expect(vt.bracketedPaste).toBe(true);
+    expect(vt.appCursorKeys).toBe(true);
+    expect(vt.renderHtml(true).includes("term-cursor")).toBe(false);
+
+    // Alt-screen isolates scroll margins
+    vt.feedText("\x1b[2;8r\x1b[?1049h\x1b[1;4rALT\x1b[?1049l");
+    expect(vt.renderPlainText()).toBe("Hello BLUE e\u0301");
+  });
+
+  test("Relay v2 supports_zstd signature binding & RelayNonceReplayCache reject tampering/replays", () => {
+    expect(MAX_HANDSHAKE_SKEW_MS).toBe(120_000);
+    const client = makeTestIdentity("web-zstd");
+    const auth = createRelaySessionAuth(client, "c-1", "d-1", Date.now(), true);
+    expect(auth.supports_zstd).toBe(true);
+    // Flipping supports_zstd breaks signature verification
+    expect(() =>
+      verifyRelaySessionAuth(
+        { ...auth, supports_zstd: false },
+        "c-1",
+        "d-1",
+        client.ed25519PublicB64,
+        client.x25519PublicB64
+      )
+    ).toThrow(/signature verification failed/i);
+
+    const cache = new RelayNonceReplayCache();
+    cache.checkAndRemember("d-1", auth.session_nonce_b64);
+    expect(() => cache.checkAndRemember("d-1", auth.session_nonce_b64)).toThrow(/replayed/i);
+
+    const hText = p2pHelloV2SigningTextWithZstd("c-1", "d-1", client.x25519PublicB64, client.x25519PublicB64, 1234, true);
+    expect(hText.endsWith(":zstd=1")).toBe(true);
   });
 });

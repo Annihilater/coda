@@ -1,5 +1,6 @@
 import {
   BrowserE2EESession,
+  RelayNonceReplayCache,
   RelaySessionAuth,
   createRelaySessionAuth,
   fromB64,
@@ -7,7 +8,7 @@ import {
   isTimestampFresh,
   loadOrCreateWebIdentity,
   p2pAckV2SigningText,
-  p2pHelloV2SigningText,
+  p2pHelloV2SigningTextWithZstd,
   signWebMessage,
   toB64,
   verifyEd25519Signature,
@@ -173,6 +174,26 @@ interface VoiceModelConfig {
   base_url: string;
   api_key: string;
   model: string;
+}
+
+interface AuthSessionInfo {
+  id: string;
+  client_label: string;
+  scope: string;
+  device_id?: string | null;
+  created_at: string;
+  last_used_at: string;
+  expires_at: string;
+  is_current: boolean;
+}
+
+interface InviteCodeInfo {
+  code: string;
+  note?: string | null;
+  max_uses: number;
+  used_count: number;
+  expires_at?: string | null;
+  created_at: string;
 }
 
 interface SiteInfo {
@@ -388,10 +409,14 @@ export class CodaTerminalWebApp {
   private pendingActivationCode: string = "";
   private pendingDeviceInfo: DeviceAuthPublicInfo | null = null;
   private activationSuccessMsg = "";
+  private settingsFeedback: { kind: "ok" | "err"; text: string } | null = null;
   private consoleNotice: { kind: "ok" | "err"; text: string } | null = null;
   private copiedToast: "" | "ok" | "manual" = "";
   private user: User | null = null;
+  private allDevices: Device[] = [];
   private devices: Device[] = [];
+  private authSessions: AuthSessionInfo[] = [];
+  private invitesList: InviteCodeInfo[] = [];
   private myClientDevice: Device | null = null;
   private selectedDaemon: Device | null = null;
   private terminals: HerdrTerminal[] = [];
@@ -402,12 +427,22 @@ export class CodaTerminalWebApp {
     api_key: "",
     model: "gpt-4o-mini-transcribe",
   };
+  private voiceApiKeyLocal = "";
   private activeTerminalAddr: string | null = null;
   private draftInput = "";
   private imeComposing = false;
-  private showSidebar = true;
+  private showSidebar = typeof window === "undefined" ? true : window.innerWidth >= 900;
+  private lastIsNarrowViewport = typeof window !== "undefined" && window.innerWidth < 900;
   private showSettingsModal = false;
+  private settingsTab: "devices" | "security" | "voice" = "devices";
+  private showSpawnModal = false;
   private showKeyboardInputBar = false;
+  private isRecordingVoice = false;
+  private isTranscribingVoice = false;
+  private mediaRecorder: MediaRecorder | null = null;
+  private mediaStream: MediaStream | null = null;
+  private voiceChunks: Blob[] = [];
+  private speechRecognition: any = null;
   private pairCommand: string | null = null;
   private latestInviteCode: string | null = null;
   private rttMs: number | null = null;
@@ -429,6 +464,7 @@ export class CodaTerminalWebApp {
   private termResizeObserver: ResizeObserver | null = null;
   private resizeDebounceTimer: ReturnType<typeof setTimeout> | null = null;
   private e2eeSessions = new Map<string, { session: BrowserE2EESession; auth: RelaySessionAuth; confirmed: boolean }>();
+  private seenRelayNonces = new RelayNonceReplayCache();
   private directE2eeSessions = new Map<string, BrowserE2EESession>();
   private vtTerminals = new Map<string, WebVtTerminal>();
   private vtStreamActive = new Set<string>();
@@ -479,7 +515,10 @@ export class CodaTerminalWebApp {
     if (url.hash && this.route === "home") {
       this.render();
       requestAnimationFrame(() => {
-        document.querySelector(url.hash)?.scrollIntoView({ behavior: "smooth" });
+        const targetId = decodeURIComponent(url.hash.slice(1));
+        if (targetId) {
+          document.getElementById(targetId)?.scrollIntoView({ behavior: "smooth" });
+        }
       });
       return;
     }
@@ -619,8 +658,17 @@ export class CodaTerminalWebApp {
     });
 
     window.addEventListener("resize", () => {
-      if (this.route === "console" && this.selectedDaemon && this.activeTerminalAddr) {
-        this.scheduleTerminalResizeSync();
+      if (this.route === "console") {
+        const nowNarrow = window.innerWidth < 900;
+        if (nowNarrow !== this.lastIsNarrowViewport) {
+          this.lastIsNarrowViewport = nowNarrow;
+          if (nowNarrow) this.showSidebar = false;
+          this.render();
+          return;
+        }
+        if (this.selectedDaemon && this.activeTerminalAddr) {
+          this.scheduleTerminalResizeSync();
+        }
       }
     });
 
@@ -902,12 +950,22 @@ export class CodaTerminalWebApp {
     const screenEl = document.getElementById("term-screen-output");
     const boxEl = document.getElementById("term-box");
     if (screenEl && vt && this.vtStreamActive.has(key)) {
-      const wasNearBottom = boxEl
-        ? boxEl.scrollHeight - boxEl.scrollTop - boxEl.clientHeight <= 28
-        : true;
-      screenEl.innerHTML = vt.renderHtml();
-      if (boxEl && wasNearBottom) {
-        boxEl.scrollTop = boxEl.scrollHeight;
+      // Preserve user text selection inside the terminal viewport during live output.
+      const sel = typeof window !== "undefined" ? window.getSelection() : null;
+      const selectingInside =
+        sel &&
+        !sel.isCollapsed &&
+        sel.rangeCount > 0 &&
+        boxEl?.contains(sel.anchorNode);
+      if (!selectingInside) {
+        const prevScrollTop = boxEl ? boxEl.scrollTop : 0;
+        const wasNearBottom = boxEl
+          ? boxEl.scrollHeight - boxEl.scrollTop - boxEl.clientHeight <= 28
+          : true;
+        screenEl.innerHTML = vt.renderHtml(true);
+        if (boxEl) {
+          boxEl.scrollTop = wasNearBottom ? boxEl.scrollHeight : prevScrollTop;
+        }
       }
     }
     const activeTerm = this.terminals.find((t) => t.address === this.activeTerminalAddr);
@@ -943,13 +1001,28 @@ export class CodaTerminalWebApp {
   private computeTerminalDimsFromDom(): { cols: number; rows: number } {
     const box = typeof document !== "undefined" ? document.getElementById("term-box") : null;
     if (box && box.clientWidth > 120 && box.clientHeight > 80) {
-      const cols = Math.max(40, Math.min(240, Math.floor((box.clientWidth - 20) / 7.85)));
-      const rows = Math.max(12, Math.min(90, Math.floor((box.clientHeight - 76) / 21)));
+      let charW = 7.85;
+      let lineH = 21.0;
+      try {
+        const probe = document.createElement("span");
+        probe.textContent = "0000000000";
+        probe.style.cssText =
+          "position:absolute;visibility:hidden;pointer-events:none;white-space:pre;font:inherit;line-height:inherit;";
+        box.appendChild(probe);
+        const rect = probe.getBoundingClientRect();
+        box.removeChild(probe);
+        if (rect.width > 20) charW = rect.width / 10;
+        if (rect.height > 8) lineH = rect.height;
+      } catch {
+        // fallback to defaults
+      }
+      const cols = Math.max(40, Math.min(240, Math.floor((box.clientWidth - 20) / charW)));
+      const rows = Math.max(12, Math.min(90, Math.floor((box.clientHeight - 76) / lineH)));
       return { cols, rows };
     }
     const vw = typeof window !== "undefined" ? window.innerWidth : 1280;
     const vh = typeof window !== "undefined" ? window.innerHeight : 800;
-    const cols = Math.max(40, Math.min(240, Math.floor((vw - (this.showSidebar ? 390 : 80)) / 8.2)));
+    const cols = Math.max(40, Math.min(240, Math.floor((vw - (this.showSidebar && vw >= 900 ? 390 : 80)) / 8.2)));
     const rows = Math.max(12, Math.min(90, Math.floor((vh - 210) / 21)));
     return { cols, rows };
   }
@@ -1050,11 +1123,33 @@ export class CodaTerminalWebApp {
 
   private async refreshDevices() {
     const all: Device[] = await this.api("/api/v1/devices");
+    this.allDevices = all;
     this.devices = all.filter((d) => d.role === "daemon" || d.role === "hybrid");
     if (!this.selectedDaemon && this.devices.length > 0) {
       this.selectedDaemon = this.devices.find((d) => d.is_online) || this.devices[0];
     } else if (this.selectedDaemon) {
       this.selectedDaemon = this.devices.find((d) => d.id === this.selectedDaemon!.id) || null;
+    }
+  }
+
+  private async loadAccountSettingsData() {
+    if (!this.token) return;
+    try {
+      await this.refreshDevices();
+    } catch {
+      // ignore transient error
+    }
+    try {
+      this.authSessions = await this.api("/api/v1/auth/sessions");
+    } catch {
+      this.authSessions = [];
+    }
+    if (this.user?.is_admin) {
+      try {
+        this.invitesList = await this.api("/api/v1/invites");
+      } catch {
+        this.invitesList = [];
+      }
     }
   }
 
@@ -1305,13 +1400,44 @@ export class CodaTerminalWebApp {
     });
   }
 
+  private resetPeerE2eeAndReattach(peerId: string) {
+    const peer = this.devices.find((d) => d.id.toLowerCase() === peerId.toLowerCase());
+    if (!peer) return;
+    this.e2eeSessions.delete(peer.id);
+    this.directE2eeSessions.delete(peer.id);
+    if (this.directWsPeerId === peer.id && this.directWs) {
+      try { this.directWs.close(); } catch {}
+      this.directWs = null;
+      this.directWsPeerId = null;
+      this.activeTransportMode = "relay_ws";
+    }
+    if (this.selectedDaemon?.id === peer.id && peer.is_online) {
+      this.queryDaemonOverview(peer, true);
+      if (this.activeTerminalAddr) {
+        const key = this.vtKey(peer.id, this.activeTerminalAddr);
+        this.vtStreamActive.delete(key);
+        this.attachAndReadTerminal(this.activeTerminalAddr);
+      }
+      void this.tryNegotiateDirectLanWs(peer);
+    }
+  }
+
   private async handleRelayFrame(frame: any) {
+    if (frame.frame_type === "session_reset") {
+      const srcId = String(frame.src_device_id || "");
+      if (srcId) {
+        this.resetPeerE2eeAndReattach(srcId);
+      }
+      return;
+    }
     if (frame.frame_type === "peer_presence") {
+      const devId = String(frame.device_id || "");
+      const wasOnline = this.devices.find((d) => d.id === devId)?.is_online ?? false;
       if (Array.isArray(frame.endpoints)) {
-        const idx = this.devices.findIndex((d) => d.id === frame.device_id);
+        const idx = this.devices.findIndex((d) => d.id === devId);
         if (idx >= 0) {
           this.devices[idx].endpoints_json = frame.endpoints;
-          this.devices[idx].is_online = frame.is_online;
+          this.devices[idx].is_online = Boolean(frame.is_online);
         }
       }
       try {
@@ -1319,9 +1445,14 @@ export class CodaTerminalWebApp {
       } catch {
         // ignore transient refresh failure
       }
-      if (this.selectedDaemon?.is_online) {
-        void this.tryNegotiateDirectLanWs(this.selectedDaemon);
-      } else if (this.directWsPeerId === frame.device_id && !frame.is_online) {
+      if (frame.is_online) {
+        // Host reconnected or restarted: always clear stale E2EE session state and re-handshake/re-attach.
+        if (!wasOnline || this.e2eeSessions.has(devId)) {
+          this.resetPeerE2eeAndReattach(devId);
+        } else if (this.selectedDaemon?.is_online) {
+          void this.tryNegotiateDirectLanWs(this.selectedDaemon);
+        }
+      } else if (this.directWsPeerId === devId) {
         this.directWs?.close();
       }
       if (!this.isTypingIntoInput() && !this.showSettingsModal) {
@@ -1362,6 +1493,7 @@ export class CodaTerminalWebApp {
           peer.ed25519_pubkey,
           peer.x25519_pubkey
         );
+        this.seenRelayNonces.checkAndRemember(peer.id, incomingAuth.session_nonce_b64);
         const fresh = BrowserE2EESession.deriveRelayV2({
           myStaticSecretB64: this.webIdentity.x25519SecretB64,
           peerStaticPublicB64: peer.x25519_pubkey,
@@ -1403,10 +1535,14 @@ export class CodaTerminalWebApp {
 
   private collectDirectWsCandidates(peer: Device): string[] {
     const out: string[] = [];
+    const isLocalOrigin = location.hostname === "127.0.0.1" || location.hostname === "localhost";
     const pushUnique = (u: string) => {
       if (!u) return;
       if (location.protocol === "https:") {
-        const isLocalWs = u.startsWith("ws://127.0.0.1") || u.startsWith("ws://localhost");
+        // On HTTPS pages, browsers block mixed-content `ws://` (even loopback on many hosts);
+        // allow loopback `ws://` ONLY when the page itself is served from localhost/127.0.0.1.
+        const isLocalWs =
+          isLocalOrigin && (u.startsWith("ws://127.0.0.1") || u.startsWith("ws://localhost"));
         if (!u.startsWith("wss://") && !isLocalWs) return;
       }
       if (!out.includes(u)) out.push(u);
@@ -1420,7 +1556,7 @@ export class CodaTerminalWebApp {
       }
     }
 
-    if (location.hostname === "127.0.0.1" || location.hostname === "localhost") {
+    if (isLocalOrigin) {
       pushUnique("ws://127.0.0.1:24444");
     }
     return out;
@@ -1494,12 +1630,13 @@ export class CodaTerminalWebApp {
 
       sock.onopen = () => {
         const tsMs = Date.now();
-        const signedMsg = p2pHelloV2SigningText(
+        const signedMsg = p2pHelloV2SigningTextWithZstd(
           myDevId,
           peer.id,
           this.webIdentity.x25519PublicB64,
           eph.publicB64,
-          tsMs
+          tsMs,
+          true
         );
         const sigB64 = signWebMessage(this.webIdentity, signedMsg);
         sock.send(
@@ -1681,14 +1818,23 @@ export class CodaTerminalWebApp {
     if (msg.op === "workspaces_snapshot") {
       this.repos = msg.repos || [];
       if (msg.voice_config) {
-        this.voiceConfig = msg.voice_config;
+        const incomingKey = String(msg.voice_config.api_key || "");
+        this.voiceConfig = {
+          provider: msg.voice_config.provider || "openai",
+          base_url: msg.voice_config.base_url || "https://api.openai.com/v1",
+          api_key: incomingKey && !incomingKey.startsWith("••") ? incomingKey : this.voiceApiKeyLocal,
+          model: msg.voice_config.model || "gpt-4o-mini-transcribe",
+        };
       }
       if (!this.isTypingIntoInput() && !this.showSettingsModal) this.render();
       return;
     }
 
     if (msg.op === "voice_config_ack" && msg.config) {
-      this.voiceConfig = msg.config;
+      this.voiceConfig = {
+        ...msg.config,
+        api_key: this.voiceApiKeyLocal || msg.config.api_key || "",
+      };
       this.consoleNotice = {
         kind: msg.ok ? "ok" : "err",
         text: msg.ok
@@ -1857,6 +2003,292 @@ export class CodaTerminalWebApp {
       terminal: addr,
       history_lines: 120,
     });
+  }
+
+  private sendPtyInputBytes(bytes: Uint8Array | string) {
+    if (!this.selectedDaemon || !this.activeTerminalAddr) return;
+    const raw = typeof bytes === "string" ? new TextEncoder().encode(bytes) : bytes;
+    if (raw.length === 0) return;
+    this.sendEncrypted(this.selectedDaemon, {
+      op: "pty_input",
+      terminal: this.activeTerminalAddr,
+      data_b64: toB64(raw),
+    });
+  }
+
+  private isSafeVoiceBaseUrl(raw: string): boolean {
+    try {
+      const u = new URL(raw.trim());
+      if (u.protocol === "https:") return true;
+      if (
+        u.protocol === "http:" &&
+        (u.hostname === "127.0.0.1" || u.hostname === "localhost" || u.hostname === "::1")
+      ) {
+        return true;
+      }
+      return false;
+    } catch {
+      return false;
+    }
+  }
+
+  private stopVoiceCaptureResources() {
+    if (this.speechRecognition) {
+      try { this.speechRecognition.stop(); } catch {}
+      this.speechRecognition = null;
+    }
+    if (this.mediaRecorder && this.mediaRecorder.state !== "inactive") {
+      try { this.mediaRecorder.stop(); } catch {}
+    }
+    this.mediaRecorder = null;
+    if (this.mediaStream) {
+      for (const track of this.mediaStream.getTracks()) {
+        try { track.stop(); } catch {}
+      }
+      this.mediaStream = null;
+    }
+  }
+
+  private insertTranscribedText(text: string) {
+    const cleaned = text.trim();
+    if (!cleaned) return;
+    this.draftInput = this.draftInput ? `${this.draftInput} ${cleaned}` : cleaned;
+    this.consoleNotice = {
+      kind: "ok",
+      text: this.tr(`Voice transcribed: "${cleaned}"`, `语音识别完成：「${cleaned}」`),
+    };
+    const desktopInp = document.getElementById("desktop-prompt-input") as HTMLInputElement | null;
+    const kbInp = document.getElementById("kb-input") as HTMLInputElement | null;
+    if (desktopInp) {
+      desktopInp.value = this.draftInput;
+      desktopInp.focus();
+    } else if (kbInp) {
+      kbInp.value = this.draftInput;
+      kbInp.focus();
+    }
+    this.render();
+  }
+
+  private async toggleVoiceInput() {
+    if (this.isTranscribingVoice) return;
+    if (this.isRecordingVoice) {
+      if (this.speechRecognition) {
+        this.isRecordingVoice = false;
+        try { this.speechRecognition.stop(); } catch {}
+        this.speechRecognition = null;
+        this.render();
+        return;
+      }
+      if (this.mediaRecorder && this.mediaRecorder.state === "recording") {
+        this.mediaRecorder.stop();
+        return;
+      }
+      this.isRecordingVoice = false;
+      this.stopVoiceCaptureResources();
+      this.render();
+      return;
+    }
+
+    const effectiveKey = this.voiceApiKeyLocal || this.voiceConfig.api_key || "";
+    const canUseWhisperApi =
+      Boolean(effectiveKey) &&
+      this.isSafeVoiceBaseUrl(this.voiceConfig.base_url) &&
+      typeof navigator !== "undefined" &&
+      Boolean(navigator.mediaDevices?.getUserMedia) &&
+      typeof MediaRecorder !== "undefined";
+
+    if (canUseWhisperApi) {
+      await this.startMediaRecorderVoice(effectiveKey);
+      return;
+    }
+
+    // Fallback to browser Web Speech API when Whisper API key is not configured
+    const SpeechRec = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    if (SpeechRec) {
+      this.startWebSpeechFallback(SpeechRec);
+      return;
+    }
+
+    this.consoleNotice = {
+      kind: "err",
+      text: this.tr(
+        "Configure a Whisper API key in Settings -> Voice, or use a browser supporting Web Speech / MediaRecorder.",
+        "请在「设置 → 语音模型」中配置 Whisper API Key，或使用支持录音/语音识别的现代浏览器。"
+      ),
+    };
+    this.render();
+  }
+
+  private async startMediaRecorderVoice(apiKey: string) {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      this.mediaStream = stream;
+      this.voiceChunks = [];
+      const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
+        ? "audio/webm;codecs=opus"
+        : MediaRecorder.isTypeSupported("audio/mp4")
+          ? "audio/mp4"
+          : "";
+      const recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
+      this.mediaRecorder = recorder;
+      this.isRecordingVoice = true;
+      this.consoleNotice = {
+        kind: "ok",
+        text: this.tr("Recording voice… click Mic again to transcribe.", "正在录音…再次点击麦克风结束并转写。"),
+      };
+      this.render();
+
+      recorder.ondataavailable = (ev) => {
+        if (ev.data && ev.data.size > 0) this.voiceChunks.push(ev.data);
+      };
+      recorder.onstop = async () => {
+        const chunks = [...this.voiceChunks];
+        this.voiceChunks = [];
+        const actualType = recorder.mimeType || mimeType || "audio/webm";
+        this.isRecordingVoice = false;
+        this.mediaRecorder = null;
+        if (this.mediaStream) {
+          for (const t of this.mediaStream.getTracks()) {
+            try { t.stop(); } catch {}
+          }
+          this.mediaStream = null;
+        }
+        if (chunks.length === 0) {
+          this.render();
+          return;
+        }
+        const blob = new Blob(chunks, { type: actualType });
+        await this.transcribeAudioBlob(blob, apiKey, actualType);
+      };
+      recorder.start();
+    } catch (err: any) {
+      this.isRecordingVoice = false;
+      this.stopVoiceCaptureResources();
+      this.consoleNotice = {
+        kind: "err",
+        text: this.tr(
+          `Microphone error: ${err?.message || "permission denied"}`,
+          `麦克风启动失败：${err?.message || "未授予麦克风权限"}`
+        ),
+      };
+      this.render();
+    }
+  }
+
+  private async transcribeAudioBlob(blob: Blob, apiKey: string, mimeType: string) {
+    if (!this.isSafeVoiceBaseUrl(this.voiceConfig.base_url)) {
+      this.consoleNotice = {
+        kind: "err",
+        text: this.tr("Voice Base URL must use https:// (or localhost).", "语音接口 Base URL 必须为 https://（或本机 localhost）。"),
+      };
+      this.render();
+      return;
+    }
+    this.isTranscribingVoice = true;
+    this.consoleNotice = {
+      kind: "ok",
+      text: this.tr("Transcribing audio via Whisper API…", "正在调用 Whisper 接口转写语音…"),
+    };
+    this.render();
+
+    try {
+      const ext = mimeType.includes("mp4") || mimeType.includes("m4a") ? "m4a" : "webm";
+      const base = this.voiceConfig.base_url.trim().replace(/\/+$/, "");
+      const endpoint = base.endsWith("/audio/transcriptions") ? base : `${base}/audio/transcriptions`;
+      const form = new FormData();
+      form.append("file", blob, `voice.${ext}`);
+      form.append("model", (this.voiceConfig.model || "gpt-4o-mini-transcribe").trim());
+      const resp = await fetch(endpoint, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${apiKey}` },
+        body: form,
+      });
+      const textBody = await resp.text();
+      if (!resp.ok) {
+        throw new Error(`HTTP ${resp.status}: ${textBody.slice(0, 160)}`);
+      }
+      let transcribed = "";
+      try {
+        const parsed = JSON.parse(textBody);
+        transcribed = String(parsed.text || "");
+      } catch {
+        transcribed = textBody.trim();
+      }
+      this.isTranscribingVoice = false;
+      if (transcribed.trim()) {
+        this.insertTranscribedText(transcribed);
+      } else {
+        this.consoleNotice = {
+          kind: "err",
+          text: this.tr("Empty transcription returned.", "未识别到有效语音内容。"),
+        };
+        this.render();
+      }
+    } catch (err: any) {
+      this.isTranscribingVoice = false;
+      this.consoleNotice = {
+        kind: "err",
+        text: this.tr(
+          `Whisper transcription failed: ${err?.message || "network error"}`,
+          `Whisper 语音转写失败：${err?.message || "网络错误"}`
+        ),
+      };
+      this.render();
+    }
+  }
+
+  private startWebSpeechFallback(SpeechRecCtor: any) {
+    try {
+      const rec = new SpeechRecCtor();
+      rec.lang = this.locale === "zh" ? "zh-CN" : "en-US";
+      rec.interimResults = false;
+      rec.maxAlternatives = 1;
+      this.speechRecognition = rec;
+      this.isRecordingVoice = true;
+      this.consoleNotice = {
+        kind: "ok",
+        text: this.tr("Listening via browser speech recognition…", "正在使用浏览器语音识别监听中…"),
+      };
+      this.render();
+      rec.onresult = (ev: any) => {
+        const transcript = ev?.results?.[0]?.[0]?.transcript || "";
+        this.isRecordingVoice = false;
+        this.speechRecognition = null;
+        if (transcript) {
+          this.insertTranscribedText(transcript);
+        } else {
+          this.render();
+        }
+      };
+      rec.onerror = (ev: any) => {
+        this.isRecordingVoice = false;
+        this.speechRecognition = null;
+        this.consoleNotice = {
+          kind: "err",
+          text: this.tr(
+            `Speech recognition error: ${ev?.error || "unavailable"}`,
+            `浏览器语音识别失败：${ev?.error || "不可用"}`
+          ),
+        };
+        this.render();
+      };
+      rec.onend = () => {
+        if (this.isRecordingVoice) {
+          this.isRecordingVoice = false;
+          this.speechRecognition = null;
+          this.render();
+        }
+      };
+      rec.start();
+    } catch (err: any) {
+      this.isRecordingVoice = false;
+      this.speechRecognition = null;
+      this.consoleNotice = {
+        kind: "err",
+        text: String(err?.message || this.tr("Voice input unavailable", "无法启动语音输入")),
+      };
+      this.render();
+    }
   }
 
   private formatCursorDraft(str: string): string {
@@ -2333,7 +2765,7 @@ export class CodaTerminalWebApp {
               <div class="pm-hero-actions">
                 ${
                   dl && safeHref(dl.desktop_macos_dmg) !== "#"
-                    ? `<a class="pm-btn pm-btn-primary pm-btn-lg" href="${this.escapeHtml(safeHref(dl.desktop_macos_dmg))}" target="_blank" rel="noopener noreferrer">${svgIcon("apple", 15)} ${this.tr("Download for macOS (.dmg)", "下载 macOS 桌面端 (.dmg)")}</a>`
+                    ? `<a class="pm-btn pm-btn-primary pm-btn-lg" href="${safeHref(dl.desktop_macos_dmg)}" target="_blank" rel="noopener noreferrer">${svgIcon("apple", 15)} ${this.tr("Download for macOS (.dmg)", "下载 macOS 桌面端 (.dmg)")}</a>`
                     : `<a class="pm-btn pm-btn-primary pm-btn-lg" href="#downloads">${svgIcon("laptop", 15)} ${this.tr("Download Clients", "获取全端客户端")}</a>`
                 }
                 <a class="pm-btn pm-btn-secondary pm-btn-lg" href="${this.user ? "/console" : "/login"}" data-nav="${this.user ? "/console" : "/login"}">
@@ -2762,7 +3194,7 @@ export class CodaTerminalWebApp {
                   '任意设备安装后登录同一个 Coda 账号，或通过 <a href="/activate" data-nav="/activate" style="color:var(--signal-blue);text-decoration:underline;"><code>/activate</code></a> 设备码授权即可实时互通。'
                 )}</p>
               </div>
-              ${dl && safeHref(dl.releases_page) !== "#" ? `<a class="pm-btn pm-btn-secondary pm-btn-sm" href="${this.escapeHtml(safeHref(dl.releases_page))}" target="_blank" rel="noopener noreferrer">${this.tr("GitHub Releases &amp; Checksums", "查看 GitHub Releases &amp; Checksums")} ${svgIcon("arrowRight", 13)}</a>` : ""}
+              ${dl && safeHref(dl.releases_page) !== "#" ? `<a class="pm-btn pm-btn-secondary pm-btn-sm" href="${safeHref(dl.releases_page)}" target="_blank" rel="noopener noreferrer">${this.tr("GitHub Releases &amp; Checksums", "查看 GitHub Releases &amp; Checksums")} ${svgIcon("arrowRight", 13)}</a>` : ""}
             </div>
 
             <div class="pm-frame">
@@ -2783,8 +3215,8 @@ export class CodaTerminalWebApp {
                     </p>
                   </div>
                   <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
-                    ${dl && safeHref(dl.desktop_macos_dmg) !== "#" ? `<a class="pm-btn pm-btn-primary pm-btn-sm" href="${this.escapeHtml(safeHref(dl.desktop_macos_dmg))}" target="_blank" rel="noopener noreferrer">${this.tr("Download .dmg", "下载 .dmg 安装包")}</a>` : ""}
-                    ${dl && safeHref(dl.desktop_macos_tar) !== "#" ? `<a class="pm-btn pm-btn-secondary pm-btn-sm" href="${this.escapeHtml(safeHref(dl.desktop_macos_tar))}" target="_blank" rel="noopener noreferrer">${this.tr("Full .tar.gz", "全套 .tar.gz")}</a>` : ""}
+                    ${dl && safeHref(dl.desktop_macos_dmg) !== "#" ? `<a class="pm-btn pm-btn-primary pm-btn-sm" href="${safeHref(dl.desktop_macos_dmg)}" target="_blank" rel="noopener noreferrer">${this.tr("Download .dmg", "下载 .dmg 安装包")}</a>` : ""}
+                    ${dl && safeHref(dl.desktop_macos_tar) !== "#" ? `<a class="pm-btn pm-btn-secondary pm-btn-sm" href="${safeHref(dl.desktop_macos_tar)}" target="_blank" rel="noopener noreferrer">${this.tr("Full .tar.gz", "全套 .tar.gz")}</a>` : ""}
                     <span class="coda-mono" style="font-size:11px;color:var(--text-tertiary);">macOS 14+</span>
                   </div>
                 </div>
@@ -2803,9 +3235,9 @@ export class CodaTerminalWebApp {
                     </p>
                   </div>
                   <div style="display:flex;gap:8px;flex-wrap:wrap;">
-                    ${dl && safeHref(dl.daemon_linux_x64) !== "#" ? `<a class="pm-btn pm-btn-secondary pm-btn-sm" href="${this.escapeHtml(safeHref(dl.daemon_linux_x64))}" target="_blank" rel="noopener noreferrer">Linux x86_64</a>` : ""}
-                    ${dl && safeHref(dl.daemon_linux_arm64) !== "#" ? `<a class="pm-btn pm-btn-secondary pm-btn-sm" href="${this.escapeHtml(safeHref(dl.daemon_linux_arm64))}" target="_blank" rel="noopener noreferrer">Linux ARM64</a>` : ""}
-                    ${dl && safeHref(dl.daemon_macos_arm64) !== "#" ? `<a class="pm-btn pm-btn-secondary pm-btn-sm" href="${this.escapeHtml(safeHref(dl.daemon_macos_arm64))}" target="_blank" rel="noopener noreferrer">macOS Daemon</a>` : ""}
+                    ${dl && safeHref(dl.daemon_linux_x64) !== "#" ? `<a class="pm-btn pm-btn-secondary pm-btn-sm" href="${safeHref(dl.daemon_linux_x64)}" target="_blank" rel="noopener noreferrer">Linux x86_64</a>` : ""}
+                    ${dl && safeHref(dl.daemon_linux_arm64) !== "#" ? `<a class="pm-btn pm-btn-secondary pm-btn-sm" href="${safeHref(dl.daemon_linux_arm64)}" target="_blank" rel="noopener noreferrer">Linux ARM64</a>` : ""}
+                    ${dl && safeHref(dl.daemon_macos_arm64) !== "#" ? `<a class="pm-btn pm-btn-secondary pm-btn-sm" href="${safeHref(dl.daemon_macos_arm64)}" target="_blank" rel="noopener noreferrer">macOS Daemon</a>` : ""}
                   </div>
                 </div>
 
@@ -2817,15 +3249,15 @@ export class CodaTerminalWebApp {
                     </div>
                     <p style="font-size:13px;color:var(--text-secondary);line-height:1.65;">
                       ${this.tr(
-                        'Open this site in iPhone Safari and choose "Add to Home Screen" for full-screen 2-row tactile terminal keys, Whisper voice, and sub-ms LAN P2P—no App Store gate required.',
-                        "使用 iPhone Safari 打开本页面并「添加到主屏幕」，即可零审核全屏使用双排终端触控键盘、Whisper 语音与 E2EE 局域网直连。"
+                        'Open this site in iPhone Safari and choose "Add to Home Screen" for full-screen 2-row tactile terminal keys, Whisper voice, and encrypted relay / LAN access—no App Store gate required.',
+                        "使用 iPhone Safari 打开本页面并「添加到主屏幕」，即可零审核全屏使用双排终端触控键盘、Whisper 语音与端到端加密访问。"
                       )}
                     </p>
                   </div>
                   <div style="display:flex;gap:8px;flex-wrap:wrap;">
                     ${
                       dl?.ios_beta_url && safeHref(dl.ios_beta_url) !== "#"
-                        ? `<a class="pm-btn pm-btn-primary pm-btn-sm" href="${this.escapeHtml(safeHref(dl.ios_beta_url))}" target="_blank" rel="noopener noreferrer">${this.tr("Open TestFlight Beta", "打开 TestFlight Beta")}</a>`
+                        ? `<a class="pm-btn pm-btn-primary pm-btn-sm" href="${safeHref(dl.ios_beta_url)}" target="_blank" rel="noopener noreferrer">${this.tr("Open TestFlight Beta", "打开 TestFlight Beta")}</a>`
                         : `<a class="pm-btn pm-btn-secondary pm-btn-sm" href="${this.user ? "/console" : "/login"}" data-nav="${this.user ? "/console" : "/login"}">${this.tr("Open Mobile Web Console", "打开 Web 移动端控制台")}</a>`
                     }
                   </div>
@@ -2845,8 +3277,8 @@ export class CodaTerminalWebApp {
                     </p>
                   </div>
                   <div style="display:flex;gap:8px;flex-wrap:wrap;">
-                    ${dl && safeHref(dl.deploy_bundle) !== "#" ? `<a class="pm-btn pm-btn-secondary pm-btn-sm" href="${this.escapeHtml(safeHref(dl.deploy_bundle))}" target="_blank" rel="noopener noreferrer">${this.tr("Download deploy-bundle", "下载 deploy-bundle")}</a>` : ""}
-                    ${dl && safeHref(dl.releases_page) !== "#" ? `<a class="pm-btn pm-btn-secondary pm-btn-sm" href="${this.escapeHtml(safeHref(dl.releases_page))}" target="_blank" rel="noopener noreferrer">GitHub Releases</a>` : ""}
+                    ${dl && safeHref(dl.deploy_bundle) !== "#" ? `<a class="pm-btn pm-btn-secondary pm-btn-sm" href="${safeHref(dl.deploy_bundle)}" target="_blank" rel="noopener noreferrer">${this.tr("Download deploy-bundle", "下载 deploy-bundle")}</a>` : ""}
+                    ${dl && safeHref(dl.releases_page) !== "#" ? `<a class="pm-btn pm-btn-secondary pm-btn-sm" href="${safeHref(dl.releases_page)}" target="_blank" rel="noopener noreferrer">GitHub Releases</a>` : ""}
                   </div>
                 </div>
               </div>
@@ -2918,7 +3350,7 @@ export class CodaTerminalWebApp {
                 <a href="#downloads">${this.tr("macOS Desktop (.dmg)", "macOS 桌面端 (.dmg)")}</a>
                 <a href="#downloads">Linux / macOS Daemon</a>
                 <a href="#downloads">Docker + CF Tunnel</a>
-                ${dl && safeHref(dl.releases_page) !== "#" ? `<a href="${this.escapeHtml(safeHref(dl.releases_page))}" target="_blank" rel="noopener noreferrer">${this.tr("GitHub Releases (Latest)", "GitHub Releases (最新版)")}</a>` : ""}
+                ${dl && safeHref(dl.releases_page) !== "#" ? `<a href="${safeHref(dl.releases_page)}" target="_blank" rel="noopener noreferrer">${this.tr("GitHub Releases (Latest)", "GitHub Releases (最新版)")}</a>` : ""}
               </div>
             </div>
             <div>
@@ -3023,7 +3455,7 @@ export class CodaTerminalWebApp {
             </button>
             ${
               dl && safeHref(dl.desktop_macos_dmg) !== "#"
-                ? `<a class="cmd-row" href="${this.escapeHtml(safeHref(dl.desktop_macos_dmg))}" target="_blank" rel="noopener noreferrer">
+                ? `<a class="cmd-row" href="${safeHref(dl.desktop_macos_dmg)}" target="_blank" rel="noopener noreferrer">
                     <span style="display:inline-flex;align-items:center;gap:8px;">${svgIcon("laptop", 14)} ${this.tr("Download macOS Desktop (.dmg)", "下载 macOS 桌面端 (.dmg)")}</span>
                     <span class="pm-badge">${this.tr("Latest", "最新版")}</span>
                   </a>`
@@ -3269,7 +3701,7 @@ export class CodaTerminalWebApp {
         this.token = res.token;
         this.user = res.user;
         this.errorMsg = "";
-        this.saveSessionToken(res.token);
+        saveSessionToken(res.token);
         await this.bootstrapMesh();
         if (this.pendingActivationCode) {
           this.navigate(`/activate?code=${encodeURIComponent(this.pendingActivationCode)}`);
@@ -3371,9 +3803,9 @@ export class CodaTerminalWebApp {
                     `批准此设备接入 @${this.escapeHtml(this.user.handle)} 的网络`
                   )}
                 </button>
-                <a href="/console" data-nav="/console" class="pm-btn pm-btn-secondary pm-btn-lg" style="width:100%;">
+                <button id="btn-cancel-activate" type="button" class="pm-btn pm-btn-secondary pm-btn-lg" style="width:100%;">
                   ${this.tr("Cancel &amp; Return to Console", "取消并返回在线控制台")}
-                </a>
+                </button>
               </div>
             `
                 : `
@@ -3395,6 +3827,13 @@ export class CodaTerminalWebApp {
     `;
 
     this.bindCommonNavigation(root);
+
+    document.getElementById("btn-cancel-activate")?.addEventListener("click", () => {
+      this.pendingActivationCode = "";
+      this.pendingDeviceInfo = null;
+      this.errorMsg = "";
+      this.navigate("/console");
+    });
 
     document.getElementById("activate-lookup-form")?.addEventListener("submit", async (e) => {
       e.preventDefault();
@@ -3454,10 +3893,10 @@ export class CodaTerminalWebApp {
     const activeVt = selectedVtKey ? this.vtTerminals.get(selectedVtKey) : undefined;
     const initialVtHtml =
       activeVt && this.vtStreamActive.has(selectedVtKey)
-        ? activeVt.renderHtml()
+        ? activeVt.renderHtml(true)
         : this.tr(
-            `  - Connected to PostgreSQL 18 multi-tenant control plane &amp; E2EE tunnel (X25519 + ChaCha20-Poly1305)\n  - Local Herdr Core online. Use '+' on the right rail to launch Claude Code / Codex / Gemini CLI.\n\n* Ready · ${this.rttMs !== null ? `RTT ${this.rttMs}ms` : "Relay WSS :443 & Direct LAN P2P Ready"}`,
-            `  - 已连接 PostgreSQL 18 多租户控制面与端到端加密隧道 (X25519 + ChaCha20-Poly1305)\n  - 本机 Herdr Core 在线，随时可通过右侧「+」拉起 Claude Code / Codex / Gemini CLI\n\n* Ready · ${this.rttMs !== null ? `RTT ${this.rttMs}ms` : "Relay WSS :443 & Direct LAN P2P Ready"}`
+            `  - Connected to PostgreSQL 18 multi-tenant control plane &amp; E2EE tunnel (X25519 + ChaCha20-Poly1305)\n  - Local Herdr Core online. Use '+' on the right rail to launch Shell / Claude Code / Codex / Gemini CLI.\n\n* Ready · ${this.rttMs !== null ? `RTT ${this.rttMs}ms` : "Relay WSS :443 Ready"}`,
+            `  - 已连接 PostgreSQL 18 多租户控制面与端到端加密隧道 (X25519 + ChaCha20-Poly1305)\n  - 本机 Herdr Core 在线，随时可通过右侧「+」拉起 Shell / Claude Code / Codex / Gemini CLI\n\n* Ready · ${this.rttMs !== null ? `RTT ${this.rttMs}ms` : "Relay WSS :443 Ready"}`
           );
     const modeLabel =
       this.activeTransportMode === "lan_ws"
@@ -3470,13 +3909,39 @@ export class CodaTerminalWebApp {
           ? "LAN Direct :24444"
           : "Relay WSS :443";
 
+    const feedbackBanner = this.settingsFeedback
+      ? `<div style="padding:9px 11px;border-radius:8px;font-size:12px;margin-bottom:10px;border:1px solid ${
+          this.settingsFeedback.kind === "err" ? "var(--rose-bd)" : "var(--emerald-bd)"
+        };background:${
+          this.settingsFeedback.kind === "err" ? "var(--rose-bg)" : "var(--emerald-bg)"
+        };color:${this.settingsFeedback.kind === "err" ? "var(--rose)" : "var(--emerald)"};">${this.escapeHtml(
+          this.settingsFeedback.text
+        )}</div>`
+      : this.activationSuccessMsg
+        ? `<div style="background:var(--emerald-bg);border:1px solid var(--emerald-bd);color:var(--emerald);padding:9px 11px;border-radius:8px;font-size:12px;margin-bottom:10px;">${this.escapeHtml(
+            this.activationSuccessMsg
+          )}</div>`
+        : "";
+
+    const micBtnClass = this.isRecordingVoice ? "is-recording" : "";
+    const micLabel = this.isTranscribingVoice
+      ? this.tr("Transcribing…", "转写中…")
+      : this.isRecordingVoice
+        ? this.tr("Stop", "停止")
+        : "";
+
     root.innerHTML = `
       <div class="shell-root">
+        ${
+          this.showSidebar && isNarrowViewport
+            ? `<div class="sidebar-backdrop" id="sidebar-backdrop"></div>`
+            : ""
+        }
         ${
           this.showSidebar
             ? `
           <!-- LEFT SIDEBAR: Account + Machine/Repo/Branch List -->
-          <aside class="left-sidebar">
+          <aside class="left-sidebar ${isNarrowViewport ? "drawer-mobile" : ""}">
             <div style="padding:14px 16px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--border-primary);">
               <div style="display:flex;align-items:center;gap:10px;min-width:0;">
                 ${codaLogoSVG(24)}
@@ -3489,7 +3954,7 @@ export class CodaTerminalWebApp {
                 </div>
               </div>
               <div style="display:flex;gap:6px;">
-                <button id="btn-open-settings" class="circle-btn" title="${this.tr("Device pairing, invites & settings", "配对机器与好友邀请码")}">${svgIcon("settings", 14)}</button>
+                <button id="btn-open-settings" class="circle-btn" title="${this.tr("Devices, security & settings", "设备管理、安全与设置")}">${svgIcon("settings", 14)}</button>
                 <button id="btn-collapse-sidebar" class="circle-btn" title="${this.tr("Collapse sidebar", "收起侧边栏")}">${svgIcon("sidebar", 14)}</button>
               </div>
             </div>
@@ -3525,7 +3990,7 @@ export class CodaTerminalWebApp {
                                     )}</div>`;
                               return `
                           <div class="branch-item ${this.activeTerminalAddr === t.address ? "active" : ""}" data-term="${this.escapeHtml(t.address)}">
-                            <div style="display:flex;align-items:center;gap:10px;min-width:0;">
+                            <div style="display:flex;align-items:center;gap:10px;min-width:0;flex:1;">
                               ${codaNodeDotSVG(t.alive ? "#e06c50" : "#52525b")}
                               <div style="min-width:0;">
                                 <div class="coda-mono" style="font-size:13px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
@@ -3536,7 +4001,10 @@ export class CodaTerminalWebApp {
                                 </div>
                               </div>
                             </div>
-                            ${rightMeta}
+                            <div style="display:flex;align-items:center;gap:6px;flex-shrink:0;">
+                              ${rightMeta}
+                              <button type="button" data-kill-term="${this.escapeHtml(t.address)}" title="${this.tr("Close & terminate PTY", "终止并关闭终端")}" style="background:none;border:none;color:var(--text-tertiary);cursor:pointer;padding:2px 4px;border-radius:4px;font-size:13px;line-height:1;">&times;</button>
+                            </div>
                           </div>
                         `;
                             })
@@ -3609,8 +4077,8 @@ export class CodaTerminalWebApp {
             </div>
           </div>
 
-          <!-- Live Terminal Viewport -->
-          <div class="term-viewport" id="term-box">${
+          <!-- Live Terminal Viewport (focusable for direct keyboard input) -->
+          <div class="term-viewport" id="term-box" tabindex="0" aria-label="${this.tr("Interactive Terminal Viewport", "交互式终端视口")}">${
             this.consoleNotice
               ? `<div style="margin-bottom:10px;padding:8px 10px;border-radius:8px;font-size:12px;border:1px solid ${
                   this.consoleNotice.kind === "err" ? "var(--rose-bd, rgba(244,63,94,0.35))" : "var(--emerald-bd)"
@@ -3619,10 +4087,14 @@ export class CodaTerminalWebApp {
                 };color:${this.consoleNotice.kind === "err" ? "var(--rose)" : "var(--emerald)"};">${this.escapeHtml(this.consoleNotice.text)}</div>`
               : ""
           }<div id="term-screen-output" style="white-space:pre;overflow-x:auto;">${initialVtHtml}</div>
-<div style="margin-top:14px;border-top:1px solid var(--border-primary);padding-top:6px;border-bottom:1px solid var(--border-primary);padding-bottom:6px;">&gt; ${this.formatCursorDraft(
-            this.draftInput
-          )}</div>
-<div id="term-footer-meta" style="font-size:12px;color:var(--text-tertiary);margin-top:4px;">${this.escapeHtml(footerTransport)} &middot; E2EE X25519 + ChaCha20 &middot; ${this.termCols}&times;${this.termRows} &middot; ${this.terminals.length} PTY</div></div>
+${
+  this.draftInput
+    ? `<div style="margin-top:14px;border-top:1px solid var(--border-primary);padding-top:6px;border-bottom:1px solid var(--border-primary);padding-bottom:6px;">&gt; ${this.formatCursorDraft(
+        this.draftInput
+      )}</div>`
+    : ""
+}
+<div id="term-footer-meta" style="font-size:12px;color:var(--text-tertiary);margin-top:8px;">${this.escapeHtml(footerTransport)} &middot; E2EE X25519 + ChaCha20 &middot; ${this.termCols}&times;${this.termRows} &middot; ${this.terminals.length} PTY &middot; ${this.tr("Click terminal for direct keys", "点击终端区域即可直接键入")}</div></div>
 
           ${
             this.showKeyboardInputBar
@@ -3630,8 +4102,8 @@ export class CodaTerminalWebApp {
             <form id="kb-form" style="display:flex;gap:8px;margin-bottom:8px;">
               <input id="kb-input" class="pm-input" style="margin:0;flex:1;" value="${this.escapeHtml(
                 this.draftInput
-              )}" placeholder="${this.tr("Type a command or prompt for Herdr PTY...", "输入命令或中文 Prompt 发送至当前 Herdr 终端...")}" autofocus />
-              <button type="submit" class="pm-btn pm-btn-primary">${this.tr("OK", "确定")}</button>
+              )}" placeholder="${this.tr("Type command or prompt (sends directly)…", "输入命令或中文 Prompt（回车直发终端）…")}" autofocus />
+              <button type="submit" class="pm-btn pm-btn-primary">${this.tr("Send", "发送")}</button>
             </form>
           `
               : ""
@@ -3641,29 +4113,33 @@ export class CodaTerminalWebApp {
             renderTouchKeypad
               ? `
           <!-- Mobile 2-Row Tactile Keypad + Tall Enter -->
+          ${
+            !isNarrowViewport && this.showMobileKeypadOnDesktop
+              ? `<div style="display:flex;justify-content:flex-end;margin-bottom:4px;">
+                  <button type="button" id="btn-hide-touch-pad" class="pm-btn pm-btn-ghost pm-btn-sm">${svgIcon("keyboard", 13)} ${this.tr("Back to Desktop Input Bar", "切回桌面输入框")}</button>
+                </div>`
+              : ""
+          }
           <div class="keypad-grid">
             <div class="keypad-left">
               <div class="keypad-row">
-                <button data-k="esc" class="k-btn" style="grid-column:span 2;">esc</button>
-                <button data-k="shift+tab" class="k-btn" style="grid-column:span 2;">tab</button>
-                <button id="btn-kb-toggle" class="k-btn" style="grid-column:span 3;display:flex;justify-content:space-around;padding:0 10px;">
-                  ${svgIcon("keyboard", 14)}
-                  <span style="width:1px;height:14px;background:var(--border-strong);"></span>
-                  ${svgIcon("mic", 14)}
-                </button>
-                <button data-k="up" class="k-btn" style="grid-column:span 1;">↑</button>
-                <button data-k="backspace" class="k-btn" style="grid-column:span 2;">⌫</button>
+                <button type="button" data-k="esc" class="k-btn" style="grid-column:span 2;">esc</button>
+                <button type="button" data-k="tab" class="k-btn" style="grid-column:span 2;">tab</button>
+                <button type="button" id="btn-kb-toggle" class="k-btn" style="grid-column:span 2;" title="${this.tr("Toggle text input bar", "切换文字输入栏")}">${svgIcon("keyboard", 14)}</button>
+                <button type="button" id="btn-voice-mic" class="k-btn ${micBtnClass}" style="grid-column:span 1;" title="${this.tr("Voice input (Whisper / Speech)", "语音输入 (Whisper / 语音识别)")}">${svgIcon("mic", 14)}</button>
+                <button type="button" data-k="up" class="k-btn" style="grid-column:span 1;">↑</button>
+                <button type="button" data-k="backspace" class="k-btn" style="grid-column:span 2;">⌫</button>
               </div>
               <div class="keypad-row">
-                <button data-k="ctrl+c" class="k-btn" style="grid-column:span 2;color:var(--coral);font-weight:600;">^C</button>
-                <button data-k="ctrl+d" class="k-btn" style="grid-column:span 2;font-weight:600;">^D</button>
-                <button data-k="slash" class="k-btn" style="grid-column:span 2;font-weight:600;">/</button>
-                <button data-k="left" class="k-btn" style="grid-column:span 1;">←</button>
-                <button data-k="down" class="k-btn" style="grid-column:span 2;">↓</button>
-                <button data-k="right" class="k-btn" style="grid-column:span 1;">→</button>
+                <button type="button" data-k="ctrl+c" class="k-btn" style="grid-column:span 2;color:var(--coral);font-weight:600;">^C</button>
+                <button type="button" data-k="ctrl+d" class="k-btn" style="grid-column:span 2;font-weight:600;">^D</button>
+                <button type="button" data-k="slash" class="k-btn" style="grid-column:span 2;font-weight:600;">/</button>
+                <button type="button" data-k="left" class="k-btn" style="grid-column:span 1;">←</button>
+                <button type="button" data-k="down" class="k-btn" style="grid-column:span 2;">↓</button>
+                <button type="button" data-k="right" class="k-btn" style="grid-column:span 1;">→</button>
               </div>
             </div>
-            <button data-k="enter" class="k-enter">↵</button>
+            <button type="button" data-k="enter" class="k-enter">↵</button>
           </div>`
               : `
           <!-- Desktop Prompt Composer Bar -->
@@ -3672,7 +4148,8 @@ export class CodaTerminalWebApp {
               <span class="coda-mono" style="color:var(--emerald);font-weight:700;">&gt;</span>
               <input id="desktop-prompt-input" class="desktop-composer-inp" value="${this.escapeHtml(
                 this.draftInput
-              )}" placeholder="${this.tr("Send command or prompt to active Herdr / Agent PTY... (Enter to send)", "向当前 Herdr / Agent 终端发送指令或 Prompt... (Enter 发送)")}" autocomplete="off" />
+              )}" placeholder="${this.tr("Send command or prompt (or click terminal above for raw keystrokes)...", "发送命令/Prompt（或点击上方终端区域直连按键）...")}" autocomplete="off" />
+              <button type="button" id="btn-voice-mic-desktop" class="pm-btn pm-btn-ghost pm-btn-sm ${micBtnClass}" title="${this.tr("Voice input (Whisper / Speech)", "语音输入 (Whisper / 语音识别)")}">${svgIcon("mic", 14)}${micLabel ? ` <span>${this.escapeHtml(micLabel)}</span>` : ""}</button>
               <button type="button" data-k="ctrl+c" class="pm-btn pm-btn-ghost pm-btn-sm" style="color:var(--coral);">^C</button>
               <button type="button" id="btn-toggle-touch-pad" class="pm-btn pm-btn-ghost pm-btn-sm" title="${this.tr("Toggle virtual keypad", "切换触控虚拟键盘")}">${svgIcon("keyboard", 14)}</button>
               <button type="submit" class="pm-btn pm-btn-primary pm-btn-sm">${this.tr("Send", "发送")}</button>
@@ -3704,9 +4181,9 @@ export class CodaTerminalWebApp {
               this.showSidebar ? svgIcon("chevronLeft", 14) : svgIcon("chevronRight", 14)
             }</button>
             <div class="rail-capsule">
-              <button id="rail-spawn-btn" title="${this.tr("Spawn new Herdr terminal", "新建 Herdr 终端")}">${svgIcon("plus", 15)}</button>
+              <button id="rail-spawn-btn" title="${this.tr("Launch Shell / Claude / Codex / Gemini", "新建 Shell / Claude / Codex / Gemini 终端")}">${svgIcon("plus", 15)}</button>
               <span style="width:16px;height:1px;background:var(--border-primary);"></span>
-              <button id="rail-more-btn" title="${this.tr("System settings &amp; pairing", "系统设置与配对")}">${svgIcon("more", 15)}</button>
+              <button id="rail-more-btn" title="${this.tr("System settings &amp; account", "系统设置与账号管理")}">${svgIcon("more", 15)}</button>
             </div>
           </div>
 
@@ -3718,6 +4195,47 @@ export class CodaTerminalWebApp {
           </div>
         </aside>
       </div>
+
+      ${
+        this.showSpawnModal
+          ? `
+        <div class="modal-mask" id="spawn-modal-bg">
+          <div class="modal-card">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+              <strong style="font-size:15px;">${this.tr("Launch Remote Terminal / AI Agent", "启动远端终端 / AI Agent")}</strong>
+              <button id="btn-close-spawn" type="button" class="circle-btn" style="width:28px;height:28px;">${svgIcon("close", 13)}</button>
+            </div>
+            <form id="spawn-agent-form" style="display:flex;flex-direction:column;gap:10px;">
+              <div>
+                <label style="font-size:11.5px;color:var(--text-secondary);display:block;margin-bottom:4px;">${this.tr("Agent / Runtime", "启动类型")}</label>
+                <select name="agent" class="pm-input" style="margin:0;">
+                  <option value="shell">Shell (Interactive PTY)</option>
+                  <option value="claude">Claude Code</option>
+                  <option value="codex">Codex CLI</option>
+                  <option value="gemini">Gemini CLI</option>
+                </select>
+              </div>
+              <div>
+                <label style="font-size:11.5px;color:var(--text-secondary);display:block;margin-bottom:4px;">${this.tr("Working Directory (optional)", "工作目录（可选）")}</label>
+                <input name="cwd" class="pm-input coda-mono" style="margin:0;" list="spawn-cwd-list" value="${this.escapeHtml(activeTerm?.cwd || "")}" placeholder="${this.tr("Leave blank for host default", "留空使用主机默认目录")}" />
+                <datalist id="spawn-cwd-list">
+                  ${allBranches.map((b) => `<option value="${this.escapeHtml(b.worktree_path)}"></option>`).join("")}
+                  ${this.repos.map((r) => `<option value="${this.escapeHtml(r.root_path)}"></option>`).join("")}
+                </datalist>
+              </div>
+              <div>
+                <label style="font-size:11.5px;color:var(--text-secondary);display:block;margin-bottom:4px;">${this.tr("Initial Prompt (optional)", "初始指令 / Prompt（可选）")}</label>
+                <input name="initial_prompt" class="pm-input" style="margin:0;" placeholder="${this.tr("e.g. Inspect git status and run tests", "如：查看 git status 并运行测试")}" />
+              </div>
+              <button type="submit" class="pm-btn pm-btn-primary" style="width:100%;margin-top:4px;">
+                ${svgIcon("plus", 14)} ${this.tr("Launch on Host", "在远端主机启动")}
+              </button>
+            </form>
+          </div>
+        </div>
+      `
+          : ""
+      }
 
       ${
         this.pendingActivationCode
@@ -3755,67 +4273,160 @@ export class CodaTerminalWebApp {
         <div class="modal-mask" id="modal-bg">
           <div class="modal-card">
             <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
-              <strong style="font-size:15px;">${this.tr("Devices, Pairing &amp; Voice Model", "接入新设备、授权码与语音模型配置")}</strong>
+              <strong style="font-size:15px;">${this.tr("Workspace &amp; Account Settings", "工作区与账号设置")}</strong>
               <button id="btn-close-modal" class="circle-btn" style="width:28px;height:28px;">${svgIcon("close", 13)}</button>
             </div>
-            <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;padding-bottom:12px;margin-bottom:12px;border-bottom:1px solid var(--border-primary);">
-              <span style="font-size:12px;color:var(--text-secondary);">${this.tr("Interface Language &amp; Theme", "界面语言与外观主题")}</span>
-              <div style="display:flex;align-items:center;gap:8px;">
-                ${this.renderLangSwitcher()}
-                ${this.renderThemeSwitcher()}
-              </div>
+            <div class="pm-auth-tabs" style="grid-template-columns:repeat(3,minmax(0,1fr));margin-bottom:14px;">
+              <button type="button" class="pm-auth-tab ${this.settingsTab === "devices" ? "active" : ""}" data-settings-tab="devices">${this.tr("Devices", "设备管理")}</button>
+              <button type="button" class="pm-auth-tab ${this.settingsTab === "security" ? "active" : ""}" data-settings-tab="security">${this.tr("Security", "安全与邀请")}</button>
+              <button type="button" class="pm-auth-tab ${this.settingsTab === "voice" ? "active" : ""}" data-settings-tab="voice">${this.tr("Voice & Prefs", "语音与偏好")}</button>
             </div>
+            ${feedbackBanner}
             ${
-              this.activationSuccessMsg
-                ? `<div style="background:var(--emerald-bg);border:1px solid var(--emerald-bd);color:var(--emerald);padding:9px 11px;border-radius:8px;font-size:12px;margin-bottom:10px;">${this.escapeHtml(this.activationSuccessMsg)}</div>`
-                : ""
-            }
-            <div class="coda-mono" style="background:var(--bg-elevated);border:1px solid var(--border-primary);padding:10px;border-radius:8px;font-size:11px;margin-bottom:10px;word-break:break-all;">
-              ${this.tr("Run on any Linux / macOS host and open the activation link:", "在任意 Linux / Mac 终端执行后打开返回的激活链接：")}<br/>
-              <span style="color:var(--emerald);">${this.escapeHtml(installCmd)}</span>
-            </div>
-            <form id="quick-approve-form" style="display:flex;gap:8px;margin-bottom:12px;">
-              <input name="user_code" class="pm-input" style="margin:0;flex:1;" placeholder="${this.tr("Enter device code, e.g. ABCD-2345", "输入终端设备码 如 ABCD-2345")}" />
-              <button type="submit" class="pm-btn pm-btn-secondary">${this.tr("Approve", "授权接入")}</button>
-            </form>
-            <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;">
-              <button id="btn-gen-pair" class="pm-btn pm-btn-secondary pm-btn-sm">${this.tr("+ 6-Digit Pair Token", "+ 生成 6 位配对码")}</button>
+              this.settingsTab === "devices"
+                ? `
+              <div class="coda-mono" style="background:var(--bg-elevated);border:1px solid var(--border-primary);padding:10px;border-radius:8px;font-size:11px;margin-bottom:10px;word-break:break-all;">
+                ${this.tr("Run on any Linux / macOS host and open the activation link:", "在任意 Linux / Mac 终端执行后打开返回的激活链接：")}<br/>
+                <span style="color:var(--emerald);">${this.escapeHtml(installCmd)}</span>
+              </div>
+              <form id="quick-approve-form" style="display:flex;gap:8px;margin-bottom:12px;">
+                <input name="user_code" class="pm-input" style="margin:0;flex:1;" placeholder="${this.tr("Enter device code, e.g. ABCD-2345", "输入终端设备码 如 ABCD-2345")}" />
+                <button type="submit" class="pm-btn pm-btn-secondary">${this.tr("Approve", "授权接入")}</button>
+              </form>
+              <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;">
+                <button id="btn-gen-pair" type="button" class="pm-btn pm-btn-secondary pm-btn-sm">${this.tr("+ 6-Digit Pair Token", "+ 生成 6 位配对码")}</button>
+                <button id="btn-go-home" type="button" class="pm-btn pm-btn-secondary pm-btn-sm">${this.tr("Home", "官网首页")}</button>
+                <button id="btn-logout" type="button" class="pm-btn pm-btn-secondary pm-btn-sm" style="color:var(--rose);">${this.tr("Sign Out", "退出登录")}</button>
+              </div>
               ${
-                this.user.is_admin
-                  ? `<button id="btn-gen-invite" class="pm-btn pm-btn-secondary pm-btn-sm">${this.tr("+ Issue Invite Code", "+ 签发邀请码")}</button>`
+                this.pairCommand
+                  ? `<div class="coda-mono" style="background:var(--bg-elevated);border:1px dashed var(--emerald);padding:10px;border-radius:8px;font-size:11.5px;margin-bottom:12px;word-break:break-all;">
+                      ${this.tr("One-line install &amp; pair on macOS / Linux:", "在 Mac / Linux 一键安装并配对：")}<br/>${this.escapeHtml(this.pairCommand)}
+                    </div>`
                   : ""
               }
-              <button id="btn-go-home" type="button" class="pm-btn pm-btn-secondary pm-btn-sm">${this.tr("Home", "官网首页")}</button>
-              <button id="btn-logout" class="pm-btn pm-btn-secondary pm-btn-sm" style="color:var(--rose);">${this.tr("Sign Out", "退出登录")}</button>
-            </div>
-            ${
-              this.pairCommand
-                ? `<div class="coda-mono" style="background:var(--bg-elevated);border:1px dashed var(--emerald);padding:10px;border-radius:8px;font-size:12px;margin-bottom:10px;word-break:break-all;">
-                    ${this.tr("One-line install &amp; pair on macOS / Linux:", "在 Mac / Linux 一键安装并配对：")}<br/>${this.escapeHtml(this.pairCommand)}
-                  </div>`
-                : ""
+              <div style="font-size:12px;font-weight:600;margin-bottom:6px;color:var(--text-secondary);">
+                ${this.tr(`All Devices &amp; Clients (${this.allDevices.length})`, `全部节点与客户端设备 (${this.allDevices.length})`)}
+              </div>
+              <div style="display:flex;flex-direction:column;gap:6px;max-height:240px;overflow-y:auto;">
+                ${this.allDevices
+                  .map(
+                    (dev) => `
+                  <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 10px;border-radius:8px;background:var(--bg-elevated);border:1px solid var(--border-primary);">
+                    <div style="min-width:0;flex:1;">
+                      <div style="font-size:12.5px;font-weight:500;display:flex;align-items:center;gap:6px;">
+                        <span style="width:7px;height:7px;border-radius:99px;background:${dev.is_online ? "var(--emerald)" : "var(--text-quaternary)"};flex-shrink:0;"></span>
+                        <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${this.escapeHtml(dev.name)}</span>
+                      </div>
+                      <div class="coda-mono" style="font-size:10.5px;color:var(--text-tertiary);margin-top:2px;">${this.escapeHtml(dev.platform)} &middot; ${this.escapeHtml(dev.role)}${dev.id === this.myClientDevice?.id ? " (this tab)" : ""}</div>
+                    </div>
+                    <div style="display:flex;gap:6px;flex-shrink:0;">
+                      <button type="button" class="pm-btn pm-btn-ghost pm-btn-sm" data-rename-dev="${this.escapeHtml(dev.id)}" data-dev-name="${this.escapeHtml(dev.name)}">${this.tr("Rename", "重命名")}</button>
+                      <button type="button" class="pm-btn pm-btn-ghost pm-btn-sm" style="color:var(--rose);" data-delete-dev="${this.escapeHtml(dev.id)}">${this.tr("Remove", "移除")}</button>
+                    </div>
+                  </div>
+                `
+                  )
+                  .join("")}
+              </div>
+            `
+                : this.settingsTab === "security"
+                  ? `
+              <div style="margin-bottom:14px;">
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+                  <strong style="font-size:12.5px;">${this.tr(`Active Sessions (${this.authSessions.length})`, `活跃登录会话 (${this.authSessions.length})`)}</strong>
+                  <button type="button" id="btn-logout-all" class="pm-btn pm-btn-secondary pm-btn-sm" style="color:var(--rose);">${this.tr("Sign Out All", "全部下线")}</button>
+                </div>
+                <div style="display:flex;flex-direction:column;gap:6px;max-height:140px;overflow-y:auto;">
+                  ${this.authSessions
+                    .map(
+                      (s) => `
+                    <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:7px 10px;border-radius:8px;background:var(--bg-elevated);border:1px solid var(--border-primary);font-size:11.5px;">
+                      <div style="min-width:0;flex:1;">
+                        <div style="font-weight:500;">${this.escapeHtml(s.client_label)}${s.is_current ? ` <span class="pm-badge green">${this.tr("Current", "当前")}</span>` : ""}</div>
+                        <div class="coda-mono" style="font-size:10px;color:var(--text-tertiary);">${this.escapeHtml(s.scope)} &middot; ${this.escapeHtml(String(s.last_used_at || "").slice(0, 16))}</div>
+                      </div>
+                      ${
+                        !s.is_current
+                          ? `<button type="button" class="pm-btn pm-btn-ghost pm-btn-sm" style="color:var(--rose);" data-revoke-session="${this.escapeHtml(s.id)}">${this.tr("Revoke", "吊销")}</button>`
+                          : ""
+                      }
+                    </div>
+                  `
+                    )
+                    .join("")}
+                </div>
+              </div>
+
+              ${
+                this.user.is_admin
+                  ? `
+                <div style="border-top:1px solid var(--border-primary);padding-top:12px;margin-bottom:14px;">
+                  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+                    <strong style="font-size:12.5px;">${this.tr("Admin Invite Codes", "管理员注册邀请码")}</strong>
+                    <button id="btn-gen-invite" type="button" class="pm-btn pm-btn-secondary pm-btn-sm">${this.tr("+ Issue Invite Code", "+ 签发邀请码")}</button>
+                  </div>
+                  ${
+                    this.latestInviteCode
+                      ? `<div class="coda-mono" style="background:var(--bg-elevated);border:1px dashed var(--signal-blue);padding:8px 10px;border-radius:8px;font-size:12px;margin-bottom:8px;">
+                          ${this.tr("New invite code:", "新签发邀请码：")} <b>${this.escapeHtml(this.latestInviteCode)}</b>
+                        </div>`
+                      : ""
+                  }
+                  <div style="display:flex;flex-direction:column;gap:5px;max-height:120px;overflow-y:auto;">
+                    ${this.invitesList
+                      .map(
+                        (inv) => `
+                      <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:6px 10px;border-radius:6px;background:var(--bg-elevated);border:1px solid var(--border-primary);font-size:11.5px;">
+                        <span class="coda-mono">${this.escapeHtml(inv.code)} <span style="color:var(--text-tertiary);">(${inv.used_count}/${inv.max_uses})</span></span>
+                        <button type="button" class="pm-btn pm-btn-ghost pm-btn-sm" style="color:var(--rose);" data-delete-invite="${this.escapeHtml(inv.code)}">${this.tr("Revoke", "撤销")}</button>
+                      </div>
+                    `
+                      )
+                      .join("")}
+                  </div>
+                </div>
+              `
+                  : ""
+              }
+
+              <form id="change-pw-form" style="border-top:1px solid var(--border-primary);padding-top:12px;margin-bottom:14px;display:flex;flex-direction:column;gap:6px;">
+                <strong style="font-size:12.5px;">${this.tr("Change Password", "修改登录密码")}</strong>
+                <input type="password" name="current_password" class="pm-input" style="margin:0;" required placeholder="${this.tr("Current password", "当前密码")}" autocomplete="current-password" />
+                <input type="password" name="new_password" class="pm-input" style="margin:0;" required minlength="6" placeholder="${this.tr("New password (at least 6 chars)", "新密码（至少 6 位）")}" autocomplete="new-password" />
+                <button type="submit" class="pm-btn pm-btn-secondary pm-btn-sm">${this.tr("Update Password", "确认修改密码")}</button>
+              </form>
+
+              <form id="delete-account-form" style="border-top:1px solid var(--rose-bd);padding-top:12px;display:flex;flex-direction:column;gap:6px;">
+                <strong style="font-size:12.5px;color:var(--rose);">${this.tr("Danger Zone · Delete Account", "危险操作 · 注销当前账号")}</strong>
+                <input type="password" name="current_password" class="pm-input" style="margin:0;" required placeholder="${this.tr("Confirm current password to permanently delete", "输入当前密码确认永久注销账号")}" />
+                <button type="submit" class="pm-btn pm-btn-secondary pm-btn-sm" style="color:var(--rose);border-color:var(--rose-bd);">${this.tr("Permanently Delete Account", "永久注销并清除所有设备")}</button>
+              </form>
+            `
+                  : `
+              <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;padding-bottom:12px;margin-bottom:12px;border-bottom:1px solid var(--border-primary);">
+                <span style="font-size:12px;color:var(--text-secondary);">${this.tr("Interface Language &amp; Theme", "界面语言与外观主题")}</span>
+                <div style="display:flex;align-items:center;gap:8px;">
+                  ${this.renderLangSwitcher()}
+                  ${this.renderThemeSwitcher()}
+                </div>
+              </div>
+              <form id="voice-cfg-form">
+                <div style="font-size:13px;font-weight:600;margin-bottom:8px;display:inline-flex;align-items:center;gap:6px;">${svgIcon("mic", 14)} ${this.tr("Whisper Voice Transcription Config", "Whisper 语音转写模型配置")}</div>
+                <label style="font-size:11px;color:var(--text-secondary);">Provider</label>
+                <input name="provider" class="pm-input" value="${this.escapeHtml(this.voiceConfig.provider)}" placeholder="openai / groq / deepseek" />
+                <label style="font-size:11px;color:var(--text-secondary);">Base URL (https://)</label>
+                <input name="base_url" class="pm-input" value="${this.escapeHtml(this.voiceConfig.base_url)}" placeholder="https://api.openai.com/v1" />
+                <label style="font-size:11px;color:var(--text-secondary);">API Key (${this.tr("leave blank to keep existing key on host", "留空则保留主机已保存密钥")})</label>
+                <input type="password" name="api_key" class="pm-input" value="${this.escapeHtml(this.voiceApiKeyLocal)}" placeholder="sk-..." />
+                <label style="font-size:11px;color:var(--text-secondary);">Model</label>
+                <input name="model" class="pm-input" value="${this.escapeHtml(this.voiceConfig.model)}" placeholder="gpt-4o-mini-transcribe / whisper-1" />
+                <button type="submit" class="pm-btn pm-btn-primary" style="width:100%;">
+                  ${this.tr("Save Voice Config", "保存语音模型配置")}
+                </button>
+              </form>
+            `
             }
-            ${
-              this.latestInviteCode
-                ? `<div class="coda-mono" style="background:var(--bg-elevated);border:1px dashed var(--signal-blue);padding:10px;border-radius:8px;font-size:12px;margin-bottom:10px;">
-                    ${this.tr("Invite code:", "好友注册邀请码：")} <b>${this.escapeHtml(this.latestInviteCode)}</b>
-                  </div>`
-                : ""
-            }
-            <form id="voice-cfg-form" style="border-top:1px solid var(--border-primary);padding-top:12px;margin-top:8px;">
-              <div style="font-size:13px;font-weight:600;margin-bottom:8px;display:inline-flex;align-items:center;gap:6px;">${svgIcon("mic", 14)} ${this.tr("Voice Model Config (Herdr doc.set)", "语音模型配置 (Herdr doc.set)")}</div>
-              <label style="font-size:11px;color:var(--text-secondary);">Provider</label>
-              <input name="provider" class="pm-input" value="${this.escapeHtml(this.voiceConfig.provider)}" placeholder="openai / groq / deepseek" />
-              <label style="font-size:11px;color:var(--text-secondary);">Base URL</label>
-              <input name="base_url" class="pm-input" value="${this.escapeHtml(this.voiceConfig.base_url)}" placeholder="https://api.openai.com/v1" />
-              <label style="font-size:11px;color:var(--text-secondary);">API Key</label>
-              <input type="password" name="api_key" class="pm-input" value="${this.escapeHtml(this.voiceConfig.api_key)}" placeholder="sk-..." />
-              <label style="font-size:11px;color:var(--text-secondary);">Model</label>
-              <input name="model" class="pm-input" value="${this.escapeHtml(this.voiceConfig.model)}" placeholder="gpt-4o-mini-transcribe" />
-              <button type="submit" class="pm-btn pm-btn-primary" style="width:100%;">
-                ${this.tr("Save Voice Config", "保存语音模型配置")}
-              </button>
-            </form>
           </div>
         </div>
       `
@@ -3825,6 +4436,52 @@ export class CodaTerminalWebApp {
 
     this.bindCommonNavigation(root);
 
+    const openSettings = () => {
+      this.showSettingsModal = true;
+      this.settingsFeedback = null;
+      this.render();
+      void this.loadAccountSettingsData().then(() => {
+        if (this.showSettingsModal) this.render();
+      });
+    };
+
+    const performLocalSignOut = () => {
+      this.stopVoiceCaptureResources();
+      this.isRecordingVoice = false;
+      this.isTranscribingVoice = false;
+      this.stopAllTransportsAndTimers();
+      clearSessionToken();
+      this.token = null;
+      this.user = null;
+      this.allDevices = [];
+      this.devices = [];
+      this.authSessions = [];
+      this.invitesList = [];
+      this.myClientDevice = null;
+      this.selectedDaemon = null;
+      this.terminals = [];
+      this.repos = [];
+      this.activeTerminalAddr = null;
+      this.draftInput = "";
+      this.pairCommand = null;
+      this.latestInviteCode = null;
+      this.rttMs = null;
+      this.consoleNotice = null;
+      this.settingsFeedback = null;
+      this.e2eeSessions.clear();
+      this.seenRelayNonces.clear();
+      this.directE2eeSessions.clear();
+      this.vtTerminals.clear();
+      this.vtStreamActive.clear();
+      this.showSettingsModal = false;
+      this.showSpawnModal = false;
+      this.navigate("/login");
+    };
+
+    document.getElementById("sidebar-backdrop")?.addEventListener("click", () => {
+      this.showSidebar = false;
+      this.render();
+    });
     document.getElementById("btn-collapse-sidebar")?.addEventListener("click", () => {
       this.showSidebar = false;
       this.render();
@@ -3833,14 +4490,8 @@ export class CodaTerminalWebApp {
       this.showSidebar = !this.showSidebar;
       this.render();
     });
-    document.getElementById("btn-open-settings")?.addEventListener("click", () => {
-      this.showSettingsModal = true;
-      this.render();
-    });
-    document.getElementById("rail-more-btn")?.addEventListener("click", () => {
-      this.showSettingsModal = true;
-      this.render();
-    });
+    document.getElementById("btn-open-settings")?.addEventListener("click", openSettings);
+    document.getElementById("rail-more-btn")?.addEventListener("click", openSettings);
     document.getElementById("btn-dismiss-activate")?.addEventListener("click", () => {
       this.pendingActivationCode = "";
       this.pendingDeviceInfo = null;
@@ -3873,6 +4524,21 @@ export class CodaTerminalWebApp {
         this.render();
       }
     });
+
+    root.querySelectorAll<HTMLElement>("[data-settings-tab]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const tab = btn.dataset.settingsTab as "devices" | "security" | "voice";
+        this.settingsTab = tab;
+        this.settingsFeedback = null;
+        this.render();
+        if (tab === "security" || tab === "devices") {
+          void this.loadAccountSettingsData().then(() => {
+            if (this.showSettingsModal) this.render();
+          });
+        }
+      });
+    });
+
     document.getElementById("quick-approve-form")?.addEventListener("submit", async (e) => {
       e.preventDefault();
       const fd = Object.fromEntries(new FormData(e.target as HTMLFormElement).entries()) as any;
@@ -3880,35 +4546,188 @@ export class CodaTerminalWebApp {
       if (!code) return;
       try {
         const dev = await this.api("/api/v1/auth/device/approve", "POST", { user_code: code });
-        this.activationSuccessMsg = this.tr(
-          `Approved device ${dev.name} (${dev.platform})`,
-          `已授权设备 ${dev.name} (${dev.platform})`
-        );
+        this.settingsFeedback = {
+          kind: "ok",
+          text: this.tr(`Approved device ${dev.name} (${dev.platform})`, `已授权设备 ${dev.name} (${dev.platform})`),
+        };
         await this.refreshDevices();
         this.render();
       } catch (err: any) {
-        this.activationSuccessMsg = err.message;
+        this.settingsFeedback = {
+          kind: "err",
+          text: String(err?.message || this.tr("Failed to approve device code", "设备码授权失败")),
+        };
         this.render();
       }
     });
+
+    root.querySelectorAll<HTMLElement>("[data-rename-dev]").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const id = btn.dataset.renameDev!;
+        const oldName = btn.dataset.devName || "";
+        const nextName = window.prompt(this.tr("New device name:", "输入新的设备名称："), oldName)?.trim();
+        if (!nextName || nextName === oldName) return;
+        try {
+          await this.api(`/api/v1/devices/${encodeURIComponent(id)}`, "PATCH", { name: nextName });
+          this.settingsFeedback = {
+            kind: "ok",
+            text: this.tr(`Renamed device to "${nextName}"`, `已重命名为「${nextName}」`),
+          };
+          await this.refreshDevices();
+          this.render();
+        } catch (err: any) {
+          this.settingsFeedback = { kind: "err", text: String(err?.message || "Rename failed") };
+          this.render();
+        }
+      });
+    });
+
+    root.querySelectorAll<HTMLElement>("[data-delete-dev]").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const id = btn.dataset.deleteDev!;
+        if (!window.confirm(this.tr("Remove and revoke this device from your account?", "确认移除并吊销该设备吗？"))) {
+          return;
+        }
+        try {
+          await this.api(`/api/v1/devices/${encodeURIComponent(id)}`, "DELETE");
+          this.e2eeSessions.delete(id);
+          this.directE2eeSessions.delete(id);
+          this.settingsFeedback = { kind: "ok", text: this.tr("Device removed.", "设备已移除。") };
+          await this.refreshDevices();
+          this.render();
+        } catch (err: any) {
+          this.settingsFeedback = { kind: "err", text: String(err?.message || "Delete failed") };
+          this.render();
+        }
+      });
+    });
+
+    root.querySelectorAll<HTMLElement>("[data-revoke-session]").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const sid = btn.dataset.revokeSession!;
+        try {
+          await this.api(`/api/v1/auth/sessions/${encodeURIComponent(sid)}`, "DELETE");
+          this.settingsFeedback = { kind: "ok", text: this.tr("Session revoked.", "会话已吊销。") };
+          await this.loadAccountSettingsData();
+          this.render();
+        } catch (err: any) {
+          this.settingsFeedback = { kind: "err", text: String(err?.message || "Revoke failed") };
+          this.render();
+        }
+      });
+    });
+
+    document.getElementById("btn-logout-all")?.addEventListener("click", async () => {
+      if (!window.confirm(this.tr("Sign out all browser/mobile sessions?", "确认强制退出全部登录会话吗？"))) {
+        return;
+      }
+      try {
+        await this.api("/api/v1/auth/logout-all", "POST", {});
+      } catch {
+        // proceed to local teardown regardless
+      }
+      performLocalSignOut();
+    });
+
+    root.querySelectorAll<HTMLElement>("[data-delete-invite]").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const code = btn.dataset.deleteInvite!;
+        try {
+          await this.api(`/api/v1/invites/${encodeURIComponent(code)}`, "DELETE");
+          this.settingsFeedback = { kind: "ok", text: this.tr(`Revoked invite ${code}`, `已撤销邀请码 ${code}`) };
+          await this.loadAccountSettingsData();
+          this.render();
+        } catch (err: any) {
+          this.settingsFeedback = { kind: "err", text: String(err?.message || "Revoke invite failed") };
+          this.render();
+        }
+      });
+    });
+
+    document.getElementById("change-pw-form")?.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const fd = Object.fromEntries(new FormData(e.target as HTMLFormElement).entries()) as any;
+      try {
+        const res = await this.api("/api/v1/auth/password", "POST", {
+          current_password: String(fd.current_password || ""),
+          new_password: String(fd.new_password || ""),
+        });
+        if (res?.token) {
+          this.token = res.token;
+          saveSessionToken(res.token);
+        }
+        this.settingsFeedback = {
+          kind: "ok",
+          text: this.tr("Password updated. Other sessions were signed out.", "密码已更新，其余会话已自动下线。"),
+        };
+        await this.loadAccountSettingsData();
+        this.render();
+      } catch (err: any) {
+        this.settingsFeedback = { kind: "err", text: String(err?.message || "Password update failed") };
+        this.render();
+      }
+    });
+
+    document.getElementById("delete-account-form")?.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      if (
+        !window.confirm(
+          this.tr(
+            "Permanently delete your account and all enrolled devices? This cannot be undone.",
+            "确定永久注销账号并清除全部设备吗？此操作不可撤销。"
+          )
+        )
+      ) {
+        return;
+      }
+      const fd = Object.fromEntries(new FormData(e.target as HTMLFormElement).entries()) as any;
+      try {
+        await this.api("/api/v1/auth/me", "DELETE", {
+          current_password: String(fd.current_password || ""),
+        });
+        performLocalSignOut();
+      } catch (err: any) {
+        this.settingsFeedback = { kind: "err", text: String(err?.message || "Delete account failed") };
+        this.render();
+      }
+    });
+
     document.getElementById("btn-close-modal")?.addEventListener("click", () => {
       this.showSettingsModal = false;
       this.render();
     });
+    document.getElementById("modal-bg")?.addEventListener("click", (e) => {
+      if ((e.target as HTMLElement).id === "modal-bg") {
+        this.showSettingsModal = false;
+        this.render();
+      }
+    });
     document.getElementById("btn-gen-pair")?.addEventListener("click", async () => {
-      const res = await this.api("/api/v1/devices/pair-token", "POST", {});
-      this.pairCommand = res.one_liner_command;
-      this.render();
+      try {
+        const res = await this.api("/api/v1/devices/pair-token", "POST", {});
+        this.pairCommand = res.one_liner_command;
+        this.render();
+      } catch (err: any) {
+        this.settingsFeedback = { kind: "err", text: String(err?.message || "Failed generating pair token") };
+        this.render();
+      }
     });
     document.getElementById("btn-gen-invite")?.addEventListener("click", async () => {
-      const res = await this.api("/api/v1/invites", "POST", { note: "Friend", max_uses: 5, valid_days: 30 });
-      this.latestInviteCode = res.code;
-      this.render();
+      try {
+        const res = await this.api("/api/v1/invites", "POST", { note: "Friend", max_uses: 5, valid_days: 30 });
+        this.latestInviteCode = res.code;
+        await this.loadAccountSettingsData();
+        this.render();
+      } catch (err: any) {
+        this.settingsFeedback = { kind: "err", text: String(err?.message || "Failed issuing invite code") };
+        this.render();
+      }
     });
     document.getElementById("btn-go-home")?.addEventListener("click", () => {
       this.showSettingsModal = false;
       this.navigate("/");
     });
+
     if (this.termResizeObserver) {
       this.termResizeObserver.disconnect();
       this.termResizeObserver = null;
@@ -3921,6 +4740,59 @@ export class CodaTerminalWebApp {
       this.termResizeObserver.observe(termBox);
     }
 
+    // Direct raw keystroke & bracketed paste support when #term-box is focused
+    termBox?.addEventListener("keydown", (e) => {
+      if (!this.selectedDaemon || !this.activeTerminalAddr) return;
+      if (e.isComposing || this.imeComposing) return;
+      if (e.metaKey && (e.key.toLowerCase() === "c" || e.key.toLowerCase() === "v" || e.key.toLowerCase() === "r" || e.key.toLowerCase() === "l")) {
+        return;
+      }
+      const keyVt = this.vtTerminals.get(this.vtKey(this.selectedDaemon.id, this.activeTerminalAddr));
+      const appCursor = keyVt?.appCursorKeys ?? false;
+      let seq: string | null = null;
+      if (e.ctrlKey && !e.altKey && !e.metaKey && e.key.length === 1) {
+        const code = e.key.toLowerCase().charCodeAt(0);
+        if (code >= 97 && code <= 122) {
+          seq = String.fromCharCode(code - 96);
+        }
+      } else {
+        switch (e.key) {
+          case "Enter": seq = "\r"; break;
+          case "Backspace": seq = "\x7f"; break;
+          case "Tab": seq = e.shiftKey ? "\x1b[Z" : "\t"; break;
+          case "Escape": seq = "\x1b"; break;
+          case "ArrowUp": seq = appCursor ? "\x1bOA" : "\x1b[A"; break;
+          case "ArrowDown": seq = appCursor ? "\x1bOB" : "\x1b[B"; break;
+          case "ArrowRight": seq = appCursor ? "\x1bOC" : "\x1b[C"; break;
+          case "ArrowLeft": seq = appCursor ? "\x1bOD" : "\x1b[D"; break;
+          case "Home": seq = "\x1b[H"; break;
+          case "End": seq = "\x1b[F"; break;
+          case "Delete": seq = "\x1b[3~"; break;
+          case "PageUp": seq = "\x1b[5~"; break;
+          case "PageDown": seq = "\x1b[6~"; break;
+          default:
+            if (e.key.length === 1 && !e.ctrlKey && !e.metaKey) {
+              seq = e.altKey ? `\x1b${e.key}` : e.key;
+            }
+            break;
+        }
+      }
+      if (seq !== null) {
+        e.preventDefault();
+        this.sendPtyInputBytes(seq);
+      }
+    });
+
+    termBox?.addEventListener("paste", (e) => {
+      if (!this.selectedDaemon || !this.activeTerminalAddr) return;
+      const text = e.clipboardData?.getData("text");
+      if (!text) return;
+      e.preventDefault();
+      const keyVt = this.vtTerminals.get(this.vtKey(this.selectedDaemon.id, this.activeTerminalAddr));
+      const payload = keyVt?.bracketedPaste ? `\x1b[200~${text}\x1b[201~` : text;
+      this.sendPtyInputBytes(payload);
+    });
+
     document.getElementById("btn-logout")?.addEventListener("click", async () => {
       try {
         if (this.token) {
@@ -3929,32 +4801,22 @@ export class CodaTerminalWebApp {
       } catch {
         // Ignore network/revoked errors during local teardown
       } finally {
-        this.stopAllTransportsAndTimers();
-        clearSessionToken();
-        this.token = null;
-        this.user = null;
-        this.devices = [];
-        this.myClientDevice = null;
-        this.selectedDaemon = null;
-        this.terminals = [];
-        this.repos = [];
-        this.activeTerminalAddr = null;
-        this.draftInput = "";
-        this.pairCommand = null;
-        this.latestInviteCode = null;
-        this.rttMs = null;
-        this.consoleNotice = null;
-        this.e2eeSessions.clear();
-        this.directE2eeSessions.clear();
-        this.vtTerminals.clear();
-        this.vtStreamActive.clear();
-        this.showSettingsModal = false;
-        this.navigate("/login");
+        performLocalSignOut();
       }
     });
 
     document.getElementById("btn-kb-toggle")?.addEventListener("click", () => {
       this.showKeyboardInputBar = !this.showKeyboardInputBar;
+      this.render();
+    });
+    document.getElementById("btn-voice-mic")?.addEventListener("click", () => {
+      void this.toggleVoiceInput();
+    });
+    document.getElementById("btn-voice-mic-desktop")?.addEventListener("click", () => {
+      void this.toggleVoiceInput();
+    });
+    document.getElementById("btn-hide-touch-pad")?.addEventListener("click", () => {
+      this.showMobileKeypadOnDesktop = false;
       this.render();
     });
 
@@ -3975,11 +4837,25 @@ export class CodaTerminalWebApp {
       }
     });
 
+    // Mobile 1-step submit: sends command directly to PTY!
     document.getElementById("kb-form")?.addEventListener("submit", (e) => {
       e.preventDefault();
       if (this.imeComposing) return;
       const inp = document.getElementById("kb-input") as HTMLInputElement | null;
-      this.draftInput = inp ? inp.value : this.draftInput;
+      const text = inp ? inp.value : this.draftInput;
+      if (this.selectedDaemon && this.activeTerminalAddr) {
+        if (text.trim()) {
+          this.sendEncrypted(this.selectedDaemon, {
+            op: "send_terminal_text",
+            req_id: `tx-${Date.now()}`,
+            terminal: this.activeTerminalAddr,
+            text,
+          });
+        } else {
+          this.sendPtyInputBytes("\r");
+        }
+      }
+      this.draftInput = "";
       this.showKeyboardInputBar = false;
       this.render();
     });
@@ -4010,35 +4886,69 @@ export class CodaTerminalWebApp {
       e.preventDefault();
       if (this.imeComposing) return;
       const inp = document.getElementById("desktop-prompt-input") as HTMLInputElement | null;
-      const text = (inp ? inp.value : this.draftInput).trim();
-      if (this.selectedDaemon && this.activeTerminalAddr && text) {
-        this.sendEncrypted(this.selectedDaemon, {
-          op: "send_terminal_text",
-          req_id: `tx-${Date.now()}`,
-          terminal: this.activeTerminalAddr,
-          text,
-        });
+      const text = inp ? inp.value : this.draftInput;
+      if (this.selectedDaemon && this.activeTerminalAddr) {
+        if (text.trim()) {
+          this.sendEncrypted(this.selectedDaemon, {
+            op: "send_terminal_text",
+            req_id: `tx-${Date.now()}`,
+            terminal: this.activeTerminalAddr,
+            text,
+          });
+        } else {
+          // Empty Enter sends bare CR (\r) for interactive prompts
+          this.sendPtyInputBytes("\r");
+        }
       }
       this.draftInput = "";
+      if (inp) inp.value = "";
       this.render();
     });
 
     document.getElementById("rail-spawn-btn")?.addEventListener("click", () => {
-      if (this.selectedDaemon?.is_online) {
-        const { cols, rows } = this.computeTerminalDimsFromDom();
-        this.termCols = cols;
-        this.termRows = rows;
-        this.sendEncrypted(this.selectedDaemon, {
-          op: "launch_agent",
-          req_id: `run-${Date.now()}`,
-          agent: "shell",
-          name: null,
-          cwd: null,
-          initial_prompt: null,
-          cols,
-          rows,
-        });
+      if (!this.selectedDaemon?.is_online) {
+        this.consoleNotice = {
+          kind: "err",
+          text: this.tr("Select an online host first.", "请先选择一台在线主机。"),
+        };
+        this.render();
+        return;
       }
+      this.showSpawnModal = true;
+      this.render();
+    });
+    document.getElementById("btn-close-spawn")?.addEventListener("click", () => {
+      this.showSpawnModal = false;
+      this.render();
+    });
+    document.getElementById("spawn-modal-bg")?.addEventListener("click", (e) => {
+      if ((e.target as HTMLElement).id === "spawn-modal-bg") {
+        this.showSpawnModal = false;
+        this.render();
+      }
+    });
+    document.getElementById("spawn-agent-form")?.addEventListener("submit", (e) => {
+      e.preventDefault();
+      if (!this.selectedDaemon?.is_online) return;
+      const fd = Object.fromEntries(new FormData(e.target as HTMLFormElement).entries()) as any;
+      const agent = String(fd.agent || "shell").trim() || "shell";
+      const cwd = String(fd.cwd || "").trim() || null;
+      const initial_prompt = String(fd.initial_prompt || "").trim() || null;
+      const { cols, rows } = this.computeTerminalDimsFromDom();
+      this.termCols = cols;
+      this.termRows = rows;
+      this.sendEncrypted(this.selectedDaemon, {
+        op: "launch_agent",
+        req_id: `run-${Date.now()}`,
+        agent,
+        name: null,
+        cwd,
+        initial_prompt,
+        cols,
+        rows,
+      });
+      this.showSpawnModal = false;
+      this.render();
     });
 
     document.getElementById("rail-refresh-btn")?.addEventListener("click", () => {
@@ -4117,11 +5027,24 @@ export class CodaTerminalWebApp {
     document.getElementById("voice-cfg-form")?.addEventListener("submit", (e) => {
       e.preventDefault();
       const fd = Object.fromEntries(new FormData(e.target as HTMLFormElement).entries()) as any;
+      const nextBaseUrl = String(fd.base_url || "https://api.openai.com/v1").trim();
+      if (!this.isSafeVoiceBaseUrl(nextBaseUrl)) {
+        this.settingsFeedback = {
+          kind: "err",
+          text: this.tr("Base URL must use https:// (or localhost http://).", "Base URL 必须使用 https://（或本机 localhost）。"),
+        };
+        this.render();
+        return;
+      }
+      const typedKey = String(fd.api_key || "").trim();
+      if (typedKey) {
+        this.voiceApiKeyLocal = typedKey;
+      }
       this.voiceConfig = {
-        provider: fd.provider || "openai",
-        base_url: fd.base_url || "https://api.openai.com/v1",
-        api_key: fd.api_key || "",
-        model: fd.model || "gpt-4o-mini-transcribe",
+        provider: String(fd.provider || "openai").trim() || "openai",
+        base_url: nextBaseUrl,
+        api_key: typedKey,
+        model: String(fd.model || "gpt-4o-mini-transcribe").trim() || "gpt-4o-mini-transcribe",
       };
       if (this.selectedDaemon?.is_online) {
         this.sendEncrypted(this.selectedDaemon, {
@@ -4130,8 +5053,34 @@ export class CodaTerminalWebApp {
           config: this.voiceConfig,
         });
       }
-      this.showSettingsModal = false;
+      this.settingsFeedback = {
+        kind: "ok",
+        text: this.tr("Voice config saved.", "语音模型配置已保存。"),
+      };
       this.render();
+    });
+
+    document.querySelectorAll("[data-kill-term]").forEach((el) => {
+      el.addEventListener("click", (e) => {
+        e.stopPropagation();
+        const addr = (el as HTMLElement).dataset.killTerm!;
+        if (!addr || !this.selectedDaemon) return;
+        this.sendEncrypted(this.selectedDaemon, {
+          op: "kill_terminal",
+          req_id: `kt-${Date.now()}`,
+          terminal: addr,
+        });
+        this.terminals = this.terminals.filter((t) => t.address !== addr);
+        this.vtStreamActive.delete(this.vtKey(this.selectedDaemon.id, addr));
+        this.vtTerminals.delete(this.vtKey(this.selectedDaemon.id, addr));
+        if (this.activeTerminalAddr === addr) {
+          this.activeTerminalAddr = this.terminals[0]?.address ?? null;
+          if (this.activeTerminalAddr) {
+            this.attachAndReadTerminal(this.activeTerminalAddr);
+          }
+        }
+        this.render();
+      });
     });
 
     document.querySelectorAll("[data-dev]").forEach((el) => {
@@ -4151,6 +5100,7 @@ export class CodaTerminalWebApp {
           this.queryDaemonOverview(peer);
           void this.tryNegotiateDirectLanWs(peer);
         }
+        if (isNarrowViewport) this.showSidebar = false;
         this.render();
       });
     });
@@ -4164,6 +5114,7 @@ export class CodaTerminalWebApp {
         }
         this.activeTerminalAddr = nextAddr;
         this.attachAndReadTerminal(nextAddr);
+        if (isNarrowViewport) this.showSidebar = false;
         this.render();
       });
     });
@@ -4172,35 +5123,62 @@ export class CodaTerminalWebApp {
       el.addEventListener("click", () => {
         const k = (el as HTMLElement).dataset.k!;
         if (k === "slash") {
-          this.draftInput = "/clear";
-          this.render();
+          if (this.draftInput) {
+            this.draftInput = `${this.draftInput}/`;
+            this.render();
+          } else {
+            this.sendPtyInputBytes("/");
+          }
           return;
         }
         if (k === "backspace") {
-          this.draftInput = this.draftInput.slice(0, -1);
-          this.render();
+          if (this.draftInput.length > 0) {
+            this.draftInput = this.draftInput.slice(0, -1);
+            this.render();
+          } else {
+            this.sendPtyInputBytes("\x7f");
+          }
           return;
         }
         if (k === "enter") {
-          if (this.selectedDaemon && this.activeTerminalAddr && this.draftInput.trim()) {
-            this.sendEncrypted(this.selectedDaemon, {
-              op: "send_terminal_text",
-              req_id: `tx-${Date.now()}`,
-              terminal: this.activeTerminalAddr,
-              text: this.draftInput,
-            });
+          if (this.selectedDaemon && this.activeTerminalAddr) {
+            if (this.draftInput.trim()) {
+              this.sendEncrypted(this.selectedDaemon, {
+                op: "send_terminal_text",
+                req_id: `tx-${Date.now()}`,
+                terminal: this.activeTerminalAddr,
+                text: this.draftInput,
+              });
+            } else {
+              this.sendPtyInputBytes("\r");
+            }
           }
           this.draftInput = "";
           this.render();
           return;
         }
         if (this.selectedDaemon && this.activeTerminalAddr) {
-          this.sendEncrypted(this.selectedDaemon, {
-            op: "send_terminal_keys",
-            req_id: `k-${Date.now()}`,
-            terminal: this.activeTerminalAddr,
-            keys: [k],
-          });
+          const rawMap: Record<string, string> = {
+            esc: "\x1b",
+            tab: "\t",
+            "shift+tab": "\x1b[Z",
+            "ctrl+c": "\x03",
+            "ctrl+d": "\x04",
+            up: "\x1b[A",
+            down: "\x1b[B",
+            right: "\x1b[C",
+            left: "\x1b[D",
+          };
+          if (rawMap[k]) {
+            this.sendPtyInputBytes(rawMap[k]);
+          } else {
+            this.sendEncrypted(this.selectedDaemon, {
+              op: "send_terminal_keys",
+              req_id: `k-${Date.now()}`,
+              terminal: this.activeTerminalAddr,
+              keys: [k],
+            });
+          }
         }
       });
     });

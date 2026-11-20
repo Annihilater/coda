@@ -97,8 +97,26 @@ function color256(idx: number): string {
   return `rgb(${comp(rIdx)},${comp(gIdx)},${comp(bIdx)})`;
 }
 
-function charDisplayWidth(ch: string): 1 | 2 {
+function isZeroWidthChar(cp: number): boolean {
+  return (
+    cp === 0x200b ||
+    cp === 0x200c ||
+    cp === 0x200d ||
+    cp === 0x2060 ||
+    cp === 0xfeff ||
+    (cp >= 0x0300 && cp <= 0x036f) ||
+    (cp >= 0x1ab0 && cp <= 0x1aff) ||
+    (cp >= 0x1dc0 && cp <= 0x1dff) ||
+    (cp >= 0x20d0 && cp <= 0x20ff) ||
+    (cp >= 0xfe00 && cp <= 0xfe0f) ||
+    (cp >= 0xfe20 && cp <= 0xfe2f) ||
+    (cp >= 0xe0100 && cp <= 0xe01ef)
+  );
+}
+
+function charDisplayWidth(ch: string): 0 | 1 | 2 {
   const cp = ch.codePointAt(0) ?? 0;
+  if (isZeroWidthChar(cp)) return 0;
   if (
     (cp >= 0x1100 && cp <= 0x115f) ||
     cp === 0x2329 ||
@@ -127,11 +145,21 @@ function makeBlankRow(cols: number): VtCell[] {
   return row;
 }
 
-type ParserState = "ground" | "esc" | "escIntermediate" | "csi" | "osc" | "oscEsc";
+type ParserState = "ground" | "esc" | "escIntermediate" | "csi" | "osc" | "oscEsc" | "strSkip" | "strSkipEsc";
+
+interface SavedBufferState {
+  row: number;
+  col: number;
+  style: VtStyle;
+  scrollTop: number;
+  scrollBottom: number;
+  savedCursor: { row: number; col: number; style: VtStyle } | null;
+}
 
 /**
  * Stateful 2D VT100/xterm screen buffer with streaming UTF-8 decoding, carriage-return overwrite,
- * CJK wide characters, alternate screen buffer (`?1049h`/`l`), scrollback, and `OSC 7501` extraction.
+ * CJK wide characters, zero-width combining marks, alternate screen buffer (`?1049h`/`l`),
+ * DCS/APC/PM/SOS string skip, scrollback, and `OSC 7501` extraction.
  */
 export class WebVtTerminal {
   public cols: number;
@@ -144,6 +172,7 @@ export class WebVtTerminal {
   private cursorRow = 0;
   private cursorCol = 0;
   private savedCursor: { row: number; col: number; style: VtStyle } | null = null;
+  private primarySavedOnAlt: SavedBufferState | null = null;
   private scrollTop = 0;
   private scrollBottom: number;
   private pendingWrap = false;
@@ -152,6 +181,9 @@ export class WebVtTerminal {
   private parserState: ParserState = "ground";
   private csiBuf = "";
   private oscBuf = "";
+  public cursorVisible = true;
+  public bracketedPaste = false;
+  public appCursorKeys = false;
   public latestStatus: VtHerdrStatus | null = null;
   public windowTitle: string | null = null;
 
@@ -182,10 +214,14 @@ export class WebVtTerminal {
     this.cursorRow = 0;
     this.cursorCol = 0;
     this.savedCursor = null;
+    this.primarySavedOnAlt = null;
     this.scrollTop = 0;
     this.scrollBottom = this.rows - 1;
     this.pendingWrap = false;
     this.style = { ...DEFAULT_STYLE };
+    this.cursorVisible = true;
+    this.bracketedPaste = false;
+    this.appCursorKeys = false;
     this.utf8Decoder = new TextDecoder("utf-8", { fatal: false });
     this.parserState = "ground";
     this.csiBuf = "";
@@ -268,6 +304,25 @@ export class WebVtTerminal {
       return;
     }
 
+    if (this.parserState === "strSkip") {
+      if (cp === 0x07) {
+        this.parserState = "ground";
+      } else if (cp === 0x1b) {
+        this.parserState = "strSkipEsc";
+      }
+      return;
+    }
+
+    if (this.parserState === "strSkipEsc") {
+      if (ch === "\\") {
+        this.parserState = "ground";
+      } else {
+        this.parserState = "esc";
+        this.stepChar(ch);
+      }
+      return;
+    }
+
     if (this.parserState === "escIntermediate") {
       if (cp >= 0x30 && cp <= 0x7e) {
         this.parserState = "ground";
@@ -282,7 +337,10 @@ export class WebVtTerminal {
       } else if (ch === "]") {
         this.oscBuf = "";
         this.parserState = "osc";
-      } else if (ch === "(" || ch === ")" || ch === "*" || ch === "+") {
+      } else if (ch === "P" || ch === "_" || ch === "^" || ch === "X") {
+        // DCS, APC, PM, SOS string sequences terminated by ST (ESC \)
+        this.parserState = "strSkip";
+      } else if (ch === "(" || ch === ")" || ch === "*" || ch === "+" || ch === "#") {
         this.parserState = "escIntermediate";
       } else if (ch === "7") {
         this.savedCursor = { row: this.cursorRow, col: this.cursorCol, style: cloneStyle(this.style) };
@@ -372,6 +430,22 @@ export class WebVtTerminal {
 
   private putGlyph(ch: string): void {
     const w = charDisplayWidth(ch);
+    if (w === 0) {
+      // Zero-width combining mark / VS16 / ZWJ attaches to previous cell without advancing cursor.
+      const grid = this.activeGrid();
+      const targetCol = this.pendingWrap ? this.cols - 1 : this.cursorCol - 1;
+      if (targetCol >= 0 && targetCol < this.cols) {
+        let baseCol = targetCol;
+        if (grid[this.cursorRow][baseCol].width === 0 && baseCol > 0) {
+          baseCol -= 1;
+        }
+        const cell = grid[this.cursorRow][baseCol];
+        if (cell.ch.length < 16) {
+          cell.ch += ch;
+        }
+      }
+      return;
+    }
     if (this.pendingWrap) {
       this.cursorCol = 0;
       this.lineFeed();
@@ -447,9 +521,29 @@ export class WebVtTerminal {
   }
 
   private handleCsi(rawParams: string, cmd: string): void {
-    const isPrivate = rawParams.startsWith("?");
-    const clean = (isPrivate ? rawParams.slice(1) : rawParams).replace(/^[<=>!]+/, "");
-    const parts = clean ? clean.split(";") : [];
+    let prefix = "";
+    let idxStart = 0;
+    if (rawParams.length > 0 && "?><=".includes(rawParams[0])) {
+      prefix = rawParams[0];
+      idxStart = 1;
+    }
+    let body = rawParams.slice(idxStart);
+    let intermediates = "";
+    const interIdx = body.search(/[\x20-\x2f]/);
+    if (interIdx >= 0) {
+      intermediates = body.slice(interIdx);
+      body = body.slice(0, interIdx);
+    }
+
+    // Ignore non-`?` private prefixes (`>`, `<`, `=`) and intermediate CSI sequences
+    // (e.g. Kitty keyboard `CSI > 1 u`, modifyOtherKeys `CSI > 4 ; 2 m`, DECSCUSR `CSI 2 q`)
+    // so they never mis-trigger SGR/cursor/erase commands.
+    if (intermediates.length > 0 || (prefix !== "" && prefix !== "?")) {
+      return;
+    }
+
+    const isPrivate = prefix === "?";
+    const parts = body ? body.split(";") : [];
     const param = (idx: number, def = 1) => {
       const n = parseInt(parts[idx] || "", 10);
       return Number.isFinite(n) && n > 0 ? n : def;
@@ -463,25 +557,57 @@ export class WebVtTerminal {
       const modes = parts.map((p) => parseInt(p, 10)).filter((n) => Number.isFinite(n));
       if (cmd === "h") {
         for (const m of modes) {
-          if (m === 1049 || m === 1047 || m === 47) {
-            if (m === 1049) {
-              this.savedCursor = { row: this.cursorRow, col: this.cursorCol, style: cloneStyle(this.style) };
+          if (m === 1) {
+            this.appCursorKeys = true;
+          } else if (m === 25) {
+            this.cursorVisible = true;
+          } else if (m === 2004) {
+            this.bracketedPaste = true;
+          } else if (m === 1049 || m === 1047 || m === 47) {
+            if (!this.usingAltScreen) {
+              this.primarySavedOnAlt = {
+                row: this.cursorRow,
+                col: this.cursorCol,
+                style: cloneStyle(this.style),
+                scrollTop: this.scrollTop,
+                scrollBottom: this.scrollBottom,
+                savedCursor: this.savedCursor ? { ...this.savedCursor, style: cloneStyle(this.savedCursor.style) } : null,
+              };
             }
             this.usingAltScreen = true;
             this.altGrid = this.createEmptyGrid(this.cols, this.rows);
+            this.scrollTop = 0;
+            this.scrollBottom = this.rows - 1;
             this.cursorRow = 0;
             this.cursorCol = 0;
+            this.savedCursor = null;
             this.pendingWrap = false;
           }
         }
       } else if (cmd === "l") {
         for (const m of modes) {
-          if (m === 1049 || m === 1047 || m === 47) {
+          if (m === 1) {
+            this.appCursorKeys = false;
+          } else if (m === 25) {
+            this.cursorVisible = false;
+          } else if (m === 2004) {
+            this.bracketedPaste = false;
+          } else if (m === 1049 || m === 1047 || m === 47) {
             this.usingAltScreen = false;
-            if (m === 1049 && this.savedCursor) {
-              this.cursorRow = Math.min(this.rows - 1, this.savedCursor.row);
-              this.cursorCol = Math.min(this.cols - 1, this.savedCursor.col);
-              this.style = cloneStyle(this.savedCursor.style);
+            if (this.primarySavedOnAlt) {
+              const saved = this.primarySavedOnAlt;
+              this.primarySavedOnAlt = null;
+              this.scrollTop = Math.max(0, Math.min(this.rows - 1, saved.scrollTop));
+              this.scrollBottom = Math.max(this.scrollTop, Math.min(this.rows - 1, saved.scrollBottom));
+              this.savedCursor = saved.savedCursor;
+              if (m === 1049) {
+                this.cursorRow = Math.min(this.rows - 1, saved.row);
+                this.cursorCol = Math.min(this.cols - 1, saved.col);
+                this.style = cloneStyle(saved.style);
+              }
+            } else {
+              this.scrollTop = 0;
+              this.scrollBottom = this.rows - 1;
             }
             this.pendingWrap = false;
           }
@@ -538,6 +664,7 @@ export class WebVtTerminal {
         break;
       }
       case "L": {
+        if (this.cursorRow < this.scrollTop || this.cursorRow > this.scrollBottom) break;
         const n = Math.min(param(0), this.scrollBottom - this.cursorRow + 1);
         for (let i = 0; i < n; i++) {
           grid.splice(this.scrollBottom, 1);
@@ -546,6 +673,7 @@ export class WebVtTerminal {
         break;
       }
       case "M": {
+        if (this.cursorRow < this.scrollTop || this.cursorRow > this.scrollBottom) break;
         const n = Math.min(param(0), this.scrollBottom - this.cursorRow + 1);
         for (let i = 0; i < n; i++) {
           grid.splice(this.cursorRow, 1);
@@ -554,6 +682,7 @@ export class WebVtTerminal {
         break;
       }
       case "@": {
+        this.clearWidePartner(grid, this.cursorRow, this.cursorCol);
         const n = Math.min(param(0), this.cols - this.cursorCol);
         for (let i = 0; i < n; i++) {
           grid[this.cursorRow].splice(this.cursorCol, 0, { ch: " ", width: 1, style: { ...DEFAULT_STYLE } });
@@ -562,6 +691,7 @@ export class WebVtTerminal {
         break;
       }
       case "P": {
+        this.clearWidePartner(grid, this.cursorRow, this.cursorCol);
         const n = Math.min(param(0), this.cols - this.cursorCol);
         grid[this.cursorRow].splice(this.cursorCol, n);
         for (let i = 0; i < n; i++) {
@@ -572,10 +702,17 @@ export class WebVtTerminal {
       case "S": this.scrollUp(param(0)); break;
       case "T": this.scrollDown(param(0)); break;
       case "r": {
-        const t = Math.max(0, Math.min(this.rows - 2, param(0, 1) - 1));
-        const b = Math.max(t + 1, Math.min(this.rows - 1, param(1, this.rows) - 1));
-        this.scrollTop = t;
-        this.scrollBottom = b;
+        const rawTop = param(0, 1) - 1;
+        const rawBot = param(1, this.rows) - 1;
+        const t = Math.max(0, Math.min(this.rows - 1, rawTop));
+        const b = Math.max(0, Math.min(this.rows - 1, rawBot));
+        if (t < b) {
+          this.scrollTop = t;
+          this.scrollBottom = b;
+        } else {
+          this.scrollTop = 0;
+          this.scrollBottom = this.rows - 1;
+        }
         this.cursorRow = 0;
         this.cursorCol = 0;
         break;
@@ -589,20 +726,52 @@ export class WebVtTerminal {
         }
         break;
       case "m":
-        this.applySgr(clean ? clean.split(/[;:]/) : ["0"]);
+        this.applySgr(body ? body.split(";") : ["0"]);
         break;
     }
   }
 
-  private applySgr(tokens: string[]): void {
-    const nums = tokens.map((t) => (t === "" ? 0 : parseInt(t, 10))).filter((n) => !Number.isNaN(n));
-    if (nums.length === 0) {
+  private applySgr(segments: string[]): void {
+    if (segments.length === 0) {
       this.style = { ...DEFAULT_STYLE };
       return;
     }
     let i = 0;
-    while (i < nums.length) {
-      const code = nums[i];
+    while (i < segments.length) {
+      const seg = segments[i];
+      if (seg.includes(":")) {
+        // ITU T.416 colon-separated extended SGR, e.g. `38:2::R:G:B`, `38:2:R:G:B`, `38:5:N`, `4:3`
+        const sub = seg.split(":");
+        const mainCode = parseInt(sub[0] || "0", 10);
+        if (mainCode === 38 || mainCode === 48) {
+          const isFg = mainCode === 38;
+          const kind = parseInt(sub[1] || "", 10);
+          if (kind === 5 && sub.length >= 3) {
+            const color = color256(parseInt(sub[2] || "0", 10) || 0);
+            if (isFg) this.style.fg = color; else this.style.bg = color;
+          } else if (kind === 2) {
+            // 38:2:colorspace:R:G:B (length >= 6) or 38:2:R:G:B (length === 5)
+            const off = sub.length >= 6 ? 3 : 2;
+            if (sub.length >= off + 3) {
+              const r = Math.max(0, Math.min(255, parseInt(sub[off] || "0", 10) || 0));
+              const g = Math.max(0, Math.min(255, parseInt(sub[off + 1] || "0", 10) || 0));
+              const b = Math.max(0, Math.min(255, parseInt(sub[off + 2] || "0", 10) || 0));
+              const color = `rgb(${r},${g},${b})`;
+              if (isFg) this.style.fg = color; else this.style.bg = color;
+            }
+          }
+        } else if (mainCode === 4) {
+          this.style.underline = sub[1] !== "0";
+        }
+        i += 1;
+        continue;
+      }
+
+      const code = seg === "" ? 0 : parseInt(seg, 10);
+      if (Number.isNaN(code)) {
+        i += 1;
+        continue;
+      }
       if (code === 0) {
         this.style = { ...DEFAULT_STYLE };
       } else if (code === 1) this.style.bold = true;
@@ -620,17 +789,17 @@ export class WebVtTerminal {
       else if (code >= 40 && code <= 47) this.style.bg = ANSI_16[code - 40];
       else if (code === 49) this.style.bg = null;
       else if (code >= 100 && code <= 107) this.style.bg = ANSI_16[8 + code - 100];
-      else if ((code === 38 || code === 48) && i + 1 < nums.length) {
+      else if ((code === 38 || code === 48) && i + 1 < segments.length) {
         const isFg = code === 38;
-        const kind = nums[i + 1];
-        if (kind === 5 && i + 2 < nums.length) {
-          const color = color256(nums[i + 2]);
+        const kind = parseInt(segments[i + 1] || "", 10);
+        if (kind === 5 && i + 2 < segments.length) {
+          const color = color256(parseInt(segments[i + 2] || "0", 10) || 0);
           if (isFg) this.style.fg = color; else this.style.bg = color;
           i += 2;
-        } else if (kind === 2 && i + 4 < nums.length) {
-          const r = Math.max(0, Math.min(255, nums[i + 2]));
-          const g = Math.max(0, Math.min(255, nums[i + 3]));
-          const b = Math.max(0, Math.min(255, nums[i + 4]));
+        } else if (kind === 2 && i + 4 < segments.length) {
+          const r = Math.max(0, Math.min(255, parseInt(segments[i + 2] || "0", 10) || 0));
+          const g = Math.max(0, Math.min(255, parseInt(segments[i + 3] || "0", 10) || 0));
+          const b = Math.max(0, Math.min(255, parseInt(segments[i + 4] || "0", 10) || 0));
           const color = `rgb(${r},${g},${b})`;
           if (isFg) this.style.fg = color; else this.style.bg = color;
           i += 4;
@@ -687,20 +856,27 @@ export class WebVtTerminal {
     }
   }
 
-  private visibleRows(): VtCell[][] {
+  private visibleRows(includeCursorRow = false): { rows: VtCell[][]; cursorVisRow: number } {
     const base = this.usingAltScreen
       ? this.altGrid
       : [...this.primaryScrollback, ...this.primaryGrid];
+    const absCursorRow = this.usingAltScreen
+      ? this.cursorRow
+      : this.primaryScrollback.length + this.cursorRow;
+    const minEnd = includeCursorRow ? Math.min(base.length, absCursorRow + 1) : 1;
     let end = base.length;
-    while (end > 1 && base[end - 1].every((c) => c.width === 1 && c.ch === " " && c.style.bg === null)) {
+    while (
+      end > minEnd &&
+      base[end - 1].every((c) => c.width === 1 && c.ch === " " && c.style.bg === null)
+    ) {
       end -= 1;
     }
-    return base.slice(0, end);
+    return { rows: base.slice(0, end), cursorVisRow: absCursorRow };
   }
 
   renderPlainText(): string {
-    return this.visibleRows()
-      .map((row) =>
+    return this.visibleRows(false)
+      .rows.map((row) =>
         row
           .filter((c) => c.width !== 0)
           .map((c) => c.ch)
@@ -710,12 +886,22 @@ export class WebVtTerminal {
       .join("\n");
   }
 
-  renderHtml(): string {
-    const rows = this.visibleRows();
+  renderHtml(showCursor = true): string {
+    const drawCursor = showCursor && this.cursorVisible;
+    const { rows, cursorVisRow } = this.visibleRows(drawCursor);
     const linesHtml: string[] = [];
-    for (const row of rows) {
+    for (let rIdx = 0; rIdx < rows.length; rIdx++) {
+      const row = rows[rIdx];
+      const hasCursorHere = drawCursor && rIdx === cursorVisRow;
       let lastNonEmpty = row.length - 1;
-      while (lastNonEmpty >= 0 && row[lastNonEmpty].width === 1 && row[lastNonEmpty].ch === " " && row[lastNonEmpty].style.bg === null && !row[lastNonEmpty].style.inverse) {
+      while (
+        lastNonEmpty >= 0 &&
+        !(hasCursorHere && lastNonEmpty === this.cursorCol) &&
+        row[lastNonEmpty].width === 1 &&
+        row[lastNonEmpty].ch === " " &&
+        row[lastNonEmpty].style.bg === null &&
+        !row[lastNonEmpty].style.inverse
+      ) {
         lastNonEmpty -= 1;
       }
       if (lastNonEmpty < 0) {
@@ -748,6 +934,12 @@ export class WebVtTerminal {
       for (let c = 0; c <= lastNonEmpty; c++) {
         const cell = row[c];
         if (cell.width === 0) continue;
+        if (hasCursorHere && c === this.cursorCol) {
+          flushRun();
+          runStyle = null;
+          out += `<span class="term-cursor">${escapeHtml(cell.ch || " ")}</span>`;
+          continue;
+        }
         if (!runStyle || !sameStyle(runStyle, cell.style)) {
           flushRun();
           runStyle = cell.style;

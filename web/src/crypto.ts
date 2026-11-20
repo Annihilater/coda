@@ -8,24 +8,26 @@ const enc = new TextEncoder();
 const dec = new TextDecoder();
 
 export const MAX_E2EE_DECOMPRESSED_BYTES = 16 * 1024 * 1024;
-export const MAX_HANDSHAKE_SKEW_MS = 300_000;
+export const MAX_HANDSHAKE_SKEW_MS = 120_000;
 export const RELAY_SESSION_NONCE_LEN = 16;
+const RELAY_NONCE_TTL_MS = 10 * 60 * 1000;
+const RELAY_NONCE_MAX_ENTRIES = 2048;
 
 const memoryStorageFallback = new Map<string, string>();
 
-function storageGet(key: string): string | null {
+function tabStorageGet(key: string): string | null {
   try {
-    if (typeof localStorage !== "undefined") return localStorage.getItem(key);
+    if (typeof sessionStorage !== "undefined") return sessionStorage.getItem(key);
   } catch {
     // ignore storage access errors
   }
   return memoryStorageFallback.get(key) ?? null;
 }
 
-function storageSet(key: string, val: string): void {
+function tabStorageSet(key: string, val: string): void {
   try {
-    if (typeof localStorage !== "undefined") {
-      localStorage.setItem(key, val);
+    if (typeof sessionStorage !== "undefined") {
+      sessionStorage.setItem(key, val);
       return;
     }
   } catch {
@@ -75,8 +77,12 @@ export interface EncryptedPayload {
   session_nonce_b64?: string | null;
 }
 
+/**
+ * Per-tab Web client identity stored in `sessionStorage` so multiple tabs do not share
+ * one `client_device_id` and kick each other's Relay bindings.
+ */
 export function loadOrCreateWebIdentity(): WebDeviceIdentity {
-  const cached = storageGet("coda_web_identity_v1");
+  const cached = tabStorageGet("coda_web_tab_identity_v2");
   if (cached) {
     try {
       const parsed = JSON.parse(cached) as WebDeviceIdentity;
@@ -92,14 +98,15 @@ export function loadOrCreateWebIdentity(): WebDeviceIdentity {
   const dhPriv = x25519.utils.randomPrivateKey();
   const dhPub = x25519.getPublicKey(dhPriv);
 
+  const tabTag = Math.random().toString(36).slice(2, 6).toUpperCase();
   const id: WebDeviceIdentity = {
-    name: "Coda Web Console",
+    name: `Coda Web (${tabTag})`,
     ed25519SecretB64: toB64(edPriv),
     ed25519PublicB64: toB64(edPub),
     x25519SecretB64: toB64(dhPriv),
     x25519PublicB64: toB64(dhPub),
   };
-  storageSet("coda_web_identity_v1", JSON.stringify(id));
+  tabStorageSet("coda_web_tab_identity_v2", JSON.stringify(id));
   return id;
 }
 
@@ -145,6 +152,17 @@ export function p2pHelloV2SigningText(
   return `p2p-hello-v2:${clientDeviceId.toLowerCase()}:${targetDeviceId.toLowerCase()}:${clientStaticX25519PubB64}:${clientEphX25519PubB64}:${tsMs}`;
 }
 
+export function p2pHelloV2SigningTextWithZstd(
+  clientDeviceId: string,
+  targetDeviceId: string,
+  clientStaticX25519PubB64: string,
+  clientEphX25519PubB64: string,
+  tsMs: number,
+  supportsZstd: boolean
+): string {
+  return `p2p-hello-v2:${clientDeviceId.toLowerCase()}:${targetDeviceId.toLowerCase()}:${clientStaticX25519PubB64}:${clientEphX25519PubB64}:${tsMs}:zstd=${supportsZstd ? 1 : 0}`;
+}
+
 export function p2pAckV2SigningText(
   clientDeviceId: string,
   daemonDeviceId: string,
@@ -165,26 +183,65 @@ export function relaySessionAuthSigningText(
   return `relay-sess-v2:${clientDeviceId.toLowerCase()}:${daemonDeviceId.toLowerCase()}:${senderX25519PubB64}:${sessionNonceB64}:${initTsMs}`;
 }
 
+export function relaySessionAuthSigningTextWithZstd(
+  clientDeviceId: string,
+  daemonDeviceId: string,
+  senderX25519PubB64: string,
+  sessionNonceB64: string,
+  initTsMs: number,
+  supportsZstd: boolean
+): string {
+  return `relay-sess-v2:${clientDeviceId.toLowerCase()}:${daemonDeviceId.toLowerCase()}:${senderX25519PubB64}:${sessionNonceB64}:${initTsMs}:zstd=${supportsZstd ? 1 : 0}`;
+}
+
+/** Bounded 10-minute replay cache for incoming `RelaySessionAuth` session nonces. */
+export class RelayNonceReplayCache {
+  private seen = new Map<string, number>();
+
+  checkAndRemember(peerId: string, nonceB64: string, nowMs = Date.now()): void {
+    for (const [k, ts] of this.seen.entries()) {
+      if (nowMs - ts > RELAY_NONCE_TTL_MS) {
+        this.seen.delete(k);
+      }
+    }
+    const key = `${peerId.toLowerCase()}:${nonceB64}`;
+    if (this.seen.has(key)) {
+      throw new Error("replayed relay session auth nonce");
+    }
+    if (this.seen.size >= RELAY_NONCE_MAX_ENTRIES) {
+      const oldest = this.seen.keys().next().value;
+      if (oldest !== undefined) this.seen.delete(oldest);
+    }
+    this.seen.set(key, nowMs);
+  }
+
+  clear(): void {
+    this.seen.clear();
+  }
+}
+
 export function createRelaySessionAuth(
   identity: WebDeviceIdentity,
   clientDeviceId: string,
   dstDaemonId: string,
-  nowMs = Date.now()
+  nowMs = Date.now(),
+  supportsZstd = true
 ): RelaySessionAuth {
   const session_nonce_b64 = randomSessionNonceB64();
-  const payload = relaySessionAuthSigningText(
+  const payload = relaySessionAuthSigningTextWithZstd(
     clientDeviceId,
     dstDaemonId,
     identity.x25519PublicB64,
     session_nonce_b64,
-    nowMs
+    nowMs,
+    supportsZstd
   );
   return {
     session_nonce_b64,
     init_ts_ms: nowMs,
     sender_ed25519_pub_b64: identity.ed25519PublicB64,
     sender_x25519_pub_b64: identity.x25519PublicB64,
-    supports_zstd: true,
+    supports_zstd: supportsZstd,
     signature_b64: signWebMessage(identity, payload),
   };
 }
@@ -215,14 +272,25 @@ export function verifyRelaySessionAuth(
   if (nonceRaw.length !== RELAY_SESSION_NONCE_LEN) {
     throw new Error("invalid relay session nonce length");
   }
-  const msg = relaySessionAuthSigningText(
+  const msgWithZstd = relaySessionAuthSigningTextWithZstd(
+    clientDeviceId,
+    daemonDeviceId,
+    auth.sender_x25519_pub_b64,
+    auth.session_nonce_b64,
+    auth.init_ts_ms,
+    Boolean(auth.supports_zstd)
+  );
+  const msgLegacy = relaySessionAuthSigningText(
     clientDeviceId,
     daemonDeviceId,
     auth.sender_x25519_pub_b64,
     auth.session_nonce_b64,
     auth.init_ts_ms
   );
-  if (!verifyEd25519Signature(expectedEd25519PubB64, msg, auth.signature_b64)) {
+  if (
+    !verifyEd25519Signature(expectedEd25519PubB64, msgWithZstd, auth.signature_b64) &&
+    !verifyEd25519Signature(expectedEd25519PubB64, msgLegacy, auth.signature_b64)
+  ) {
     throw new Error("relay session auth signature verification failed");
   }
   return nonceRaw;
