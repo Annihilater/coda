@@ -1155,6 +1155,28 @@ pub struct VoiceModelConfig {
     pub model: String,
 }
 
+/// Host system & daemon runtime health telemetry reported over E2EE `PeerMessage`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HostHealthSnapshot {
+    pub daemon_version: String,
+    pub os: String,
+    pub arch: String,
+    pub cpu_cores: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load_avg_1m: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mem_used_mb: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mem_total_mb: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub os_uptime_secs: Option<u64>,
+    pub daemon_uptime_secs: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub herdr_version: Option<String>,
+    #[serde(default)]
+    pub ota_supported: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum PeerMessage {
@@ -1188,6 +1210,8 @@ pub enum PeerMessage {
         machine_name: String,
         repos: Vec<RepoWorkspaceSummary>,
         voice_config: Option<VoiceModelConfig>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        host_health: Option<HostHealthSnapshot>,
     },
     LaunchAgent {
         req_id: String,
@@ -1355,6 +1379,28 @@ pub enum PeerMessage {
         content_type: String,
         body_b64: String,
     },
+    /// Queries live host CPU/memory/uptime/version telemetry over E2EE.
+    GetHostHealth {
+        req_id: String,
+    },
+    HostHealthResult {
+        req_id: String,
+        health: HostHealthSnapshot,
+    },
+    /// Triggers a zero-downtime E2EE OTA upgrade of standalone `coda-daemon` (terminals remain live in `herdr-core`).
+    UpgradeDaemon {
+        req_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_version: Option<String>,
+    },
+    UpgradeDaemonResult {
+        req_id: String,
+        ok: bool,
+        previous_version: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_version: Option<String>,
+        message: String,
+    },
 }
 
 impl PeerMessage {
@@ -1377,7 +1423,9 @@ impl PeerMessage {
             | Self::KillTerminal { req_id, .. }
             | Self::ListDirectory { req_id, .. }
             | Self::ReadFilePreview { req_id, .. }
-            | Self::HttpLocalPreviewRequest { req_id, .. } => Some(req_id.as_str()),
+            | Self::HttpLocalPreviewRequest { req_id, .. }
+            | Self::GetHostHealth { req_id, .. }
+            | Self::UpgradeDaemon { req_id, .. } => Some(req_id.as_str()),
             _ => None,
         }
     }
@@ -1397,7 +1445,9 @@ impl PeerMessage {
             | Self::GitDiffResponse { req_id, .. }
             | Self::DirectoryListing { req_id, .. }
             | Self::FilePreviewResponse { req_id, .. }
-            | Self::HttpLocalPreviewResponse { req_id, .. } => Some(req_id.as_str()),
+            | Self::HttpLocalPreviewResponse { req_id, .. }
+            | Self::HostHealthResult { req_id, .. }
+            | Self::UpgradeDaemonResult { req_id, .. } => Some(req_id.as_str()),
             _ => None,
         }
     }

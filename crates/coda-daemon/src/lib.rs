@@ -6,6 +6,15 @@
 //! - Bridges E2EE encrypted `PeerMessage` requests directly to local `herdr-core` (`hc`),
 //!   `git diff`, and localhost web port preview (`127.0.0.1:PORT`).
 
+pub mod fs_sandbox;
+pub mod telemetry_ota;
+
+pub use fs_sandbox::is_sensitive_path;
+use fs_sandbox::{
+    handle_list_directory_rpc, handle_read_file_preview_rpc, lossy_utf8_prefix,
+    sanitize_upload_filename, validate_local_preview_target,
+};
+
 use std::{
     collections::HashMap,
     net::{SocketAddr, UdpSocket},
@@ -30,7 +39,7 @@ use coda_protocol::{
     p2p_hello_v2_signing_bytes_with_zstd, relay_ticket_renew_signing_bytes,
     validate_ed25519_pub_b64, validate_x25519_pub_b64, AccountLiveEvent, BranchWorktreeItem,
     E2eeSession, HerdrTerminalSummary, NetworkEndpointCandidate, PeerMessage, RelaySessionAuth,
-    RelayWireFrame, RemoteFileItem, RepoWorkspaceSummary, StoredDeviceIdentity, TrafficLane,
+    RelayWireFrame, RepoWorkspaceSummary, StoredDeviceIdentity, TrafficLane,
     TrustedPeerEntry, VoiceModelConfig, HANDSHAKE_MAX_SKEW_MS, MAX_AUTH_FRAME_BYTES,
     MAX_WIRE_FRAME_BYTES,
 };
@@ -157,6 +166,8 @@ pub struct RemoteHostSummary {
     #[serde(default)]
     pub endpoints: Vec<NetworkEndpointCandidate>,
     pub is_online: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health: Option<coda_protocol::HostHealthSnapshot>,
 }
 
 impl RemoteHostSummary {
@@ -1272,6 +1283,7 @@ pub async fn list_account_hosts(
             x25519_pubkey: item["x25519_pubkey"].as_str().unwrap_or("").to_string(),
             endpoints,
             is_online: item["is_online"].as_bool().unwrap_or(false),
+            health: None,
         });
     }
     Ok(out)
@@ -1844,10 +1856,9 @@ fn spawn_trusted_peers_sync_task(
 async fn dispatch_decrypted_peer_message(
     session_key: PeerSessionKey,
     req_msg: PeerMessage,
-    herdr: &SharedHerdr,
-    fallback_shells: &Arc<Mutex<NativeFallbackShells>>,
+    runtime: &SharedHostRuntime,
+    server_url: &str,
     hostname: &str,
-    active_ptys: &Arc<Mutex<HashMap<(PeerSessionKey, String), ActivePtySubscription>>>,
     sessions: &Arc<Mutex<HashMap<PeerSessionKey, PeerCryptoSession>>>,
     my_device_id: Uuid,
     rpc_semaphore: &Arc<Semaphore>,
@@ -1859,10 +1870,9 @@ async fn dispatch_decrypted_peer_message(
         let _ = handle_peer_request_full(
             session_key,
             req_msg,
-            herdr,
-            fallback_shells,
+            runtime,
+            server_url,
             hostname,
-            active_ptys,
             sessions,
             my_device_id,
         )
@@ -1887,20 +1897,18 @@ async fn dispatch_decrypted_peer_message(
         return;
     };
 
-    let herdr_c = Arc::clone(herdr);
-    let fallback_c = Arc::clone(fallback_shells);
+    let runtime_c = runtime.clone();
+    let server_url_c = server_url.to_string();
     let hostname_c = hostname.to_string();
-    let active_ptys_c = Arc::clone(active_ptys);
     let sessions_c = Arc::clone(sessions);
     tokio::spawn(async move {
         let _permit = permit;
         if let Some((reply_msg, reply_lane)) = handle_peer_request_full(
             session_key.clone(),
             req_msg,
-            &herdr_c,
-            &fallback_c,
+            &runtime_c,
+            &server_url_c,
             &hostname_c,
-            &active_ptys_c,
             &sessions_c,
             my_device_id,
         )
@@ -2120,17 +2128,24 @@ pub struct SharedHostRuntime {
     fallback_shells: Arc<Mutex<NativeFallbackShells>>,
     active_ptys: Arc<Mutex<HashMap<(PeerSessionKey, String), ActivePtySubscription>>>,
     shutdown_tx: watch::Sender<bool>,
+    reexec_tx: watch::Sender<bool>,
+    started_at: std::time::Instant,
+    ota_lock: Arc<Mutex<()>>,
 }
 
 impl SharedHostRuntime {
     pub async fn new() -> Self {
         let herdr: SharedHerdr = Arc::new(RwLock::new(connect_herdr_with_install().await));
         let (shutdown_tx, _) = watch::channel(false);
+        let (reexec_tx, _) = watch::channel(false);
         Self {
             herdr,
             fallback_shells: Arc::new(Mutex::new(NativeFallbackShells::default())),
             active_ptys: Arc::new(Mutex::new(HashMap::new())),
             shutdown_tx,
+            reexec_tx,
+            started_at: std::time::Instant::now(),
+            ota_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -2140,6 +2155,14 @@ impl SharedHostRuntime {
 
     pub fn trigger_shutdown(&self) {
         let _ = self.shutdown_tx.send(true);
+    }
+
+    pub fn reexec_rx(&self) -> watch::Receiver<bool> {
+        self.reexec_tx.subscribe()
+    }
+
+    pub fn request_reexec(&self) {
+        let _ = self.reexec_tx.send(true);
     }
 }
 
@@ -2507,7 +2530,6 @@ pub async fn run_daemon_once_with_runtime(
         info!("herdr-core not active yet; native Unix openpty fallback shell manager ready");
     }
 
-    let fallback_shells = Arc::clone(&runtime.fallback_shells);
     let sessions: Arc<Mutex<HashMap<PeerSessionKey, PeerCryptoSession>>> =
         Arc::new(Mutex::new(HashMap::new()));
     let active_ptys = Arc::clone(&runtime.active_ptys);
@@ -2611,10 +2633,9 @@ pub async fn run_daemon_once_with_runtime(
                         dispatch_decrypted_peer_message(
                             session_key,
                             req_msg,
-                            &herdr,
-                            &fallback_shells,
+                            &runtime,
+                            &cfg.server_url,
                             &hostname,
-                            &active_ptys,
                             &sessions,
                             my_device_id,
                             &rpc_semaphore,
@@ -2681,9 +2702,6 @@ pub async fn spawn_direct_p2p_listener_with_runtime(
         local_addr, cfg.device_id
     );
 
-    let herdr = Arc::clone(&runtime.herdr);
-    let fallback_shells = Arc::clone(&runtime.fallback_shells);
-    let active_ptys = Arc::clone(&runtime.active_ptys);
     let p2p_replay = Arc::new(Mutex::new(TimedReplayCache::default()));
     let conn_sem = Arc::new(Semaphore::new(MAX_DIRECT_P2P_CONNS));
     let mut accept_shutdown_rx = runtime.shutdown_rx();
@@ -2710,9 +2728,7 @@ pub async fn spawn_direct_p2p_listener_with_runtime(
                 continue;
             };
             let cfg_clone = cfg.clone();
-            let herdr_clone = Arc::clone(&herdr);
-            let fallback_clone = Arc::clone(&fallback_shells);
-            let active_ptys_clone = Arc::clone(&active_ptys);
+            let runtime_clone = runtime.clone();
             let peers_clone = Arc::clone(&peers_store);
             let replay_clone = Arc::clone(&p2p_replay);
             let conn_shutdown_rx = runtime.shutdown_rx();
@@ -2733,9 +2749,7 @@ pub async fn spawn_direct_p2p_listener_with_runtime(
                         stream,
                         peer_addr,
                         cfg_clone,
-                        herdr_clone,
-                        fallback_clone,
-                        active_ptys_clone,
+                        runtime_clone,
                         peers_clone,
                         replay_clone,
                         conn_shutdown_rx,
@@ -2746,9 +2760,7 @@ pub async fn spawn_direct_p2p_listener_with_runtime(
                         stream,
                         peer_addr,
                         cfg_clone,
-                        herdr_clone,
-                        fallback_clone,
-                        active_ptys_clone,
+                        runtime_clone,
                         peers_clone,
                         replay_clone,
                         conn_shutdown_rx,
@@ -2869,10 +2881,8 @@ async fn verify_direct_p2p_hello(
 async fn dispatch_direct_p2p_frame(
     frame: RelayWireFrame,
     cfg: &DaemonConfig,
-    herdr: &SharedHerdr,
-    fallback_shells: &Arc<Mutex<NativeFallbackShells>>,
+    runtime: &SharedHostRuntime,
     sessions: &Arc<Mutex<HashMap<PeerSessionKey, PeerCryptoSession>>>,
-    active_ptys: &Arc<Mutex<HashMap<(PeerSessionKey, String), ActivePtySubscription>>>,
     out_tx: &mpsc::Sender<RelayWireFrame>,
     rpc_semaphore: &Arc<Semaphore>,
     p2p_conn_nonce: &str,
@@ -2908,10 +2918,9 @@ async fn dispatch_direct_p2p_frame(
             dispatch_decrypted_peer_message(
                 session_key,
                 req_msg,
-                herdr,
-                fallback_shells,
+                runtime,
+                &cfg.server_url,
                 &cfg.identity.name,
-                active_ptys,
                 sessions,
                 cfg.device_id,
                 rpc_semaphore,
@@ -3026,13 +3035,13 @@ async fn handle_direct_p2p_socket(
     stream: TcpStream,
     peer_addr: SocketAddr,
     cfg: DaemonConfig,
-    herdr: SharedHerdr,
-    fallback_shells: Arc<Mutex<NativeFallbackShells>>,
-    active_ptys: Arc<Mutex<HashMap<(PeerSessionKey, String), ActivePtySubscription>>>,
+    runtime: SharedHostRuntime,
     peers_store: Arc<TrustedPeersStore>,
     replay_cache: Arc<Mutex<TimedReplayCache>>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
+    let herdr = Arc::clone(&runtime.herdr);
+    let active_ptys = Arc::clone(&runtime.active_ptys);
     if *shutdown_rx.borrow() {
         return Ok(());
     }
@@ -3155,10 +3164,8 @@ async fn handle_direct_p2p_socket(
                 dispatch_direct_p2p_frame(
                     frame,
                     &cfg,
-                    &herdr,
-                    &fallback_shells,
+                    &runtime,
                     &sessions,
-                    &active_ptys,
                     &out_tx,
                     &rpc_semaphore,
                     &p2p_conn_nonce,
@@ -3184,13 +3191,13 @@ async fn handle_direct_p2p_ws_socket(
     stream: TcpStream,
     peer_addr: SocketAddr,
     cfg: DaemonConfig,
-    herdr: SharedHerdr,
-    fallback_shells: Arc<Mutex<NativeFallbackShells>>,
-    active_ptys: Arc<Mutex<HashMap<(PeerSessionKey, String), ActivePtySubscription>>>,
+    runtime: SharedHostRuntime,
     peers_store: Arc<TrustedPeersStore>,
     replay_cache: Arc<Mutex<TimedReplayCache>>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
+    let herdr = Arc::clone(&runtime.herdr);
+    let active_ptys = Arc::clone(&runtime.active_ptys);
     if *shutdown_rx.borrow() {
         return Ok(());
     }
@@ -3341,10 +3348,8 @@ async fn handle_direct_p2p_ws_socket(
                             dispatch_direct_p2p_frame(
                                 frame,
                                 &cfg,
-                                &herdr,
-                                &fallback_shells,
+                                &runtime,
                                 &sessions,
-                                &active_ptys,
                                 &out_tx,
                                 &rpc_semaphore,
                                 &p2p_conn_nonce,
@@ -3357,10 +3362,8 @@ async fn handle_direct_p2p_ws_socket(
                             dispatch_direct_p2p_frame(
                                 frame,
                                 &cfg,
-                                &herdr,
-                                &fallback_shells,
+                                &runtime,
                                 &sessions,
-                                &active_ptys,
                                 &out_tx,
                                 &rpc_semaphore,
                                 &p2p_conn_nonce,
@@ -3400,7 +3403,7 @@ pub async fn spawn_lan_udp_beacon(
         .map(|(addr, _)| addr)
 }
 
-async fn spawn_lan_udp_beacon_with_abort(
+pub async fn spawn_lan_udp_beacon_with_abort(
     device_id: Uuid,
     tcp_p2p_port: u16,
     bind_addr: SocketAddr,
@@ -3636,37 +3639,6 @@ pub async fn start_embedded_host_with_handle(cfg_path: &Path) -> Option<Embedded
     })
 }
 
-fn sanitize_upload_filename(raw: &str) -> Result<String> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() || trimmed.len() > 128 {
-        anyhow::bail!("invalid upload filename length");
-    }
-    if trimmed.contains('/')
-        || trimmed.contains('\\')
-        || trimmed.contains("..")
-        || trimmed.contains('\0')
-        || trimmed.starts_with('.')
-        || trimmed.chars().any(|c| c.is_control())
-    {
-        anyhow::bail!("unsafe upload filename rejected");
-    }
-    let clean: String = trimmed
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ' ') {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    let final_name = clean.trim().to_string();
-    if final_name.is_empty() || final_name.starts_with('.') {
-        anyhow::bail!("unsafe upload filename rejected");
-    }
-    Ok(final_name)
-}
-
 fn redact_voice_config(cfg: VoiceModelConfig) -> VoiceModelConfig {
     VoiceModelConfig {
         provider: cfg.provider,
@@ -3705,15 +3677,80 @@ fn key_name_to_terminal_bytes(key: &str) -> Option<Vec<u8>> {
 async fn handle_peer_request_full(
     session_key: PeerSessionKey,
     msg: PeerMessage,
-    herdr: &SharedHerdr,
-    fallback_shells: &Arc<Mutex<NativeFallbackShells>>,
+    runtime: &SharedHostRuntime,
+    server_url: &str,
     hostname: &str,
-    active_ptys: &Arc<Mutex<HashMap<(PeerSessionKey, String), ActivePtySubscription>>>,
     sessions: &Arc<Mutex<HashMap<PeerSessionKey, PeerCryptoSession>>>,
     my_device_id: Uuid,
 ) -> Option<(PeerMessage, TrafficLane)> {
+    let herdr = &runtime.herdr;
+    let fallback_shells = &runtime.fallback_shells;
+    let active_ptys = &runtime.active_ptys;
     let resolved_herdr = resolve_herdr_lazy(herdr).await;
+    let herdr_ver = resolved_herdr
+        .as_deref()
+        .map(|hc| hc.info().version.clone());
     match msg {
+        PeerMessage::GetHostHealth { req_id } => {
+            let health = telemetry_ota::collect_host_health_snapshot(runtime.started_at, herdr_ver);
+            return Some((
+                PeerMessage::HostHealthResult { req_id, health },
+                TrafficLane::ControlP0,
+            ));
+        }
+        PeerMessage::UpgradeDaemon {
+            req_id,
+            target_version,
+        } => {
+            let prev_ver = env!("CARGO_PKG_VERSION").to_string();
+            let Ok(_ota_guard) = runtime.ota_lock.try_lock() else {
+                return Some((
+                    PeerMessage::UpgradeDaemonResult {
+                        req_id,
+                        ok: false,
+                        previous_version: prev_ver,
+                        target_version,
+                        message: "An OTA upgrade is already in progress on this host.".into(),
+                    },
+                    TrafficLane::ControlP0,
+                ));
+            };
+            match telemetry_ota::perform_daemon_ota_upgrade(server_url, target_version.as_deref())
+                .await
+            {
+                Ok((prev, next_ver)) => {
+                    let rt_reexec = runtime.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(450)).await;
+                        rt_reexec.request_reexec();
+                    });
+                    return Some((
+                        PeerMessage::UpgradeDaemonResult {
+                            req_id,
+                            ok: true,
+                            previous_version: prev.clone(),
+                            target_version: Some(next_ver.clone()),
+                            message: format!(
+                                "Upgraded coda-daemon {prev} -> {next_ver}; hot-restarting daemon (active terminals remain live)."
+                            ),
+                        },
+                        TrafficLane::ControlP0,
+                    ));
+                }
+                Err(e) => {
+                    return Some((
+                        PeerMessage::UpgradeDaemonResult {
+                            req_id,
+                            ok: false,
+                            previous_version: prev_ver,
+                            target_version,
+                            message: e.to_string(),
+                        },
+                        TrafficLane::ControlP0,
+                    ));
+                }
+            }
+        }
         PeerMessage::ListWorkspaces { req_id, root_dirs } => {
             let mut terminals = match resolved_herdr.as_deref() {
                 Some(hc) => hc.list_terminals(false).await.unwrap_or_default(),
@@ -3765,12 +3802,17 @@ async fn handle_peer_request_full(
                     .map(redact_voice_config),
                 None => None,
             };
+            let host_health = Some(telemetry_ota::collect_host_health_snapshot(
+                runtime.started_at,
+                herdr_ver,
+            ));
             return Some((
                 PeerMessage::WorkspacesSnapshot {
                     req_id,
                     machine_name: hostname.to_string(),
                     repos,
                     voice_config,
+                    host_health,
                 },
                 TrafficLane::ControlP0,
             ));
@@ -4164,177 +4206,6 @@ async fn handle_peer_request_full(
         }
         other => Some(handle_peer_request(other, resolved_herdr.as_deref(), fallback_shells, hostname).await),
     }
-}
-
-pub fn is_sensitive_path(path: &Path) -> bool {
-    let lower_full = path.to_string_lossy().to_ascii_lowercase();
-    for sys_prefix in [
-        "/etc/shadow",
-        "/etc/gshadow",
-        "/etc/sudoers",
-        "/private/etc/shadow",
-        "/private/etc/master.passwd",
-        "/private/etc/sudoers",
-        "/proc/",
-        "/sys/",
-        "/dev/",
-        "/boot/",
-    ] {
-        if lower_full == sys_prefix.trim_end_matches('/') || lower_full.starts_with(sys_prefix) {
-            return true;
-        }
-    }
-
-    let comps: Vec<String> = path
-        .components()
-        .filter_map(|c| match c {
-            std::path::Component::Normal(s) => Some(s.to_string_lossy().to_ascii_lowercase()),
-            _ => None,
-        })
-        .collect();
-
-    for c in &comps {
-        if matches!(
-            c.as_str(),
-            ".ssh"
-                | ".gnupg"
-                | ".aws"
-                | ".kube"
-                | ".azure"
-                | "keychains"
-                | ".docker"
-                | ".claude"
-                | ".codex"
-                | ".grok"
-                | ".antigravity"
-                | ".gemini"
-        ) {
-            return true;
-        }
-    }
-    for win in comps.windows(2) {
-        if (win[0] == ".config"
-            && matches!(
-                win[1].as_str(),
-                "coda" | "gcloud" | "gh" | "herdr" | "herdr-core" | "grok" | "antigravity"
-            ))
-            || (win[0] == ".cargo" && win[1].starts_with("credentials"))
-            || (win[0] == "library" && win[1] == "keychains")
-            || (win[0] == "application support" && matches!(win[1].as_str(), "herdr" | "herdr-core"))
-            || (win[0] == "share" && matches!(win[1].as_str(), "herdr" | "herdr-core"))
-        {
-            return true;
-        }
-    }
-
-    if let Some(fname) = comps.last() {
-        if (fname == ".env"
-            || (fname.starts_with(".env.")
-                && !matches!(
-                    fname.as_str(),
-                    ".env.example" | ".env.sample" | ".env.template"
-                )))
-            || matches!(
-                fname.as_str(),
-                "id_rsa"
-                    | "id_ed25519"
-                    | "id_ecdsa"
-                    | "id_dsa"
-                    | "id_ed25519_sk"
-                    | "id_ecdsa_sk"
-                    | "authorized_keys"
-                    | "known_hosts"
-                    | "credentials"
-                    | "credentials.toml"
-                    | "daemon.json"
-                    | "desktop-session.json"
-                    | "desktop_client_identity.json"
-                    | "trusted_peers.json"
-                    | "coda-daemon.lock"
-                    | ".netrc"
-                    | ".npmrc"
-                    | ".pypirc"
-                    | ".pgpass"
-                    | ".git-credentials"
-                    | "shadow"
-                    | "gshadow"
-                    | "master.passwd"
-                    | "sudoers"
-                    | "terraform.tfstate"
-                    | "terraform.tfstate.backup"
-            )
-        {
-            return true;
-        }
-        if fname.ends_with(".pem")
-            || fname.ends_with(".key")
-            || fname.ends_with(".p12")
-            || fname.ends_with(".pfx")
-            || fname.ends_with(".kdbx")
-            || fname.ends_with("_history")
-            || fname.ends_with(".tfstate")
-        {
-            return true;
-        }
-    }
-
-    false
-}
-
-fn validate_local_preview_target(port: u16, path: &str) -> Result<reqwest::Url, String> {
-    if port < 1024 {
-        return Err(format!(
-            "Local preview port {port} blocked (privileged ports < 1024 are disallowed)"
-        ));
-    }
-    if matches!(
-        port,
-        2375 | 2376 | 3306 | 5432 | 6379 | 9200 | 11211 | 24443 | 24444 | 27017
-    ) {
-        return Err(format!(
-            "Local preview port {port} blocked (internal infrastructure/control port)"
-        ));
-    }
-    if path.starts_with('@') || path.contains("://") {
-        return Err("Invalid local preview path".into());
-    }
-    let clean_path = if path.starts_with('/') {
-        path.to_string()
-    } else {
-        format!("/{path}")
-    };
-    if clean_path.chars().any(|c| c.is_control())
-        || clean_path.contains('\\')
-        || clean_path.starts_with("//")
-    {
-        return Err("Invalid local preview path".into());
-    }
-    let raw_url = format!("http://127.0.0.1:{port}{clean_path}");
-    let parsed = reqwest::Url::parse(&raw_url).map_err(|e| format!("Invalid preview URL: {e}"))?;
-    if parsed.scheme() != "http"
-        || parsed.host_str() != Some("127.0.0.1")
-        || parsed.port() != Some(port)
-        || !parsed.username().is_empty()
-        || parsed.password().is_some()
-    {
-        return Err("Local preview target must remain strictly http://127.0.0.1".into());
-    }
-    Ok(parsed)
-}
-
-fn lossy_utf8_prefix(bytes: &[u8], max_bytes: usize) -> String {
-    let slice = if bytes.len() <= max_bytes {
-        bytes
-    } else {
-        // Trim back up to 3 bytes if slicing landed inside a multi-byte UTF-8 sequence (#25).
-        let mut end = max_bytes;
-        let floor = max_bytes.saturating_sub(3);
-        while end > floor && (bytes[end] & 0b1100_0000) == 0b1000_0000 {
-            end -= 1;
-        }
-        &bytes[..end]
-    };
-    String::from_utf8_lossy(slice).to_string()
 }
 
 async fn handle_peer_request(
@@ -4797,270 +4668,12 @@ async fn handle_peer_request(
             req_id,
             root_path,
             sub_path,
-        } => {
-            let clean_sub = sub_path.trim_matches('/');
-            let bad_sub = std::path::Path::new(clean_sub).components().any(|c| {
-                matches!(
-                    c,
-                    std::path::Component::ParentDir
-                        | std::path::Component::RootDir
-                        | std::path::Component::Prefix(_)
-                )
-            });
-            if bad_sub {
-                return (
-                    PeerMessage::DirectoryListing {
-                        req_id,
-                        root_path,
-                        sub_path: clean_sub.to_string(),
-                        entries: Vec::new(),
-                        error: Some("access denied: invalid sub_path traversal".into()),
-                    },
-                    TrafficLane::BulkP1,
-                );
-            }
-
-            let Ok(canon_base) = tokio::fs::canonicalize(&root_path).await else {
-                return (
-                    PeerMessage::DirectoryListing {
-                        req_id,
-                        root_path: root_path.clone(),
-                        sub_path: clean_sub.to_string(),
-                        entries: Vec::new(),
-                        error: Some(format!("root_path not found: {root_path}")),
-                    },
-                    TrafficLane::BulkP1,
-                );
-            };
-            if is_sensitive_path(&canon_base) {
-                return (
-                    PeerMessage::DirectoryListing {
-                        req_id,
-                        root_path,
-                        sub_path: clean_sub.to_string(),
-                        entries: Vec::new(),
-                        error: Some("access denied: restricted path".into()),
-                    },
-                    TrafficLane::BulkP1,
-                );
-            }
-
-            let mut candidate = canon_base.clone();
-            if !clean_sub.is_empty() {
-                for comp in std::path::Path::new(clean_sub).components() {
-                    if let std::path::Component::Normal(c) = comp {
-                        candidate.push(c);
-                    }
-                }
-            }
-            let Ok(canon_target) = tokio::fs::canonicalize(&candidate).await else {
-                return (
-                    PeerMessage::DirectoryListing {
-                        req_id,
-                        root_path,
-                        sub_path: clean_sub.to_string(),
-                        entries: Vec::new(),
-                        error: Some(format!("directory not found: {}", candidate.display())),
-                    },
-                    TrafficLane::BulkP1,
-                );
-            };
-            if !canon_target.starts_with(&canon_base) || is_sensitive_path(&canon_target) {
-                return (
-                    PeerMessage::DirectoryListing {
-                        req_id,
-                        root_path,
-                        sub_path: clean_sub.to_string(),
-                        entries: Vec::new(),
-                        error: Some("access denied: path escapes workspace or is sensitive".into()),
-                    },
-                    TrafficLane::BulkP1,
-                );
-            }
-
-            match tokio::fs::read_dir(&canon_target).await {
-                Ok(mut rd) => {
-                    let mut entries = Vec::new();
-                    while let Ok(Some(ent)) = rd.next_entry().await {
-                        let name = ent.file_name().to_string_lossy().to_string();
-                        if matches!(
-                            name.as_str(),
-                            ".git" | "target" | "node_modules" | ".DS_Store"
-                        ) {
-                            continue;
-                        }
-                        let ent_path = ent.path();
-                        if is_sensitive_path(&ent_path) {
-                            continue;
-                        }
-                        if let Ok(ent_canon) = tokio::fs::canonicalize(&ent_path).await {
-                            if !ent_canon.starts_with(&canon_base) || is_sensitive_path(&ent_canon) {
-                                continue;
-                            }
-                        } else {
-                            continue;
-                        }
-                        let meta = tokio::fs::metadata(&ent_path).await.ok();
-                        let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
-                        let size_bytes = if is_dir {
-                            0
-                        } else {
-                            meta.as_ref().map(|m| m.len()).unwrap_or(0)
-                        };
-                        let rel_path = if clean_sub.is_empty() {
-                            name.clone()
-                        } else {
-                            format!("{clean_sub}/{name}")
-                        };
-                        entries.push(RemoteFileItem {
-                            name,
-                            rel_path,
-                            is_dir,
-                            size_bytes,
-                        });
-                    }
-                    entries.sort_by(|a, b| {
-                        b.is_dir
-                            .cmp(&a.is_dir)
-                            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-                    });
-                    entries.truncate(120);
-                    (
-                        PeerMessage::DirectoryListing {
-                            req_id,
-                            root_path,
-                            sub_path: clean_sub.to_string(),
-                            entries,
-                            error: None,
-                        },
-                        TrafficLane::BulkP1,
-                    )
-                }
-                Err(e) => (
-                    PeerMessage::DirectoryListing {
-                        req_id,
-                        root_path,
-                        sub_path: clean_sub.to_string(),
-                        entries: Vec::new(),
-                        error: Some(format!("{}: {e}", canon_target.display())),
-                    },
-                    TrafficLane::BulkP1,
-                ),
-            }
-        }
+        } => handle_list_directory_rpc(req_id, root_path, sub_path).await,
         PeerMessage::ReadFilePreview {
             req_id,
             path,
             max_bytes,
-        } => {
-            let cap = max_bytes.clamp(1024, 256_000);
-            let canon = match tokio::fs::canonicalize(&path).await {
-                Ok(p) => p,
-                Err(e) => {
-                    return (
-                        PeerMessage::FilePreviewResponse {
-                            req_id,
-                            path,
-                            content: String::new(),
-                            error: Some(e.to_string()),
-                        },
-                        TrafficLane::BulkP1,
-                    );
-                }
-            };
-            if is_sensitive_path(&canon) {
-                return (
-                    PeerMessage::FilePreviewResponse {
-                        req_id,
-                        path,
-                        content: String::new(),
-                        error: Some("access denied: sensitive file path blocked".into()),
-                    },
-                    TrafficLane::BulkP1,
-                );
-            }
-            match tokio::fs::File::open(&canon).await {
-                Ok(file) => {
-                    let meta = match file.metadata().await {
-                        Ok(m) => m,
-                        Err(e) => {
-                            return (
-                                PeerMessage::FilePreviewResponse {
-                                    req_id,
-                                    path,
-                                    content: String::new(),
-                                    error: Some(e.to_string()),
-                                },
-                                TrafficLane::BulkP1,
-                            );
-                        }
-                    };
-                    if !meta.is_file() {
-                        return (
-                            PeerMessage::FilePreviewResponse {
-                                req_id,
-                                path,
-                                content: String::new(),
-                                error: Some("not a regular file".into()),
-                            },
-                            TrafficLane::BulkP1,
-                        );
-                    }
-                    let total_bytes = meta.len();
-                    let mut buf = Vec::with_capacity(cap.min(65_536));
-                    if let Err(e) = file.take((cap + 1) as u64).read_to_end(&mut buf).await {
-                        return (
-                            PeerMessage::FilePreviewResponse {
-                                req_id,
-                                path,
-                                content: String::new(),
-                                error: Some(e.to_string()),
-                            },
-                            TrafficLane::BulkP1,
-                        );
-                    }
-                    let was_truncated = buf.len() > cap || total_bytes > cap as u64;
-                    let slice = &buf[..buf.len().min(cap)];
-                    if slice.contains(&0u8) {
-                        (
-                            PeerMessage::FilePreviewResponse {
-                                req_id,
-                                path,
-                                content: format!(
-                                    "[Binary file · {} bytes — preview skipped]",
-                                    total_bytes
-                                ),
-                                error: None,
-                            },
-                            TrafficLane::BulkP1,
-                        )
-                    } else {
-                        let mut text = lossy_utf8_prefix(&buf, cap);
-                        if was_truncated {
-                            text.push_str("\n\n... [truncated] ...");
-                        }
-                        (
-                            PeerMessage::FilePreviewResponse {
-                                req_id,
-                                path,
-                                content: text,
-                                error: None,
-                            },
-                            TrafficLane::BulkP1,
-                        )
-                    }
-                }
-                Err(e) => (
-                    PeerMessage::FilePreviewResponse {
-                        req_id,
-                        path,
-                        content: String::new(),
-                        error: Some(e.to_string()),
-                    },
-                    TrafficLane::BulkP1,
-                ),
-            }
-        }
+        } => handle_read_file_preview_rpc(req_id, path, max_bytes).await,
         other => (
             PeerMessage::ActionAck {
                 req_id: "unhandled".into(),

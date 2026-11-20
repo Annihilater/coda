@@ -216,6 +216,7 @@ async fn main() -> Result<()> {
         std::env::remove_var(k);
     }
 
+    let orig_args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     let cli = Cli::parse();
     let cfg_path = cli.config.unwrap_or_else(DaemonConfig::default_path);
 
@@ -637,7 +638,7 @@ async fn main() -> Result<()> {
             let _ = peers_store.refresh_from_server(true).await;
 
             let runtime = SharedHostRuntime::new().await;
-            let bound_p2p = match spawn_direct_p2p_listener_with_runtime(
+            let (bound_p2p, p2p_abort) = match spawn_direct_p2p_listener_with_runtime(
                 cfg.clone(),
                 p2p_bind,
                 Arc::clone(&peers_store),
@@ -645,7 +646,7 @@ async fn main() -> Result<()> {
             )
             .await
             {
-                Ok((addr, _)) => Some(addr),
+                Ok((addr, ab)) => (Some(addr), Some(ab)),
                 Err(e) => {
                     let fallback = SocketAddr::new(p2p_bind.ip(), 0);
                     match spawn_direct_p2p_listener_with_runtime(
@@ -656,25 +657,33 @@ async fn main() -> Result<()> {
                     )
                     .await
                     {
-                        Ok((addr, _)) => Some(addr),
+                        Ok((addr, ab)) => (Some(addr), Some(ab)),
                         Err(_) => {
                             warn!("Direct P2P listener on {p2p_bind} not bound ({e}); continuing with Relay tunnel");
-                            None
+                            (None, None)
                         }
                     }
                 }
             };
             let bound_port = bound_p2p.map(|a| a.port());
-            if let Some(port) = bound_port {
+            let udp_abort = if let Some(port) = bound_port {
                 let udp_bind = SocketAddr::from(([0, 0, 0, 0], coda_daemon::DEFAULT_DIRECT_P2P_PORT));
-                if let Err(e) = coda_daemon::spawn_lan_udp_beacon(cfg.device_id, port, udp_bind).await {
-                    warn!("UDP LAN discovery beacon not bound on {udp_bind} ({e})");
+                match coda_daemon::spawn_lan_udp_beacon_with_abort(cfg.device_id, port, udp_bind).await {
+                    Ok((_, ab)) => Some(ab),
+                    Err(e) => {
+                        warn!("UDP LAN discovery beacon not bound on {udp_bind} ({e})");
+                        None
+                    }
                 }
-            }
+            } else {
+                None
+            };
 
             let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
             let mut sigterm =
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+            let mut reexec_rx = runtime.reexec_rx();
+            let mut ota_reexec = false;
             let mut backoff_secs = 1u64;
 
             loop {
@@ -689,6 +698,14 @@ async fn main() -> Result<()> {
                     runtime.clone(),
                 );
                 tokio::select! {
+                    _ = reexec_rx.changed() => {
+                        if *reexec_rx.borrow() {
+                            info!("coda-daemon OTA upgrade staged; shutting down old listeners to exec new binary");
+                            ota_reexec = true;
+                            runtime.trigger_shutdown();
+                            break;
+                        }
+                    }
                     _ = tokio::signal::ctrl_c() => {
                         info!("coda-daemon received SIGINT; shutting down cleanly");
                         runtime.trigger_shutdown();
@@ -729,6 +746,13 @@ async fn main() -> Result<()> {
                             }
                         }
                         tokio::select! {
+                            _ = reexec_rx.changed() => {
+                                if *reexec_rx.borrow() {
+                                    ota_reexec = true;
+                                    runtime.trigger_shutdown();
+                                    break;
+                                }
+                            }
                             _ = tokio::time::sleep(Duration::from_secs(backoff_secs)) => {}
                             _ = tokio::signal::ctrl_c() => {
                                 runtime.trigger_shutdown();
@@ -748,6 +772,26 @@ async fn main() -> Result<()> {
                             }
                         }
                         backoff_secs = (backoff_secs * 2).min(30);
+                    }
+                }
+            }
+
+            if ota_reexec {
+                if let Some(ab) = p2p_abort {
+                    ab.abort();
+                }
+                if let Some(ab) = udp_abort {
+                    ab.abort();
+                }
+                drop(_daemon_lock);
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::CommandExt;
+                    if let Ok(exe) = std::env::current_exe() {
+                        info!("exec-ing upgraded coda-daemon binary at {}", exe.display());
+                        let err = std::process::Command::new(&exe).args(&orig_args).exec();
+                        error!("failed to exec upgraded coda-daemon ({err}); exiting for supervisor restart");
                     }
                 }
             }

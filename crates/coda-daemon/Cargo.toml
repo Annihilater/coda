@@ -19,10 +19,12 @@ clap.workspace = true
 coda-herdr = { path = "../coda-herdr" }
 coda-protocol = { path = "../coda-protocol" }
 futures-util.workspace = true
+hex.workspace = true
 libc.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 socket2 = "0.6"
 tokio.workspace = true
 tokio-tungstenite.workspace = true
