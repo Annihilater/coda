@@ -9,6 +9,7 @@ import UniformTypeIdentifiers
 private final class TerminalViewportLocalState: ObservableObject {
     @Published var directInputBuffer: String = ""
     @Published var showDirectInputBar: Bool = false
+    @Published var useMultiLineComposer: Bool = false
     @Published var showSearchBar: Bool = false
     @Published var searchQuery: String = ""
     @Published var searchMatchIndex: Int = 0
@@ -97,6 +98,11 @@ public struct CodaTerminalSessionView: View {
 
                 if !hideBottomControls {
                     VStack(spacing: 8) {
+                        if session.status == .needsYou {
+                            floatingNeedsYouApprovalBar
+                                .transition(.move(edge: .bottom).combined(with: .opacity))
+                        }
+
                         if local.showDirectInputBar || store.showTactileTwoRowKeypad {
                             quickCommandsStrip
                                 .transition(.move(edge: .bottom).combined(with: .opacity))
@@ -277,7 +283,7 @@ public struct CodaTerminalSessionView: View {
                             }
                         }
                     } else {
-                        store.loadGitDiff(for: session, presentModal: true)
+                        store.openRemoteInspector(for: session, mode: .changes)
                     }
                 } label: {
                     Image(systemName: "plus.forwardslash.minus")
@@ -324,6 +330,11 @@ public struct CodaTerminalSessionView: View {
                         store.openRemoteInspector(for: session, mode: .files)
                     } label: {
                         Label(tr("Workspace Files (E2EE)", "工作区文件浏览", locale: store.locale), systemImage: "folder")
+                    }
+                    Button {
+                        store.openRemoteInspector(for: session, mode: .changes)
+                    } label: {
+                        Label(tr("Changes (Git Diff)", "代码变更 (Git Diff)", locale: store.locale), systemImage: "plus.forwardslash.minus")
                     }
                     Button {
                         store.openRemoteInspector(for: session, mode: .portPreview)
@@ -750,68 +761,233 @@ public struct CodaTerminalSessionView: View {
         }
     }
 
+    private var floatingNeedsYouApprovalBar: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 6) {
+                HStack(spacing: 4) {
+                    Circle()
+                        .fill(CodaHerdrTheme.amberNeedsYou)
+                        .frame(width: 7, height: 7)
+                    Text(tr("Needs you", "待审批", locale: store.locale))
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundStyle(CodaHerdrTheme.amberNeedsYou)
+                }
+                .padding(.leading, 6)
+                .padding(.trailing, 2)
+
+                approvalCapsuleButton(
+                    tr("Allow (y)", "允许 (y)", locale: store.locale),
+                    tint: CodaHerdrTheme.greenDiff
+                ) {
+                    store.sendDirectText("y", submit: true, to: session)
+                }
+                approvalCapsuleButton(
+                    tr("Reject (Esc)", "拒绝 (Esc)", locale: store.locale),
+                    tint: CodaHerdrTheme.redDiff
+                ) {
+                    store.sendQuickKey(.esc, to: session)
+                }
+                approvalCapsuleButton("1", tint: CodaHerdrTheme.amberNeedsYou) {
+                    store.sendDirectText("1", submit: true, to: session)
+                }
+                approvalCapsuleButton("2", tint: CodaHerdrTheme.amberNeedsYou) {
+                    store.sendDirectText("2", submit: true, to: session)
+                }
+                approvalCapsuleButton("3", tint: CodaHerdrTheme.amberNeedsYou) {
+                    store.sendDirectText("3", submit: true, to: session)
+                }
+                approvalCapsuleButton("Enter", tint: CodaHerdrTheme.cyanWorking) {
+                    store.sendQuickKey(.enter, to: session)
+                }
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 6)
+        }
+        .background(
+            Capsule()
+                .fill(CodaHerdrTheme.elevatedBG.opacity(0.97))
+                .overlay(Capsule().strokeBorder(CodaHerdrTheme.amberNeedsYou.opacity(0.65), lineWidth: 1.2))
+                .shadow(color: .black.opacity(0.5), radius: 14, x: 0, y: 6)
+        )
+    }
+
+    private func approvalCapsuleButton(
+        _ title: String,
+        tint: Color,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            Text(title)
+                .font(.system(size: 11.5, weight: .semibold, design: .monospaced))
+                .foregroundStyle(tint)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .background(
+                    Capsule()
+                        .fill(tint.opacity(0.14))
+                        .overlay(Capsule().strokeBorder(tint.opacity(0.45), lineWidth: 1))
+                )
+        }
+        .buttonStyle(.plain)
+    }
+
     private var directKeystrokeStrip: some View {
-        HStack(spacing: 8) {
-            if store.ctrlActive {
-                modifierChip("CTRL")
-            }
-            if store.altActive {
-                modifierChip("ALT")
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Button {
+                    withAnimation(.snappy(duration: 0.16)) {
+                        local.useMultiLineComposer.toggle()
+                    }
+                    directKeyboardFocused = true
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: local.useMultiLineComposer ? "text.alignleft" : "terminal")
+                            .font(.system(size: 10.5, weight: .semibold))
+                        Text(
+                            local.useMultiLineComposer
+                                ? tr("Prompt Composer · Bracketed Paste", "多行指令编排 · 括号粘贴发送", locale: store.locale)
+                                : tr("Direct Keystroke · Tap for Multi-Line", "单行按键 · 点击切换多行编排", locale: store.locale)
+                        )
+                        .font(.system(size: 10.5, weight: .semibold))
+                    }
+                    .foregroundStyle(local.useMultiLineComposer ? CodaHerdrTheme.cyanWorking : CodaHerdrTheme.textSecondary)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3.5)
+                    .background(
+                        Capsule()
+                            .fill(local.useMultiLineComposer ? CodaHerdrTheme.cyanWorking.opacity(0.14) : CodaHerdrTheme.cardBG)
+                    )
+                }
+                .buttonStyle(.plain)
+
+                if store.ctrlActive {
+                    modifierChip("CTRL")
+                }
+                if store.altActive {
+                    modifierChip("ALT")
+                }
+
+                Spacer()
+
+                Button {
+                    local.useMultiLineComposer = true
+                    Task {
+                        await store.toggleVoiceDictation { transcript in
+                            if local.directInputBuffer.isEmpty
+                                || local.directInputBuffer.hasSuffix(" ")
+                                || local.directInputBuffer.hasSuffix("\n") {
+                                local.directInputBuffer += transcript
+                            } else {
+                                local.directInputBuffer += " \(transcript)"
+                            }
+                        }
+                    }
+                } label: {
+                    HStack(spacing: 4) {
+                        if store.isTranscribingVoice {
+                            ProgressView().controlSize(.mini).tint(CodaHerdrTheme.cyanWorking)
+                        } else {
+                            Image(systemName: store.isRecordingVoice ? "stop.circle.fill" : "mic.fill")
+                                .font(.system(size: 11, weight: .semibold))
+                        }
+                        Text(
+                            store.isRecordingVoice
+                                ? tr("Stop", "停止", locale: store.locale)
+                                : tr("Dictate", "语音", locale: store.locale)
+                        )
+                        .font(.system(size: 10.5, weight: .semibold))
+                    }
+                    .foregroundStyle(store.isRecordingVoice ? .white : CodaHerdrTheme.textPrimary)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3.5)
+                    .background(
+                        Capsule()
+                            .fill(store.isRecordingVoice ? CodaHerdrTheme.redDiff : CodaHerdrTheme.cardBG)
+                    )
+                }
+                .buttonStyle(.plain)
+                .disabled(store.isTranscribingVoice)
+
+                Button {
+                    directKeyboardFocused = false
+                    store.cancelVoiceDictation()
+                    withAnimation(.snappy(duration: 0.16)) {
+                        local.showDirectInputBar = false
+                    }
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 15))
+                        .foregroundStyle(CodaHerdrTheme.textDim)
+                }
+                .buttonStyle(.plain)
             }
 
-            TextField(
-                tr("Type command or keystroke (Enter to send)...", "输入指令或按键（回车发送）...", locale: store.locale),
-                text: $local.directInputBuffer
-            )
-            .font(.system(size: 13, design: .monospaced))
-            .foregroundStyle(CodaHerdrTheme.textPrimary)
-            .focused($directKeyboardFocused)
-            .codaNoAutocapAndSpelling()
-            .onChange(of: local.directInputBuffer) { _, next in
-                if (store.ctrlActive || store.altActive), let last = next.last {
-                    local.directInputBuffer = ""
-                    store.sendDirectText(String(last), submit: false, to: session)
-                }
+            if let voiceErr = store.voiceError {
+                Text(voiceErr)
+                    .font(.system(size: 11))
+                    .foregroundStyle(CodaHerdrTheme.redDiff)
             }
-            .onSubmit {
-                let text = local.directInputBuffer
-                local.directInputBuffer = ""
-                if text.isEmpty {
-                    store.sendQuickKey(.enter, to: session)
+
+            HStack(alignment: .bottom, spacing: 8) {
+                if local.useMultiLineComposer {
+                    TextField(
+                        tr(
+                            "Compose multi-line prompt or review dictation (sends via Bracketed Paste)...",
+                            "编写或修改多行提示词（通过 Bracketed Paste 安全发送）...",
+                            locale: store.locale
+                        ),
+                        text: $local.directInputBuffer,
+                        axis: .vertical
+                    )
+                    .lineLimit(3...7)
+                    .font(.system(size: 13, design: .monospaced))
+                    .foregroundStyle(CodaHerdrTheme.textPrimary)
+                    .focused($directKeyboardFocused)
+                    .codaNoAutocapAndSpelling()
                 } else {
-                    store.sendDirectText(text, submit: true, to: session)
+                    TextField(
+                        tr("Type command or keystroke (Enter to send)...", "输入指令或按键（回车发送）...", locale: store.locale),
+                        text: $local.directInputBuffer
+                    )
+                    .font(.system(size: 13, design: .monospaced))
+                    .foregroundStyle(CodaHerdrTheme.textPrimary)
+                    .focused($directKeyboardFocused)
+                    .codaNoAutocapAndSpelling()
+                    .onChange(of: local.directInputBuffer) { _, next in
+                        if (store.ctrlActive || store.altActive), let last = next.last {
+                            local.directInputBuffer = ""
+                            store.sendDirectText(String(last), submit: false, to: session)
+                        }
+                    }
+                    .onSubmit {
+                        submitDirectOrComposerInput()
+                    }
                 }
-            }
 
-            Button {
-                let text = local.directInputBuffer
-                local.directInputBuffer = ""
-                if text.isEmpty {
-                    store.sendQuickKey(.enter, to: session)
-                } else {
-                    store.sendDirectText(text, submit: true, to: session)
+                Button {
+                    submitDirectOrComposerInput()
+                } label: {
+                    HStack(spacing: 4) {
+                        if local.useMultiLineComposer {
+                            Text(tr("Send", "发送", locale: store.locale))
+                                .font(.system(size: 12, weight: .semibold))
+                        }
+                        Image(systemName: "arrow.up.circle.fill")
+                            .font(.system(size: 20))
+                    }
+                    .foregroundStyle(local.useMultiLineComposer ? .black : CodaHerdrTheme.cyanWorking)
+                    .padding(.horizontal, local.useMultiLineComposer ? 10 : 0)
+                    .padding(.vertical, local.useMultiLineComposer ? 5 : 0)
+                    .background(
+                        Capsule()
+                            .fill(local.useMultiLineComposer ? CodaHerdrTheme.cyanWorking : .clear)
+                    )
                 }
-            } label: {
-                Image(systemName: "arrow.up.circle.fill")
-                    .font(.system(size: 20))
-                    .foregroundStyle(CodaHerdrTheme.cyanWorking)
+                .buttonStyle(.plain)
             }
-            .buttonStyle(.plain)
-
-            Button {
-                directKeyboardFocused = false
-                withAnimation(.snappy(duration: 0.16)) {
-                    local.showDirectInputBar = false
-                }
-            } label: {
-                Image(systemName: "xmark.circle.fill")
-                    .font(.system(size: 16))
-                    .foregroundStyle(CodaHerdrTheme.textDim)
-            }
-            .buttonStyle(.plain)
         }
         .padding(.horizontal, 12)
-        .padding(.vertical, 8)
+        .padding(.vertical, 9)
         .background(
             RoundedRectangle(cornerRadius: 12, style: .continuous)
                 .fill(CodaHerdrTheme.elevatedBG)
@@ -821,6 +997,20 @@ public struct CodaTerminalSessionView: View {
             Task { @MainActor in
                 directKeyboardFocused = true
             }
+        }
+    }
+
+    private func submitDirectOrComposerInput() {
+        let text = local.directInputBuffer
+        local.directInputBuffer = ""
+        if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            if !local.useMultiLineComposer {
+                store.sendQuickKey(.enter, to: session)
+            }
+        } else if local.useMultiLineComposer || text.contains("\n") {
+            store.sendBracketedPastePrompt(text, to: session)
+        } else {
+            store.sendDirectText(text, submit: true, to: session)
         }
     }
 
@@ -1304,6 +1494,13 @@ public struct CodaPaneMinimapSheet: View {
                         Button("Gemini CLI") { store.launchAgent(agent: "gemini", on: device, cwd: session.cwd); dismiss() }
                         Divider()
                         Button("Shell") { store.launchAgent(agent: "shell", on: device, cwd: session.cwd); dismiss() }
+                        Divider()
+                        Button {
+                            dismiss()
+                            store.openBootstrapWorkspaceSheet(for: device)
+                        } label: {
+                            Label(tr("New Workspace / Git Clone…", "新建目录 / Git Clone…", locale: store.locale), systemImage: "folder.badge.plus")
+                        }
                     } label: {
                         Label(tr("New Pane", "新建窗格", locale: store.locale), systemImage: "plus")
                             .font(.system(size: 12, weight: .semibold))
@@ -1391,14 +1588,9 @@ public struct CodaGitDiffSheet: View {
     public var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("\(session.workspaceName) · Git Diff")
-                        .font(.system(size: 16, weight: .semibold))
-                        .foregroundStyle(CodaHerdrTheme.textPrimary)
-                    Text(store.gitDiffResult?.branch ?? session.branch)
-                        .font(.system(size: 12, design: .monospaced))
-                        .foregroundStyle(CodaHerdrTheme.textSecondary)
-                }
+                Text("\(session.workspaceName) · Git Diff")
+                    .font(.system(size: 16, weight: .semibold))
+                    .foregroundStyle(CodaHerdrTheme.textPrimary)
                 Spacer()
                 Button(tr("Close", "关闭", locale: store.locale)) { dismiss() }
                     .foregroundStyle(CodaHerdrTheme.textSecondary)
@@ -1406,37 +1598,7 @@ public struct CodaGitDiffSheet: View {
 
             Divider().background(CodaHerdrTheme.borderHairline)
 
-            if store.gitDiffLoading {
-                ProgressView()
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else if let diff = store.gitDiffResult {
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 4) {
-                        if !diff.statusShort.isEmpty {
-                            Text(diff.statusShort)
-                                .font(.system(size: 11, design: .monospaced))
-                                .foregroundStyle(CodaHerdrTheme.cyanWorking)
-                                .padding(.bottom, 8)
-                        }
-                        let rawLines = (diff.diffUnified.isEmpty ? tr("Working tree clean", "工作区无未提交变更", locale: store.locale) : diff.diffUnified).components(separatedBy: "\n")
-                        ForEach(Array(rawLines.enumerated()), id: \.offset) { _, line in
-                            let fg: Color = line.hasPrefix("+") && !line.hasPrefix("+++")
-                                ? CodaHerdrTheme.greenDiff
-                                : (line.hasPrefix("-") && !line.hasPrefix("---")
-                                    ? CodaHerdrTheme.redDiff
-                                    : (line.hasPrefix("@@") ? CodaHerdrTheme.cyanWorking : CodaHerdrTheme.textPrimary))
-                            Text(line.isEmpty ? " " : line)
-                                .font(.system(size: 11.5, design: .monospaced))
-                                .foregroundStyle(fg)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                        }
-                    }
-                }
-            } else {
-                Text(tr("No diff loaded.", "暂无差异输出。", locale: store.locale))
-                    .foregroundStyle(CodaHerdrTheme.textSecondary)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-            }
+            CodaGitDiffInteractiveView(store: store, session: session)
         }
         .padding(18)
         .background(CodaHerdrTheme.cardBG)

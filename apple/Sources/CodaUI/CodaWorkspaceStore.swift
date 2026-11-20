@@ -95,6 +95,20 @@ public final class CodaWorkspaceStore: ObservableObject {
     @Published public var pendingOpenSettingsAfterCompose: Bool = false
     @Published public var gitDiffResult: CodaGitDiffResult? = nil
     @Published public var gitDiffLoading: Bool = false
+    @Published public var gitDiffError: String? = nil
+    @Published public var gitDiffSelectedFile: String? = nil
+    @Published public var notificationSettings: CodaNotificationWebhookSettings = CodaNotificationWebhookSettings()
+    @Published public var isSavingNotificationSettings: Bool = false
+    @Published public var isTestingNotificationSettings: Bool = false
+    @Published public var notificationStatusMessage: String? = nil
+    @Published public var notificationErrorMessage: String? = nil
+    @Published public var isPruningStaleDevices: Bool = false
+    @Published public var showBootstrapWorkspaceSheet: Bool = false
+    @Published public var bootstrapTargetDeviceID: UUID? = nil
+    @Published public var bootstrapDefaultParentDir: String = "~/workspace"
+    @Published public var isBootstrappingWorkspace: Bool = false
+    @Published public var bootstrapErrorMessage: String? = nil
+    @Published public var bootstrapStatusMessage: String? = nil
 
     @Published public var ctrlActive: Bool = false
     @Published public var altActive: Bool = false
@@ -135,6 +149,7 @@ public final class CodaWorkspaceStore: ObservableObject {
     private var deviceAuthTask: Task<Void, Never>?
     private var screenRefreshTask: Task<Void, Never>?
     private var voiceTask: Task<Void, Never>?
+    private var pendingVoiceTranscriptHandler: ((String) -> Void)? = nil
     private var isStartingVoice: Bool = false
     private var workspaceEpoch: UInt64 = 0
     private var voiceGeneration: UInt64 = 0
@@ -329,6 +344,13 @@ public final class CodaWorkspaceStore: ObservableObject {
         self.selectedSessionID = nil
         self.gitDiffResult = nil
         self.gitDiffLoading = false
+        self.gitDiffError = nil
+        self.gitDiffSelectedFile = nil
+        self.notificationStatusMessage = nil
+        self.notificationErrorMessage = nil
+        self.bootstrapErrorMessage = nil
+        self.bootstrapStatusMessage = nil
+        self.showBootstrapWorkspaceSheet = false
         self.composeText = ""
         self.activeToast = nil
         self.uploadStatusBanner = nil
@@ -1218,6 +1240,14 @@ public final class CodaWorkspaceStore: ObservableObject {
         secondarySessionID = nil
         gitDiffResult = nil
         gitDiffLoading = false
+        gitDiffError = nil
+        gitDiffSelectedFile = nil
+        notificationSettings = CodaNotificationWebhookSettings()
+        notificationStatusMessage = nil
+        notificationErrorMessage = nil
+        bootstrapErrorMessage = nil
+        bootstrapStatusMessage = nil
+        showBootstrapWorkspaceSheet = false
         showRemoteFilesSheet = false
         remoteFileEntries = []
         remoteFileSelectedRel = nil
@@ -2008,7 +2038,7 @@ public final class CodaWorkspaceStore: ObservableObject {
               let dev = remoteMachines.first(where: { $0.id == devId }),
               let clientDevId = localIdentity.deviceId else { return }
 
-        if submit && session.state == .needsYou && (text == "1" || text == "2") {
+        if submit && session.state == .needsYou && (text == "y" || text == "Y" || text == "1" || text == "2" || text == "3") {
             CodaHaptics.success()
             optimisticallyClearNeedsYou(for: session)
         } else if submit {
@@ -2050,9 +2080,39 @@ public final class CodaWorkspaceStore: ObservableObject {
         }
     }
 
+    public func sendBracketedPastePrompt(_ rawPrompt: String, to targetSession: CodaAgentSession? = nil) {
+        let trimmed = rawPrompt.trimmingCharacters(in: .newlines)
+        guard !trimmed.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              let session = targetSession ?? activeSheetSession ?? selectedSession,
+              let client = networkClient,
+              let devId = session.deviceId,
+              let dev = remoteMachines.first(where: { $0.id == devId }),
+              let clientDevId = localIdentity.deviceId else { return }
+
+        CodaHaptics.mediumTap()
+        optimisticallyClearNeedsYou(for: session)
+        let bytes = CodaTerminalTranscriptHelper.encodeBracketedPaste(trimmed, appendCarriageReturn: true)
+        let isAttached = attachedSessionIDs.contains(session.id)
+
+        Task {
+            try? await client.sendPtyInput(
+                on: dev,
+                clientIdentity: localIdentity,
+                clientDeviceId: clientDevId,
+                terminal: session.terminalAddress,
+                data: bytes
+            )
+            if !isAttached {
+                try? await Task.sleep(nanoseconds: 250_000_000)
+                await refreshTerminalScreen(for: session, forceSnapshot: true)
+            }
+        }
+    }
+
     public func submitComposePrompt(for targetSession: CodaAgentSession? = nil) {
         let trimmed = composeText.trimmingCharacters(in: .newlines)
-        guard !trimmed.isEmpty, let session = targetSession ?? activeSheetSession ?? selectedSession,
+        guard !trimmed.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              let session = targetSession ?? activeSheetSession ?? selectedSession,
               let client = networkClient,
               let devId = session.deviceId,
               let dev = remoteMachines.first(where: { $0.id == devId }),
@@ -2067,34 +2127,15 @@ public final class CodaWorkspaceStore: ObservableObject {
 
         Task {
             defer { self.isSendingAction = false }
-            if isAttached {
-                var bytes = Data()
-                if toSend.contains("\n") {
-                    // Use bracketed paste for multiline prompts so TUIs (Claude/Codex/Gemini) keep newlines intact.
-                    bytes.append(Data("\u{1B}[200~".utf8))
-                    bytes.append(Data(toSend.utf8))
-                    bytes.append(Data("\u{1B}[201~".utf8))
-                    bytes.append(0x0D)
-                } else {
-                    bytes.append(Data(toSend.utf8))
-                    bytes.append(0x0D)
-                }
-                try? await client.sendPtyInput(
-                    on: dev,
-                    clientIdentity: localIdentity,
-                    clientDeviceId: clientDevId,
-                    terminal: session.terminalAddress,
-                    data: bytes
-                )
-            } else {
-                try? await client.sendTerminalText(
-                    on: dev,
-                    clientIdentity: localIdentity,
-                    clientDeviceId: clientDevId,
-                    terminal: session.terminalAddress,
-                    text: toSend,
-                    submit: true
-                )
+            let bytes = CodaTerminalTranscriptHelper.encodeBracketedPaste(toSend, appendCarriageReturn: true)
+            try? await client.sendPtyInput(
+                on: dev,
+                clientIdentity: localIdentity,
+                clientDeviceId: clientDevId,
+                terminal: session.terminalAddress,
+                data: bytes
+            )
+            if !isAttached {
                 try? await Task.sleep(nanoseconds: 250_000_000)
                 await refreshTerminalScreen(for: session, forceSnapshot: true)
             }
@@ -2146,7 +2187,7 @@ public final class CodaWorkspaceStore: ObservableObject {
                     filename: fileURL.lastPathComponent,
                     data: data
                 )
-                let inserted = remotePath ?? fileURL.lastPathComponent
+                let inserted = codaShellQuotePath(remotePath ?? fileURL.lastPathComponent)
                 if composeText.isEmpty {
                     composeText = inserted + " "
                 } else {
@@ -2159,7 +2200,7 @@ public final class CodaWorkspaceStore: ObservableObject {
         }
     }
 
-    public func toggleVoiceDictation() async {
+    public func toggleVoiceDictation(onTranscribed: ((String) -> Void)? = nil) async {
         voiceError = nil
         if isTranscribingVoice || isStartingVoice { return }
 
@@ -2167,6 +2208,8 @@ public final class CodaWorkspaceStore: ObservableObject {
             voiceGeneration &+= 1
             let gen = voiceGeneration
             let epoch = workspaceEpoch
+            let customHandler = pendingVoiceTranscriptHandler ?? onTranscribed
+            pendingVoiceTranscriptHandler = nil
             isRecordingVoice = false
             isTranscribingVoice = true
             let task = Task { @MainActor [weak self] in
@@ -2178,10 +2221,15 @@ public final class CodaWorkspaceStore: ObservableObject {
                     }
                 }
                 do {
-                    let transcript = try await self.voiceRecorder.stopAndTranscribe(config: self.settings.voiceConfig)
+                    let transcript = try await self.voiceRecorder.stopAndTranscribe(
+                        config: self.settings.voiceConfig,
+                        locale: self.locale
+                    )
                     guard !Task.isCancelled, self.voiceGeneration == gen, self.workspaceEpoch == epoch else { return }
                     if !transcript.isEmpty {
-                        if self.composeText.isEmpty || self.composeText.hasSuffix(" ") || self.composeText.hasSuffix("\n") {
+                        if let customHandler {
+                            customHandler(transcript)
+                        } else if self.composeText.isEmpty || self.composeText.hasSuffix(" ") || self.composeText.hasSuffix("\n") {
                             self.composeText += transcript
                         } else {
                             self.composeText += " \(transcript)"
@@ -2200,6 +2248,7 @@ public final class CodaWorkspaceStore: ObservableObject {
         voiceGeneration &+= 1
         let gen = voiceGeneration
         let epoch = workspaceEpoch
+        pendingVoiceTranscriptHandler = onTranscribed
         isStartingVoice = true
         let task = Task { @MainActor [weak self] in
             guard let self else { return }
@@ -2210,11 +2259,14 @@ public final class CodaWorkspaceStore: ObservableObject {
                 }
             }
             do {
-                _ = try CodaVoiceRecorder.validatedTranscriptionURL(from: self.settings.voiceConfig.baseURL)
+                if !CodaVoiceRecorder.usesNativeSpeechFallback(for: self.settings.voiceConfig) {
+                    _ = try CodaVoiceRecorder.validatedTranscriptionURL(from: self.settings.voiceConfig.baseURL)
+                }
                 try await self.voiceRecorder.startRecording()
                 if Task.isCancelled || self.voiceGeneration != gen || self.workspaceEpoch != epoch {
                     if self.voiceGeneration == gen {
                         self.voiceRecorder.cancelRecording()
+                        self.pendingVoiceTranscriptHandler = nil
                         self.isRecordingVoice = false
                     }
                     return
@@ -2223,6 +2275,7 @@ public final class CodaWorkspaceStore: ObservableObject {
             } catch {
                 guard self.voiceGeneration == gen else { return }
                 self.voiceRecorder.cancelRecording()
+                self.pendingVoiceTranscriptHandler = nil
                 self.isRecordingVoice = false
                 guard !Task.isCancelled, self.workspaceEpoch == epoch else { return }
                 self.voiceError = error.localizedDescription
@@ -2236,6 +2289,7 @@ public final class CodaWorkspaceStore: ObservableObject {
         voiceGeneration &+= 1
         voiceTask?.cancel()
         voiceTask = nil
+        pendingVoiceTranscriptHandler = nil
         voiceRecorder.cancelRecording()
         isStartingVoice = false
         isRecordingVoice = false
@@ -2243,14 +2297,21 @@ public final class CodaWorkspaceStore: ObservableObject {
     }
 
     public func saveVoiceConfig() async {
-        do {
-            _ = try CodaVoiceRecorder.validatedTranscriptionURL(from: settings.voiceConfig.baseURL)
-        } catch {
-            voiceConfigSyncMessage = error.localizedDescription
-            return
+        let usesNativeFallback = CodaVoiceRecorder.usesNativeSpeechFallback(for: settings.voiceConfig)
+        if !usesNativeFallback || !settings.voiceConfig.baseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            do {
+                _ = try CodaVoiceRecorder.validatedTranscriptionURL(from: settings.voiceConfig.baseURL)
+            } catch {
+                if !usesNativeFallback {
+                    voiceConfigSyncMessage = error.localizedDescription
+                    return
+                }
+            }
         }
         settings.save()
-        voiceConfigSyncMessage = tr("Saved to secure storage.", "已保存至安全存储。", locale: locale)
+        voiceConfigSyncMessage = usesNativeFallback
+            ? tr("Saved (Apple Speech zero-config fallback active).", "已保存（已启用 Apple 原生零配置语音识别）。", locale: locale)
+            : tr("Saved to secure storage.", "已保存至安全存储。", locale: locale)
         guard isSignedIn, let client = await preparedClient(), let clientDevId = localIdentity.deviceId else { return }
         let onlineHosts = remoteMachines.filter(\.isOnline)
         guard !onlineHosts.isEmpty else { return }
@@ -2262,7 +2323,6 @@ public final class CodaWorkspaceStore: ObservableObject {
                 clientDeviceId: clientDevId,
                 config: settings.voiceConfig
             ) {
-                // Keep locally saved API key if daemon returned redacted empty string.
                 var merged = synced
                 if merged.apiKey.isEmpty && !settings.voiceConfig.apiKey.isEmpty {
                     merged.apiKey = settings.voiceConfig.apiKey
@@ -2278,12 +2338,208 @@ public final class CodaWorkspaceStore: ObservableObject {
                 "已保存并同步到 \(syncedCount) 台主机。",
                 locale: locale
             )
-        } else {
-            voiceConfigSyncMessage = tr(
-                "Saved locally (host offline).",
-                "已在本地安全保存（主机离线）。",
+        }
+    }
+
+    // MARK: - Offline Alert Webhooks, Stale Web Device Pruning & Workspace Bootstrapper
+
+    public func loadNotificationWebhookSettings() async {
+        guard isSignedIn, let client = await preparedClient() else { return }
+        let epoch = workspaceEpoch
+        do {
+            let fetched = try await client.fetchNotificationSettings()
+            guard self.workspaceEpoch == epoch else { return }
+            self.notificationSettings = fetched
+        } catch {
+            if self.workspaceEpoch == epoch {
+                self.notificationErrorMessage = error.localizedDescription
+            }
+        }
+    }
+
+    public func saveNotificationWebhookSettings() async {
+        guard isSignedIn, let client = await preparedClient() else { return }
+        let epoch = workspaceEpoch
+        notificationErrorMessage = nil
+        notificationStatusMessage = nil
+        isSavingNotificationSettings = true
+        defer {
+            if self.workspaceEpoch == epoch {
+                self.isSavingNotificationSettings = false
+            }
+        }
+        do {
+            let updated = try await client.updateNotificationSettings(notificationSettings)
+            guard self.workspaceEpoch == epoch else { return }
+            self.notificationSettings = updated
+            self.notificationStatusMessage = tr(
+                "Saved offline webhook alert settings.",
+                "已保存离线 Webhook 告警推送配置。",
                 locale: locale
             )
+        } catch {
+            if self.workspaceEpoch == epoch {
+                self.notificationErrorMessage = error.localizedDescription
+            }
+        }
+    }
+
+    public func sendTestNotificationWebhook() async {
+        guard isSignedIn, let client = await preparedClient() else { return }
+        let epoch = workspaceEpoch
+        notificationErrorMessage = nil
+        notificationStatusMessage = nil
+        isTestingNotificationSettings = true
+        defer {
+            if self.workspaceEpoch == epoch {
+                self.isTestingNotificationSettings = false
+            }
+        }
+        do {
+            let updated = try await client.updateNotificationSettings(notificationSettings)
+            guard self.workspaceEpoch == epoch else { return }
+            self.notificationSettings = updated
+            let res = try await client.testNotificationSettings()
+            guard self.workspaceEpoch == epoch else { return }
+            if !res.errors.isEmpty {
+                self.notificationErrorMessage = res.errors.joined(separator: " · ")
+            }
+            if !res.deliveredChannels.isEmpty {
+                let list = res.deliveredChannels.joined(separator: ", ")
+                self.notificationStatusMessage = tr(
+                    "Test push delivered to: \(list)",
+                    "测试推送已送达：\(list)",
+                    locale: locale
+                )
+            } else if res.errors.isEmpty {
+                self.notificationStatusMessage = tr(
+                    "No webhook channels configured yet.",
+                    "尚未配置任何推送通道 URL。",
+                    locale: locale
+                )
+            }
+        } catch {
+            if self.workspaceEpoch == epoch {
+                self.notificationErrorMessage = error.localizedDescription
+            }
+        }
+    }
+
+    public func pruneStaleWebDevices(maxIdleDays: Int = 0) async {
+        guard isSignedIn, let client = await preparedClient() else { return }
+        let epoch = workspaceEpoch
+        authError = nil
+        accountStatusMessage = nil
+        isPruningStaleDevices = true
+        defer {
+            if self.workspaceEpoch == epoch {
+                self.isPruningStaleDevices = false
+            }
+        }
+        do {
+            let res = try await client.pruneStaleDevices(maxIdleDays: maxIdleDays)
+            guard self.workspaceEpoch == epoch else { return }
+            accountStatusMessage = tr(
+                "Pruned \(res.prunedCount) offline web device(s).",
+                "已清理 \(res.prunedCount) 台离线网页端设备。",
+                locale: locale
+            )
+            await refreshMachinesAndSessions()
+        } catch {
+            if self.workspaceEpoch == epoch {
+                authError = error.localizedDescription
+            }
+        }
+    }
+
+    public func openBootstrapWorkspaceSheet(
+        for device: CodaRemoteDevice? = nil,
+        defaultParentDir: String? = nil
+    ) {
+        let targetDev = device ?? remoteMachines.first(where: { $0.isOnline }) ?? remoteMachines.first
+        bootstrapTargetDeviceID = targetDev?.id
+        if let dir = defaultParentDir?.trimmingCharacters(in: .whitespacesAndNewlines), !dir.isEmpty {
+            bootstrapDefaultParentDir = dir
+        } else if let devId = targetDev?.id,
+                  let firstRepo = workspacesByDevice[devId]?.first?.rootPath,
+                  !firstRepo.isEmpty {
+            let parent = URL(fileURLWithPath: firstRepo).deletingLastPathComponent().path
+            bootstrapDefaultParentDir = parent.isEmpty ? "~/workspace" : parent
+        } else {
+            bootstrapDefaultParentDir = "~/workspace"
+        }
+        bootstrapErrorMessage = nil
+        bootstrapStatusMessage = nil
+        showBootstrapWorkspaceSheet = true
+    }
+
+    public func bootstrapWorkspaceAndLaunch(
+        on device: CodaRemoteDevice,
+        parentDir: String,
+        folderName: String,
+        gitCloneUrl: String?,
+        agent: String?,
+        initialPrompt: String? = nil
+    ) async -> Bool {
+        guard isSignedIn, let client = await preparedClient() else { return false }
+        let epoch = workspaceEpoch
+        let clientDevId = localIdentity.deviceId ?? device.id
+        bootstrapErrorMessage = nil
+        bootstrapStatusMessage = nil
+        isBootstrappingWorkspace = true
+        defer {
+            if self.workspaceEpoch == epoch {
+                self.isBootstrappingWorkspace = false
+            }
+        }
+
+        do {
+            _ = try? await client.connectBestAvailable(
+                sessionToken: settings.sessionToken,
+                targetDevice: device,
+                clientIdentity: localIdentity
+            )
+            let res = try await client.bootstrapRemoteWorkspace(
+                device: device,
+                clientIdentity: localIdentity,
+                clientDeviceId: clientDevId,
+                parentDir: parentDir,
+                folderName: folderName,
+                gitCloneUrl: gitCloneUrl
+            )
+            guard self.workspaceEpoch == epoch else { return false }
+            guard res.ok else {
+                bootstrapErrorMessage = res.detail.isEmpty
+                    ? tr("Workspace bootstrap failed.", "创建或克隆工作区失败。", locale: locale)
+                    : res.detail
+                return false
+            }
+
+            bootstrapStatusMessage = res.workspacePath
+            let cleanAgent = (agent ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            if !cleanAgent.isEmpty && cleanAgent != "none" {
+                let cleanPrompt = initialPrompt?.trimmingCharacters(in: .whitespacesAndNewlines)
+                if let launched = try? await client.launchAgent(
+                    on: device,
+                    clientIdentity: localIdentity,
+                    clientDeviceId: clientDevId,
+                    agent: cleanAgent,
+                    name: nil,
+                    cwd: res.workspacePath,
+                    initialPrompt: (cleanPrompt?.isEmpty == false) ? cleanPrompt : nil,
+                    cols: max(48, terminalColumns),
+                    rows: 32
+                ) {
+                    pendingSelectSessionID = "\(device.id.uuidString.lowercased())/\(launched.address)"
+                }
+            }
+            await refreshMachinesAndSessions(forceWorkspaces: true)
+            return true
+        } catch {
+            if self.workspaceEpoch == epoch {
+                bootstrapErrorMessage = error.localizedDescription
+            }
+            return false
         }
     }
 
@@ -2317,6 +2573,8 @@ public final class CodaWorkspaceStore: ObservableObject {
         let diffGen = gitDiffGeneration
         let epoch = workspaceEpoch
         gitDiffResult = nil
+        gitDiffError = nil
+        gitDiffSelectedFile = nil
         gitDiffLoading = true
         if presentModal {
             activeSheetSessionID = session.id
@@ -2329,14 +2587,20 @@ public final class CodaWorkspaceStore: ObservableObject {
                     self.gitDiffLoading = false
                 }
             }
-            let fetched = try? await client.fetchGitDiff(
-                on: dev,
-                clientIdentity: self.localIdentity,
-                clientDeviceId: clientDevId,
-                cwd: session.cwd
-            )
-            if self.gitDiffGeneration == diffGen && self.workspaceEpoch == epoch {
-                self.gitDiffResult = fetched
+            do {
+                let fetched = try await client.fetchRemoteGitDiff(
+                    device: dev,
+                    clientIdentity: self.localIdentity,
+                    clientDeviceId: clientDevId,
+                    cwd: session.cwd
+                )
+                if self.gitDiffGeneration == diffGen && self.workspaceEpoch == epoch {
+                    self.gitDiffResult = fetched
+                }
+            } catch {
+                if self.gitDiffGeneration == diffGen && self.workspaceEpoch == epoch {
+                    self.gitDiffError = error.localizedDescription
+                }
             }
         }
     }
@@ -2371,12 +2635,14 @@ public final class CodaWorkspaceStore: ObservableObject {
         activeSheetSessionID = session.id
         inspectorSheetMode = mode
         showRemoteFilesSheet = true
+        let root = session.cwd.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "." : session.cwd
+        remoteFileRootPath = root
+        remoteFileSelectedRel = nil
+        remoteFilePreviewText = ""
         if mode == .files {
-            let root = session.cwd.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "." : session.cwd
-            remoteFileRootPath = root
-            remoteFileSelectedRel = nil
-            remoteFilePreviewText = ""
             browseRemoteSubPath("", for: session)
+        } else if mode == .changes {
+            loadGitDiff(for: session, presentModal: false)
         }
     }
 

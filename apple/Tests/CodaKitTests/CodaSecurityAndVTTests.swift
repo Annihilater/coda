@@ -468,4 +468,44 @@ final class CodaSecurityAndVTTests: XCTestCase {
         XCTAssertTrue(vtAlt.plainVisibleText.contains("hist-1"))
         XCTAssertTrue(vtAlt.plainVisibleText.contains("hist-10"))
     }
+
+    func testV090GitDiffParserShellQuoteBracketedPasteAndBootstrapGuards() throws {
+        let statusRaw = " M src/main.rs\nA  src/new.rs\nR  old.rs -> new_name.rs\n?? untracked.md\n"
+        let files = CodaGitDiffResult.parseStatusShort(statusRaw)
+        XCTAssertEqual(files.count, 4)
+        XCTAssertEqual(files[0], CodaGitChangedFile(status: "M", path: "src/main.rs"))
+        XCTAssertEqual(files[2], CodaGitChangedFile(status: "R", path: "new_name.rs", previousPath: "old.rs"))
+
+        let diffRaw = """
+        diff --git a/src/main.rs b/src/main.rs
+        --- a/src/main.rs
+        +++ b/src/main.rs
+        @@ -1 +1,2 @@
+         fn main() {}
+        +// added
+        diff --git a/src/new.rs b/src/new.rs
+        new file mode 100644
+        --- /dev/null
+        +++ b/src/new.rs
+        @@ -0,0 +1 @@
+        +pub const X: i32 = 1;
+        """
+        let filteredMain = CodaGitDiffResult.filterDiffByFile(diffRaw, filePath: "src/main.rs")
+        XCTAssertTrue(filteredMain.contains("+// added"))
+        XCTAssertFalse(filteredMain.contains("pub const X"))
+
+        XCTAssertEqual(codaShellQuotePath("/tmp/safe_path.png"), "/tmp/safe_path.png")
+        XCTAssertEqual(codaShellQuotePath("/tmp/a b'c.png"), "'/tmp/a b'\\''c.png'")
+        XCTAssertEqual(codaShellQuotePath("-flag"), "'-flag'")
+
+        let bp = CodaTerminalTranscriptHelper.encodeBracketedPaste("hi\nthere\u{1B}[201~x")
+        XCTAssertEqual(bp, Data("\u{1B}[200~hi\ntherex\u{1B}[201~\r".utf8))
+
+        XCTAssertTrue(CodaWorkspaceBootstrapValidator.isValidFolderName("coda-repo"))
+        XCTAssertFalse(CodaWorkspaceBootstrapValidator.isValidFolderName("../bad"))
+        XCTAssertTrue(CodaWorkspaceBootstrapValidator.isAllowedGitCloneURL("https://github.com/org/repo.git"))
+        XCTAssertTrue(CodaWorkspaceBootstrapValidator.isAllowedGitCloneURL("git@github.com:org/repo.git"))
+        XCTAssertFalse(CodaWorkspaceBootstrapValidator.isAllowedGitCloneURL("ext::sh -c whoami"))
+        XCTAssertFalse(CodaWorkspaceBootstrapValidator.isAllowedGitCloneURL("file:///etc/hosts"))
+    }
 }

@@ -566,6 +566,26 @@ struct CodaSelfTest {
             submit: true
         )
 
+        let loopbackDiff = try await net.fetchRemoteGitDiff(
+            device: targetDevice,
+            clientIdentity: clientIdentity,
+            clientDeviceId: clientId,
+            cwd: "/Users/dev/coda"
+        )
+        precondition(loopbackDiff.branch == "feat/v0.9")
+        precondition(loopbackDiff.changedFiles.count == 2)
+        precondition(loopbackDiff.changedFiles[0].path == "src/main.rs")
+
+        let loopbackBoot = try await net.bootstrapRemoteWorkspace(
+            device: targetDevice,
+            clientIdentity: clientIdentity,
+            clientDeviceId: clientId,
+            parentDir: "~/workspace",
+            folderName: "demo-repo",
+            gitCloneUrl: "https://github.com/org/demo-repo.git"
+        )
+        precondition(loopbackBoot.ok && loopbackBoot.workspacePath == "/Users/dev/workspace/demo-repo")
+
         tcpListener.cancel()
     }
 
@@ -700,6 +720,26 @@ struct CodaSelfTest {
                     "req_id": reqId,
                     "ok": true,
                     "detail": "text_sent",
+                ]
+            case "git_diff_request":
+                precondition((req["cwd"] as? String) == "/Users/dev/coda")
+                replyObj = [
+                    "op": "git_diff_response",
+                    "req_id": reqId,
+                    "branch": "feat/v0.9",
+                    "status_short": " M src/main.rs\n?? docs/notes.md",
+                    "diff_unified": "diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1,1 +1,2 @@\n fn main() {}\n+// v0.9",
+                ]
+            case "bootstrap_workspace":
+                precondition((req["parent_dir"] as? String) == "~/workspace")
+                precondition((req["folder_name"] as? String) == "demo-repo")
+                precondition((req["git_clone_url"] as? String) == "https://github.com/org/demo-repo.git")
+                replyObj = [
+                    "op": "bootstrap_workspace_result",
+                    "req_id": reqId,
+                    "ok": true,
+                    "workspace_path": "/Users/dev/workspace/demo-repo",
+                    "detail": "cloned",
                 ]
             default:
                 replyObj = [
@@ -1053,6 +1093,127 @@ struct CodaSelfTest {
         precondition(md.contains("# Coda Session Transcript — coda · agy") && md.contains("$ cargo test\nok\n```"))
         precondition(CodaTerminalTranscriptHelper.parentSubPath("crates/coda-daemon/src") == "crates/coda-daemon")
         precondition(CodaTerminalTranscriptHelper.joinRootAndRel(rootPath: "/opt/coda/", relPath: "/src/lib.rs") == "/opt/coda/src/lib.rs")
+
+        // 8l. v0.9.0 Git Diff Parser, File Filter, Shell-Safe Path Quoting, Bracketed Paste, Bootstrap RCE Guards & Webhook Codables
+        let rawStatusShort = """
+         M crates/coda-server/src/lib.rs
+        A  apple/Sources/CodaUI/NewView.swift
+        D  legacy/old.txt
+        R  src/before.rs -> src/after.rs
+        ?? "docs/my spec.md"
+        """
+        let parsedFiles = CodaGitDiffResult.parseStatusShort(rawStatusShort)
+        precondition(parsedFiles.count == 5, "Expected 5 parsed git changed files, got \(parsedFiles.count)")
+        precondition(parsedFiles[0] == CodaGitChangedFile(status: "M", path: "crates/coda-server/src/lib.rs"))
+        precondition(parsedFiles[1] == CodaGitChangedFile(status: "A", path: "apple/Sources/CodaUI/NewView.swift"))
+        precondition(parsedFiles[2] == CodaGitChangedFile(status: "D", path: "legacy/old.txt"))
+        precondition(parsedFiles[3] == CodaGitChangedFile(status: "R", path: "src/after.rs", previousPath: "src/before.rs"))
+        precondition(parsedFiles[4] == CodaGitChangedFile(status: "??", path: "docs/my spec.md"))
+
+        let sampleUnifiedDiff = """
+        diff --git a/crates/coda-server/src/lib.rs b/crates/coda-server/src/lib.rs
+        index 1111111..2222222 100644
+        --- a/crates/coda-server/src/lib.rs
+        +++ b/crates/coda-server/src/lib.rs
+        @@ -10,2 +10,3 @@
+         pub fn run() {}
+        +pub fn notify() {}
+        diff --git a/src/before.rs b/src/after.rs
+        similarity index 92%
+        rename from src/before.rs
+        rename to src/after.rs
+        --- a/src/before.rs
+        +++ b/src/after.rs
+        @@ -1,2 +1,2 @@
+        -let v = 8;
+        +let v = 9;
+        """
+        precondition(CodaGitDiffResult.filterDiffByFile(sampleUnifiedDiff, filePath: nil) == sampleUnifiedDiff)
+        let serverOnlyDiff = CodaGitDiffResult.filterDiffByFile(sampleUnifiedDiff, filePath: "crates/coda-server/src/lib.rs")
+        precondition(serverOnlyDiff.contains("+pub fn notify() {}") && !serverOnlyDiff.contains("let v = 9;"))
+        let renamedDiff = CodaGitDiffResult.filterDiffByFile(sampleUnifiedDiff, filePath: "src/after.rs")
+        precondition(renamedDiff.contains("+let v = 9;") && !renamedDiff.contains("pub fn notify()"))
+        let untrackedDiff = CodaGitDiffResult.filterDiffByFile(sampleUnifiedDiff, filePath: "docs/my spec.md")
+        precondition(untrackedDiff.isEmpty)
+
+        // Shell-safe path quoting & Bracketed Paste escape injection guard
+        precondition(codaShellQuotePath("/tmp/coda/paste-01.png") == "/tmp/coda/paste-01.png")
+        precondition(codaShellQuotePath("/tmp/my shot's $(id).png") == "'/tmp/my shot'\\''s $(id).png'")
+        precondition(codaShellQuotePath("-rf") == "'-rf'")
+        precondition(codaShellQuotePath("/tmp/a\0b.png") == "/tmp/ab.png")
+        precondition(codaShellQuotePath("") == "''")
+
+        let bpBytes = CodaTerminalTranscriptHelper.encodeBracketedPaste("step 1\nstep 2\u{1B}[201~evil")
+        precondition(bpBytes == Data("\u{1B}[200~step 1\nstep 2evil\u{1B}[201~\r".utf8))
+
+        // Workspace bootstrapper RCE validation & repo folder suggestion
+        precondition(CodaWorkspaceBootstrapValidator.isValidFolderName("coda-v0.9"))
+        precondition(!CodaWorkspaceBootstrapValidator.isValidFolderName("../escape"))
+        precondition(!CodaWorkspaceBootstrapValidator.isValidFolderName("sub/dir"))
+        precondition(!CodaWorkspaceBootstrapValidator.isValidFolderName("-upload-pack"))
+        precondition(CodaWorkspaceBootstrapValidator.isAllowedGitCloneURL(""))
+        precondition(CodaWorkspaceBootstrapValidator.isAllowedGitCloneURL("https://github.com/org/coda.git"))
+        precondition(CodaWorkspaceBootstrapValidator.isAllowedGitCloneURL("ssh://git@github.com/org/coda.git"))
+        precondition(CodaWorkspaceBootstrapValidator.isAllowedGitCloneURL("git@github.com:org/coda.git"))
+        precondition(!CodaWorkspaceBootstrapValidator.isAllowedGitCloneURL("ext::sh -c id"))
+        precondition(!CodaWorkspaceBootstrapValidator.isAllowedGitCloneURL("file:///etc/passwd"))
+        precondition(!CodaWorkspaceBootstrapValidator.isAllowedGitCloneURL("--upload-pack=evil"))
+        precondition(!CodaWorkspaceBootstrapValidator.isAllowedGitCloneURL("http://example.com/repo.git"))
+        precondition(CodaWorkspaceBootstrapValidator.suggestedFolderName(fromGitCloneURL: "https://github.com/org/coda-apple.git") == "coda-apple")
+        precondition(CodaWorkspaceBootstrapValidator.suggestedFolderName(fromGitCloneURL: "git@github.com:org/herdr.git") == "herdr")
+
+        // Webhook & Prune Stale Devices wire JSON field alignment
+        let wh = CodaNotificationWebhookSettings(
+            barkURL: "https://api.day.app/demo",
+            telegramBotToken: "123:ABC",
+            telegramChatId: "999",
+            feishuWebhookURL: "https://open.feishu.cn/open-apis/bot/v2/hook/xyz",
+            discordWebhookURL: "https://discord.com/api/webhooks/1/2",
+            genericWebhookURL: "https://hooks.example.com/coda",
+            notifyOnNeedsYou: true,
+            notifyOnFinished: false
+        )
+        let whData = try JSONEncoder().encode(wh)
+        let whDict = try JSONSerialization.jsonObject(with: whData) as? [String: Any]
+        precondition((whDict?["bark_url"] as? String) == "https://api.day.app/demo")
+        precondition((whDict?["telegram_bot_token"] as? String) == "123:ABC")
+        precondition((whDict?["telegram_chat_id"] as? String) == "999")
+        precondition((whDict?["feishu_webhook_url"] as? String) == "https://open.feishu.cn/open-apis/bot/v2/hook/xyz")
+        precondition((whDict?["discord_webhook_url"] as? String) == "https://discord.com/api/webhooks/1/2")
+        precondition((whDict?["generic_webhook_url"] as? String) == "https://hooks.example.com/coda")
+        precondition((whDict?["notify_on_needs_you"] as? Bool) == true)
+        precondition((whDict?["notify_on_finished"] as? Bool) == false)
+        let whDecoded = try JSONDecoder().decode(CodaNotificationWebhookSettings.self, from: whData)
+        precondition(whDecoded == wh)
+        try whDecoded.validateWebhookURLs()
+        var badWebhookRejected = false
+        do {
+            try CodaNotificationWebhookSettings(barkURL: "http://169.254.169.254/latest/meta-data").validateWebhookURLs()
+        } catch {
+            badWebhookRejected = true
+        }
+        precondition(badWebhookRejected, "Expected SSRF metadata webhook URL to be rejected")
+
+        let testPushDecoded = try JSONDecoder().decode(
+            CodaNotificationTestResult.self,
+            from: Data(#"{"ok":true,"delivered_channels":["bark","discord"],"errors":[]}"#.utf8)
+        )
+        precondition(testPushDecoded.ok && testPushDecoded.deliveredChannels == ["bark", "discord"])
+        let pruneDecoded = try JSONDecoder().decode(
+            CodaPruneStaleDevicesResult.self,
+            from: Data(#"{"ok":true,"pruned_count":4}"#.utf8)
+        )
+        precondition(pruneDecoded.ok && pruneDecoded.prunedCount == 4)
+        let statusCheckSession = CodaAgentSession(
+            id: "s-status",
+            terminalAddress: "t9",
+            workspaceName: "coda",
+            hostName: "mac",
+            agentName: "claude",
+            taskTitle: "Verify status alias",
+            state: .needsYou
+        )
+        precondition(statusCheckSession.status == .needsYou)
     }
 
     private static func readFramed(conn: NWConnection, completion: @escaping @Sendable ([String: Any]?) -> Void) {

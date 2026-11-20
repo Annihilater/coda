@@ -74,18 +74,6 @@ public struct CodaTerminalScreenResult: Sendable {
     }
 }
 
-public struct CodaGitDiffResult: Sendable {
-    public let branch: String
-    public let statusShort: String
-    public let diffUnified: String
-
-    public init(branch: String, statusShort: String, diffUnified: String) {
-        self.branch = branch
-        self.statusShort = statusShort
-        self.diffUnified = diffUnified
-    }
-}
-
 public struct CodaWorkspacesFetchResult: Sendable {
     public let machineName: String
     public let repos: [CodaRepoWorkspaceSummary]
@@ -464,6 +452,75 @@ public actor CodaNetworkClient {
             throw CodaAPIError.fromResponse(data: data, response: resp, fallback: "Remove device failed")
         }
         invalidatePeerSession(peerDeviceId: deviceId)
+    }
+
+    public func pruneStaleDevices(maxIdleDays: Int = 0) async throws -> CodaPruneStaleDevicesResult {
+        let url = serverBaseURL.appendingPathComponent("api/v1/devices/prune-stale")
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if let token = bearerToken {
+            req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
+        req.httpBody = try JSONSerialization.data(withJSONObject: [
+            "max_idle_days": max(0, maxIdleDays),
+        ])
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            throw CodaAPIError.fromResponse(data: data, response: resp, fallback: "Prune stale web devices failed")
+        }
+        return try JSONDecoder().decode(CodaPruneStaleDevicesResult.self, from: data)
+    }
+
+    public func fetchNotificationSettings() async throws -> CodaNotificationWebhookSettings {
+        let url = serverBaseURL.appendingPathComponent("api/v1/me/notifications")
+        var req = URLRequest(url: url)
+        req.httpMethod = "GET"
+        if let token = bearerToken {
+            req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            throw CodaAPIError.fromResponse(data: data, response: resp, fallback: "Fetch notification settings failed")
+        }
+        return try JSONDecoder().decode(CodaNotificationWebhookSettings.self, from: data)
+    }
+
+    public func updateNotificationSettings(
+        _ settings: CodaNotificationWebhookSettings
+    ) async throws -> CodaNotificationWebhookSettings {
+        let allowLoopback = serverBaseURL.scheme?.lowercased() == "http"
+            && Self.isLoopbackHost(serverBaseURL.host ?? "")
+        try settings.validateWebhookURLs(allowLoopbackHTTP: allowLoopback)
+        let url = serverBaseURL.appendingPathComponent("api/v1/me/notifications")
+        var req = URLRequest(url: url)
+        req.httpMethod = "PUT"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if let token = bearerToken {
+            req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
+        req.httpBody = try JSONEncoder().encode(settings)
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            throw CodaAPIError.fromResponse(data: data, response: resp, fallback: "Save notification settings failed")
+        }
+        return try JSONDecoder().decode(CodaNotificationWebhookSettings.self, from: data)
+    }
+
+    public func testNotificationSettings() async throws -> CodaNotificationTestResult {
+        let url = serverBaseURL.appendingPathComponent("api/v1/me/notifications/test")
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if let token = bearerToken {
+            req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
+        req.httpBody = Data("{}".utf8)
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            throw CodaAPIError.fromResponse(data: data, response: resp, fallback: "Test push failed")
+        }
+        return try JSONDecoder().decode(CodaNotificationTestResult.self, from: data)
     }
 
     public func changePassword(currentPassword: String, newPassword: String) async throws -> String? {
@@ -2027,7 +2084,8 @@ public actor CodaNetworkClient {
         clientIdentity: CodaDeviceIdentity,
         clientDeviceId: UUID,
         targetDeviceId: UUID,
-        lane: String = "control_p0"
+        lane: String = "control_p0",
+        timeoutSeconds: UInt64 = 15
     ) async throws -> Data {
         guard var peerState = self.directP2PPeers[targetDeviceId] else {
             throw URLError(.networkConnectionLost)
@@ -2060,9 +2118,10 @@ public actor CodaNetworkClient {
             )
         )
 
+        let timeoutNs = max(5, timeoutSeconds) * 1_000_000_000
         let (stream, cont) = AsyncThrowingStream<Data, Error>.makeStream(bufferingPolicy: .bufferingNewest(1))
         let timeoutTask = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 15_000_000_000)
+            try? await Task.sleep(nanoseconds: timeoutNs)
             guard !Task.isCancelled else { return }
             await self?.failPendingRequest(reqId: reqId, error: URLError(.timedOut))
         }
@@ -2085,7 +2144,8 @@ public actor CodaNetworkClient {
         to targetDevice: CodaRemoteDevice,
         clientIdentity: CodaDeviceIdentity,
         clientDeviceId: UUID,
-        lane: String = "control_p0"
+        lane: String = "control_p0",
+        timeoutSeconds: UInt64 = 15
     ) async throws -> Data {
         var finalData = messageJSONData
         let reqId: String
@@ -2109,7 +2169,8 @@ public actor CodaNetworkClient {
                 clientIdentity: clientIdentity,
                 clientDeviceId: clientDeviceId,
                 targetDeviceId: targetDevice.id,
-                lane: lane
+                lane: lane,
+                timeoutSeconds: timeoutSeconds
             )
         }
 
@@ -2131,12 +2192,14 @@ public actor CodaNetworkClient {
             relayAuthState: relayState
         )
 
+        let timeoutNs = max(5, timeoutSeconds) * 1_000_000_000
+
         // Path 2: Global CDN WebSocket Relay
         if let ws = self.wsTask {
             let txt = String(data: try JSONSerialization.data(withJSONObject: routePacket), encoding: .utf8) ?? "{}"
             let (stream, cont) = AsyncThrowingStream<Data, Error>.makeStream(bufferingPolicy: .bufferingNewest(1))
             let timeoutTask = Task { [weak self] in
-                try? await Task.sleep(nanoseconds: 15_000_000_000)
+                try? await Task.sleep(nanoseconds: timeoutNs)
                 guard !Task.isCancelled else { return }
                 await self?.failPendingRequest(reqId: reqId, error: URLError(.timedOut))
             }
@@ -2159,7 +2222,7 @@ public actor CodaNetworkClient {
             let framed = try Self.encodeLengthDelimitedJSON(routePacket)
             let (stream, cont) = AsyncThrowingStream<Data, Error>.makeStream(bufferingPolicy: .bufferingNewest(1))
             let timeoutTask = Task { [weak self] in
-                try? await Task.sleep(nanoseconds: 15_000_000_000)
+                try? await Task.sleep(nanoseconds: timeoutNs)
                 guard !Task.isCancelled else { return }
                 await self?.failPendingRequest(reqId: reqId, error: URLError(.timedOut))
             }
@@ -2631,8 +2694,8 @@ public actor CodaNetworkClient {
         return (try? JSONDecoder().decode(Resp.self, from: respData))?.remotePath
     }
 
-    public func fetchGitDiff(
-        on device: CodaRemoteDevice,
+    public func fetchRemoteGitDiff(
+        device: CodaRemoteDevice,
         clientIdentity: CodaDeviceIdentity,
         clientDeviceId: UUID,
         cwd: String
@@ -2649,22 +2712,70 @@ public actor CodaNetworkClient {
             clientDeviceId: clientDeviceId,
             lane: "bulk_p1"
         )
-        struct Resp: Decodable {
-            let branch: String
-            let statusShort: String
-            let diffUnified: String
-            enum CodingKeys: String, CodingKey {
-                case branch
-                case statusShort = "status_short"
-                case diffUnified = "diff_unified"
-            }
-        }
-        let decoded = try JSONDecoder().decode(Resp.self, from: respData)
-        return CodaGitDiffResult(
-            branch: decoded.branch,
-            statusShort: decoded.statusShort,
-            diffUnified: decoded.diffUnified
+        return try JSONDecoder().decode(CodaGitDiffResult.self, from: respData)
+    }
+
+    public func fetchGitDiff(
+        on device: CodaRemoteDevice,
+        clientIdentity: CodaDeviceIdentity,
+        clientDeviceId: UUID,
+        cwd: String
+    ) async throws -> CodaGitDiffResult {
+        try await fetchRemoteGitDiff(
+            device: device,
+            clientIdentity: clientIdentity,
+            clientDeviceId: clientDeviceId,
+            cwd: cwd
         )
+    }
+
+    public func bootstrapRemoteWorkspace(
+        device: CodaRemoteDevice,
+        clientIdentity: CodaDeviceIdentity,
+        clientDeviceId: UUID,
+        parentDir: String,
+        folderName: String,
+        gitCloneUrl: String? = nil
+    ) async throws -> CodaBootstrapWorkspaceResult {
+        let cleanParent = parentDir.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanFolder = folderName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanClone = gitCloneUrl?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+        guard !cleanParent.isEmpty else {
+            throw CodaAPIError.httpError(statusCode: 400, message: "Parent directory cannot be empty.")
+        }
+        guard CodaWorkspaceBootstrapValidator.isValidFolderName(cleanFolder) else {
+            throw CodaAPIError.httpError(
+                statusCode: 400,
+                message: "Invalid folder name (must be a single safe directory name without '/' or leading '-')."
+            )
+        }
+        guard CodaWorkspaceBootstrapValidator.isAllowedGitCloneURL(cleanClone) else {
+            throw CodaAPIError.httpError(
+                statusCode: 400,
+                message: "Git clone URL must use https://, ssh://, or git@<host>:<path>."
+            )
+        }
+
+        var reqObj: [String: Any] = [
+            "op": "bootstrap_workspace",
+            "req_id": nextRequestID(),
+            "parent_dir": cleanParent,
+            "folder_name": cleanFolder,
+        ]
+        if !cleanClone.isEmpty {
+            reqObj["git_clone_url"] = cleanClone
+        }
+        let reqData = try JSONSerialization.data(withJSONObject: reqObj)
+        let respData = try await sendPeerMessageData(
+            reqData,
+            to: device,
+            clientIdentity: clientIdentity,
+            clientDeviceId: clientDeviceId,
+            lane: "control_p0",
+            timeoutSeconds: cleanClone.isEmpty ? 20 : 65
+        )
+        return try JSONDecoder().decode(CodaBootstrapWorkspaceResult.self, from: respData)
     }
 
     public func detachTerminalPty(

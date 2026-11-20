@@ -410,8 +410,198 @@ public struct CodaPortPreviewResult: Sendable, Equatable {
     }
 }
 
+public struct CodaGitChangedFile: Identifiable, Codable, Sendable, Equatable, Hashable {
+    public var id: String { path }
+    public let status: String
+    public let path: String
+    public let previousPath: String?
+
+    public init(status: String, path: String, previousPath: String? = nil) {
+        self.status = status
+        self.path = path
+        self.previousPath = previousPath
+    }
+}
+
+public struct CodaGitDiffResult: Codable, Sendable, Equatable {
+    public let branch: String
+    public let statusShort: String
+    public let diffUnified: String
+
+    enum CodingKeys: String, CodingKey {
+        case branch
+        case statusShort = "status_short"
+        case diffUnified = "diff_unified"
+    }
+
+    public init(branch: String, statusShort: String, diffUnified: String) {
+        self.branch = branch
+        self.statusShort = statusShort
+        self.diffUnified = diffUnified
+    }
+
+    public var changedFiles: [CodaGitChangedFile] {
+        Self.parseStatusShort(statusShort)
+    }
+
+    /// Parses `git status --short` output into structured `CodaGitChangedFile` items.
+    public static func parseStatusShort(_ raw: String) -> [CodaGitChangedFile] {
+        var out: [CodaGitChangedFile] = []
+        var seen = Set<String>()
+        for rawLine in raw.components(separatedBy: "\n") {
+            let cleanCR = rawLine.hasSuffix("\r") ? String(rawLine.dropLast()) : rawLine
+            guard !cleanCR.trimmingCharacters(in: .whitespaces).isEmpty else { continue }
+
+            let statusCode: String
+            let restPath: String
+            if cleanCR.count >= 3 {
+                let idx2 = cleanCR.index(cleanCR.startIndex, offsetBy: 2)
+                if cleanCR[idx2] == " " {
+                    let prefix = String(cleanCR[..<idx2]).trimmingCharacters(in: .whitespaces)
+                    statusCode = prefix.isEmpty ? "M" : prefix
+                    restPath = String(cleanCR[cleanCR.index(after: idx2)...]).trimmingCharacters(in: .whitespaces)
+                } else {
+                    let trimmed = cleanCR.trimmingCharacters(in: .whitespaces)
+                    if let sp = trimmed.firstIndex(where: { $0.isWhitespace }) {
+                        statusCode = String(trimmed[..<sp])
+                        restPath = String(trimmed[sp...]).trimmingCharacters(in: .whitespaces)
+                    } else {
+                        continue
+                    }
+                }
+            } else {
+                continue
+            }
+
+            guard !restPath.isEmpty else { continue }
+            let previousPath: String?
+            let currentPath: String
+            if let arrowRange = restPath.range(of: " -> ") {
+                previousPath = unquoteGitPath(String(restPath[..<arrowRange.lowerBound]))
+                currentPath = unquoteGitPath(String(restPath[arrowRange.upperBound...]))
+            } else {
+                previousPath = nil
+                currentPath = unquoteGitPath(restPath)
+            }
+            guard !currentPath.isEmpty, seen.insert(currentPath).inserted else { continue }
+            out.append(CodaGitChangedFile(status: statusCode, path: currentPath, previousPath: previousPath))
+        }
+        return out
+    }
+
+    /// Filters a unified `git diff` string down to hunks touching `filePath` (returns full diff when `filePath` is nil/empty).
+    public static func filterDiffByFile(_ diffUnified: String, filePath: String?) -> String {
+        guard let rawTarget = filePath?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !rawTarget.isEmpty else {
+            return diffUnified
+        }
+        let target = rawTarget.hasPrefix("./") ? String(rawTarget.dropFirst(2)) : rawTarget
+        guard !diffUnified.isEmpty else { return "" }
+
+        let lines = diffUnified.components(separatedBy: "\n")
+        var sections: [[String]] = []
+        var current: [String] = []
+        for line in lines {
+            if line.hasPrefix("diff --git ") {
+                if !current.isEmpty {
+                    sections.append(current)
+                }
+                current = [line]
+            } else if !current.isEmpty {
+                current.append(line)
+            }
+        }
+        if !current.isEmpty {
+            sections.append(current)
+        }
+        if sections.isEmpty {
+            return diffUnified
+        }
+
+        let matched = sections.filter { section in
+            sectionMatchesFile(section, target: target)
+        }
+        return matched.map { $0.joined(separator: "\n") }.joined(separator: "\n")
+    }
+
+    private static func sectionMatchesFile(_ section: [String], target: String) -> Bool {
+        guard let first = section.first else { return false }
+        let headerSuffixes = [" b/\(target)", " \"b/\(target)\"", " a/\(target)", " \"a/\(target)\""]
+        if headerSuffixes.contains(where: { first.hasSuffix($0) || first.contains("\($0) ") }) {
+            return true
+        }
+        for line in section {
+            if line.hasPrefix("@@") { break }
+            if line.hasPrefix("+++ ") || line.hasPrefix("--- ") {
+                let raw = unquoteGitPath(String(line.dropFirst(4)).trimmingCharacters(in: .whitespaces))
+                let stripped: String
+                if raw.hasPrefix("a/") || raw.hasPrefix("b/") {
+                    stripped = String(raw.dropFirst(2))
+                } else {
+                    stripped = raw
+                }
+                if stripped == target { return true }
+            } else if line.hasPrefix("rename to ") {
+                if unquoteGitPath(String(line.dropFirst("rename to ".count))) == target { return true }
+            } else if line.hasPrefix("rename from ") {
+                if unquoteGitPath(String(line.dropFirst("rename from ".count))) == target { return true }
+            }
+        }
+        return false
+    }
+
+    private static func unquoteGitPath(_ raw: String) -> String {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count >= 2, trimmed.hasPrefix("\""), trimmed.hasSuffix("\"") else {
+            return trimmed
+        }
+        let inner = String(trimmed.dropFirst().dropLast())
+        return inner
+            .replacingOccurrences(of: "\\\"", with: "\"")
+            .replacingOccurrences(of: "\\\\", with: "\\")
+    }
+}
+
+/// Shell-escapes a file path safely for POSIX shells (`sh`/`bash`/`zsh`), stripping NUL bytes and blocking flag/command injection.
+public func codaShellQuotePath(_ path: String) -> String {
+    let sanitized = path.replacingOccurrences(of: "\0", with: "")
+    guard !sanitized.isEmpty else { return "''" }
+    let isSafeBare = !sanitized.hasPrefix("-") && sanitized.unicodeScalars.allSatisfy { scalar in
+        let v = scalar.value
+        return (v >= 0x30 && v <= 0x39) // 0-9
+            || (v >= 0x41 && v <= 0x5A) // A-Z
+            || (v >= 0x61 && v <= 0x7A) // a-z
+            || v == 0x5F || v == 0x2E || v == 0x2F || v == 0x2D // _ . / -
+    }
+    if isSafeBare {
+        return sanitized
+    }
+    let escaped = sanitized.replacingOccurrences(of: "'", with: "'\\''")
+    return "'\(escaped)'"
+}
+
 public enum CodaTerminalTranscriptHelper {
     public static let quickPreviewPorts: [Int] = [3000, 5173, 8000, 8080, 4321]
+
+    public static func shellQuotePath(_ path: String) -> String {
+        codaShellQuotePath(path)
+    }
+
+    /// Encodes a prompt using terminal Bracketed Paste (`\u{001B}[200~<text>\u{001B}[201~\r`),
+    /// stripping any embedded bracketed-paste escape markers to prevent escape injection.
+    public static func encodeBracketedPaste(_ text: String, appendCarriageReturn: Bool = true) -> Data {
+        let sanitized = text
+            .replacingOccurrences(of: "\u{1B}[200~", with: "")
+            .replacingOccurrences(of: "\u{1B}[201~", with: "")
+            .replacingOccurrences(of: "\0", with: "")
+        var out = Data("\u{1B}[200~".utf8)
+        out.append(Data(sanitized.utf8))
+        out.append(Data("\u{1B}[201~".utf8))
+        if appendCarriageReturn {
+            out.append(0x0D)
+        }
+        return out
+    }
 
     public static func findMatchingLineIndices(in lines: [String], query: String) -> [Int] {
         let needle = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -1075,6 +1265,7 @@ public struct CodaAgentSession: Identifiable, Codable, Sendable, Equatable, Hash
     public var screenPreview: String
 
     public var address: String { terminalAddress }
+    public var status: HerdrLifecycleState { state }
 
     public init(
         id: String,
@@ -1527,6 +1718,229 @@ public struct CodaDeviceAuthPollResult: Codable, Sendable, Equatable {
         case device
         case daemonRelayTicket = "daemon_relay_ticket"
         case relays
+    }
+}
+
+public struct CodaBootstrapWorkspaceResult: Codable, Sendable, Equatable {
+    public let ok: Bool
+    public let workspacePath: String
+    public let detail: String
+
+    enum CodingKeys: String, CodingKey {
+        case ok
+        case workspacePath = "workspace_path"
+        case detail
+    }
+
+    public init(ok: Bool, workspacePath: String, detail: String) {
+        self.ok = ok
+        self.workspacePath = workspacePath
+        self.detail = detail
+    }
+}
+
+public enum CodaWorkspaceBootstrapValidator {
+    public static func isValidFolderName(_ raw: String) -> Bool {
+        let name = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty, name.count <= 128 else { return false }
+        if name == "." || name == ".." || name.hasPrefix("-") {
+            return false
+        }
+        return !name.unicodeScalars.contains { s in
+            s.value < 0x20 || s.value == 0x7F || s == "/" || s == "\\"
+        }
+    }
+
+    /// Strict client-side RCE guard matching `coda-daemon`: allows ONLY `https://`, `ssh://`, or `git@<host>:<path>`.
+    public static func isAllowedGitCloneURL(_ raw: String) -> Bool {
+        let urlStr = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if urlStr.isEmpty { return true }
+        guard urlStr.count <= 1024, !urlStr.hasPrefix("-") else { return false }
+        if urlStr.unicodeScalars.contains(where: { $0.value <= 0x20 || $0.value == 0x7F }) {
+            return false
+        }
+        if urlStr.hasPrefix("https://") || urlStr.hasPrefix("ssh://") {
+            guard let parsed = URL(string: urlStr),
+                  let host = parsed.host,
+                  !host.isEmpty,
+                  !host.hasPrefix("-"),
+                  !parsed.path.isEmpty,
+                  parsed.path != "/" else {
+                return false
+            }
+            return true
+        }
+        if urlStr.hasPrefix("git@") {
+            let afterAt = String(urlStr.dropFirst(4))
+            guard let colon = afterAt.firstIndex(of: ":") else { return false }
+            let host = String(afterAt[..<colon])
+            let repoPath = String(afterAt[afterAt.index(after: colon)...])
+            guard !host.isEmpty, !host.hasPrefix("-"),
+                  !repoPath.isEmpty, !repoPath.hasPrefix("-"),
+                  !repoPath.contains("..") else {
+                return false
+            }
+            let hostValid = host.unicodeScalars.allSatisfy { s in
+                (s.value >= 0x30 && s.value <= 0x39)
+                    || (s.value >= 0x41 && s.value <= 0x5A)
+                    || (s.value >= 0x61 && s.value <= 0x7A)
+                    || s == "." || s == "-"
+            }
+            return hostValid
+        }
+        return false
+    }
+
+    public static func suggestedFolderName(fromGitCloneURL raw: String) -> String? {
+        var s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        while s.hasSuffix("/") { s.removeLast() }
+        if s.hasSuffix(".git") {
+            s = String(s.dropLast(4))
+        }
+        let lastSeg: String
+        if let slash = s.lastIndex(of: "/") {
+            lastSeg = String(s[s.index(after: slash)...])
+        } else if let colon = s.lastIndex(of: ":") {
+            lastSeg = String(s[s.index(after: colon)...])
+        } else {
+            return nil
+        }
+        return isValidFolderName(lastSeg) ? lastSeg : nil
+    }
+}
+
+public struct CodaNotificationWebhookSettings: Codable, Sendable, Equatable {
+    public var barkURL: String
+    public var telegramBotToken: String
+    public var telegramChatId: String
+    public var feishuWebhookURL: String
+    public var discordWebhookURL: String
+    public var genericWebhookURL: String
+    public var notifyOnNeedsYou: Bool
+    public var notifyOnFinished: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case barkURL = "bark_url"
+        case telegramBotToken = "telegram_bot_token"
+        case telegramChatId = "telegram_chat_id"
+        case feishuWebhookURL = "feishu_webhook_url"
+        case discordWebhookURL = "discord_webhook_url"
+        case genericWebhookURL = "generic_webhook_url"
+        case notifyOnNeedsYou = "notify_on_needs_you"
+        case notifyOnFinished = "notify_on_finished"
+    }
+
+    public init(
+        barkURL: String = "",
+        telegramBotToken: String = "",
+        telegramChatId: String = "",
+        feishuWebhookURL: String = "",
+        discordWebhookURL: String = "",
+        genericWebhookURL: String = "",
+        notifyOnNeedsYou: Bool = true,
+        notifyOnFinished: Bool = true
+    ) {
+        self.barkURL = barkURL
+        self.telegramBotToken = telegramBotToken
+        self.telegramChatId = telegramChatId
+        self.feishuWebhookURL = feishuWebhookURL
+        self.discordWebhookURL = discordWebhookURL
+        self.genericWebhookURL = genericWebhookURL
+        self.notifyOnNeedsYou = notifyOnNeedsYou
+        self.notifyOnFinished = notifyOnFinished
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        barkURL = (try? c.decodeIfPresent(String.self, forKey: .barkURL)) ?? ""
+        telegramBotToken = (try? c.decodeIfPresent(String.self, forKey: .telegramBotToken)) ?? ""
+        telegramChatId = (try? c.decodeIfPresent(String.self, forKey: .telegramChatId)) ?? ""
+        feishuWebhookURL = (try? c.decodeIfPresent(String.self, forKey: .feishuWebhookURL)) ?? ""
+        discordWebhookURL = (try? c.decodeIfPresent(String.self, forKey: .discordWebhookURL)) ?? ""
+        genericWebhookURL = (try? c.decodeIfPresent(String.self, forKey: .genericWebhookURL)) ?? ""
+        notifyOnNeedsYou = (try? c.decodeIfPresent(Bool.self, forKey: .notifyOnNeedsYou)) ?? true
+        notifyOnFinished = (try? c.decodeIfPresent(Bool.self, forKey: .notifyOnFinished)) ?? true
+    }
+
+    public func validateWebhookURLs(allowLoopbackHTTP: Bool = false) throws {
+        let fields: [(String, String)] = [
+            ("Bark URL", barkURL),
+            ("Feishu Webhook URL", feishuWebhookURL),
+            ("Discord Webhook URL", discordWebhookURL),
+            ("Generic Webhook URL", genericWebhookURL),
+        ]
+        for (label, raw) in fields {
+            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { continue }
+            guard let url = URL(string: trimmed),
+                  let scheme = url.scheme?.lowercased(),
+                  let host = url.host?.lowercased(),
+                  !host.isEmpty else {
+                throw CodaAPIError.httpError(statusCode: 400, message: "\(label) is not a valid URL.")
+            }
+            let isLoopback = host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "[::1]"
+            let isPrivateOrMeta = isLoopback
+                || host == "0.0.0.0"
+                || host.hasPrefix("169.254.")
+                || host.hasPrefix("10.")
+                || host.hasPrefix("192.168.")
+                || host.hasSuffix(".internal")
+            if allowLoopbackHTTP && isLoopback && (scheme == "http" || scheme == "https") {
+                continue
+            }
+            guard scheme == "https" && !isPrivateOrMeta else {
+                throw CodaAPIError.httpError(
+                    statusCode: 400,
+                    message: "\(label) must use a public https:// endpoint."
+                )
+            }
+        }
+    }
+}
+
+public struct CodaNotificationTestResult: Codable, Sendable, Equatable {
+    public let ok: Bool
+    public let deliveredChannels: [String]
+    public let errors: [String]
+
+    enum CodingKeys: String, CodingKey {
+        case ok
+        case deliveredChannels = "delivered_channels"
+        case errors
+    }
+
+    public init(ok: Bool, deliveredChannels: [String] = [], errors: [String] = []) {
+        self.ok = ok
+        self.deliveredChannels = deliveredChannels
+        self.errors = errors
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        ok = (try? c.decodeIfPresent(Bool.self, forKey: .ok)) ?? false
+        deliveredChannels = (try? c.decodeIfPresent([String].self, forKey: .deliveredChannels)) ?? []
+        errors = (try? c.decodeIfPresent([String].self, forKey: .errors)) ?? []
+    }
+}
+
+public struct CodaPruneStaleDevicesResult: Codable, Sendable, Equatable {
+    public let ok: Bool
+    public let prunedCount: Int
+
+    enum CodingKeys: String, CodingKey {
+        case ok
+        case prunedCount = "pruned_count"
+    }
+
+    public init(ok: Bool, prunedCount: Int) {
+        self.ok = ok
+        self.prunedCount = prunedCount
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        ok = (try? c.decodeIfPresent(Bool.self, forKey: .ok)) ?? false
+        prunedCount = (try? c.decodeIfPresent(Int.self, forKey: .prunedCount)) ?? 0
     }
 }
 

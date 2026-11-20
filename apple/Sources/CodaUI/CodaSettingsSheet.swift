@@ -43,6 +43,7 @@ public struct CodaSettingsAndPairingSheet: View {
                         if store.isSignedIn {
                             machinePairingSection
                                 .id("machine_pairing_section")
+                            offlineWebhooksSection
                         }
                         voiceModelSection
                     }
@@ -50,6 +51,9 @@ public struct CodaSettingsAndPairingSheet: View {
                 }
                 .onAppear {
                     form.serverURLInput = store.settings.serverBaseURLString
+                    if store.isSignedIn {
+                        Task { await store.loadNotificationWebhookSettings() }
+                    }
                     if store.settingsInitialFocusPairing && store.isSignedIn {
                         store.settingsInitialFocusPairing = false
                         Task { @MainActor in
@@ -63,6 +67,7 @@ public struct CodaSettingsAndPairingSheet: View {
                     if signedIn {
                         form.passwordInput = ""
                         form.inviteCodeInput = ""
+                        Task { await store.loadNotificationWebhookSettings() }
                     }
                 }
             }
@@ -666,6 +671,166 @@ public struct CodaSettingsAndPairingSheet: View {
                         }
                     }
                 }
+
+                Divider().background(CodaHerdrTheme.borderHairline)
+
+                HStack(spacing: 8) {
+                    if let onlineHost = store.remoteMachines.first(where: { $0.isOnline }) {
+                        Button {
+                            dismiss()
+                            Task { @MainActor in
+                                try? await Task.sleep(nanoseconds: 250_000_000)
+                                store.openBootstrapWorkspaceSheet(for: onlineHost)
+                            }
+                        } label: {
+                            Label(
+                                tr("Bootstrap Workspace", "新建/克隆工作区", locale: store.locale),
+                                systemImage: "folder.badge.plus"
+                            )
+                            .font(.system(size: 11.5, weight: .semibold))
+                            .foregroundStyle(CodaHerdrTheme.cyanWorking)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 7)
+                            .background(RoundedRectangle(cornerRadius: 8).fill(CodaHerdrTheme.cyanWorking.opacity(0.14)))
+                        }
+                        .buttonStyle(.plain)
+                    }
+
+                    Spacer()
+
+                    Button {
+                        Task { await store.pruneStaleWebDevices() }
+                    } label: {
+                        Label(
+                            store.isPruningStaleDevices
+                                ? tr("Pruning…", "正在清理…", locale: store.locale)
+                                : tr("Prune Offline Web Devices", "清理离线网页端设备", locale: store.locale),
+                            systemImage: "sparkles"
+                        )
+                        .font(.system(size: 11.5, weight: .semibold))
+                        .foregroundStyle(CodaHerdrTheme.textPrimary)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 7)
+                        .background(RoundedRectangle(cornerRadius: 8).fill(CodaHerdrTheme.pillActiveBG))
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(store.isPruningStaleDevices)
+                }
+            }
+        }
+    }
+
+    // MARK: - Zero-Knowledge Offline Alert Webhooks
+
+    private var offlineWebhooksSection: some View {
+        sectionCard(title: tr("Offline Alert Webhooks", "离线告警推送 Webhooks", locale: store.locale)) {
+            VStack(alignment: .leading, spacing: 10) {
+                Text(tr(
+                    "Zero-knowledge push when remote agents enter Needs-You or Finish (metadata only — never terminal plaintext).",
+                    "零知识后台推送：当远端 Agent 进入待审批或完成任务时发送通知（仅含元数据，绝不包含终端明文）。",
+                    locale: store.locale
+                ))
+                .font(.system(size: 11))
+                .foregroundStyle(CodaHerdrTheme.textSecondary)
+
+                Toggle(isOn: $store.notificationSettings.notifyOnNeedsYou) {
+                    Text(tr("Notify on Needs-You (Approval)", "待审批 (Needs-You) 时推送", locale: store.locale))
+                        .font(.system(size: 12.5))
+                        .foregroundStyle(CodaHerdrTheme.textPrimary)
+                }
+                .tint(CodaHerdrTheme.amberNeedsYou)
+
+                Toggle(isOn: $store.notificationSettings.notifyOnFinished) {
+                    Text(tr("Notify on Task Finished", "任务完成 (Finished) 时推送", locale: store.locale))
+                        .font(.system(size: 12.5))
+                        .foregroundStyle(CodaHerdrTheme.textPrimary)
+                }
+                .tint(CodaHerdrTheme.greenDiff)
+
+                labeledInput(
+                    tr("Bark URL (e.g. https://api.day.app/<key>)", "Bark 推送地址", locale: store.locale),
+                    text: $store.notificationSettings.barkURL
+                )
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(tr("Telegram Bot Token", "Telegram Bot Token", locale: store.locale))
+                        .font(.system(size: 11))
+                        .foregroundStyle(CodaHerdrTheme.textSecondary)
+                    SecureField("123456789:AA...", text: $store.notificationSettings.telegramBotToken)
+                        .font(.system(size: 12, design: .monospaced))
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 8)
+                        .background(RoundedRectangle(cornerRadius: 8).fill(CodaHerdrTheme.canvasBG))
+                }
+
+                labeledInput(
+                    tr("Telegram Chat ID", "Telegram Chat ID", locale: store.locale),
+                    text: $store.notificationSettings.telegramChatId
+                )
+
+                labeledInput(
+                    tr("Feishu Webhook URL", "飞书机器人 Webhook URL", locale: store.locale),
+                    text: $store.notificationSettings.feishuWebhookURL
+                )
+
+                labeledInput(
+                    tr("Discord Webhook URL", "Discord Webhook URL", locale: store.locale),
+                    text: $store.notificationSettings.discordWebhookURL
+                )
+
+                labeledInput(
+                    tr("Generic JSON Webhook URL (optional)", "通用 JSON Webhook URL（可选）", locale: store.locale),
+                    text: $store.notificationSettings.genericWebhookURL
+                )
+
+                HStack(spacing: 10) {
+                    Button {
+                        Task { await store.saveNotificationWebhookSettings() }
+                    } label: {
+                        Label(
+                            store.isSavingNotificationSettings
+                                ? tr("Saving…", "保存中…", locale: store.locale)
+                                : tr("Save Webhooks", "保存推送配置", locale: store.locale),
+                            systemImage: "checkmark.circle.fill"
+                        )
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(.black)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 8)
+                        .background(RoundedRectangle(cornerRadius: 8).fill(CodaHerdrTheme.textPrimary))
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(store.isSavingNotificationSettings || store.isTestingNotificationSettings)
+
+                    Button {
+                        Task { await store.sendTestNotificationWebhook() }
+                    } label: {
+                        Label(
+                            store.isTestingNotificationSettings
+                                ? tr("Sending…", "推送中…", locale: store.locale)
+                                : tr("Test Push", "发送测试推送", locale: store.locale),
+                            systemImage: "paperplane.fill"
+                        )
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(.black)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 8)
+                        .background(RoundedRectangle(cornerRadius: 8).fill(CodaHerdrTheme.cyanWorking))
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(store.isSavingNotificationSettings || store.isTestingNotificationSettings)
+                }
+
+                if let okMsg = store.notificationStatusMessage {
+                    Text(okMsg)
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(CodaHerdrTheme.greenDiff)
+                }
+                if let errMsg = store.notificationErrorMessage {
+                    Text(errMsg)
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(CodaHerdrTheme.redDiff)
+                }
             }
         }
     }
@@ -675,14 +840,28 @@ public struct CodaSettingsAndPairingSheet: View {
     private var voiceModelSection: some View {
         sectionCard(title: tr("Voice Dictation Model", "语音识别模型", locale: store.locale)) {
             VStack(alignment: .leading, spacing: 10) {
+                if CodaVoiceRecorder.usesNativeSpeechFallback(for: store.settings.voiceConfig) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "waveform.badge.mic")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(CodaHerdrTheme.greenDiff)
+                        Text(tr(
+                            "Zero-config Apple Native Speech (SFSpeechRecognizer) fallback active while API Key is empty.",
+                            "零配置模式已激活：未填 API Key 时自动使用 Apple 原生语音识别 (SFSpeechRecognizer)。",
+                            locale: store.locale
+                        ))
+                        .font(.system(size: 11))
+                        .foregroundStyle(CodaHerdrTheme.greenDiff)
+                    }
+                }
                 labeledInput(tr("Provider", "服务商", locale: store.locale), text: $store.settings.voiceConfig.provider)
                 labeledInput(tr("Base URL", "接口地址", locale: store.locale), text: $store.settings.voiceConfig.baseURL)
                 labeledInput(tr("Model", "模型名称", locale: store.locale), text: $store.settings.voiceConfig.model)
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("API Key")
+                    Text(tr("API Key (leave empty for Apple Native Speech)", "API Key（留空则使用 Apple 原生语音识别）", locale: store.locale))
                         .font(.system(size: 11))
                         .foregroundStyle(CodaHerdrTheme.textSecondary)
-                    SecureField(tr("Enter API Key", "输入 API Key", locale: store.locale), text: $store.settings.voiceConfig.apiKey)
+                    SecureField(tr("Optional Whisper API Key", "可选 Whisper API Key", locale: store.locale), text: $store.settings.voiceConfig.apiKey)
                         .font(.system(size: 12, design: .monospaced))
                         .padding(.horizontal, 10)
                         .padding(.vertical, 8)
@@ -740,5 +919,201 @@ public struct CodaSettingsAndPairingSheet: View {
                 .fill(CodaHerdrTheme.cardBG)
                 .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).strokeBorder(CodaHerdrTheme.borderHairline, lineWidth: 1))
         )
+    }
+}
+
+// MARK: - Remote Workspace Bootstrapper Sheet (`git clone` / New Folder + Launch Session)
+
+private final class BootstrapWorkspaceFormModel: ObservableObject {
+    @Published var selectedDeviceId: UUID? = nil
+    @Published var parentDir: String = "~/workspace"
+    @Published var gitCloneURL: String = ""
+    @Published var folderName: String = ""
+    @Published var selectedAgent: String = "claude"
+    @Published var initialPrompt: String = ""
+    @Published var didAutoSuggestFolder: Bool = false
+}
+
+public struct CodaBootstrapWorkspaceSheet: View {
+    @ObservedObject public var store: CodaWorkspaceStore
+    @Environment(\.dismiss) private var dismiss
+    @StateObject private var form = BootstrapWorkspaceFormModel()
+
+    public init(store: CodaWorkspaceStore) {
+        self.store = store
+    }
+
+    private var onlineHosts: [CodaRemoteDevice] {
+        store.remoteMachines.filter(\.isOnline)
+    }
+
+    private var activeDevice: CodaRemoteDevice? {
+        if let id = form.selectedDeviceId, let match = onlineHosts.first(where: { $0.id == id }) {
+            return match
+        }
+        return onlineHosts.first
+    }
+
+    public var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 14) {
+                    if onlineHosts.isEmpty {
+                        Text(tr("No online hosts paired. Connect a workstation first.", "当前没有在线主机，请先启动或配对工作站。", locale: store.locale))
+                            .font(.system(size: 13))
+                            .foregroundStyle(CodaHerdrTheme.amberNeedsYou)
+                    } else {
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text(tr("Target Host", "目标主机", locale: store.locale))
+                                .font(.system(size: 11.5, weight: .medium))
+                                .foregroundStyle(CodaHerdrTheme.textSecondary)
+
+                            Picker("", selection: Binding(
+                                get: { activeDevice?.id ?? onlineHosts[0].id },
+                                set: { form.selectedDeviceId = $0 }
+                            )) {
+                                ForEach(onlineHosts) { dev in
+                                    Text("\(dev.name) (\(dev.platform))").tag(dev.id)
+                                }
+                            }
+                            .pickerStyle(.menu)
+                        }
+
+                        fieldBlock(
+                            title: tr("Parent Directory on Host", "远端父目录", locale: store.locale),
+                            placeholder: "~/workspace",
+                            text: $form.parentDir
+                        )
+
+                        fieldBlock(
+                            title: tr("Git Clone URL (optional — https://, ssh://, or git@)", "Git 仓库地址（可选，留空则仅创建空目录）", locale: store.locale),
+                            placeholder: "https://github.com/org/repo.git",
+                            text: $form.gitCloneURL
+                        )
+                        .onChange(of: form.gitCloneURL) { _, next in
+                            if form.folderName.isEmpty || form.didAutoSuggestFolder {
+                                if let suggested = CodaWorkspaceBootstrapValidator.suggestedFolderName(fromGitCloneURL: next) {
+                                    form.folderName = suggested
+                                    form.didAutoSuggestFolder = true
+                                }
+                            }
+                        }
+
+                        fieldBlock(
+                            title: tr("New Folder Name", "新工作区目录名", locale: store.locale),
+                            placeholder: "my-project",
+                            text: $form.folderName
+                        )
+
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text(tr("Launch Agent Session", "创建后立即启动会话", locale: store.locale))
+                                .font(.system(size: 11.5, weight: .medium))
+                                .foregroundStyle(CodaHerdrTheme.textSecondary)
+
+                            Picker("", selection: $form.selectedAgent) {
+                                Text("Claude Code").tag("claude")
+                                Text("Codex").tag("codex")
+                                Text("Antigravity (AGY)").tag("agy")
+                                Text("Gemini CLI").tag("gemini")
+                                Text("Grok").tag("grok")
+                                Text("Shell").tag("shell")
+                                Text(tr("None (Create Folder Only)", "不启动（仅初始化目录）", locale: store.locale)).tag("none")
+                            }
+                            .pickerStyle(.menu)
+                        }
+
+                        if form.selectedAgent != "none" {
+                            fieldBlock(
+                                title: tr("Initial Prompt (optional)", "初始指令（可选）", locale: store.locale),
+                                placeholder: tr("e.g. Inspect repo structure and run tests", "例如：阅读项目结构并运行测试", locale: store.locale),
+                                text: $form.initialPrompt
+                            )
+                        }
+
+                        if let err = store.bootstrapErrorMessage {
+                            Text(err)
+                                .font(.system(size: 12))
+                                .foregroundStyle(CodaHerdrTheme.redDiff)
+                        }
+
+                        Button {
+                            guard let dev = activeDevice else { return }
+                            Task {
+                                let ok = await store.bootstrapWorkspaceAndLaunch(
+                                    on: dev,
+                                    parentDir: form.parentDir,
+                                    folderName: form.folderName,
+                                    gitCloneUrl: form.gitCloneURL,
+                                    agent: form.selectedAgent,
+                                    initialPrompt: form.initialPrompt
+                                )
+                                if ok {
+                                    dismiss()
+                                }
+                            }
+                        } label: {
+                            HStack(spacing: 8) {
+                                if store.isBootstrappingWorkspace {
+                                    ProgressView().controlSize(.small).tint(.black)
+                                } else {
+                                    Image(systemName: form.gitCloneURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "folder.badge.plus" : "arrow.down.doc.fill")
+                                }
+                                Text(
+                                    store.isBootstrappingWorkspace
+                                        ? tr("Bootstrapping over E2EE…", "正在远端创建/克隆工作区…", locale: store.locale)
+                                        : (form.gitCloneURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                                            ? tr("Create Workspace & Launch", "创建目录并启动", locale: store.locale)
+                                            : tr("Git Clone & Launch", "Git Clone 并启动", locale: store.locale))
+                                )
+                                .font(.system(size: 13, weight: .semibold))
+                            }
+                            .foregroundStyle(.black)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 11)
+                            .background(RoundedRectangle(cornerRadius: 10).fill(CodaHerdrTheme.cyanWorking))
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(
+                            store.isBootstrappingWorkspace
+                                || form.folderName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                        )
+                    }
+                }
+                .padding(18)
+            }
+            .background(CodaHerdrTheme.canvasBG)
+            .navigationTitle(tr("Bootstrap Workspace", "新建 / 克隆远端工作区", locale: store.locale))
+            #if os(iOS)
+            .navigationBarTitleDisplayMode(.inline)
+            #endif
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button(tr("Cancel", "取消", locale: store.locale)) {
+                        dismiss()
+                    }
+                }
+            }
+            .onAppear {
+                form.selectedDeviceId = store.bootstrapTargetDeviceID ?? onlineHosts.first?.id
+                form.parentDir = store.bootstrapDefaultParentDir
+            }
+        }
+        .preferredColorScheme(.dark)
+    }
+
+    private func fieldBlock(title: String, placeholder: String, text: Binding<String>) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(title)
+                .font(.system(size: 11.5, weight: .medium))
+                .foregroundStyle(CodaHerdrTheme.textSecondary)
+            TextField(placeholder, text: text)
+                .font(.system(size: 12.5, design: .monospaced))
+                .foregroundStyle(CodaHerdrTheme.textPrimary)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 8)
+                .background(RoundedRectangle(cornerRadius: 8).fill(CodaHerdrTheme.cardBG))
+                .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(CodaHerdrTheme.borderHairline, lineWidth: 1))
+                .codaNoAutocapAndSpelling()
+        }
     }
 }

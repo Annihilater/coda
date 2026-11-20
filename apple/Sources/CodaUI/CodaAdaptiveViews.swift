@@ -176,6 +176,9 @@ public struct CodaAdaptiveRootView: View {
         .sheet(isPresented: $store.showSettingsSheet) {
             CodaSettingsAndPairingSheet(store: store)
         }
+        .sheet(isPresented: $store.showBootstrapWorkspaceSheet) {
+            CodaBootstrapWorkspaceSheet(store: store)
+        }
         .preferredColorScheme(.dark)
     }
 
@@ -419,6 +422,12 @@ public struct CodaAdaptiveRootView: View {
                         Button("Gemini CLI") { store.launchAgent(agent: "gemini", on: group.device, cwd: group.repos.first?.rootPath) }
                         Divider()
                         Button("Shell") { store.launchAgent(agent: "shell", on: group.device, cwd: group.repos.first?.rootPath) }
+                        Divider()
+                        Button {
+                            store.openBootstrapWorkspaceSheet(for: group.device)
+                        } label: {
+                            Label(tr("New Workspace / Git Clone…", "新建目录 / Git Clone…", locale: store.locale), systemImage: "folder.badge.plus")
+                        }
                     } label: {
                         Image(systemName: "plus")
                             .font(.system(size: 11, weight: .semibold))
@@ -596,6 +605,12 @@ public struct CodaAdaptiveRootView: View {
                             Button("Gemini CLI") { store.launchAgent(agent: "gemini", on: onlineHost, cwd: defaultCwd) }
                             Divider()
                             Button("Shell") { store.launchAgent(agent: "shell", on: onlineHost, cwd: defaultCwd) }
+                            Divider()
+                            Button {
+                                store.openBootstrapWorkspaceSheet(for: onlineHost)
+                            } label: {
+                                Label(tr("New Workspace / Git Clone…", "新建目录 / Git Clone…", locale: store.locale), systemImage: "folder.badge.plus")
+                            }
                         } label: {
                             Label(tr("New Terminal", "新建终端", locale: store.locale), systemImage: "terminal")
                                 .font(.system(size: 13, weight: .semibold))

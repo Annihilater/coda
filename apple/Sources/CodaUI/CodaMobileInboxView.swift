@@ -656,6 +656,12 @@ public struct CodaMobileSpacesTabView: View {
             Button("Gemini CLI") { store.launchAgent(agent: "gemini", on: device, cwd: cwd) }
             Divider()
             Button("Shell") { store.launchAgent(agent: "shell", on: device, cwd: cwd) }
+            Divider()
+            Button {
+                store.openBootstrapWorkspaceSheet(for: device)
+            } label: {
+                Label(tr("New Workspace / Git Clone…", "新建目录 / Git Clone…", locale: store.locale), systemImage: "folder.badge.plus")
+            }
         } label: {
             Image(systemName: "plus")
                 .font(.system(size: 12, weight: .semibold))

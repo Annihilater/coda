@@ -675,6 +675,12 @@ public struct CodaDuoDirectoryPane: View {
                         Button("Gemini CLI") { store.launchAgent(agent: "gemini", on: group.device, cwd: group.repos.first?.rootPath) }
                         Divider()
                         Button("Shell") { store.launchAgent(agent: "shell", on: group.device, cwd: group.repos.first?.rootPath) }
+                        Divider()
+                        Button {
+                            store.openBootstrapWorkspaceSheet(for: group.device)
+                        } label: {
+                            Label(tr("New Workspace / Git Clone…", "新建目录 / Git Clone…", locale: store.locale), systemImage: "folder.badge.plus")
+                        }
                     } label: {
                         Image(systemName: "plus.circle.fill")
                             .font(.system(size: 13))
@@ -752,6 +758,12 @@ public struct CodaDuoDirectoryPane: View {
                         Button("Gemini CLI") { store.launchAgent(agent: "gemini", on: onlineHost, cwd: defaultCwd) }
                         Divider()
                         Button("Shell") { store.launchAgent(agent: "shell", on: onlineHost, cwd: defaultCwd) }
+                        Divider()
+                        Button {
+                            store.openBootstrapWorkspaceSheet(for: onlineHost)
+                        } label: {
+                            Label(tr("New Workspace / Git Clone…", "新建目录 / Git Clone…", locale: store.locale), systemImage: "folder.badge.plus")
+                        }
                     } label: {
                         Text(tr("New Terminal", "新建终端", locale: store.locale))
                             .font(.system(size: 12, weight: .semibold))
@@ -1479,53 +1491,8 @@ public struct CodaDuoInlineGitDiffLeaf: View {
 
             Divider().background(CodaHerdrTheme.borderHairline)
 
-            if store.gitDiffLoading {
-                ProgressView()
-                    .tint(CodaHerdrTheme.cyanWorking)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else if let diff = store.gitDiffResult {
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 3) {
-                        if !diff.statusShort.isEmpty {
-                            Text(diff.statusShort)
-                                .font(.system(size: 11, design: .monospaced))
-                                .foregroundStyle(CodaHerdrTheme.cyanWorking)
-                                .padding(.bottom, 8)
-                        }
-                        let rawLines = (diff.diffUnified.isEmpty
-                            ? tr("Working tree clean", "工作区无未提交变更", locale: store.locale)
-                            : diff.diffUnified).components(separatedBy: "\n")
-
-                        ForEach(Array(rawLines.enumerated()), id: \.offset) { _, line in
-                            let isAdd = line.hasPrefix("+") && !line.hasPrefix("+++")
-                            let isDel = line.hasPrefix("-") && !line.hasPrefix("---")
-                            let isHunk = line.hasPrefix("@@")
-                            let fg: Color = isAdd
-                                ? CodaHerdrTheme.greenDiff
-                                : (isDel ? CodaHerdrTheme.redDiff : (isHunk ? CodaHerdrTheme.cyanWorking : CodaHerdrTheme.textPrimary))
-                            let bg: Color = isAdd
-                                ? CodaHerdrTheme.greenDiff.opacity(0.10)
-                                : (isDel ? CodaHerdrTheme.redDiff.opacity(0.10) : (isHunk ? CodaHerdrTheme.cyanWorking.opacity(0.08) : .clear))
-
-                            Text(line.isEmpty ? " " : line)
-                                .font(.system(size: 11, design: .monospaced))
-                                .foregroundStyle(fg)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .padding(.horizontal, 6)
-                                .padding(.vertical, 1)
-                                .background(RoundedRectangle(cornerRadius: 3).fill(bg))
-                        }
-                    }
-                    .padding(12)
-                }
-            } else {
-                VStack(spacing: 8) {
-                    Text(tr("Tap refresh to load remote diff over E2EE", "点击右上角刷新按钮通过加密通道拉取远程变更", locale: store.locale))
-                        .font(.system(size: 12))
-                        .foregroundStyle(CodaHerdrTheme.textSecondary)
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-            }
+            CodaGitDiffInteractiveView(store: store, session: session)
+                .padding(10)
         }
         .background(CodaHerdrTheme.canvasBG)
     }
