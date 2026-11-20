@@ -1,0 +1,24 @@
+{
+  "name": "Coda — Zero-Knowledge Cross-Device AI Coding Workbench",
+  "short_name": "Coda",
+  "description": "Control your Linux servers, macOS workstation, and AI coding agents from anywhere with zero-knowledge E2EE.",
+  "start_url": "/console",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#000000",
+  "theme_color": "#09090b",
+  "orientation": "any",
+  "icons": [
+    {
+      "src": "/apple-touch-icon.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/logo.svg",
+      "sizes": "any",
+      "type": "image/svg+xml"
+    }
+  ]
+}

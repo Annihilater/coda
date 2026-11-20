@@ -51,6 +51,42 @@ interface VtCell {
   style: VtStyle;
 }
 
+interface VtRow {
+  cells: VtCell[];
+  ver: number;
+}
+
+export interface VtDomPatchStats {
+  patched: number;
+  reused: number;
+  total: number;
+}
+
+export interface VtRowNodeLike {
+  className: string;
+  innerHTML: string;
+  getAttribute(name: string): string | null;
+  setAttribute(name: string, value: string): void;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  contains?(node: any): boolean;
+  remove(): void;
+}
+
+export interface VtDomContainerLike {
+  innerHTML: string;
+  children: ArrayLike<VtRowNodeLike>;
+  childElementCount: number;
+  getAttribute(name: string): string | null;
+  setAttribute(name: string, value: string): void;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  appendChild(node: any): unknown;
+  ownerDocument?: {
+    createElement(tag: string): VtRowNodeLike;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    createDocumentFragment?(): { appendChild(node: any): unknown };
+  } | null;
+}
+
 const DEFAULT_STYLE: VtStyle = {
   fg: null,
   bg: null,
@@ -156,6 +192,8 @@ interface SavedBufferState {
   savedCursor: { row: number; col: number; style: VtStyle } | null;
 }
 
+let globalRowVer = 1;
+
 /**
  * Stateful 2D VT100/xterm screen buffer with streaming UTF-8 decoding, carriage-return overwrite,
  * CJK wide characters, zero-width combining marks, alternate screen buffer (`?1049h`/`l`),
@@ -165,9 +203,9 @@ export class WebVtTerminal {
   public cols: number;
   public rows: number;
   private maxScrollback: number;
-  private primaryGrid: VtCell[][];
-  private altGrid: VtCell[][];
-  private primaryScrollback: VtCell[][] = [];
+  private primaryGrid: VtRow[];
+  private altGrid: VtRow[];
+  private primaryScrollback: VtRow[] = [];
   private usingAltScreen = false;
   private cursorRow = 0;
   private cursorCol = 0;
@@ -196,13 +234,21 @@ export class WebVtTerminal {
     this.altGrid = this.createEmptyGrid(this.cols, this.rows);
   }
 
-  private createEmptyGrid(cols: number, rows: number): VtCell[][] {
-    const grid: VtCell[][] = [];
-    for (let r = 0; r < rows; r++) grid.push(makeBlankRow(cols));
+  private makeRow(cols: number): VtRow {
+    return { cells: makeBlankRow(cols), ver: ++globalRowVer };
+  }
+
+  private bumpRow(row: VtRow): void {
+    row.ver = ++globalRowVer;
+  }
+
+  private createEmptyGrid(cols: number, rows: number): VtRow[] {
+    const grid: VtRow[] = [];
+    for (let r = 0; r < rows; r++) grid.push(this.makeRow(cols));
     return grid;
   }
 
-  private activeGrid(): VtCell[][] {
+  private activeGrid(): VtRow[] {
     return this.usingAltScreen ? this.altGrid : this.primaryGrid;
   }
 
@@ -262,18 +308,18 @@ export class WebVtTerminal {
     this.pendingWrap = false;
   }
 
-  private resizeGrid(old: VtCell[][], newCols: number, newRows: number): VtCell[][] {
-    const out: VtCell[][] = [];
+  private resizeGrid(old: VtRow[], newCols: number, newRows: number): VtRow[] {
+    const out: VtRow[] = [];
     const copyRows = Math.min(old.length, newRows);
     for (let r = 0; r < copyRows; r++) {
-      const row = makeBlankRow(newCols);
-      const copyCols = Math.min(old[r].length, newCols);
+      const row = this.makeRow(newCols);
+      const copyCols = Math.min(old[r].cells.length, newCols);
       for (let c = 0; c < copyCols; c++) {
-        row[c] = { ...old[r][c], style: cloneStyle(old[r][c].style) };
+        row.cells[c] = { ...old[r].cells[c], style: cloneStyle(old[r].cells[c].style) };
       }
       out.push(row);
     }
-    while (out.length < newRows) out.push(makeBlankRow(newCols));
+    while (out.length < newRows) out.push(this.makeRow(newCols));
     return out;
   }
 
@@ -418,13 +464,16 @@ export class WebVtTerminal {
     this.putGlyph(ch);
   }
 
-  private clearWidePartner(grid: VtCell[][], row: number, col: number): void {
-    const cell = grid[row]?.[col];
-    if (!cell) return;
+  private clearWidePartner(grid: VtRow[], row: number, col: number): void {
+    const line = grid[row];
+    const cell = line?.cells[col];
+    if (!line || !cell) return;
     if (cell.width === 2 && col + 1 < this.cols) {
-      grid[row][col + 1] = { ch: " ", width: 1, style: { ...DEFAULT_STYLE } };
+      line.cells[col + 1] = { ch: " ", width: 1, style: { ...DEFAULT_STYLE } };
+      this.bumpRow(line);
     } else if (cell.width === 0 && col > 0) {
-      grid[row][col - 1] = { ch: " ", width: 1, style: { ...DEFAULT_STYLE } };
+      line.cells[col - 1] = { ch: " ", width: 1, style: { ...DEFAULT_STYLE } };
+      this.bumpRow(line);
     }
   }
 
@@ -435,13 +484,15 @@ export class WebVtTerminal {
       const grid = this.activeGrid();
       const targetCol = this.pendingWrap ? this.cols - 1 : this.cursorCol - 1;
       if (targetCol >= 0 && targetCol < this.cols) {
+        const line = grid[this.cursorRow];
         let baseCol = targetCol;
-        if (grid[this.cursorRow][baseCol].width === 0 && baseCol > 0) {
+        if (line.cells[baseCol].width === 0 && baseCol > 0) {
           baseCol -= 1;
         }
-        const cell = grid[this.cursorRow][baseCol];
+        const cell = line.cells[baseCol];
         if (cell.ch.length < 16) {
           cell.ch += ch;
+          this.bumpRow(line);
         }
       }
       return;
@@ -454,18 +505,21 @@ export class WebVtTerminal {
     if (w === 2 && this.cursorCol === this.cols - 1) {
       const grid = this.activeGrid();
       this.clearWidePartner(grid, this.cursorRow, this.cursorCol);
-      grid[this.cursorRow][this.cursorCol] = { ch: " ", width: 1, style: cloneStyle(this.style) };
+      grid[this.cursorRow].cells[this.cursorCol] = { ch: " ", width: 1, style: cloneStyle(this.style) };
+      this.bumpRow(grid[this.cursorRow]);
       this.cursorCol = 0;
       this.lineFeed();
     }
 
     const grid = this.activeGrid();
+    const line = grid[this.cursorRow];
     this.clearWidePartner(grid, this.cursorRow, this.cursorCol);
-    grid[this.cursorRow][this.cursorCol] = { ch, width: w, style: cloneStyle(this.style) };
+    line.cells[this.cursorCol] = { ch, width: w, style: cloneStyle(this.style) };
+    this.bumpRow(line);
 
     if (w === 2 && this.cursorCol + 1 < this.cols) {
       this.clearWidePartner(grid, this.cursorRow, this.cursorCol + 1);
-      grid[this.cursorRow][this.cursorCol + 1] = { ch: "", width: 0, style: cloneStyle(this.style) };
+      line.cells[this.cursorCol + 1] = { ch: "", width: 0, style: cloneStyle(this.style) };
       if (this.cursorCol + 2 >= this.cols) {
         this.pendingWrap = true;
       } else {
@@ -507,7 +561,7 @@ export class WebVtTerminal {
           this.primaryScrollback.shift();
         }
       }
-      grid.splice(this.scrollBottom, 0, makeBlankRow(this.cols));
+      grid.splice(this.scrollBottom, 0, this.makeRow(this.cols));
     }
   }
 
@@ -516,7 +570,7 @@ export class WebVtTerminal {
     const grid = this.activeGrid();
     for (let i = 0; i < n; i++) {
       grid.splice(this.scrollBottom, 1);
-      grid.splice(this.scrollTop, 0, makeBlankRow(this.cols));
+      grid.splice(this.scrollTop, 0, this.makeRow(this.cols));
     }
   }
 
@@ -635,32 +689,41 @@ export class WebVtTerminal {
       case "J": {
         const mode = paramZero(0, 0);
         if (mode === 0) {
-          for (let c = this.cursorCol; c < this.cols; c++) grid[this.cursorRow][c] = { ch: " ", width: 1, style: { ...DEFAULT_STYLE } };
-          for (let r = this.cursorRow + 1; r < this.rows; r++) grid[r] = makeBlankRow(this.cols);
+          const line = grid[this.cursorRow];
+          for (let c = this.cursorCol; c < this.cols; c++) line.cells[c] = { ch: " ", width: 1, style: { ...DEFAULT_STYLE } };
+          this.bumpRow(line);
+          for (let r = this.cursorRow + 1; r < this.rows; r++) grid[r] = this.makeRow(this.cols);
         } else if (mode === 1) {
-          for (let r = 0; r < this.cursorRow; r++) grid[r] = makeBlankRow(this.cols);
-          for (let c = 0; c <= this.cursorCol; c++) grid[this.cursorRow][c] = { ch: " ", width: 1, style: { ...DEFAULT_STYLE } };
+          for (let r = 0; r < this.cursorRow; r++) grid[r] = this.makeRow(this.cols);
+          const line = grid[this.cursorRow];
+          for (let c = 0; c <= this.cursorCol; c++) line.cells[c] = { ch: " ", width: 1, style: { ...DEFAULT_STYLE } };
+          this.bumpRow(line);
         } else if (mode === 2 || mode === 3) {
-          for (let r = 0; r < this.rows; r++) grid[r] = makeBlankRow(this.cols);
+          for (let r = 0; r < this.rows; r++) grid[r] = this.makeRow(this.cols);
           if (mode === 3 && !this.usingAltScreen) this.primaryScrollback = [];
         }
         break;
       }
       case "K": {
         const mode = paramZero(0, 0);
+        const line = grid[this.cursorRow];
         if (mode === 0) {
           this.clearWidePartner(grid, this.cursorRow, this.cursorCol);
-          for (let c = this.cursorCol; c < this.cols; c++) grid[this.cursorRow][c] = { ch: " ", width: 1, style: { ...DEFAULT_STYLE } };
+          for (let c = this.cursorCol; c < this.cols; c++) line.cells[c] = { ch: " ", width: 1, style: { ...DEFAULT_STYLE } };
+          this.bumpRow(line);
         } else if (mode === 1) {
-          for (let c = 0; c <= this.cursorCol; c++) grid[this.cursorRow][c] = { ch: " ", width: 1, style: { ...DEFAULT_STYLE } };
+          for (let c = 0; c <= this.cursorCol; c++) line.cells[c] = { ch: " ", width: 1, style: { ...DEFAULT_STYLE } };
+          this.bumpRow(line);
         } else if (mode === 2) {
-          grid[this.cursorRow] = makeBlankRow(this.cols);
+          grid[this.cursorRow] = this.makeRow(this.cols);
         }
         break;
       }
       case "X": {
+        const line = grid[this.cursorRow];
         const n = Math.min(param(0), this.cols - this.cursorCol);
-        for (let i = 0; i < n; i++) grid[this.cursorRow][this.cursorCol + i] = { ch: " ", width: 1, style: { ...DEFAULT_STYLE } };
+        for (let i = 0; i < n; i++) line.cells[this.cursorCol + i] = { ch: " ", width: 1, style: { ...DEFAULT_STYLE } };
+        this.bumpRow(line);
         break;
       }
       case "L": {
@@ -668,7 +731,7 @@ export class WebVtTerminal {
         const n = Math.min(param(0), this.scrollBottom - this.cursorRow + 1);
         for (let i = 0; i < n; i++) {
           grid.splice(this.scrollBottom, 1);
-          grid.splice(this.cursorRow, 0, makeBlankRow(this.cols));
+          grid.splice(this.cursorRow, 0, this.makeRow(this.cols));
         }
         break;
       }
@@ -677,26 +740,30 @@ export class WebVtTerminal {
         const n = Math.min(param(0), this.scrollBottom - this.cursorRow + 1);
         for (let i = 0; i < n; i++) {
           grid.splice(this.cursorRow, 1);
-          grid.splice(this.scrollBottom, 0, makeBlankRow(this.cols));
+          grid.splice(this.scrollBottom, 0, this.makeRow(this.cols));
         }
         break;
       }
       case "@": {
+        const line = grid[this.cursorRow];
         this.clearWidePartner(grid, this.cursorRow, this.cursorCol);
         const n = Math.min(param(0), this.cols - this.cursorCol);
         for (let i = 0; i < n; i++) {
-          grid[this.cursorRow].splice(this.cursorCol, 0, { ch: " ", width: 1, style: { ...DEFAULT_STYLE } });
-          grid[this.cursorRow].pop();
+          line.cells.splice(this.cursorCol, 0, { ch: " ", width: 1, style: { ...DEFAULT_STYLE } });
+          line.cells.pop();
         }
+        this.bumpRow(line);
         break;
       }
       case "P": {
+        const line = grid[this.cursorRow];
         this.clearWidePartner(grid, this.cursorRow, this.cursorCol);
         const n = Math.min(param(0), this.cols - this.cursorCol);
-        grid[this.cursorRow].splice(this.cursorCol, n);
+        line.cells.splice(this.cursorCol, n);
         for (let i = 0; i < n; i++) {
-          grid[this.cursorRow].push({ ch: " ", width: 1, style: { ...DEFAULT_STYLE } });
+          line.cells.push({ ch: " ", width: 1, style: { ...DEFAULT_STYLE } });
         }
+        this.bumpRow(line);
         break;
       }
       case "S": this.scrollUp(param(0)); break;
@@ -856,7 +923,7 @@ export class WebVtTerminal {
     }
   }
 
-  private visibleRows(includeCursorRow = false): { rows: VtCell[][]; cursorVisRow: number } {
+  private visibleRows(includeCursorRow = false): { rows: VtRow[]; cursorVisRow: number } {
     const base = this.usingAltScreen
       ? this.altGrid
       : [...this.primaryScrollback, ...this.primaryGrid];
@@ -867,7 +934,7 @@ export class WebVtTerminal {
     let end = base.length;
     while (
       end > minEnd &&
-      base[end - 1].every((c) => c.width === 1 && c.ch === " " && c.style.bg === null)
+      base[end - 1].cells.every((c) => c.width === 1 && c.ch === " " && c.style.bg === null && !c.style.inverse)
     ) {
       end -= 1;
     }
@@ -877,7 +944,7 @@ export class WebVtTerminal {
   renderPlainText(): string {
     return this.visibleRows(false)
       .rows.map((row) =>
-        row
+        row.cells
           .filter((c) => c.width !== 0)
           .map((c) => c.ch)
           .join("")
@@ -886,69 +953,195 @@ export class WebVtTerminal {
       .join("\n");
   }
 
+  private renderSingleRowHtml(row: VtCell[], cursorColHere: number): string {
+    const hasCursorHere = cursorColHere >= 0;
+    let lastNonEmpty = row.length - 1;
+    while (
+      lastNonEmpty >= 0 &&
+      !(hasCursorHere && lastNonEmpty === cursorColHere) &&
+      row[lastNonEmpty].width === 1 &&
+      row[lastNonEmpty].ch === " " &&
+      row[lastNonEmpty].style.bg === null &&
+      !row[lastNonEmpty].style.inverse
+    ) {
+      lastNonEmpty -= 1;
+    }
+    if (lastNonEmpty < 0) {
+      return " ";
+    }
+    let out = "";
+    let runStyle: VtStyle | null = null;
+    let runText = "";
+    const flushRun = () => {
+      if (!runText) return;
+      const escaped = escapeHtml(runText);
+      if (!runStyle || sameStyle(runStyle, DEFAULT_STYLE)) {
+        out += escaped;
+      } else {
+        const css: string[] = [];
+        const fg = runStyle.inverse ? (runStyle.bg || "var(--bg-surface)") : runStyle.fg;
+        const bg = runStyle.inverse ? (runStyle.fg || "var(--text-primary)") : runStyle.bg;
+        if (fg) css.push(`color:${fg}`);
+        if (bg) css.push(`background-color:${bg}`);
+        if (runStyle.bold) css.push("font-weight:600");
+        if (runStyle.dim) css.push("opacity:0.72");
+        if (runStyle.italic) css.push("font-style:italic");
+        if (runStyle.underline) css.push("text-decoration:underline");
+        out += css.length > 0 ? `<span style="${css.join(";")}">${escaped}</span>` : escaped;
+      }
+      runText = "";
+    };
+
+    for (let c = 0; c <= lastNonEmpty; c++) {
+      const cell = row[c];
+      if (cell.width === 0) continue;
+      if (hasCursorHere && c === cursorColHere) {
+        flushRun();
+        runStyle = null;
+        out += `<span class="term-cursor">${escapeHtml(cell.ch || " ")}</span>`;
+        continue;
+      }
+      if (!runStyle || !sameStyle(runStyle, cell.style)) {
+        flushRun();
+        runStyle = cell.style;
+      }
+      runText += cell.ch;
+    }
+    flushRun();
+    return out;
+  }
+
   renderHtml(showCursor = true): string {
     const drawCursor = showCursor && this.cursorVisible;
     const { rows, cursorVisRow } = this.visibleRows(drawCursor);
     const linesHtml: string[] = [];
     for (let rIdx = 0; rIdx < rows.length; rIdx++) {
-      const row = rows[rIdx];
-      const hasCursorHere = drawCursor && rIdx === cursorVisRow;
-      let lastNonEmpty = row.length - 1;
-      while (
-        lastNonEmpty >= 0 &&
-        !(hasCursorHere && lastNonEmpty === this.cursorCol) &&
-        row[lastNonEmpty].width === 1 &&
-        row[lastNonEmpty].ch === " " &&
-        row[lastNonEmpty].style.bg === null &&
-        !row[lastNonEmpty].style.inverse
-      ) {
-        lastNonEmpty -= 1;
-      }
-      if (lastNonEmpty < 0) {
-        linesHtml.push(" ");
-        continue;
-      }
-      let out = "";
-      let runStyle: VtStyle | null = null;
-      let runText = "";
-      const flushRun = () => {
-        if (!runText) return;
-        const escaped = escapeHtml(runText);
-        if (!runStyle || sameStyle(runStyle, DEFAULT_STYLE)) {
-          out += escaped;
-        } else {
-          const css: string[] = [];
-          const fg = runStyle.inverse ? (runStyle.bg || "var(--bg-surface)") : runStyle.fg;
-          const bg = runStyle.inverse ? (runStyle.fg || "var(--text-primary)") : runStyle.bg;
-          if (fg) css.push(`color:${fg}`);
-          if (bg) css.push(`background-color:${bg}`);
-          if (runStyle.bold) css.push("font-weight:600");
-          if (runStyle.dim) css.push("opacity:0.72");
-          if (runStyle.italic) css.push("font-style:italic");
-          if (runStyle.underline) css.push("text-decoration:underline");
-          out += css.length > 0 ? `<span style="${css.join(";")}">${escaped}</span>` : escaped;
-        }
-        runText = "";
-      };
-
-      for (let c = 0; c <= lastNonEmpty; c++) {
-        const cell = row[c];
-        if (cell.width === 0) continue;
-        if (hasCursorHere && c === this.cursorCol) {
-          flushRun();
-          runStyle = null;
-          out += `<span class="term-cursor">${escapeHtml(cell.ch || " ")}</span>`;
-          continue;
-        }
-        if (!runStyle || !sameStyle(runStyle, cell.style)) {
-          flushRun();
-          runStyle = cell.style;
-        }
-        runText += cell.ch;
-      }
-      flushRun();
-      linesHtml.push(out);
+      const cursorColHere = drawCursor && rIdx === cursorVisRow ? this.cursorCol : -1;
+      linesHtml.push(this.renderSingleRowHtml(rows[rIdx].cells, cursorColHere));
     }
     return linesHtml.join("\n");
+  }
+
+  /**
+   * Renders initial `<div class="vt-row" data-vt-key="...">` HTML so the first `rAF`
+   * immediately reuses existing row nodes via `patchDom` without rebuilding the DOM.
+   */
+  renderInitialRowsHtml(showCursor = true): string {
+    const drawCursor = showCursor && this.cursorVisible;
+    const { rows, cursorVisRow } = this.visibleRows(drawCursor);
+    let out = "";
+    for (let rIdx = 0; rIdx < rows.length; rIdx++) {
+      const row = rows[rIdx];
+      const cursorColHere = drawCursor && rIdx === cursorVisRow ? this.cursorCol : -1;
+      const key = `${row.ver}:${cursorColHere}`;
+      out += `<div class="vt-row" data-vt-key="${key}">${this.renderSingleRowHtml(row.cells, cursorColHere)}</div>`;
+    }
+    return out;
+  }
+
+  /**
+   * Row-level dirty-diff DOM patcher (60fps zero-jitter):
+   * - Reuses unchanged `<div class="vt-row">` elements in O(1) without regenerating HTML.
+   * - Skips rows currently holding an active text selection anchor/focus node.
+   * - Batches newly appended rows through a `DocumentFragment`.
+   */
+  patchDom(
+    container: VtDomContainerLike,
+    showCursor = true,
+    protectedSelection?: { anchorNode?: unknown; focusNode?: unknown } | null
+  ): VtDomPatchStats {
+    const drawCursor = showCursor && this.cursorVisible;
+    const { rows, cursorVisRow } = this.visibleRows(drawCursor);
+    const doc = container.ownerDocument ?? (typeof document !== "undefined" ? (document as unknown as NonNullable<VtDomContainerLike["ownerDocument"]>) : null);
+
+    if (container.getAttribute("data-vt-mode") !== "rows") {
+      container.innerHTML = "";
+      container.setAttribute("data-vt-mode", "rows");
+    }
+
+    // Compute protected row index range so active single- or multi-row text selections stay intact
+    // while non-selected rows continue streaming smoothly at 60fps.
+    let protMin = -1;
+    let protMax = -1;
+    if (protectedSelection && (protectedSelection.anchorNode || protectedSelection.focusNode)) {
+      const { anchorNode, focusNode } = protectedSelection;
+      if (anchorNode === container || focusNode === container) {
+        protMin = 0;
+        protMax = Math.max(0, container.childElementCount - 1);
+      } else {
+        let anchorIdx = -1;
+        let focusIdx = -1;
+        for (let i = 0; i < container.childElementCount; i++) {
+          const child = container.children[i];
+          if (!child?.contains) continue;
+          if (anchorIdx < 0 && anchorNode && child.contains(anchorNode)) anchorIdx = i;
+          if (focusIdx < 0 && focusNode && child.contains(focusNode)) focusIdx = i;
+          if ((anchorIdx >= 0 || !anchorNode) && (focusIdx >= 0 || !focusNode)) break;
+        }
+        if (anchorIdx >= 0 && focusIdx >= 0) {
+          protMin = Math.min(anchorIdx, focusIdx);
+          protMax = Math.max(anchorIdx, focusIdx);
+        } else if (anchorIdx >= 0) {
+          protMin = anchorIdx;
+          protMax = anchorIdx;
+        } else if (focusIdx >= 0) {
+          protMin = focusIdx;
+          protMax = focusIdx;
+        }
+      }
+    }
+    const isProtectedIdx = (idx: number): boolean => protMin >= 0 && idx >= protMin && idx <= protMax;
+
+    // Trim trailing rows when screen shrinks or switches into shorter alt-screen.
+    while (container.childElementCount > rows.length) {
+      const lastIdx = container.childElementCount - 1;
+      const last = container.children[lastIdx];
+      if (!last || isProtectedIdx(lastIdx)) break;
+      last.remove();
+    }
+
+    let patched = 0;
+    let reused = 0;
+    const frag = doc?.createDocumentFragment ? doc.createDocumentFragment() : null;
+    let fragCount = 0;
+
+    for (let rIdx = 0; rIdx < rows.length; rIdx++) {
+      const row = rows[rIdx];
+      const cursorColHere = drawCursor && rIdx === cursorVisRow ? this.cursorCol : -1;
+      const nextKey = `${row.ver}:${cursorColHere}`;
+      const existing = container.children[rIdx];
+
+      if (existing) {
+        if (existing.getAttribute("data-vt-key") === nextKey) {
+          reused += 1;
+          continue;
+        }
+        if (isProtectedIdx(rIdx)) {
+          reused += 1;
+          continue;
+        }
+        existing.innerHTML = this.renderSingleRowHtml(row.cells, cursorColHere);
+        existing.setAttribute("data-vt-key", nextKey);
+        patched += 1;
+      } else if (doc) {
+        const div = doc.createElement("div");
+        div.className = "vt-row";
+        div.setAttribute("data-vt-key", nextKey);
+        div.innerHTML = this.renderSingleRowHtml(row.cells, cursorColHere);
+        if (frag) {
+          frag.appendChild(div);
+          fragCount += 1;
+        } else {
+          container.appendChild(div);
+        }
+        patched += 1;
+      }
+    }
+
+    if (frag && fragCount > 0) {
+      container.appendChild(frag);
+    }
+
+    return { patched, reused, total: rows.length };
   }
 }

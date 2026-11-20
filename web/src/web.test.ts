@@ -19,7 +19,16 @@ import {
   verifyEd25519Signature,
   verifyRelaySessionAuth,
 } from "./crypto";
-import { WebVtTerminal, escapeHtml, safeHref } from "./vt";
+import {
+  WebVtTerminal,
+  escapeHtml,
+  safeHref,
+  type VtDomContainerLike,
+  type VtRowNodeLike,
+} from "./vt";
+import { encodeTerminalKeyEvent, wrapBracketedPaste } from "./terminal_keys";
+import { TerminalNotificationTracker } from "./notify";
+import { SmartPathBackoffPolicy, collectDirectWsCandidates } from "./smart_path";
 
 function makeTestIdentity(name: string): WebDeviceIdentity {
   const edPriv = ed25519.utils.randomPrivateKey();
@@ -311,6 +320,159 @@ describe("WebVtTerminal 2D VT100 engine", () => {
     expect(vt.renderPlainText()).toBe("Hello BLUE e\u0301");
   });
 
+  test("row-level dirty-diff patchDom reuses unchanged rows, protects multi-row selection & handles alt-screen", () => {
+    class MockRow implements VtRowNodeLike {
+      className = "";
+      innerHTML = "";
+      attrs = new Map<string, string>();
+      private parentList: MockRow[];
+      constructor(parentList: MockRow[]) {
+        this.parentList = parentList;
+      }
+      getAttribute(name: string): string | null {
+        return this.attrs.get(name) ?? null;
+      }
+      setAttribute(name: string, value: string): void {
+        this.attrs.set(name, value);
+      }
+      contains(node: unknown): boolean {
+        return node === this;
+      }
+      remove(): void {
+        const idx = this.parentList.indexOf(this);
+        if (idx >= 0) this.parentList.splice(idx, 1);
+      }
+    }
+
+    const createMockContainer = (): VtDomContainerLike & { rows: MockRow[] } => {
+      const rows: MockRow[] = [];
+      const attrs = new Map<string, string>();
+      const container: VtDomContainerLike & { rows: MockRow[] } = {
+        rows,
+        get innerHTML() {
+          return rows.map((r) => r.innerHTML).join("\n");
+        },
+        set innerHTML(val: string) {
+          if (val === "") rows.length = 0;
+        },
+        get children() {
+          return rows;
+        },
+        get childElementCount() {
+          return rows.length;
+        },
+        getAttribute(name: string) {
+          return attrs.get(name) ?? null;
+        },
+        setAttribute(name: string, value: string) {
+          attrs.set(name, value);
+        },
+        appendChild(node: unknown) {
+          if (Array.isArray(node)) {
+            rows.push(...(node as MockRow[]));
+          } else {
+            rows.push(node as MockRow);
+          }
+          return node;
+        },
+        ownerDocument: {
+          createElement(_tag: string) {
+            return new MockRow(rows);
+          },
+          createDocumentFragment() {
+            const list: MockRow[] = [];
+            return {
+              appendChild(n: unknown) {
+                list.push(n as MockRow);
+                return n;
+              },
+              [Symbol.iterator]: () => list[Symbol.iterator](),
+              // Allow container.appendChild to unpack fragment items
+              toArray: () => list,
+            } as unknown as { appendChild(node: unknown): unknown };
+          },
+        },
+      };
+      // Handle fragment object in appendChild
+      const origAppend = container.appendChild.bind(container);
+      container.appendChild = (node: unknown) => {
+        if (node && typeof node === "object" && "toArray" in node) {
+          return origAppend((node as { toArray: () => MockRow[] }).toArray());
+        }
+        return origAppend(node);
+      };
+      return container;
+    };
+
+    const vt = new WebVtTerminal(40, 8);
+    vt.feedText("line-1\r\nline-2\r\nline-3");
+
+    const initHtml = vt.renderInitialRowsHtml(true);
+    expect(initHtml.includes('class="vt-row"')).toBe(true);
+    expect(initHtml.includes("data-vt-key=")).toBe(true);
+
+    const container = createMockContainer();
+    container.setAttribute("data-vt-mode", "placeholder");
+
+    // 1. Initial mount patches all 3 rows via DocumentFragment
+    const s1 = vt.patchDom(container, true);
+    expect(s1).toEqual({ patched: 3, reused: 0, total: 3 });
+    expect(container.getAttribute("data-vt-mode")).toBe("rows");
+    expect(container.rows.length).toBe(3);
+
+    // 2. Identical frame reuses 100% of DOM rows (0 patches)
+    const s2 = vt.patchDom(container, true);
+    expect(s2).toEqual({ patched: 0, reused: 3, total: 3 });
+
+    // 3. Appending to line 3 patches ONLY line 3 (reuses lines 1 & 2)
+    vt.feedText("!");
+    const s3 = vt.patchDom(container, true);
+    expect(s3).toEqual({ patched: 1, reused: 2, total: 3 });
+    expect(container.rows[2].innerHTML.includes("line-3!")).toBe(true);
+
+    // 4. Cursor-only jump to line 1 patches ONLY old cursor row (3) & new cursor row (1)
+    vt.feedText("\x1b[1;1H");
+    const s4 = vt.patchDom(container, true);
+    expect(s4).toEqual({ patched: 2, reused: 1, total: 3 });
+
+    // 5. Protected multi-row selection (row 0 -> row 1) skips rows 0 & 1 while patching dirty row 2
+    const row0Ref = container.rows[0];
+    const row1Ref = container.rows[1];
+    const row0HtmlBefore = row0Ref.innerHTML;
+    const row1HtmlBefore = row1Ref.innerHTML;
+    vt.feedText("EDIT0\x1b[2;1HEDIT1\x1b[3;1HSTREAM2");
+    const s5 = vt.patchDom(container, true, { anchorNode: row0Ref, focusNode: row1Ref });
+    expect(s5).toEqual({ patched: 1, reused: 2, total: 3 });
+    expect(row0Ref.innerHTML).toBe(row0HtmlBefore);
+    expect(row1Ref.innerHTML).toBe(row1HtmlBefore);
+    expect(container.rows[2].innerHTML.includes("STREAM2")).toBe(true);
+
+    // Once selection clears, deferred rows 0 & 1 catch up cleanly
+    const s5After = vt.patchDom(container, true, null);
+    expect(s5After).toEqual({ patched: 2, reused: 1, total: 3 });
+    expect(row0Ref.innerHTML.includes("EDIT0")).toBe(true);
+    expect(row1Ref.innerHTML.includes("EDIT1")).toBe(true);
+
+    // 6. Alt-screen shrink trims trailing DOM rows cleanly, and exit restores primary buffer
+    vt.feedText("\x1b[?1049h\x1b[2J\x1b[1;1HALT-ONLY");
+    const sAlt = vt.patchDom(container, true);
+    expect(sAlt).toEqual({ patched: 1, reused: 0, total: 1 });
+    expect(container.rows.length).toBe(1);
+    expect(container.rows[0].innerHTML.includes("ALT-ONLY")).toBe(true);
+
+    vt.feedText("\x1b[?1049l");
+    const sRestore = vt.patchDom(container, true);
+    expect(sRestore).toEqual({ patched: 3, reused: 0, total: 3 });
+    expect(container.rows.length).toBe(3);
+
+    // 7. Distinct WebVtTerminal instance on same container never collides on data-vt-key
+    const vtOther = new WebVtTerminal(40, 8);
+    vtOther.feedText("other-session");
+    const sOther = vtOther.patchDom(container, true);
+    expect(sOther).toEqual({ patched: 1, reused: 0, total: 1 });
+    expect(container.rows[0].innerHTML.includes("other-session")).toBe(true);
+  });
+
   test("Relay v2 supports_zstd signature binding & RelayNonceReplayCache reject tampering/replays", () => {
     expect(MAX_HANDSHAKE_SKEW_MS).toBe(120_000);
     const client = makeTestIdentity("web-zstd");
@@ -333,5 +495,131 @@ describe("WebVtTerminal 2D VT100 engine", () => {
 
     const hText = p2pHelloV2SigningTextWithZstd("c-1", "d-1", client.x25519PublicB64, client.x25519PublicB64, 1234, true);
     expect(hText.endsWith(":zstd=1")).toBe(true);
+  });
+});
+
+describe("Web modular engines: terminal_keys, OSC 7501 notifications & Smart-Path hot-switch", () => {
+  test("encodeTerminalKeyEvent handles Ctrl/DECCKM/Shift+Tab/F-keys/Alt & Cmd passthrough", () => {
+    expect(encodeTerminalKeyEvent({ key: "c", ctrlKey: true })).toBe("\x03");
+    expect(encodeTerminalKeyEvent({ key: "c", metaKey: true })).toBeNull();
+    expect(encodeTerminalKeyEvent({ key: "a", isComposing: true })).toBeNull();
+    expect(encodeTerminalKeyEvent({ key: "Tab", shiftKey: true })).toBe("\x1b[Z");
+    expect(encodeTerminalKeyEvent({ key: "ArrowUp" }, { appCursorKeys: false })).toBe("\x1b[A");
+    expect(encodeTerminalKeyEvent({ key: "ArrowUp" }, { appCursorKeys: true })).toBe("\x1bOA");
+    expect(encodeTerminalKeyEvent({ key: "F5" })).toBe("\x1b[15~");
+    expect(encodeTerminalKeyEvent({ key: "b", altKey: true })).toBe("\x1bb");
+    expect(wrapBracketedPaste("hello", true)).toBe("\x1b[200~hello\x1b[201~");
+    expect(wrapBracketedPaste("hello", false)).toBe("hello");
+  });
+
+  test("TerminalNotificationTracker is edge-triggered, suppresses visible active terminal & respects cooldown", () => {
+    const tracker = new TerminalNotificationTracker(20_000);
+    const baseInput = {
+      daemonId: "d-1",
+      daemonName: "Mac-mini",
+      terminalAddr: "/tmp/h/1",
+      terminalName: "claude",
+    };
+
+    // Baseline snapshot never fires
+    expect(
+      tracker.observe(
+        { ...baseInput, status: { state: "working", app: "claude" } },
+        { activeDaemonId: "d-1", activeTerminalAddr: "/tmp/h/1", documentHidden: true, locale: "zh", nowMs: 1_000 }
+      )
+    ).toBeNull();
+
+    // Transition to needs_you while visible on SAME terminal is suppressed
+    expect(
+      tracker.observe(
+        { ...baseInput, status: { state: "needs_you", app: "claude", msg: "Approve rm?" } },
+        { activeDaemonId: "d-1", activeTerminalAddr: "/tmp/h/1", documentHidden: false, locale: "zh", nowMs: 2_000 }
+      )
+    ).toBeNull();
+
+    // Transition back to working, then needs_you while tab hidden -> fires!
+    tracker.observe(
+      { ...baseInput, status: { state: "working", app: "claude" } },
+      { activeDaemonId: "d-1", activeTerminalAddr: "/tmp/h/1", documentHidden: true, locale: "zh", nowMs: 3_000 }
+    );
+    const alert = tracker.observe(
+      { ...baseInput, status: { state: "needs_you", app: "claude", msg: "Approve tool?" } },
+      { activeDaemonId: "d-1", activeTerminalAddr: "/tmp/h/1", documentHidden: true, locale: "zh", nowMs: 4_000 }
+    );
+    expect(alert).not.toBeNull();
+    expect(alert?.kind).toBe("needs_you");
+    expect(alert?.title).toContain("Mac-mini");
+    expect(alert?.body).toBe("Approve tool?");
+
+    // Within 20s cooldown, rapid working -> done is suppressed
+    tracker.observe(
+      { ...baseInput, status: { state: "working", app: "claude" } },
+      { activeDaemonId: "d-1", activeTerminalAddr: "/tmp/h/2", documentHidden: false, locale: "en", nowMs: 5_000 }
+    );
+    expect(
+      tracker.observe(
+        { ...baseInput, status: { state: "done", app: "claude" } },
+        { activeDaemonId: "d-1", activeTerminalAddr: "/tmp/h/2", documentHidden: false, locale: "en", nowMs: 10_000 }
+      )
+    ).toBeNull();
+
+    // After cooldown expires, working -> done on background terminal fires
+    tracker.observe(
+      { ...baseInput, status: { state: "working", app: "claude" } },
+      { activeDaemonId: "d-1", activeTerminalAddr: "/tmp/h/2", documentHidden: false, locale: "en", nowMs: 25_000 }
+    );
+    const doneAlert = tracker.observe(
+      { ...baseInput, status: { state: "done", app: "claude", title: "Tests green" } },
+      { activeDaemonId: "d-1", activeTerminalAddr: "/tmp/h/2", documentHidden: false, locale: "en", nowMs: 26_000 }
+    );
+    expect(doneAlert?.kind).toBe("done");
+    expect(doneAlert?.body).toBe("Tests green");
+  });
+
+  test("SmartPathBackoffPolicy & collectDirectWsCandidates enforce mixed-content rules, backoff & flap guard", () => {
+    const peer = {
+      id: "d-1",
+      name: "Mac-mini",
+      role: "host",
+      platform: "macos",
+      x25519_pubkey: "abc",
+      is_online: true,
+      endpoints_json: [
+        { kind: "lan_ipv4", addr: "192.168.1.10:24444" },
+        { kind: "lan_ws", addr: "wss://mac.lan:24444" },
+        { kind: "ipv6_ws", addr: "ws://[::1]:24444" },
+      ],
+    };
+
+    // HTTPS remote origin filters out insecure ws:// endpoints and keeps wss://
+    const httpsCands = collectDirectWsCandidates(peer, { protocol: "https:", hostname: "coda.example.com" });
+    expect(httpsCands).toEqual(["wss://mac.lan:24444"]);
+
+    // Local HTTP origin prioritizes lan_ws -> ipv6_ws -> lan_ipv4 -> loopback fallback
+    const httpCands = collectDirectWsCandidates(peer, { protocol: "http:", hostname: "localhost" });
+    expect(httpCands).toEqual([
+      "wss://mac.lan:24444",
+      "ws://[::1]:24444",
+      "ws://192.168.1.10:24444",
+      "ws://127.0.0.1:24444",
+    ]);
+
+    const policy = new SmartPathBackoffPolicy({ baseIntervalMs: 10_000, maxIntervalMs: 60_000, dropCooldownMs: 5_000 });
+    expect(policy.canProbeNow("d-1", "relay_ws", 1000)).toBe(true);
+    expect(policy.canProbeNow("d-1", "lan_ws", 1000)).toBe(false);
+
+    expect(policy.recordProbeFailure("d-1").delayMs).toBe(10_000);
+    expect(policy.recordProbeFailure("d-1").delayMs).toBe(20_000);
+    expect(policy.recordProbeFailure("d-1").delayMs).toBe(40_000);
+    expect(policy.recordProbeFailure("d-1").delayMs).toBe(60_000);
+
+    // Network change resets exponential backoff
+    policy.resetForNetworkChange("d-1");
+    expect(policy.nextDelayMs("d-1")).toBe(10_000);
+
+    // Direct drop enforces flap cooldown
+    policy.recordDirectDrop("d-1", 50_000);
+    expect(policy.canProbeNow("d-1", "relay_ws", 52_000)).toBe(false);
+    expect(policy.canProbeNow("d-1", "relay_ws", 55_000)).toBe(true);
   });
 });

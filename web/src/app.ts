@@ -15,6 +15,43 @@ import {
   verifyRelaySessionAuth,
 } from "./crypto";
 import { WebVtTerminal, escapeHtml, safeHref } from "./vt";
+import {
+  type AppRoute,
+  type AuthSessionInfo,
+  type BranchWorktreeItem,
+  type Device,
+  type DeviceAuthPublicInfo,
+  type HerdrTerminal,
+  type InviteCodeInfo,
+  type Locale,
+  type RelayNodeInfo,
+  type RepoWorkspaceSummary,
+  type SiteInfo,
+  type ThemePreference,
+  type TransportMode,
+  type User,
+  type VoiceModelConfig,
+  clearSessionToken,
+  readLocalPref,
+  readSessionOrLegacyToken,
+  saveSessionToken,
+  writeLocalPref,
+} from "./types";
+import {
+  type IconName,
+  codaLogoSVG,
+  codaNodeDotSVG,
+  svgIcon,
+} from "./icons";
+import { BentoMotionController } from "./bento_motion";
+import { encodeTerminalKeyEvent, wrapBracketedPaste } from "./terminal_keys";
+import {
+  TerminalNotificationTracker,
+  dispatchBrowserNotification,
+  getBrowserNotificationPermission,
+  requestBrowserNotificationPermission,
+} from "./notify";
+import { SmartPathBackoffPolicy, collectDirectWsCandidates } from "./smart_path";
 
 if (typeof window !== "undefined" && typeof document !== "undefined") {
   try {
@@ -47,353 +84,6 @@ if (typeof window !== "undefined" && typeof document !== "undefined") {
 
 const MAX_UPLOAD_BYTES = 8 * 1024 * 1024;
 
-function readSessionOrLegacyToken(): string | null {
-  try {
-    if (typeof sessionStorage !== "undefined") {
-      const s = sessionStorage.getItem("coda_token");
-      if (s) return s;
-      if (typeof localStorage !== "undefined") {
-        const legacy = localStorage.getItem("coda_token");
-        if (legacy) {
-          sessionStorage.setItem("coda_token", legacy);
-          localStorage.removeItem("coda_token");
-          return legacy;
-        }
-      }
-      return null;
-    }
-    if (typeof localStorage !== "undefined") return localStorage.getItem("coda_token");
-  } catch {
-    // ignore storage access errors
-  }
-  return null;
-}
-
-function saveSessionToken(token: string): void {
-  try {
-    if (typeof sessionStorage !== "undefined") sessionStorage.setItem("coda_token", token);
-    if (typeof localStorage !== "undefined") localStorage.removeItem("coda_token");
-  } catch {
-    // ignore storage errors
-  }
-}
-
-function clearSessionToken(): void {
-  try {
-    if (typeof sessionStorage !== "undefined") sessionStorage.removeItem("coda_token");
-    if (typeof localStorage !== "undefined") localStorage.removeItem("coda_token");
-  } catch {
-    // ignore storage errors
-  }
-}
-
-function readLocalPref(key: string, fallback: string): string {
-  try {
-    if (typeof localStorage !== "undefined") return localStorage.getItem(key) || fallback;
-  } catch {
-    // ignore
-  }
-  return fallback;
-}
-
-function writeLocalPref(key: string, val: string): void {
-  try {
-    if (typeof localStorage !== "undefined") localStorage.setItem(key, val);
-  } catch {
-    // ignore
-  }
-}
-
-interface User {
-  id: string;
-  email: string;
-  handle: string;
-  display_name: string;
-  is_admin: boolean;
-  bandwidth_quota_mbps: number;
-}
-
-interface EndpointCandidate {
-  kind: string;
-  addr: string;
-}
-
-interface Device {
-  id: string;
-  name: string;
-  role: string;
-  platform: string;
-  ed25519_pubkey?: string;
-  x25519_pubkey: string;
-  endpoints_json?: EndpointCandidate[];
-  herdr_version?: string | null;
-  is_online: boolean;
-}
-
-interface RelayNodeInfo {
-  id: string;
-  region: string;
-  mode: string;
-  endpoint: string;
-  priority: number;
-}
-
-interface HerdrTerminal {
-  address: string;
-  name?: string | null;
-  argv: string[];
-  cwd: string;
-  alive: boolean;
-  status?: {
-    state: string;
-    kind?: string | null;
-    app?: string | null;
-    title?: string | null;
-    msg?: string | null;
-  } | null;
-}
-
-interface BranchWorktreeItem {
-  branch: string;
-  worktree_path: string;
-  diff_added: number;
-  diff_deleted: number;
-  active_terminals: HerdrTerminal[];
-  status_summary: string;
-}
-
-interface RepoWorkspaceSummary {
-  repo_name: string;
-  root_path: string;
-  machine_name: string;
-  branches: BranchWorktreeItem[];
-}
-
-interface VoiceModelConfig {
-  provider: string;
-  base_url: string;
-  api_key: string;
-  model: string;
-}
-
-interface AuthSessionInfo {
-  id: string;
-  client_label: string;
-  scope: string;
-  device_id?: string | null;
-  created_at: string;
-  last_used_at: string;
-  expires_at: string;
-  is_current: boolean;
-}
-
-interface InviteCodeInfo {
-  code: string;
-  note?: string | null;
-  max_uses: number;
-  used_count: number;
-  expires_at?: string | null;
-  created_at: string;
-}
-
-interface SiteInfo {
-  version: string;
-  open_registration: boolean;
-  has_any_users: boolean;
-  public_base_url: string;
-  install_command: string;
-  downloads: {
-    daemon_linux_x64: string;
-    daemon_linux_arm64: string;
-    daemon_macos_arm64: string;
-    server_linux_x64: string;
-    server_linux_arm64: string;
-    server_macos_arm64: string;
-    desktop_macos_dmg: string;
-    desktop_macos_tar: string;
-    deploy_bundle: string;
-    ios_beta_url?: string | null;
-    releases_page: string;
-  };
-}
-
-interface DeviceAuthPublicInfo {
-  user_code: string;
-  device_name: string;
-  role: string;
-  platform: string;
-  status: string;
-  expires_at: string;
-}
-
-type ThemePreference = "light" | "dark" | "system";
-type Locale = "en" | "zh";
-type IconName =
-  | "terminal"
-  | "laptop"
-  | "server"
-  | "smartphone"
-  | "cloud"
-  | "shield"
-  | "zap"
-  | "key"
-  | "copy"
-  | "check"
-  | "sun"
-  | "moon"
-  | "monitor"
-  | "search"
-  | "settings"
-  | "sidebar"
-  | "paperclip"
-  | "clipboard"
-  | "mic"
-  | "keyboard"
-  | "plus"
-  | "arrowRight"
-  | "close"
-  | "chevronLeft"
-  | "chevronRight"
-  | "more"
-  | "apple"
-  | "arrowLeft"
-  | "mail"
-  | "user"
-  | "lock"
-  | "eye"
-  | "eyeOff"
-  | "gitBranch"
-  | "layers"
-  | "cpu"
-  | "globe";
-
-function svgIcon(name: IconName, size = 14): string {
-  const attrs = `width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" class="pm-icon" aria-hidden="true"`;
-  switch (name) {
-    case "terminal":
-      return `<svg ${attrs}><polyline points="4 17 10 11 4 5"></polyline><line x1="12" y1="19" x2="20" y2="19"></line></svg>`;
-    case "laptop":
-      return `<svg ${attrs}><rect x="3" y="4" width="18" height="12" rx="2"></rect><line x1="2" y1="20" x2="22" y2="20"></line></svg>`;
-    case "server":
-      return `<svg ${attrs}><rect x="2" y="3" width="20" height="8" rx="2"></rect><rect x="2" y="13" width="20" height="8" rx="2"></rect><line x1="6" y1="7" x2="6.01" y2="7"></line><line x1="6" y1="17" x2="6.01" y2="17"></line></svg>`;
-    case "smartphone":
-      return `<svg ${attrs}><rect x="6" y="2" width="12" height="20" rx="2"></rect><line x1="12" y1="18" x2="12.01" y2="18"></line></svg>`;
-    case "cloud":
-      return `<svg ${attrs}><path d="M17.5 19H7a5 5 0 0 1-.5-9.97A6 6 0 0 1 18.2 10a4.5 4.5 0 0 1-.7 9Z"></path></svg>`;
-    case "shield":
-      return `<svg ${attrs}><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path></svg>`;
-    case "zap":
-      return `<svg ${attrs}><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon></svg>`;
-    case "key":
-      return `<svg ${attrs}><circle cx="7.5" cy="15.5" r="5.5"></circle><path d="m21 2-9.6 9.6"></path><path d="m15.5 7.5 3 3L22 7l-3-3"></path></svg>`;
-    case "copy":
-      return `<svg ${attrs}><rect x="9" y="9" width="13" height="13" rx="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>`;
-    case "check":
-      return `<svg ${attrs}><polyline points="20 6 9 17 4 12"></polyline></svg>`;
-    case "sun":
-      return `<svg ${attrs}><circle cx="12" cy="12" r="4"></circle><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"></path></svg>`;
-    case "moon":
-      return `<svg ${attrs}><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"></path></svg>`;
-    case "monitor":
-      return `<svg ${attrs}><rect x="2" y="3" width="20" height="14" rx="2"></rect><line x1="8" y1="21" x2="16" y2="21"></line><line x1="12" y1="17" x2="12" y2="21"></line></svg>`;
-    case "search":
-      return `<svg ${attrs}><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>`;
-    case "settings":
-      return `<svg ${attrs}><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>`;
-    case "sidebar":
-      return `<svg ${attrs}><rect x="3" y="3" width="18" height="18" rx="2"></rect><line x1="9" y1="3" x2="9" y2="21"></line></svg>`;
-    case "paperclip":
-      return `<svg ${attrs}><path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48"></path></svg>`;
-    case "clipboard":
-      return `<svg ${attrs}><rect x="9" y="2" width="6" height="4" rx="1"></rect><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"></path></svg>`;
-    case "mic":
-      return `<svg ${attrs}><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"></path><path d="M19 10v2a7 7 0 0 1-14 0v-2"></path><line x1="12" y1="19" x2="12" y2="22"></line></svg>`;
-    case "keyboard":
-      return `<svg ${attrs}><rect x="2" y="4" width="20" height="16" rx="2"></rect><path d="M6 8h.01M10 8h.01M14 8h.01M18 8h.01M8 12h.01M12 12h.01M16 12h.01M7 16h10"></path></svg>`;
-    case "plus":
-      return `<svg ${attrs}><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>`;
-    case "arrowRight":
-      return `<svg ${attrs}><line x1="5" y1="12" x2="19" y2="12"></line><polyline points="12 5 19 12 12 19"></polyline></svg>`;
-    case "arrowLeft":
-      return `<svg ${attrs}><line x1="19" y1="12" x2="5" y2="12"></line><polyline points="12 19 5 12 12 5"></polyline></svg>`;
-    case "close":
-      return `<svg ${attrs}><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>`;
-    case "chevronLeft":
-      return `<svg ${attrs}><polyline points="15 18 9 12 15 6"></polyline></svg>`;
-    case "chevronRight":
-      return `<svg ${attrs}><polyline points="9 18 15 12 9 6"></polyline></svg>`;
-    case "more":
-      return `<svg ${attrs}><circle cx="12" cy="12" r="1"></circle><circle cx="19" cy="12" r="1"></circle><circle cx="5" cy="12" r="1"></circle></svg>`;
-    case "mail":
-      return `<svg ${attrs}><rect x="2" y="4" width="20" height="16" rx="2"></rect><path d="m22 7-8.97 5.7a1.94 1.94 0 0 1-2.06 0L2 7"></path></svg>`;
-    case "user":
-      return `<svg ${attrs}><path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"></path><circle cx="12" cy="7" r="4"></circle></svg>`;
-    case "lock":
-      return `<svg ${attrs}><rect x="3" y="11" width="18" height="11" rx="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg>`;
-    case "eye":
-      return `<svg ${attrs}><path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7Z"></path><circle cx="12" cy="12" r="3"></circle></svg>`;
-    case "eyeOff":
-      return `<svg ${attrs}><path d="M9.88 9.88a3 3 0 1 0 4.24 4.24"></path><path d="M10.73 5.08A10.43 10.43 0 0 1 12 5c7 0 10 7 10 7a13.16 13.16 0 0 1-1.67 2.68"></path><path d="M6.61 6.61A13.526 13.526 0 0 0 2 12s3 7 10 7a9.74 9.74 0 0 0 5.39-1.61"></path><line x1="2" y1="2" x2="22" y2="22"></line></svg>`;
-    case "gitBranch":
-      return `<svg ${attrs}><line x1="6" y1="3" x2="6" y2="15"></line><circle cx="18" cy="6" r="3"></circle><circle cx="6" cy="18" r="3"></circle><path d="M18 9a9 9 0 0 1-9 9"></path></svg>`;
-    case "layers":
-      return `<svg ${attrs}><polygon points="12 2 2 7 12 12 22 7 12 2"></polygon><polyline points="2 17 12 22 22 17"></polyline><polyline points="2 12 12 17 22 12"></polyline></svg>`;
-    case "cpu":
-      return `<svg ${attrs}><rect x="4" y="4" width="16" height="16" rx="2"></rect><rect x="9" y="9" width="6" height="6"></rect><path d="M15 2v2M15 20v2M2 15h2M2 9h2M20 15h2M20 9h2M9 2v2M9 20v2"></path></svg>`;
-    case "globe":
-      return `<svg ${attrs}><circle cx="12" cy="12" r="10"></circle><line x1="2" y1="12" x2="22" y2="12"></line><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"></path></svg>`;
-    case "apple":
-      return `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="currentColor" class="pm-icon" aria-hidden="true"><path d="M16.36 1.64a4.54 4.54 0 0 1-1.08 3.3 3.92 3.92 0 0 1-3.13 1.44 4.24 4.24 0 0 1 1.1-3.2A4.48 4.48 0 0 1 16.36 1.64ZM20.28 17.2a9.9 9.9 0 0 1-1.15 2.08c-.65.94-1.45 2.07-2.58 2.09-1.06.02-1.4-.63-2.61-.63-1.22 0-1.6.61-2.63.65-1.09.04-1.92-1.06-2.58-2-1.76-2.53-2.78-6.48-1.16-9.29a4.68 4.68 0 0 1 3.95-2.4c1.14-.02 2.21.77 2.9.77.69 0 1.98-.95 3.34-.81.57.02 2.16.23 3.18 1.72a4.38 4.38 0 0 0-2.09 3.69 4.28 4.28 0 0 0 2.61 3.91c-.08.28-.14.54-.23.82Z"/></svg>`;
-  }
-}
-
-function codaLogoSVG(size = 22) {
-  return `<svg width="${size}" height="${size}" viewBox="0 0 64 64" fill="none" aria-hidden="true" style="flex-shrink:0;">
-    <rect x="2" y="2" width="60" height="60" rx="14" fill="#141416" stroke="#2e2e34" stroke-width="2" />
-    <path d="M 44.37 44.37 A 17.5 17.5 0 1 1 38.70 15.83" stroke="#ffffff" stroke-width="5.2" stroke-linecap="round" />
-    <path d="M 25.5 24.5 L 34 32 L 25.5 39.5" stroke="#a1a1aa" stroke-width="4.4" stroke-linecap="round" stroke-linejoin="round" />
-    <circle cx="46" cy="19" r="4.2" fill="#22c55e" />
-  </svg>`;
-}
-
-function codaNodeDotSVG(color = "#e06c50") {
-  return `<span style="display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;border-radius:4px;border:1px solid var(--border-primary);background:var(--bg-elevated);flex-shrink:0;">
-    <span style="width:6px;height:6px;border-radius:99px;background:${color};"></span>
-  </span>`;
-}
-
-// Bento UI Motion timing curves (strictly from-rest & critically damped)
-const clamp01 = (v: number) => Math.max(0, Math.min(1, v));
-const SPRING_W0 = 9.5;
-const SPRING_ZETA = 0.55;
-const SPRING_WD = SPRING_W0 * Math.sqrt(1 - SPRING_ZETA * SPRING_ZETA);
-const SPRING_NORM =
-  1 -
-  Math.exp(-SPRING_ZETA * SPRING_W0) *
-    (Math.cos(SPRING_WD) + (SPRING_ZETA / Math.sqrt(1 - SPRING_ZETA * SPRING_ZETA)) * Math.sin(SPRING_WD));
-
-function springFromRest(p: number): number {
-  const t = clamp01(p);
-  if (t <= 0) return 0;
-  if (t >= 1) return 1;
-  const raw =
-    1 -
-    Math.exp(-SPRING_ZETA * SPRING_W0 * t) *
-      (Math.cos(SPRING_WD * t) +
-        (SPRING_ZETA / Math.sqrt(1 - SPRING_ZETA * SPRING_ZETA)) * Math.sin(SPRING_WD * t));
-  return raw / SPRING_NORM;
-}
-
-const SOFT_NORM = 1 - (1 + 6) * Math.exp(-6);
-function soft(p: number): number {
-  const t = clamp01(p);
-  if (t <= 0) return 0;
-  if (t >= 1) return 1;
-  return (1 - (1 + 6 * t) * Math.exp(-6 * t)) / SOFT_NORM;
-}
-
-type AppRoute = "home" | "login" | "register" | "activate" | "console";
-
 export class CodaTerminalWebApp {
   private token: string | null = readSessionOrLegacyToken();
   private themePref: ThemePreference = readLocalPref("coda_theme", "dark") as ThemePreference;
@@ -405,6 +95,7 @@ export class CodaTerminalWebApp {
   private showPassword = false;
   private showMobileKeypadOnDesktop = false;
   private showCmdPalette = false;
+  private cmdPaletteQuery = "";
   private siteInfo: SiteInfo | null = null;
   private pendingActivationCode: string = "";
   private pendingDeviceInfo: DeviceAuthPublicInfo | null = null;
@@ -452,14 +143,18 @@ export class CodaTerminalWebApp {
   private eventsWs: WebSocket | null = null;
   private directWs: WebSocket | null = null;
   private directWsPeerId: string | null = null;
-  private activeTransportMode: "lan_ws" | "relay_ws" = "relay_ws";
+  private activeTransportMode: TransportMode = "relay_ws";
   private negotiatingPeerId: string | null = null;
   private relayGeneration = 0;
   private relayKeepAliveTimer: ReturnType<typeof setInterval> | null = null;
   private relayReconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private eventsReconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private directProbeTimer: ReturnType<typeof setTimeout> | null = null;
   private relayBackoffMs = 1000;
   private eventsBackoffMs = 1000;
+  private smartPath = new SmartPathBackoffPolicy();
+  private notificationsEnabled: boolean = readLocalPref("coda_notify_enabled", "0") === "1";
+  private notifyTracker = new TerminalNotificationTracker(20_000);
   private termPaintRafId: number | null = null;
   private termResizeObserver: ResizeObserver | null = null;
   private resizeDebounceTimer: ReturnType<typeof setTimeout> | null = null;
@@ -473,10 +168,7 @@ export class CodaTerminalWebApp {
   private errorMsg = "";
 
   // Bento motion scheduler state (never triggers full DOM re-render per frame)
-  private bentoRafId: number | null = null;
-  private bentoObserver: IntersectionObserver | null = null;
-  private bentoVisible = true;
-  private bentoStartMs = typeof performance !== "undefined" ? performance.now() : 0;
+  private bento = new BentoMotionController();
 
   private resolveRouteFromLocation(): AppRoute {
     const pathname = window.location.pathname.replace(/\/+$/, "") || "/";
@@ -627,10 +319,19 @@ export class CodaTerminalWebApp {
     });
 
     window.addEventListener("keydown", (e) => {
-      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k" && this.route !== "console") {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
         e.preventDefault();
         this.showCmdPalette = !this.showCmdPalette;
+        if (this.showCmdPalette) {
+          this.cmdPaletteQuery = "";
+        }
         this.render();
+        if (this.showCmdPalette) {
+          setTimeout(() => {
+            const inp = document.getElementById("console-cmd-input") as HTMLInputElement | null;
+            inp?.focus();
+          }, 0);
+        }
       } else if (e.key === "Escape" && this.showCmdPalette) {
         this.showCmdPalette = false;
         this.render();
@@ -643,7 +344,8 @@ export class CodaTerminalWebApp {
       this.pendingActivationCode = codeParam.trim().toUpperCase();
     }
 
-    window.addEventListener("online", () => {
+    const triggerNetworkHotSwitch = () => {
+      this.smartPath.resetForNetworkChange();
       if (this.token) {
         if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
           void this.connectRelayWebSocket();
@@ -652,10 +354,20 @@ export class CodaTerminalWebApp {
           this.connectAccountEventsWebSocket();
         }
       }
-      if (this.selectedDaemon?.is_online) {
-        void this.tryNegotiateDirectLanWs(this.selectedDaemon);
+      if (this.selectedDaemon?.is_online && this.activeTransportMode !== "lan_ws") {
+        this.scheduleDirectLanProbe(1000);
+      }
+    };
+
+    window.addEventListener("online", triggerNetworkHotSwitch);
+    document.addEventListener("visibilitychange", () => {
+      if (!document.hidden && this.route === "console" && this.selectedDaemon?.is_online && this.activeTransportMode !== "lan_ws") {
+        this.smartPath.resetForNetworkChange(this.selectedDaemon.id);
+        this.scheduleDirectLanProbe(1200);
       }
     });
+    const navConn = (navigator as unknown as { connection?: EventTarget }).connection;
+    navConn?.addEventListener?.("change", triggerNetworkHotSwitch);
 
     window.addEventListener("resize", () => {
       if (this.route === "console") {
@@ -721,164 +433,11 @@ export class CodaTerminalWebApp {
   }
 
   private stopBentoLoop() {
-    if (this.bentoRafId !== null) {
-      cancelAnimationFrame(this.bentoRafId);
-      this.bentoRafId = null;
-    }
-    if (this.bentoObserver) {
-      this.bentoObserver.disconnect();
-      this.bentoObserver = null;
-    }
+    this.bento.stop();
   }
 
   private startBentoLoop() {
-    this.stopBentoLoop();
-    const stage = document.getElementById("bento-stage");
-    if (!stage || this.route !== "home") return;
-
-    const glider = stage.querySelector<HTMLElement>('[data-bento="route-glider"]');
-    const rttEl = stage.querySelector<HTMLElement>('[data-bento="rtt-val"]');
-    const badgeLan = stage.querySelector<HTMLElement>('[data-bento="badge-lan"]');
-    const badgeWss = stage.querySelector<HTMLElement>('[data-bento="badge-wss"]');
-    const sparkLan = stage.querySelector<SVGPathElement>('[data-bento="spark-lan"]');
-    const sparkWss = stage.querySelector<SVGPathElement>('[data-bento="spark-wss"]');
-    const sealRing = stage.querySelector<SVGCircleElement>('[data-bento="seal-ring"]');
-    const sealPlain = stage.querySelector<HTMLElement>('[data-bento="seal-plain"]');
-    const sealCipher = stage.querySelector<HTMLElement>('[data-bento="seal-cipher"]');
-    const sealPct = stage.querySelector<HTMLElement>('[data-bento="seal-pct"]');
-    const sealSteps = Array.from(stage.querySelectorAll<HTMLElement>("[data-seal-step]"));
-    const otpCells = Array.from(stage.querySelectorAll<HTMLElement>("[data-otp-idx]"));
-    const otpPending = stage.querySelector<HTMLElement>('[data-bento="otp-pending"]');
-    const otpApproved = stage.querySelector<HTMLElement>('[data-bento="otp-approved"]');
-    const ptyLines = Array.from(stage.querySelectorAll<HTMLElement>("[data-pty-idx]"));
-    const pktA = stage.querySelector<SVGCircleElement>('[data-bento="pkt-a"]');
-    const pktB = stage.querySelector<SVGCircleElement>('[data-bento="pkt-b"]');
-    const voiceBars = Array.from(stage.querySelectorAll<HTMLElement>("[data-voice-idx]"));
-    const reducedMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false;
-    const CIRC = 113.1;
-
-    const paintFrame = (nowMs: number) => {
-      const l = reducedMotion ? 1.5 : ((nowMs - this.bentoStartMs) / 1000) % 16;
-
-      // 1. SmartPath Route Glider + Sparkline Crossfade (0..1 -> holds -> 1..0 cleanly back to 0 at 16s)
-      let routeT = 0;
-      if (l >= 1.5 && l < 2.9) {
-        routeT = springFromRest((l - 1.5) / 1.4);
-      } else if (l >= 2.9 && l < 9.0) {
-        routeT = 1;
-      } else if (l >= 9.0 && l < 10.4) {
-        routeT = 1 - springFromRest((l - 9.0) / 1.4);
-      }
-      const crossFade = clamp01(routeT);
-      if (glider) glider.style.transform = `translate3d(${routeT * 100}%, 0, 0)`;
-      if (rttEl) rttEl.textContent = `${(0.8 + crossFade * 25.6).toFixed(1)} ms`;
-      if (badgeLan) badgeLan.style.opacity = `${1 - soft(crossFade)}`;
-      if (badgeWss) badgeWss.style.opacity = `${soft(crossFade)}`;
-      if (sparkLan) sparkLan.style.opacity = `${(1 - soft(crossFade) * 0.72).toFixed(3)}`;
-      if (sparkWss) sparkWss.style.opacity = `${(0.28 + soft(crossFade) * 0.72).toFixed(3)}`;
-
-      // 2. Zero-Knowledge E2EE Seal Ring + 3-Stage Pipeline Highlight
-      let sealP = 0;
-      if (l >= 3.0 && l < 4.5) {
-        sealP = springFromRest((l - 3.0) / 1.5);
-      } else if (l >= 4.5 && l < 12.2) {
-        sealP = 1;
-      } else if (l >= 12.2 && l < 13.7) {
-        sealP = 1 - soft((l - 12.2) / 1.5);
-      }
-      const clampedSeal = clamp01(sealP);
-      if (sealRing) sealRing.style.strokeDashoffset = `${CIRC * (1 - clampedSeal)}`;
-      if (sealPlain) sealPlain.style.opacity = `${1 - soft(clampedSeal)}`;
-      if (sealCipher) sealCipher.style.opacity = `${soft(clampedSeal)}`;
-      if (sealPct) sealPct.textContent = `${Math.round(clampedSeal * 100)}%`;
-      sealSteps.forEach((step, idx) => {
-        const active = clampedSeal >= idx * 0.34 + 0.05;
-        step.style.borderColor = active ? (idx === 2 ? "var(--emerald-bd)" : "var(--signal-blue-bd)") : "var(--border-primary)";
-        step.style.color = active ? (idx === 2 ? "var(--emerald)" : "var(--text-primary)") : "var(--text-tertiary)";
-      });
-
-      // 3. RFC 8628 Device Code sequential reveal + approval state
-      let approvedP = 0;
-      if (l >= 7.2 && l < 8.4) {
-        approvedP = soft((l - 7.2) / 1.2);
-      } else if (l >= 8.4 && l < 13.5) {
-        approvedP = 1;
-      } else if (l >= 13.5 && l < 14.8) {
-        approvedP = 1 - soft((l - 13.5) / 1.3);
-      }
-      if (otpPending) otpPending.style.opacity = `${1 - approvedP}`;
-      if (otpApproved) otpApproved.style.opacity = `${approvedP}`;
-      otpCells.forEach((cell, idx) => {
-        const focusStart = 1.0 + idx * 0.7;
-        const focusEnd = focusStart + 0.7;
-        const dist =
-          l >= focusStart && l <= focusEnd
-            ? 1 - Math.abs(l - (focusStart + 0.35)) / 0.35
-            : 0;
-        const isLit = dist > 0.1 || approvedP > 0.5;
-        cell.style.borderColor = isLit ? "var(--signal-blue)" : "var(--border-primary)";
-        cell.style.transform = `translate3d(0, ${-2 * Math.max(0, dist)}px, 0)`;
-      });
-
-      // 4. Live PTY Stream subtle active line pulse
-      ptyLines.forEach((line, idx) => {
-        const center = 2.5 + idx * 4.5;
-        const delta = Math.abs(l - center);
-        const w = delta < 2.2 ? soft(1 - delta / 2.2) : 0;
-        line.style.backgroundColor = `rgba(255, 255, 255, ${(0.03 + 0.06 * w).toFixed(3)})`;
-        line.style.opacity = `${(0.72 + 0.28 * w).toFixed(3)}`;
-      });
-
-      // 5. Encrypted Mesh Topology Packet Dots (periodic 16s loop)
-      const phaseA = 0.5 - 0.5 * Math.cos((2 * Math.PI * l) / 8);
-      const phaseB = 0.5 - 0.5 * Math.cos((2 * Math.PI * ((l + 4) % 16)) / 8);
-      if (pktA) {
-        const ax = 54 + phaseA * 102;
-        const ay = 29 - Math.sin(phaseA * Math.PI) * 14;
-        pktA.setAttribute("cx", ax.toFixed(1));
-        pktA.setAttribute("cy", ay.toFixed(1));
-      }
-      if (pktB) {
-        const bx = 190 + phaseB * 102;
-        const by = 29 + Math.sin(phaseB * Math.PI) * 14;
-        pktB.setAttribute("cx", bx.toFixed(1));
-        pktB.setAttribute("cy", by.toFixed(1));
-      }
-
-      // 6. Voice-to-Terminal periodic 16s-locked bars (exact l=0 == l=16 continuity)
-      const speechEnv = 0.28 + 0.72 * (0.5 - 0.5 * Math.cos((2 * Math.PI * l) / 16));
-      voiceBars.forEach((bar, idx) => {
-        const harmonic = 0.5 + 0.5 * Math.sin(((3 + (idx % 3)) * 2 * Math.PI * l) / 16 + idx * 0.9);
-        const sy = 0.2 + 0.8 * speechEnv * harmonic;
-        bar.style.transform = `scaleY(${sy.toFixed(3)})`;
-        bar.style.opacity = `${(0.45 + 0.55 * sy).toFixed(3)}`;
-      });
-    };
-
-    paintFrame(performance.now());
-    if (reducedMotion) return;
-
-    this.bentoObserver = new IntersectionObserver(
-      (entries) => {
-        const visible = entries.some((entry) => entry.isIntersecting);
-        this.bentoVisible = visible;
-        if (visible && this.bentoRafId === null && this.route === "home") {
-          this.bentoRafId = requestAnimationFrame(tick);
-        }
-      },
-      { threshold: 0.08 }
-    );
-    this.bentoObserver.observe(stage);
-
-    const tick = (now: number) => {
-      if (!this.bentoVisible || this.route !== "home") {
-        this.bentoRafId = null;
-        return;
-      }
-      paintFrame(now);
-      this.bentoRafId = requestAnimationFrame(tick);
-    };
-    this.bentoRafId = requestAnimationFrame(tick);
+    this.bento.start("bento-stage", () => this.route === "home");
   }
 
   private async lookupActivationCode(code: string) {
@@ -943,6 +502,43 @@ export class CodaTerminalWebApp {
     });
   }
 
+  private isNeedsYouStatus(status: HerdrTerminal["status"] | null | undefined): boolean {
+    const s = String(status?.state || "").trim().toLowerCase();
+    return (
+      s === "needs_you" ||
+      s === "needsyou" ||
+      s === "needs-you" ||
+      s === "blocked" ||
+      s === "waiting" ||
+      s === "permission" ||
+      s === "attention"
+    );
+  }
+
+  private syncNeedsYouBarInPlace(term: HerdrTerminal | undefined) {
+    const bar = document.getElementById("needs-you-bar");
+    if (!bar) return;
+    const show = Boolean(term && this.isNeedsYouStatus(term.status));
+    bar.classList.toggle("visible", show);
+    if (show && term) {
+      const msgEl = document.getElementById("needs-you-msg");
+      if (msgEl) {
+        const appTag = term.status?.app ? `[${term.status.app}] ` : "";
+        const detail =
+          (term.status?.msg || term.status?.title || "").trim() ||
+          this.tr("Agent is waiting for your approval", "AI Agent 正在等待你的交互确认");
+        msgEl.textContent = `${appTag}${detail}`;
+      }
+    }
+  }
+
+  private syncScrollBottomPill(boxEl: HTMLElement | null) {
+    const btn = document.getElementById("btn-scroll-bottom");
+    if (!btn || !boxEl) return;
+    const distFromBottom = boxEl.scrollHeight - boxEl.scrollTop - boxEl.clientHeight;
+    btn.classList.toggle("visible", distFromBottom > 120);
+  }
+
   private paintActiveTerminalViewport() {
     if (this.route !== "console" || !this.selectedDaemon || !this.activeTerminalAddr) return;
     const key = this.vtKey(this.selectedDaemon.id, this.activeTerminalAddr);
@@ -950,23 +546,28 @@ export class CodaTerminalWebApp {
     const screenEl = document.getElementById("term-screen-output");
     const boxEl = document.getElementById("term-box");
     if (screenEl && vt && this.vtStreamActive.has(key)) {
-      // Preserve user text selection inside the terminal viewport during live output.
+      // Preserve user text selection inside the terminal viewport during live output:
+      // row-level dirty-diff skips selected rows while keeping non-selected rows streaming at 60fps.
       const sel = typeof window !== "undefined" ? window.getSelection() : null;
-      const selectingInside =
+      const selectingInside = Boolean(
         sel &&
-        !sel.isCollapsed &&
-        sel.rangeCount > 0 &&
-        boxEl?.contains(sel.anchorNode);
-      if (!selectingInside) {
-        const prevScrollTop = boxEl ? boxEl.scrollTop : 0;
-        const wasNearBottom = boxEl
-          ? boxEl.scrollHeight - boxEl.scrollTop - boxEl.clientHeight <= 28
-          : true;
-        screenEl.innerHTML = vt.renderHtml(true);
-        if (boxEl) {
-          boxEl.scrollTop = wasNearBottom ? boxEl.scrollHeight : prevScrollTop;
-        }
+          !sel.isCollapsed &&
+          sel.rangeCount > 0 &&
+          (boxEl?.contains(sel.anchorNode) || boxEl?.contains(sel.focusNode))
+      );
+      const prevScrollTop = boxEl ? boxEl.scrollTop : 0;
+      const wasNearBottom = boxEl
+        ? boxEl.scrollHeight - boxEl.scrollTop - boxEl.clientHeight <= 28
+        : true;
+      vt.patchDom(
+        screenEl,
+        true,
+        selectingInside && sel ? { anchorNode: sel.anchorNode, focusNode: sel.focusNode } : null
+      );
+      if (boxEl && !selectingInside) {
+        boxEl.scrollTop = wasNearBottom ? boxEl.scrollHeight : prevScrollTop;
       }
+      this.syncScrollBottomPill(boxEl);
     }
     const activeTerm = this.terminals.find((t) => t.address === this.activeTerminalAddr);
     const titleEl = document.getElementById("active-term-title");
@@ -976,6 +577,7 @@ export class CodaTerminalWebApp {
         activeTerm.name ||
         this.tr("Coda Interactive AI Terminal", "Coda 交互式 AI 终端会话");
     }
+    this.syncNeedsYouBarInPlace(activeTerm);
   }
 
   private updateTransportFooterInPlace() {
@@ -1068,6 +670,11 @@ export class CodaTerminalWebApp {
       clearTimeout(this.eventsReconnectTimer);
       this.eventsReconnectTimer = null;
     }
+    if (this.directProbeTimer) {
+      clearTimeout(this.directProbeTimer);
+      this.directProbeTimer = null;
+    }
+    this.notifyTracker.reset();
     if (this.resizeDebounceTimer) {
       clearTimeout(this.resizeDebounceTimer);
       this.resizeDebounceTimer = null;
@@ -1126,7 +733,13 @@ export class CodaTerminalWebApp {
     this.allDevices = all;
     this.devices = all.filter((d) => d.role === "daemon" || d.role === "hybrid");
     if (!this.selectedDaemon && this.devices.length > 0) {
-      this.selectedDaemon = this.devices.find((d) => d.is_online) || this.devices[0];
+      const savedId = readLocalPref("coda_last_daemon_id", "");
+      const restored = savedId ? this.devices.find((d) => d.id === savedId) : undefined;
+      this.selectedDaemon =
+        (restored && restored.is_online ? restored : undefined) ||
+        this.devices.find((d) => d.is_online) ||
+        restored ||
+        this.devices[0];
     } else if (this.selectedDaemon) {
       this.selectedDaemon = this.devices.find((d) => d.id === this.selectedDaemon!.id) || null;
     }
@@ -1533,55 +1146,99 @@ export class CodaTerminalWebApp {
     }
   }
 
-  private collectDirectWsCandidates(peer: Device): string[] {
-    const out: string[] = [];
-    const isLocalOrigin = location.hostname === "127.0.0.1" || location.hostname === "localhost";
-    const pushUnique = (u: string) => {
-      if (!u) return;
-      if (location.protocol === "https:") {
-        // On HTTPS pages, browsers block mixed-content `ws://` (even loopback on many hosts);
-        // allow loopback `ws://` ONLY when the page itself is served from localhost/127.0.0.1.
-        const isLocalWs =
-          isLocalOrigin && (u.startsWith("ws://127.0.0.1") || u.startsWith("ws://localhost"));
-        if (!u.startsWith("wss://") && !isLocalWs) return;
-      }
-      if (!out.includes(u)) out.push(u);
-    };
-
-    for (const ep of peer.endpoints_json || []) {
-      if (ep.kind === "lan_ws" || ep.kind === "ipv6_ws") {
-        pushUnique(ep.addr);
-      } else if (ep.kind === "lan_ipv4" || ep.kind === "cn_public_ipv6") {
-        pushUnique(`ws://${ep.addr}`);
-      }
+  private scheduleDirectLanProbe(delayMs?: number) {
+    if (this.directProbeTimer) {
+      clearTimeout(this.directProbeTimer);
+      this.directProbeTimer = null;
     }
-
-    if (isLocalOrigin) {
-      pushUnique("ws://127.0.0.1:24444");
+    const peer = this.selectedDaemon;
+    if (!peer || !peer.is_online || !this.token || !this.myClientDevice) return;
+    if (this.activeTransportMode === "lan_ws" && this.directWsPeerId === peer.id && this.directWs?.readyState === WebSocket.OPEN) {
+      return;
     }
-    return out;
+    const wait = delayMs ?? this.smartPath.nextDelayMs(peer.id);
+    this.directProbeTimer = setTimeout(() => {
+      this.directProbeTimer = null;
+      const currentPeer = this.selectedDaemon;
+      if (
+        currentPeer &&
+        currentPeer.id === peer.id &&
+        currentPeer.is_online &&
+        this.activeTransportMode !== "lan_ws" &&
+        this.smartPath.canProbeNow(currentPeer.id, this.activeTransportMode)
+      ) {
+        void this.tryNegotiateDirectLanWs(currentPeer);
+      }
+    }, wait);
   }
 
-  private async tryNegotiateDirectLanWs(peer: Device) {
+  private reattachActiveTerminalPreserveScreen() {
+    if (!this.selectedDaemon || !this.activeTerminalAddr) return;
+    const { cols, rows } = this.computeTerminalDimsFromDom();
+    this.termCols = cols;
+    this.termRows = rows;
+    this.sendEncrypted(this.selectedDaemon, {
+      op: "pty_attach",
+      req_id: `hot-${Date.now()}`,
+      terminal: this.activeTerminalAddr,
+      cols,
+      rows,
+    });
+  }
+
+  private async tryNegotiateDirectLanWs(peer: Device, manual = false) {
     if (!peer.is_online || !this.myClientDevice || !peer.ed25519_pubkey) return;
     if (this.directWs && this.directWs.readyState === WebSocket.OPEN && this.directWsPeerId === peer.id) {
+      return;
+    }
+    if (!manual && !this.smartPath.canProbeNow(peer.id, this.activeTransportMode)) {
+      this.scheduleDirectLanProbe();
       return;
     }
     if (this.negotiatingPeerId === peer.id) return;
     this.negotiatingPeerId = peer.id;
 
     try {
-      const candidates = this.collectDirectWsCandidates(peer);
+      const candidates = collectDirectWsCandidates(peer, location);
+      let upgraded = false;
       for (const wsUrl of candidates) {
         const ok = await this.probeSingleDirectWs(peer, wsUrl);
         if (ok) {
+          upgraded = true;
+          this.smartPath.recordUpgradeSuccess(peer.id);
+          if (this.directProbeTimer) {
+            clearTimeout(this.directProbeTimer);
+            this.directProbeTimer = null;
+          }
+          // Seamlessly re-attach live PTY over Direct LAN without clearing the VT buffer.
+          if (this.selectedDaemon?.id === peer.id && this.activeTerminalAddr) {
+            this.reattachActiveTerminalPreserveScreen();
+          }
           this.sendEncrypted(peer, {
             op: "ping",
             req_id: `lan-p-${Date.now()}`,
             sent_ms: Date.now(),
           });
+          this.consoleNotice = {
+            kind: "ok",
+            text: this.tr("Hot-switched seamlessly to LAN Direct", "已无感热切至局域网直连"),
+          };
           this.updateTransportFooterInPlace();
           break;
+        }
+      }
+      if (!upgraded && this.selectedDaemon?.id === peer.id && peer.is_online) {
+        const plan = this.smartPath.recordProbeFailure(peer.id);
+        this.scheduleDirectLanProbe(plan.delayMs);
+        if (manual) {
+          this.consoleNotice = {
+            kind: "ok",
+            text: this.tr(
+              "LAN Direct unreachable on current network — staying on Smart Relay",
+              "当前网络暂无法直连该主机，继续通过智能中继稳定传输"
+            ),
+          };
+          this.render();
         }
       }
     } finally {
@@ -1734,6 +1391,23 @@ export class CodaTerminalWebApp {
           this.directE2eeSessions.delete(peer.id);
           this.activeTransportMode = "relay_ws";
           this.updateTransportFooterInPlace();
+          const plan = this.smartPath.recordDirectDrop(peer.id);
+          // Seamless failover back to Smart Relay without clearing VT screen buffer.
+          if (this.selectedDaemon?.id === peer.id && this.ws?.readyState === WebSocket.OPEN) {
+            if (this.activeTerminalAddr) {
+              this.reattachActiveTerminalPreserveScreen();
+            }
+            this.consoleNotice = {
+              kind: "ok",
+              text: this.tr(
+                "LAN Direct dropped — failed over seamlessly to Smart Relay",
+                "局域网直连断开，已无缝切回智能中继"
+              ),
+            };
+          }
+          if (this.selectedDaemon?.id === peer.id && peer.is_online) {
+            this.scheduleDirectLanProbe(plan.delayMs);
+          }
         }
         done(false);
       };
@@ -1808,6 +1482,59 @@ export class CodaTerminalWebApp {
     );
   }
 
+  private focusNotifiedTerminal(daemonId: string, terminalAddr: string) {
+    const peer = this.devices.find((d) => d.id === daemonId);
+    if (peer && this.selectedDaemon?.id !== peer.id) {
+      this.detachActiveTerminal();
+      this.selectedDaemon = peer;
+      writeLocalPref("coda_last_daemon_id", peer.id);
+      this.terminals = [];
+      this.activeTerminalAddr = terminalAddr;
+      writeLocalPref("coda_last_terminal_addr", terminalAddr);
+      this.queryDaemonOverview(peer, true);
+      void this.tryNegotiateDirectLanWs(peer);
+    } else {
+      if (this.activeTerminalAddr && this.activeTerminalAddr !== terminalAddr) {
+        this.detachActiveTerminal();
+      }
+      this.activeTerminalAddr = terminalAddr;
+      writeLocalPref("coda_last_terminal_addr", terminalAddr);
+    }
+    if (this.route !== "console") {
+      this.navigate("/console");
+    } else {
+      this.render();
+    }
+    if (this.selectedDaemon?.id === daemonId) {
+      this.attachAndReadTerminal(terminalAddr);
+    }
+  }
+
+  private observeTerminalStatusNotification(peerId: string, term: HerdrTerminal) {
+    const peer = this.devices.find((d) => d.id === peerId);
+    const payload = this.notifyTracker.observe(
+      {
+        daemonId: peerId,
+        daemonName: peer?.name || "Host",
+        terminalAddr: term.address,
+        terminalName: term.name,
+        status: term.status,
+      },
+      {
+        activeDaemonId: this.selectedDaemon?.id ?? null,
+        activeTerminalAddr: this.activeTerminalAddr,
+        documentHidden: typeof document !== "undefined" ? Boolean(document.hidden) : false,
+        locale: this.locale,
+      }
+    );
+    if (!payload) return;
+    if (this.notificationsEnabled) {
+      dispatchBrowserNotification(payload, () => {
+        this.focusNotifiedTerminal(payload.daemonId, payload.terminalAddr);
+      });
+    }
+  }
+
   private handlePeerMessage(peerId: string, msg: any) {
     if (msg.op === "pong") {
       this.rttMs = Math.max(1, Date.now() - Number(msg.sent_ms || Date.now()));
@@ -1847,11 +1574,17 @@ export class CodaTerminalWebApp {
 
     if (msg.op === "terminals_snapshot") {
       this.terminals = msg.terminals || [];
+      for (const term of this.terminals) {
+        this.observeTerminalStatusNotification(peerId, term);
+      }
       if (this.activeTerminalAddr && !this.terminals.some((t) => t.address === this.activeTerminalAddr)) {
         this.activeTerminalAddr = null;
       }
       if (!this.activeTerminalAddr && this.terminals.length > 0) {
-        this.activeTerminalAddr = this.terminals[0].address;
+        const savedTerm = readLocalPref("coda_last_terminal_addr", "");
+        const restored = savedTerm ? this.terminals.find((t) => t.address === savedTerm) : undefined;
+        this.activeTerminalAddr = restored ? restored.address : this.terminals[0].address;
+        writeLocalPref("coda_last_terminal_addr", this.activeTerminalAddr);
         this.attachAndReadTerminal(this.activeTerminalAddr);
       }
       if (!this.isTypingIntoInput() && !this.showSettingsModal) this.render();
@@ -1863,6 +1596,7 @@ export class CodaTerminalWebApp {
         this.detachActiveTerminal();
         this.terminals = [msg.terminal, ...this.terminals.filter((t) => t.address !== msg.terminal.address)];
         this.activeTerminalAddr = msg.terminal.address;
+        writeLocalPref("coda_last_terminal_addr", msg.terminal.address);
         this.render();
         setTimeout(() => {
           if (this.activeTerminalAddr === msg.terminal.address) {
@@ -1889,7 +1623,10 @@ export class CodaTerminalWebApp {
         this.vtStreamActive.add(key);
         if (msg.status) {
           const term = this.terminals.find((t) => t.address === addr);
-          if (term) term.status = msg.status;
+          if (term) {
+            term.status = msg.status;
+            this.observeTerminalStatusNotification(peerId, term);
+          }
         }
         if (addr === this.activeTerminalAddr) {
           this.scheduleTerminalPaint();
@@ -1916,6 +1653,7 @@ export class CodaTerminalWebApp {
               title: vt.latestStatus.title || null,
               msg: vt.latestStatus.msg || null,
             };
+            this.observeTerminalStatusNotification(peerId, term);
           }
         }
         if (peerId === this.selectedDaemon?.id && addr === this.activeTerminalAddr) {
@@ -1933,6 +1671,7 @@ export class CodaTerminalWebApp {
         if (idx >= 0) {
           this.terminals[idx] = msg.terminal;
         }
+        this.observeTerminalStatusNotification(peerId, msg.terminal);
         if (msg.terminal.address === this.activeTerminalAddr) {
           this.scheduleTerminalPaint();
         }
@@ -2014,6 +1753,231 @@ export class CodaTerminalWebApp {
       terminal: this.activeTerminalAddr,
       data_b64: toB64(raw),
     });
+  }
+
+  private async uploadSingleFileToHost(file: File) {
+    if (!this.selectedDaemon || !this.activeTerminalAddr) {
+      this.consoleNotice = {
+        kind: "err",
+        text: this.tr("Select an online host and terminal before uploading.", "请先选择一个在线主机和终端再上传文件。"),
+      };
+      this.render();
+      return;
+    }
+    if (file.size > MAX_UPLOAD_BYTES) {
+      this.consoleNotice = {
+        kind: "err",
+        text: this.tr(
+          `File too large (${Math.ceil(file.size / (1024 * 1024))} MiB > 8 MiB limit)`,
+          `文件过大（超过 8 MiB 单次上传限制）`
+        ),
+      };
+      this.render();
+      return;
+    }
+    const safeName =
+      (file.name || "").trim() ||
+      `screenshot-${Date.now()}.${(file.type.split("/")[1] || "png").replace(/[^a-z0-9]/gi, "") || "png"}`;
+    try {
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      const b64 = toB64(bytes);
+      this.consoleNotice = {
+        kind: "ok",
+        text: this.tr(`Uploading ${safeName}…`, `正在上传 ${safeName}…`),
+      };
+      this.sendEncrypted(this.selectedDaemon, {
+        op: "upload_terminal_file",
+        req_id: `up-${Date.now()}`,
+        terminal: this.activeTerminalAddr,
+        filename: safeName,
+        data_b64: b64,
+      });
+    } catch (err: any) {
+      this.consoleNotice = {
+        kind: "err",
+        text: String(err?.message || this.tr("Failed reading upload file", "读取上传文件失败")),
+      };
+      this.render();
+    }
+  }
+
+  private getConsolePaletteItems(query: string): Array<{
+    id: string;
+    group: string;
+    label: string;
+    hint: string;
+    action: () => void;
+  }> {
+    const q = query.trim().toLowerCase();
+    const items: Array<{ id: string; group: string; label: string; hint: string; action: () => void }> = [];
+
+    for (const dev of this.devices) {
+      items.push({
+        id: `host:${dev.id}`,
+        group: this.tr("Hosts", "切换主机"),
+        label: dev.name,
+        hint: `${dev.platform} · ${dev.is_online ? this.tr("Online", "在线") : this.tr("Offline", "离线")}`,
+        action: () => {
+          if (this.selectedDaemon && this.selectedDaemon.id !== dev.id) {
+            this.detachActiveTerminal();
+          }
+          this.selectedDaemon = dev;
+          writeLocalPref("coda_last_daemon_id", dev.id);
+          this.terminals = [];
+          this.repos = [];
+          this.activeTerminalAddr = null;
+          this.lastWorkspacesQueryAt = 0;
+          if (dev.is_online) {
+            this.queryDaemonOverview(dev);
+            void this.tryNegotiateDirectLanWs(dev);
+          }
+        },
+      });
+    }
+
+    for (const term of this.terminals) {
+      const title = term.status?.title || term.name || term.address;
+      const st = term.status?.state || "idle";
+      items.push({
+        id: `term:${term.address}`,
+        group: this.tr("Terminals", "切换终端"),
+        label: title,
+        hint: `${st} · ${term.cwd || "~"}`,
+        action: () => {
+          if (this.activeTerminalAddr && this.activeTerminalAddr !== term.address) {
+            this.detachActiveTerminal();
+          }
+          this.activeTerminalAddr = term.address;
+          writeLocalPref("coda_last_terminal_addr", term.address);
+          this.attachAndReadTerminal(term.address);
+        },
+      });
+    }
+
+    if (this.selectedDaemon?.is_online) {
+      const agents: Array<{ key: string; label: string }> = [
+        { key: "claude", label: "Claude Code" },
+        { key: "codex", label: "Codex CLI" },
+        { key: "gemini", label: "Gemini CLI" },
+        { key: "shell", label: "Interactive Shell" },
+      ];
+      for (const ag of agents) {
+        items.push({
+          id: `spawn:${ag.key}`,
+          group: this.tr("Launch Agent", "启动 Agent"),
+          label: `${this.tr("New", "新建")} ${ag.label}`,
+          hint: this.selectedDaemon.name,
+          action: () => {
+            if (!this.selectedDaemon?.is_online) return;
+            const { cols, rows } = this.computeTerminalDimsFromDom();
+            this.termCols = cols;
+            this.termRows = rows;
+            const activeTerm = this.terminals.find((t) => t.address === this.activeTerminalAddr);
+            this.sendEncrypted(this.selectedDaemon, {
+              op: "launch_agent",
+              req_id: `run-${Date.now()}`,
+              agent: ag.key,
+              name: null,
+              cwd: activeTerm?.cwd || null,
+              initial_prompt: null,
+              cols,
+              rows,
+            });
+          },
+        });
+      }
+      items.push({
+        id: "action:probe-lan",
+        group: this.tr("Actions", "快捷操作"),
+        label: this.tr("Probe LAN Direct Now", "立即探测局域网直连"),
+        hint: this.activeTransportMode === "lan_ws" ? "LAN Direct" : "Smart Relay",
+        action: () => {
+          if (!this.selectedDaemon?.is_online) return;
+          this.smartPath.resetForNetworkChange(this.selectedDaemon.id);
+          void this.tryNegotiateDirectLanWs(this.selectedDaemon, true);
+        },
+      });
+    }
+
+    items.push(
+      {
+        id: "action:settings",
+        group: this.tr("Actions", "快捷操作"),
+        label: this.tr("Open Workspace & Account Settings", "打开工作区与账号设置"),
+        hint: "Devices · Security · Voice",
+        action: () => {
+          this.showSettingsModal = true;
+          this.settingsFeedback = null;
+          void this.loadAccountSettingsData().then(() => {
+            if (this.showSettingsModal) this.render();
+          });
+        },
+      },
+      {
+        id: "action:theme",
+        group: this.tr("Actions", "快捷操作"),
+        label: this.tr("Toggle Light / Dark Theme", "切换浅色 / 深色主题"),
+        hint: this.themePref,
+        action: () => {
+          const next: ThemePreference = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
+          this.applyTheme(next, true);
+        },
+      },
+      {
+        id: "action:lang",
+        group: this.tr("Actions", "快捷操作"),
+        label: this.tr("Switch Language (EN / 中文)", "切换界面语言 (中文 / EN)"),
+        hint: this.locale === "zh" ? "中文" : "EN",
+        action: () => {
+          this.applyLocale(this.locale === "en" ? "zh" : "en", true);
+        },
+      }
+    );
+
+    if (!q) return items;
+    return items.filter(
+      (it) =>
+        it.label.toLowerCase().includes(q) ||
+        it.hint.toLowerCase().includes(q) ||
+        it.group.toLowerCase().includes(q)
+    );
+  }
+
+  private renderConsoleCommandPaletteModal(): string {
+    const items = this.getConsolePaletteItems(this.cmdPaletteQuery);
+    return `
+      <div class="cmd-mask" id="console-cmd-mask">
+        <div class="cmd-card" style="max-width:540px;">
+          <div style="display:flex;align-items:center;gap:8px;padding-bottom:10px;border-bottom:1px solid var(--border-primary);">
+            ${svgIcon("search", 15)}
+            <input id="console-cmd-input" class="pm-input" style="margin:0;border:none;background:transparent;padding:4px 0;flex:1;box-shadow:none;" value="${this.escapeHtml(
+              this.cmdPaletteQuery
+            )}" placeholder="${this.tr("Jump to host, terminal, launch agent, or run action…", "搜索主机、终端会话、拉起 Agent 或执行快捷操作…")}" autocomplete="off" />
+            <span class="pm-kbd">ESC</span>
+          </div>
+          <div class="cmd-list" id="console-cmd-list" style="max-height:340px;overflow-y:auto;">
+            ${
+              items.length === 0
+                ? `<div style="padding:18px 10px;text-align:center;font-size:12px;color:var(--text-tertiary);">${this.tr("No matching commands", "无匹配指令")}</div>`
+                : items
+                    .map(
+                      (it, idx) => `
+                  <button type="button" class="cmd-row" data-cmd-idx="${idx}" style="${
+                    idx === 0 ? "background:var(--bg-elevated);border-color:var(--border-primary);" : ""
+                  }">
+                    <span style="display:inline-flex;align-items:center;gap:8px;min-width:0;">
+                      <span class="pm-badge" style="font-size:10px;padding:2px 6px;">${this.escapeHtml(it.group)}</span>
+                      <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${this.escapeHtml(it.label)}</span>
+                    </span>
+                    <span class="coda-mono" style="font-size:11px;color:var(--text-tertiary);flex-shrink:0;margin-left:8px;">${this.escapeHtml(it.hint)}</span>
+                  </button>`
+                    )
+                    .join("")
+            }
+          </div>
+        </div>
+      </div>
+    `;
   }
 
   private isSafeVoiceBaseUrl(raw: string): boolean {
@@ -3891,13 +3855,13 @@ export class CodaTerminalWebApp {
     const selectedVtKey =
       this.selectedDaemon && activeTerm ? this.vtKey(this.selectedDaemon.id, activeTerm.address) : "";
     const activeVt = selectedVtKey ? this.vtTerminals.get(selectedVtKey) : undefined;
-    const initialVtHtml =
-      activeVt && this.vtStreamActive.has(selectedVtKey)
-        ? activeVt.renderHtml(true)
-        : this.tr(
-            `  - Connected to PostgreSQL 18 multi-tenant control plane &amp; E2EE tunnel (X25519 + ChaCha20-Poly1305)\n  - Local Herdr Core online. Use '+' on the right rail to launch Shell / Claude Code / Codex / Gemini CLI.\n\n* Ready · ${this.rttMs !== null ? `RTT ${this.rttMs}ms` : "Relay WSS :443 Ready"}`,
-            `  - 已连接 PostgreSQL 18 多租户控制面与端到端加密隧道 (X25519 + ChaCha20-Poly1305)\n  - 本机 Herdr Core 在线，随时可通过右侧「+」拉起 Shell / Claude Code / Codex / Gemini CLI\n\n* Ready · ${this.rttMs !== null ? `RTT ${this.rttMs}ms` : "Relay WSS :443 Ready"}`
-          );
+    const isVtStream = Boolean(activeVt && this.vtStreamActive.has(selectedVtKey));
+    const initialVtHtml = isVtStream && activeVt
+      ? activeVt.renderInitialRowsHtml(true)
+      : this.tr(
+          `  - Connected to PostgreSQL 18 multi-tenant control plane &amp; E2EE tunnel (X25519 + ChaCha20-Poly1305)\n  - Local Herdr Core online. Use '+' on the right rail to launch Shell / Claude Code / Codex / Gemini CLI.\n\n* Ready · ${this.rttMs !== null ? `RTT ${this.rttMs}ms` : "Relay WSS :443 Ready"}`,
+          `  - 已连接 PostgreSQL 18 多租户控制面与端到端加密隧道 (X25519 + ChaCha20-Poly1305)\n  - 本机 Herdr Core 在线，随时可通过右侧「+」拉起 Shell / Claude Code / Codex / Gemini CLI\n\n* Ready · ${this.rttMs !== null ? `RTT ${this.rttMs}ms` : "Relay WSS :443 Ready"}`
+        );
     const modeLabel =
       this.activeTransportMode === "lan_ws"
         ? this.tr("LAN Direct", "局域网直连")
@@ -4063,6 +4027,10 @@ export class CodaTerminalWebApp {
               </div>
             </div>
             <div style="display:flex;align-items:center;gap:8px;">
+              <button type="button" id="btn-console-cmd-k" class="pm-cmd-trigger" style="height:30px;padding:0 9px;" title="${this.tr("Quick Jump & Actions (⌘K / Ctrl+K)", "全局快捷跳转面板 (⌘K / Ctrl+K)")}">
+                ${svgIcon("search", 13)}
+                <span class="pm-kbd">⌘K</span>
+              </button>
               ${this.terminals
                 .map(
                   (t, i) => `
@@ -4077,16 +4045,17 @@ export class CodaTerminalWebApp {
             </div>
           </div>
 
-          <!-- Live Terminal Viewport (focusable for direct keyboard input) -->
-          <div class="term-viewport" id="term-box" tabindex="0" aria-label="${this.tr("Interactive Terminal Viewport", "交互式终端视口")}">${
-            this.consoleNotice
-              ? `<div style="margin-bottom:10px;padding:8px 10px;border-radius:8px;font-size:12px;border:1px solid ${
-                  this.consoleNotice.kind === "err" ? "var(--rose-bd, rgba(244,63,94,0.35))" : "var(--emerald-bd)"
-                };background:${
-                  this.consoleNotice.kind === "err" ? "rgba(244,63,94,0.1)" : "var(--emerald-bg)"
-                };color:${this.consoleNotice.kind === "err" ? "var(--rose)" : "var(--emerald)"};">${this.escapeHtml(this.consoleNotice.text)}</div>`
-              : ""
-          }<div id="term-screen-output" style="white-space:pre;overflow-x:auto;">${initialVtHtml}</div>
+          <!-- Live Terminal Viewport (focusable for direct keyboard input, supports drag-drop & paste upload) -->
+          <div class="term-viewport-wrap">
+            <div class="term-viewport" id="term-box" tabindex="0" aria-label="${this.tr("Interactive Terminal Viewport", "交互式终端视口")}">${
+              this.consoleNotice
+                ? `<div style="margin-bottom:10px;padding:8px 10px;border-radius:8px;font-size:12px;border:1px solid ${
+                    this.consoleNotice.kind === "err" ? "var(--rose-bd, rgba(244,63,94,0.35))" : "var(--emerald-bd)"
+                  };background:${
+                    this.consoleNotice.kind === "err" ? "rgba(244,63,94,0.1)" : "var(--emerald-bg)"
+                  };color:${this.consoleNotice.kind === "err" ? "var(--rose)" : "var(--emerald)"};">${this.escapeHtml(this.consoleNotice.text)}</div>`
+                : ""
+            }<div id="term-screen-output" data-vt-mode="${isVtStream ? "rows" : "placeholder"}" style="white-space:pre;overflow-x:auto;">${initialVtHtml}</div>
 ${
   this.draftInput
     ? `<div style="margin-top:14px;border-top:1px solid var(--border-primary);padding-top:6px;border-bottom:1px solid var(--border-primary);padding-bottom:6px;">&gt; ${this.formatCursorDraft(
@@ -4094,7 +4063,28 @@ ${
       )}</div>`
     : ""
 }
-<div id="term-footer-meta" style="font-size:12px;color:var(--text-tertiary);margin-top:8px;">${this.escapeHtml(footerTransport)} &middot; E2EE X25519 + ChaCha20 &middot; ${this.termCols}&times;${this.termRows} &middot; ${this.terminals.length} PTY &middot; ${this.tr("Click terminal for direct keys", "点击终端区域即可直接键入")}</div></div>
+<div id="term-footer-meta" style="font-size:12px;color:var(--text-tertiary);margin-top:8px;">${this.escapeHtml(footerTransport)} &middot; E2EE X25519 + ChaCha20 &middot; ${this.termCols}&times;${this.termRows} &middot; ${this.terminals.length} PTY &middot; ${this.tr("Click for keys · Drop/paste image to upload", "点击直连按键 · 拖拽/粘贴截图自动上传")}</div></div>
+            <button type="button" id="btn-scroll-bottom" class="term-scroll-bottom-btn" title="${this.tr("Jump to latest output", "回到底部最新输出")}">
+              ↓ ${this.tr("Latest", "回到最新")}
+            </button>
+          </div>
+
+          <!-- OSC 7501 Needs-You One-Tap Approval Bar -->
+          <div id="needs-you-bar" class="needs-you-bar ${this.isNeedsYouStatus(activeTerm?.status) ? "visible" : ""}" role="region" aria-label="${this.tr("Agent Approval Needed", "Agent 待审批操作")}">
+            <div class="needs-you-meta">
+              <span class="needs-you-dot"></span>
+              <span id="needs-you-msg" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${this.escapeHtml(
+                (activeTerm?.status?.app ? `[${activeTerm.status.app}] ` : "") +
+                  ((activeTerm?.status?.msg || activeTerm?.status?.title || "").trim() ||
+                    this.tr("Agent is waiting for your approval", "AI Agent 正在等待你的交互确认"))
+              )}</span>
+            </div>
+            <div class="needs-you-actions">
+              <button type="button" class="needs-you-btn primary" data-approve="yes">1 &middot; ${this.tr("Yes", "允许一次")}</button>
+              <button type="button" class="needs-you-btn" data-approve="always">2 &middot; ${this.tr("Always", "始终允许")}</button>
+              <button type="button" class="needs-you-btn deny" data-approve="deny">Esc &middot; ${this.tr("Deny", "拒绝")}</button>
+            </div>
+          </div>
 
           ${
             this.showKeyboardInputBar
@@ -4411,6 +4401,34 @@ ${
                   ${this.renderThemeSwitcher()}
                 </div>
               </div>
+              <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;padding-bottom:12px;margin-bottom:12px;border-bottom:1px solid var(--border-primary);">
+                <div style="min-width:0;">
+                  <div style="font-size:12.5px;font-weight:500;display:inline-flex;align-items:center;gap:6px;">${svgIcon("bell", 13)} ${this.tr("Browser Alerts (OSC 7501)", "浏览器系统通知 (OSC 7501)")}</div>
+                  <div style="font-size:11px;color:var(--text-tertiary);margin-top:2px;">${this.tr("Notify when a background agent needs approval or finishes.", "后台 Agent 需要审批或任务完成时弹出系统通知，点击直达终端。")}</div>
+                </div>
+                <button id="btn-toggle-browser-notify" type="button" class="pm-btn ${this.notificationsEnabled && getBrowserNotificationPermission() === "granted" ? "pm-btn-primary" : "pm-btn-secondary"} pm-btn-sm" style="flex-shrink:0;">
+                  ${
+                    getBrowserNotificationPermission() === "denied"
+                      ? this.tr("Blocked", "已拒绝权限")
+                      : this.notificationsEnabled && getBrowserNotificationPermission() === "granted"
+                        ? this.tr("Enabled", "已开启")
+                        : this.tr("Enable", "开启通知")
+                  }
+                </button>
+              </div>
+              <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;padding-bottom:12px;margin-bottom:12px;border-bottom:1px solid var(--border-primary);">
+                <div style="min-width:0;">
+                  <div style="font-size:12.5px;font-weight:500;display:inline-flex;align-items:center;gap:6px;">${svgIcon("zap", 13)} ${this.tr("Smart-Path Auto Hot-Switch", "智能路径热切直连")}</div>
+                  <div style="font-size:11px;color:var(--text-tertiary);margin-top:2px;">${
+                    this.activeTransportMode === "lan_ws"
+                      ? this.tr("Active: LAN Direct (zero-hop E2EE)", "当前状态：局域网直连（零跳端到端加密）")
+                      : this.tr("Active: Smart Relay (auto-probing LAN in background)", "当前状态：智能中继（后台自动探测局域网无感热切）")
+                  }</div>
+                </div>
+                <button id="btn-probe-lan-now" type="button" class="pm-btn pm-btn-secondary pm-btn-sm" style="flex-shrink:0;" ${!this.selectedDaemon?.is_online ? "disabled" : ""}>
+                  ${this.tr("Probe LAN", "立即探测直连")}
+                </button>
+              </div>
               <form id="voice-cfg-form">
                 <div style="font-size:13px;font-weight:600;margin-bottom:8px;display:inline-flex;align-items:center;gap:6px;">${svgIcon("mic", 14)} ${this.tr("Whisper Voice Transcription Config", "Whisper 语音转写模型配置")}</div>
                 <label style="font-size:11px;color:var(--text-secondary);">Provider</label>
@@ -4432,6 +4450,7 @@ ${
       `
           : ""
       }
+      ${this.showCmdPalette ? this.renderConsoleCommandPaletteModal() : ""}
     `;
 
     this.bindCommonNavigation(root);
@@ -4727,6 +4746,54 @@ ${
       this.showSettingsModal = false;
       this.navigate("/");
     });
+    document.getElementById("btn-toggle-browser-notify")?.addEventListener("click", async () => {
+      if (this.notificationsEnabled && getBrowserNotificationPermission() === "granted") {
+        this.notificationsEnabled = false;
+        writeLocalPref("coda_notify_enabled", "0");
+        this.settingsFeedback = {
+          kind: "ok",
+          text: this.tr("Browser notifications disabled.", "已关闭浏览器系统通知。"),
+        };
+        this.render();
+        return;
+      }
+      const perm = await requestBrowserNotificationPermission();
+      if (perm === "granted") {
+        this.notificationsEnabled = true;
+        writeLocalPref("coda_notify_enabled", "1");
+        this.settingsFeedback = {
+          kind: "ok",
+          text: this.tr("Browser notifications enabled for OSC 7501 alerts.", "已开启 OSC 7501 系统通知。"),
+        };
+      } else if (perm === "unsupported") {
+        this.notificationsEnabled = false;
+        this.settingsFeedback = {
+          kind: "err",
+          text: this.tr("This browser does not support Web Notifications.", "当前浏览器不支持系统通知 API。"),
+        };
+      } else {
+        this.notificationsEnabled = false;
+        writeLocalPref("coda_notify_enabled", "0");
+        this.settingsFeedback = {
+          kind: "err",
+          text: this.tr(
+            "Notification permission was denied in browser settings.",
+            "浏览器已拒绝通知权限，请在地址栏站点设置中允许通知。"
+          ),
+        };
+      }
+      this.render();
+    });
+    document.getElementById("btn-probe-lan-now")?.addEventListener("click", () => {
+      if (!this.selectedDaemon?.is_online) return;
+      this.smartPath.resetForNetworkChange(this.selectedDaemon.id);
+      this.settingsFeedback = {
+        kind: "ok",
+        text: this.tr("Probing LAN Direct endpoints in background…", "正在后台探测局域网直连端点…"),
+      };
+      this.render();
+      void this.tryNegotiateDirectLanWs(this.selectedDaemon, true);
+    });
 
     if (this.termResizeObserver) {
       this.termResizeObserver.disconnect();
@@ -4740,57 +4807,170 @@ ${
       this.termResizeObserver.observe(termBox);
     }
 
-    // Direct raw keystroke & bracketed paste support when #term-box is focused
+    // Direct raw keystroke, drag-drop file upload, scrollback jump-to-bottom & clipboard image/text paste
     termBox?.addEventListener("keydown", (e) => {
       if (!this.selectedDaemon || !this.activeTerminalAddr) return;
-      if (e.isComposing || this.imeComposing) return;
-      if (e.metaKey && (e.key.toLowerCase() === "c" || e.key.toLowerCase() === "v" || e.key.toLowerCase() === "r" || e.key.toLowerCase() === "l")) {
-        return;
-      }
       const keyVt = this.vtTerminals.get(this.vtKey(this.selectedDaemon.id, this.activeTerminalAddr));
-      const appCursor = keyVt?.appCursorKeys ?? false;
-      let seq: string | null = null;
-      if (e.ctrlKey && !e.altKey && !e.metaKey && e.key.length === 1) {
-        const code = e.key.toLowerCase().charCodeAt(0);
-        if (code >= 97 && code <= 122) {
-          seq = String.fromCharCode(code - 96);
-        }
-      } else {
-        switch (e.key) {
-          case "Enter": seq = "\r"; break;
-          case "Backspace": seq = "\x7f"; break;
-          case "Tab": seq = e.shiftKey ? "\x1b[Z" : "\t"; break;
-          case "Escape": seq = "\x1b"; break;
-          case "ArrowUp": seq = appCursor ? "\x1bOA" : "\x1b[A"; break;
-          case "ArrowDown": seq = appCursor ? "\x1bOB" : "\x1b[B"; break;
-          case "ArrowRight": seq = appCursor ? "\x1bOC" : "\x1b[C"; break;
-          case "ArrowLeft": seq = appCursor ? "\x1bOD" : "\x1b[D"; break;
-          case "Home": seq = "\x1b[H"; break;
-          case "End": seq = "\x1b[F"; break;
-          case "Delete": seq = "\x1b[3~"; break;
-          case "PageUp": seq = "\x1b[5~"; break;
-          case "PageDown": seq = "\x1b[6~"; break;
-          default:
-            if (e.key.length === 1 && !e.ctrlKey && !e.metaKey) {
-              seq = e.altKey ? `\x1b${e.key}` : e.key;
-            }
-            break;
-        }
-      }
+      const seq = encodeTerminalKeyEvent(e, {
+        appCursorKeys: keyVt?.appCursorKeys ?? false,
+        imeComposing: this.imeComposing,
+      });
       if (seq !== null) {
         e.preventDefault();
         this.sendPtyInputBytes(seq);
       }
     });
 
+    const handleClipboardImagePaste = (e: ClipboardEvent): boolean => {
+      const items = e.clipboardData?.items;
+      if (!items) return false;
+      for (let i = 0; i < items.length; i++) {
+        const item = items[i];
+        if (item.kind === "file" && item.type.startsWith("image/")) {
+          const imgFile = item.getAsFile();
+          if (imgFile) {
+            e.preventDefault();
+            void this.uploadSingleFileToHost(imgFile);
+            return true;
+          }
+        }
+      }
+      return false;
+    };
+
     termBox?.addEventListener("paste", (e) => {
       if (!this.selectedDaemon || !this.activeTerminalAddr) return;
+      if (handleClipboardImagePaste(e)) return;
       const text = e.clipboardData?.getData("text");
       if (!text) return;
       e.preventDefault();
       const keyVt = this.vtTerminals.get(this.vtKey(this.selectedDaemon.id, this.activeTerminalAddr));
-      const payload = keyVt?.bracketedPaste ? `\x1b[200~${text}\x1b[201~` : text;
+      const payload = wrapBracketedPaste(text, Boolean(keyVt?.bracketedPaste));
       this.sendPtyInputBytes(payload);
+    });
+
+    let dropDepth = 0;
+    termBox?.addEventListener("dragenter", (e) => {
+      e.preventDefault();
+      dropDepth += 1;
+      termBox.classList.add("term-drop-active");
+    });
+    termBox?.addEventListener("dragover", (e) => {
+      e.preventDefault();
+      if (e.dataTransfer) e.dataTransfer.dropEffect = "copy";
+    });
+    termBox?.addEventListener("dragleave", () => {
+      dropDepth = Math.max(0, dropDepth - 1);
+      if (dropDepth === 0) termBox.classList.remove("term-drop-active");
+    });
+    termBox?.addEventListener("drop", (e) => {
+      e.preventDefault();
+      dropDepth = 0;
+      termBox.classList.remove("term-drop-active");
+      const file = e.dataTransfer?.files?.[0];
+      if (file) {
+        void this.uploadSingleFileToHost(file);
+      }
+    });
+
+    termBox?.addEventListener("scroll", () => {
+      this.syncScrollBottomPill(termBox);
+    });
+    document.getElementById("btn-scroll-bottom")?.addEventListener("click", () => {
+      if (!termBox) return;
+      termBox.scrollTop = termBox.scrollHeight;
+      this.syncScrollBottomPill(termBox);
+    });
+
+    // OSC 7501 Needs-You one-tap approval buttons
+    document.querySelectorAll<HTMLButtonElement>("[data-approve]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        if (!this.selectedDaemon || !this.activeTerminalAddr) return;
+        const action = btn.dataset.approve;
+        if (action === "yes") {
+          this.sendPtyInputBytes("1\r");
+        } else if (action === "always") {
+          this.sendPtyInputBytes("2\r");
+        } else if (action === "deny") {
+          this.sendPtyInputBytes("\x1b");
+        }
+        const bar = document.getElementById("needs-you-bar");
+        bar?.classList.remove("visible");
+      });
+    });
+
+    // Console ⌘K Command Palette
+    document.getElementById("btn-console-cmd-k")?.addEventListener("click", () => {
+      this.showCmdPalette = true;
+      this.cmdPaletteQuery = "";
+      this.render();
+      setTimeout(() => {
+        (document.getElementById("console-cmd-input") as HTMLInputElement | null)?.focus();
+      }, 0);
+    });
+    document.getElementById("console-cmd-mask")?.addEventListener("click", (e) => {
+      if ((e.target as HTMLElement).id === "console-cmd-mask") {
+        this.showCmdPalette = false;
+        this.render();
+      }
+    });
+    const runConsolePaletteIdx = (idx: number) => {
+      const items = this.getConsolePaletteItems(this.cmdPaletteQuery);
+      const chosen = items[idx];
+      if (!chosen) return;
+      this.showCmdPalette = false;
+      this.cmdPaletteQuery = "";
+      chosen.action();
+      this.render();
+    };
+    const bindConsolePaletteRows = () => {
+      document.querySelectorAll<HTMLButtonElement>("[data-cmd-idx]").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          runConsolePaletteIdx(Number(btn.dataset.cmdIdx || "0"));
+        });
+      });
+    };
+    bindConsolePaletteRows();
+    const consoleCmdInput = document.getElementById("console-cmd-input") as HTMLInputElement | null;
+    consoleCmdInput?.addEventListener("input", () => {
+      this.cmdPaletteQuery = consoleCmdInput.value;
+      const listEl = document.getElementById("console-cmd-list");
+      if (!listEl) return;
+      const items = this.getConsolePaletteItems(this.cmdPaletteQuery);
+      listEl.innerHTML =
+        items.length === 0
+          ? `<div style="padding:18px 10px;text-align:center;font-size:12px;color:var(--text-tertiary);">${this.tr("No matching commands", "无匹配指令")}</div>`
+          : items
+              .map(
+                (it, idx) => `
+            <button type="button" class="cmd-row" data-cmd-idx="${idx}" style="${
+              idx === 0 ? "background:var(--bg-elevated);border-color:var(--border-primary);" : ""
+            }">
+              <span style="display:inline-flex;align-items:center;gap:8px;min-width:0;">
+                <span class="pm-badge" style="font-size:10px;padding:2px 6px;">${this.escapeHtml(it.group)}</span>
+                <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${this.escapeHtml(it.label)}</span>
+              </span>
+              <span class="coda-mono" style="font-size:11px;color:var(--text-tertiary);flex-shrink:0;margin-left:8px;">${this.escapeHtml(it.hint)}</span>
+            </button>`
+              )
+              .join("");
+      bindConsolePaletteRows();
+    });
+    consoleCmdInput?.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        runConsolePaletteIdx(0);
+      } else if (e.key === "Escape") {
+        e.preventDefault();
+        this.showCmdPalette = false;
+        this.render();
+      }
+    });
+    document.getElementById("desktop-prompt-input")?.addEventListener("paste", (e) => {
+      handleClipboardImagePaste(e as ClipboardEvent);
+    });
+    document.getElementById("kb-input")?.addEventListener("paste", (e) => {
+      handleClipboardImagePaste(e as ClipboardEvent);
     });
 
     document.getElementById("btn-logout")?.addEventListener("click", async () => {
@@ -4964,35 +5144,8 @@ ${
       const inp = ev.target as HTMLInputElement;
       const file = inp.files?.[0];
       inp.value = "";
-      if (!file || !this.selectedDaemon || !this.activeTerminalAddr) return;
-      if (file.size > MAX_UPLOAD_BYTES) {
-        this.consoleNotice = {
-          kind: "err",
-          text: this.tr(
-            `File too large (${Math.ceil(file.size / (1024 * 1024))} MiB > 8 MiB limit)`,
-            `文件过大（超过 8 MiB 单次上传限制）`
-          ),
-        };
-        this.render();
-        return;
-      }
-      try {
-        const bytes = new Uint8Array(await file.arrayBuffer());
-        const b64 = toB64(bytes);
-        this.sendEncrypted(this.selectedDaemon, {
-          op: "upload_terminal_file",
-          req_id: `up-${Date.now()}`,
-          terminal: this.activeTerminalAddr,
-          filename: file.name,
-          data_b64: b64,
-        });
-      } catch (err: any) {
-        this.consoleNotice = {
-          kind: "err",
-          text: String(err?.message || this.tr("Failed reading upload file", "读取上传文件失败")),
-        };
-        this.render();
-      }
+      if (!file) return;
+      await this.uploadSingleFileToHost(file);
     });
 
     document.getElementById("rail-paste-btn")?.addEventListener("click", async () => {
@@ -5092,6 +5245,7 @@ ${
           this.detachActiveTerminal();
         }
         this.selectedDaemon = peer;
+        writeLocalPref("coda_last_daemon_id", peer.id);
         this.terminals = [];
         this.repos = [];
         this.activeTerminalAddr = null;
@@ -5113,6 +5267,7 @@ ${
           this.detachActiveTerminal();
         }
         this.activeTerminalAddr = nextAddr;
+        writeLocalPref("coda_last_terminal_addr", nextAddr);
         this.attachAndReadTerminal(nextAddr);
         if (isNarrowViewport) this.showSidebar = false;
         this.render();

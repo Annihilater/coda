@@ -29,11 +29,15 @@ if (existsSync("../assets/logo.svg")) {
 if (existsSync("../assets/icon-512.png")) {
   copyFileSync("../assets/icon-512.png", "./dist/apple-touch-icon.png");
 }
+if (existsSync("./manifest.json")) {
+  copyFileSync("./manifest.json", "./dist/manifest.json");
+}
 
 const html = readFileSync("./index.html", "utf8")
   .replace("/app.js", `/${hashedBundleName}`)
   .replace("/logo.svg", `/logo.svg?v=${hash}`)
-  .replace("/apple-touch-icon.png", `/apple-touch-icon.png?v=${hash}`);
+  .replace("/apple-touch-icon.png", `/apple-touch-icon.png?v=${hash}`)
+  .replace("/manifest.json", `/manifest.json?v=${hash}`);
 
 writeFileSync("./dist/index.html", html, "utf8");
 console.log(`Built Coda Web Console -> web/dist/ (${hashedBundleName})`);

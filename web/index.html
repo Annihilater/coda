@@ -8,6 +8,12 @@
   <meta id="meta-desc" name="description" content="Connect your Linux servers, macOS workstation, and iPhone/Web into one zero-knowledge encrypted mesh. Persistent herdr-core PTYs, sub-millisecond LAN P2P, and zero exposed ports via Cloudflare Tunnel." />
   <link rel="icon" type="image/svg+xml" href="/logo.svg" />
   <link rel="apple-touch-icon" sizes="512x512" href="/apple-touch-icon.png" />
+  <link rel="manifest" href="/manifest.json" />
+  <meta name="theme-color" content="#09090b" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="Coda" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" />
@@ -1580,6 +1586,117 @@
     .cmd-row:hover {
       background: var(--bg-elevated);
       border-color: var(--border-primary);
+    }
+    .vt-row {
+      min-height: 1.45em;
+      line-height: 1.45;
+      white-space: pre;
+    }
+    .term-viewport-wrap {
+      position: relative;
+      flex: 1;
+      min-height: 0;
+      display: flex;
+      flex-direction: column;
+    }
+    .term-viewport.term-drop-active {
+      outline: 2px dashed var(--signal-blue);
+      outline-offset: -4px;
+      background: rgba(59, 130, 246, 0.08);
+    }
+    .term-scroll-bottom-btn {
+      position: absolute;
+      right: 16px;
+      bottom: 14px;
+      z-index: 15;
+      display: none;
+      align-items: center;
+      gap: 5px;
+      padding: 6px 11px;
+      border-radius: 999px;
+      border: 1px solid var(--border-strong);
+      background: rgba(17, 17, 19, 0.92);
+      color: var(--text-primary);
+      font-size: 11.5px;
+      font-weight: 500;
+      cursor: pointer;
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.42);
+      backdrop-filter: blur(8px);
+    }
+    .term-scroll-bottom-btn.visible {
+      display: inline-flex;
+    }
+    .term-scroll-bottom-btn:hover {
+      background: var(--bg-hover);
+      border-color: var(--signal-blue);
+    }
+    .needs-you-bar {
+      display: none;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      flex-wrap: wrap;
+      padding: 8px 12px;
+      margin-bottom: 8px;
+      border-radius: 10px;
+      border: 1px solid rgba(245, 158, 11, 0.45);
+      background: rgba(245, 158, 11, 0.11);
+      color: var(--text-primary);
+      font-size: 12px;
+    }
+    .needs-you-bar.visible {
+      display: flex;
+    }
+    .needs-you-meta {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-width: 0;
+      flex: 1;
+    }
+    .needs-you-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 999px;
+      background: #f59e0b;
+      box-shadow: 0 0 8px rgba(245, 158, 11, 0.8);
+      flex-shrink: 0;
+    }
+    .needs-you-actions {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-shrink: 0;
+    }
+    .needs-you-btn {
+      padding: 5px 10px;
+      border-radius: 7px;
+      border: 1px solid rgba(245, 158, 11, 0.4);
+      background: rgba(245, 158, 11, 0.18);
+      color: var(--text-primary);
+      font-size: 11.5px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .needs-you-btn:hover {
+      background: rgba(245, 158, 11, 0.3);
+    }
+    .needs-you-btn.primary {
+      background: #f59e0b;
+      border-color: #f59e0b;
+      color: #09090b;
+    }
+    .needs-you-btn.primary:hover {
+      filter: brightness(1.08);
+    }
+    .needs-you-btn.deny {
+      background: transparent;
+      border-color: var(--border-strong);
+      color: var(--text-secondary);
+    }
+    .needs-you-btn.deny:hover {
+      border-color: var(--rose);
+      color: var(--rose);
     }
   </style>
 </head>
