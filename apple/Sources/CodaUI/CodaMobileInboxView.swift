@@ -218,8 +218,8 @@ public struct CodaMobileInboxTabView: View {
             }
 
             Text(tr(
-                "Sign in and pair your Mac or Linux hosts to monitor Claude Code, Codex, Gemini, and shells over zero-knowledge E2EE.",
-                "登录并配对你的 Mac 或 Linux 工作站，通过零知识端到端加密随时控制终端会话。",
+                "Sign in and pair your Mac or Linux hosts to monitor Claude Code, Codex, Grok, Antigravity (AGY), Gemini, and shells over zero-knowledge E2EE.",
+                "登录并配对你的 Mac 或 Linux 工作站，通过零知识端到端加密随时控制 Claude Code、Codex、Grok、AGY 等终端会话。",
                 locale: store.locale
             ))
             .font(.system(size: 14))
@@ -545,8 +545,14 @@ public struct CodaMobileSpacesTabView: View {
                                         }
                                         if repo.branches.count > 1 && group.device.isOnline {
                                             Spacer(minLength: 4)
-                                            Button {
-                                                store.launchAgent(agent: "shell", on: group.device, cwd: b.worktreePath)
+                                            Menu {
+                                                Button("Claude Code") { store.launchAgent(agent: "claude", on: group.device, cwd: b.worktreePath) }
+                                                Button("Codex") { store.launchAgent(agent: "codex", on: group.device, cwd: b.worktreePath) }
+                                                Button("Grok") { store.launchAgent(agent: "grok", on: group.device, cwd: b.worktreePath) }
+                                                Button("Antigravity (AGY)") { store.launchAgent(agent: "agy", on: group.device, cwd: b.worktreePath) }
+                                                Button("Gemini CLI") { store.launchAgent(agent: "gemini", on: group.device, cwd: b.worktreePath) }
+                                                Divider()
+                                                Button("Shell") { store.launchAgent(agent: "shell", on: group.device, cwd: b.worktreePath) }
                                             } label: {
                                                 Image(systemName: "terminal")
                                                     .font(.system(size: 10))
@@ -645,6 +651,8 @@ public struct CodaMobileSpacesTabView: View {
         Menu {
             Button("Claude Code") { store.launchAgent(agent: "claude", on: device, cwd: cwd) }
             Button("Codex") { store.launchAgent(agent: "codex", on: device, cwd: cwd) }
+            Button("Grok") { store.launchAgent(agent: "grok", on: device, cwd: cwd) }
+            Button("Antigravity (AGY)") { store.launchAgent(agent: "agy", on: device, cwd: cwd) }
             Button("Gemini CLI") { store.launchAgent(agent: "gemini", on: device, cwd: cwd) }
             Divider()
             Button("Shell") { store.launchAgent(agent: "shell", on: device, cwd: cwd) }

@@ -414,6 +414,8 @@ public struct CodaAdaptiveRootView: View {
                     Menu {
                         Button("Claude Code") { store.launchAgent(agent: "claude", on: group.device, cwd: group.repos.first?.rootPath) }
                         Button("Codex") { store.launchAgent(agent: "codex", on: group.device, cwd: group.repos.first?.rootPath) }
+                        Button("Grok") { store.launchAgent(agent: "grok", on: group.device, cwd: group.repos.first?.rootPath) }
+                        Button("Antigravity (AGY)") { store.launchAgent(agent: "agy", on: group.device, cwd: group.repos.first?.rootPath) }
                         Button("Gemini CLI") { store.launchAgent(agent: "gemini", on: group.device, cwd: group.repos.first?.rootPath) }
                         Divider()
                         Button("Shell") { store.launchAgent(agent: "shell", on: group.device, cwd: group.repos.first?.rootPath) }
@@ -475,8 +477,14 @@ public struct CodaAdaptiveRootView: View {
                                     }
                                     Spacer()
                                     if group.device.isOnline {
-                                        Button {
-                                            store.launchAgent(agent: "shell", on: group.device, cwd: b.worktreePath)
+                                        Menu {
+                                            Button("Claude Code") { store.launchAgent(agent: "claude", on: group.device, cwd: b.worktreePath) }
+                                            Button("Codex") { store.launchAgent(agent: "codex", on: group.device, cwd: b.worktreePath) }
+                                            Button("Grok") { store.launchAgent(agent: "grok", on: group.device, cwd: b.worktreePath) }
+                                            Button("Antigravity (AGY)") { store.launchAgent(agent: "agy", on: group.device, cwd: b.worktreePath) }
+                                            Button("Gemini CLI") { store.launchAgent(agent: "gemini", on: group.device, cwd: b.worktreePath) }
+                                            Divider()
+                                            Button("Shell") { store.launchAgent(agent: "shell", on: group.device, cwd: b.worktreePath) }
                                         } label: {
                                             Image(systemName: "plus.circle")
                                                 .font(.system(size: 11))
@@ -583,6 +591,8 @@ public struct CodaAdaptiveRootView: View {
                             let defaultCwd = store.workspacesByDevice[onlineHost.id]?.first?.rootPath
                             Button("Claude Code") { store.launchAgent(agent: "claude", on: onlineHost, cwd: defaultCwd) }
                             Button("Codex") { store.launchAgent(agent: "codex", on: onlineHost, cwd: defaultCwd) }
+                            Button("Grok") { store.launchAgent(agent: "grok", on: onlineHost, cwd: defaultCwd) }
+                            Button("Antigravity (AGY)") { store.launchAgent(agent: "agy", on: onlineHost, cwd: defaultCwd) }
                             Button("Gemini CLI") { store.launchAgent(agent: "gemini", on: onlineHost, cwd: defaultCwd) }
                             Divider()
                             Button("Shell") { store.launchAgent(agent: "shell", on: onlineHost, cwd: defaultCwd) }

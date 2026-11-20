@@ -670,6 +670,8 @@ public struct CodaDuoDirectoryPane: View {
                     Menu {
                         Button("Claude Code") { store.launchAgent(agent: "claude", on: group.device, cwd: group.repos.first?.rootPath) }
                         Button("Codex") { store.launchAgent(agent: "codex", on: group.device, cwd: group.repos.first?.rootPath) }
+                        Button("Grok") { store.launchAgent(agent: "grok", on: group.device, cwd: group.repos.first?.rootPath) }
+                        Button("Antigravity (AGY)") { store.launchAgent(agent: "agy", on: group.device, cwd: group.repos.first?.rootPath) }
                         Button("Gemini CLI") { store.launchAgent(agent: "gemini", on: group.device, cwd: group.repos.first?.rootPath) }
                         Divider()
                         Button("Shell") { store.launchAgent(agent: "shell", on: group.device, cwd: group.repos.first?.rootPath) }
@@ -692,6 +694,8 @@ public struct CodaDuoDirectoryPane: View {
                             Menu {
                                 Button("Claude Code") { store.launchAgent(agent: "claude", on: group.device, cwd: repo.rootPath) }
                                 Button("Codex") { store.launchAgent(agent: "codex", on: group.device, cwd: repo.rootPath) }
+                                Button("Grok") { store.launchAgent(agent: "grok", on: group.device, cwd: repo.rootPath) }
+                                Button("Antigravity (AGY)") { store.launchAgent(agent: "agy", on: group.device, cwd: repo.rootPath) }
                                 Button("Gemini CLI") { store.launchAgent(agent: "gemini", on: group.device, cwd: repo.rootPath) }
                                 Divider()
                                 Button("Shell") { store.launchAgent(agent: "shell", on: group.device, cwd: repo.rootPath) }
@@ -743,6 +747,8 @@ public struct CodaDuoDirectoryPane: View {
                         let defaultCwd = store.workspacesByDevice[onlineHost.id]?.first?.rootPath
                         Button("Claude Code") { store.launchAgent(agent: "claude", on: onlineHost, cwd: defaultCwd) }
                         Button("Codex") { store.launchAgent(agent: "codex", on: onlineHost, cwd: defaultCwd) }
+                        Button("Grok") { store.launchAgent(agent: "grok", on: onlineHost, cwd: defaultCwd) }
+                        Button("Antigravity (AGY)") { store.launchAgent(agent: "agy", on: onlineHost, cwd: defaultCwd) }
                         Button("Gemini CLI") { store.launchAgent(agent: "gemini", on: onlineHost, cwd: defaultCwd) }
                         Divider()
                         Button("Shell") { store.launchAgent(agent: "shell", on: onlineHost, cwd: defaultCwd) }

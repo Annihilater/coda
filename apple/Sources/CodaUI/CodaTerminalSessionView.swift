@@ -1120,7 +1120,10 @@ public struct CodaPaneMinimapSheet: View {
                     Menu {
                         Button("Claude Code") { store.launchAgent(agent: "claude", on: device, cwd: session.cwd); dismiss() }
                         Button("Codex") { store.launchAgent(agent: "codex", on: device, cwd: session.cwd); dismiss() }
+                        Button("Grok") { store.launchAgent(agent: "grok", on: device, cwd: session.cwd); dismiss() }
+                        Button("Antigravity (AGY)") { store.launchAgent(agent: "agy", on: device, cwd: session.cwd); dismiss() }
                         Button("Gemini CLI") { store.launchAgent(agent: "gemini", on: device, cwd: session.cwd); dismiss() }
+                        Divider()
                         Button("Shell") { store.launchAgent(agent: "shell", on: device, cwd: session.cwd); dismiss() }
                     } label: {
                         Label(tr("New Pane", "新建窗格", locale: store.locale), systemImage: "plus")
