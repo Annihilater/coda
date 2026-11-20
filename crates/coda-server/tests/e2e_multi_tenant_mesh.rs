@@ -2083,3 +2083,539 @@ async fn test_v2_security_and_lifecycle_endpoints() {
         401
     );
 }
+
+#[tokio::test]
+async fn test_v090_webhook_notifications_daemon_alerts_prune_stale_and_bootstrap_workspace() {
+    let _guard = DB_TEST_LOCK.get_or_init(|| Mutex::new(())).lock().await;
+    let db_url = std::env::var("TEST_DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://vampire@localhost:5432/coda_test".to_string());
+    let pg = acquire_clean_test_db(&db_url).await;
+
+    let server = start_full_server_with_options(
+        &db_url,
+        "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+        "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+        b"v090-webhook-and-prune-secret-key".to_vec(),
+        None,
+        None,
+        ServerOptions {
+            open_registration: true,
+            ..ServerOptions::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let base = format!("http://{}", server.http_addr);
+    let http = reqwest::Client::new();
+
+    // Spin up a local mock webhook receiver for Bark, Feishu, Discord, and Generic JSON webhooks.
+    let (hook_tx, mut hook_rx) = tokio::sync::mpsc::unbounded_channel::<(String, serde_json::Value)>();
+    let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = mock_listener.local_addr().unwrap();
+    let mock_router = axum::Router::new().route(
+        "/hook/{channel}",
+        axum::routing::post({
+            let tx = hook_tx.clone();
+            move |axum::extract::Path(ch): axum::extract::Path<String>,
+                  axum::Json(payload): axum::Json<serde_json::Value>| {
+                let tx = tx.clone();
+                async move {
+                    let _ = tx.send((ch, payload));
+                    axum::http::StatusCode::OK
+                }
+            }
+        }),
+    );
+    let mock_server_task = tokio::spawn(async move {
+        let _ = axum::serve(mock_listener, mock_router).await;
+    });
+
+    // 1. Register owner & second tenant
+    let owner: AuthResponse = http
+        .post(format!("{base}/api/v1/auth/register"))
+        .json(&json!({
+            "email": "owner090@coda.dev",
+            "handle": "owner090",
+            "display_name": "Owner 090",
+            "password": "password-090-owner",
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let other_user: AuthResponse = http
+        .post(format!("{base}/api/v1/auth/register"))
+        .json(&json!({
+            "email": "other090@coda.dev",
+            "handle": "other090",
+            "display_name": "Other 090",
+            "password": "password-090-other",
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    // 2. Default GET /api/v1/me/notifications + SSRF rejection before enabling local test flag
+    let initial_notif: coda_server::NotificationSettingsRecord = http
+        .get(format!("{base}/api/v1/me/notifications"))
+        .bearer_auth(&owner.token)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(initial_notif.bark_url, "");
+    assert!(initial_notif.notify_on_needs_you);
+    assert!(initial_notif.notify_on_finished);
+
+    // Without allow_local_webhook_test, http://127.0.0.1 and https://169.254.169.254 MUST fail SSRF check
+    let ssrf_loopback = http
+        .put(format!("{base}/api/v1/me/notifications"))
+        .bearer_auth(&owner.token)
+        .json(&json!({
+            "generic_webhook_url": format!("http://{mock_addr}/hook/generic"),
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ssrf_loopback.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    let ssrf_metadata = http
+        .put(format!("{base}/api/v1/me/notifications"))
+        .bearer_auth(&owner.token)
+        .json(&json!({
+            "generic_webhook_url": "https://169.254.169.254/latest/meta-data",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ssrf_metadata.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    // Enable local loopback webhook test flag on this test server instance
+    server
+        .state
+        .allow_local_webhook_test
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    // Metadata IP is STILL blocked even with allow_local_webhook_test=true!
+    let ssrf_metadata_still_blocked = http
+        .put(format!("{base}/api/v1/me/notifications"))
+        .bearer_auth(&owner.token)
+        .json(&json!({
+            "generic_webhook_url": "http://169.254.169.254/latest/meta-data",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        ssrf_metadata_still_blocked.status(),
+        reqwest::StatusCode::BAD_REQUEST
+    );
+
+    // 3. Save Bark + Feishu + Discord + Generic webhooks & run POST /api/v1/me/notifications/test
+    let saved_notif: coda_server::NotificationSettingsRecord = http
+        .put(format!("{base}/api/v1/me/notifications"))
+        .bearer_auth(&owner.token)
+        .json(&json!({
+            "bark_url": format!("http://{mock_addr}/hook/bark"),
+            "feishu_webhook_url": format!("http://{mock_addr}/hook/feishu"),
+            "discord_webhook_url": format!("http://{mock_addr}/hook/discord"),
+            "generic_webhook_url": format!("http://{mock_addr}/hook/generic"),
+            "notify_on_needs_you": true,
+            "notify_on_finished": true,
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(saved_notif.feishu_webhook_url.ends_with("/hook/feishu"));
+
+    let test_push: serde_json::Value = http
+        .post(format!("{base}/api/v1/me/notifications/test"))
+        .bearer_auth(&owner.token)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(test_push["ok"], true);
+    assert_eq!(test_push["delivered_channels"].as_array().unwrap().len(), 4);
+    assert!(test_push["errors"].as_array().unwrap().is_empty());
+
+    let mut seen_test_channels = Vec::new();
+    for _ in 0..4 {
+        let (ch, payload) = tokio::time::timeout(std::time::Duration::from_secs(3), hook_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        if ch == "feishu" {
+            assert_eq!(payload["msg_type"], "text");
+        } else if ch == "discord" {
+            assert!(payload["content"].as_str().unwrap().contains("Alert Test"));
+        }
+        seen_test_channels.push(ch);
+    }
+    seen_test_channels.sort();
+    assert_eq!(
+        seen_test_channels,
+        vec!["bark", "discord", "feishu", "generic"]
+    );
+
+    // 4. Pair daemon via RFC 8628 device flow (gives BOTH daemon_host session_token AND daemon_relay_ticket!)
+    let flow = start_device_login_flow(&base, "daemon", Some("Mac-Studio-090".into()), None)
+        .await
+        .unwrap();
+    http.post(format!("{base}/api/v1/auth/device/approve"))
+        .bearer_auth(&owner.token)
+        .json(&json!({ "user_code": flow.user_code }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let daemon_cfg = poll_device_login_once(&flow)
+        .await
+        .unwrap()
+        .expect("daemon approved");
+    let daemon_session_tok = daemon_cfg.session_token.clone().expect("daemon_host token");
+
+    // Verify daemon_host session token cannot call controller endpoints (`PUT /api/v1/me/notifications` -> 403),
+    // yet CAN call `POST /api/v1/daemon/alert`!
+    assert_eq!(
+        http.get(format!("{base}/api/v1/me/notifications"))
+            .bearer_auth(&daemon_session_tok)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::FORBIDDEN
+    );
+
+    // Dispatch alert #1 using `daemon_relay_ticket` bearer token
+    let alert_resp_1: serde_json::Value = http
+        .post(format!("{base}/api/v1/daemon/alert"))
+        .bearer_auth(&daemon_cfg.daemon_relay_ticket)
+        .json(&json!({
+            "device_id": daemon_cfg.device_id,
+            "device_name": "Mac-Studio-090",
+            "session_name": "claude-refactor",
+            "status": "needs_you",
+            "cwd_basename": "/Users/private_org/coda",
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(alert_resp_1["ok"], true);
+    assert_eq!(alert_resp_1["dispatched"], 4);
+
+    for _ in 0..4 {
+        let (ch, payload) = tokio::time::timeout(std::time::Duration::from_secs(3), hook_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let raw_s = serde_json::to_string(&payload).unwrap();
+        assert!(
+            !raw_s.contains("private_org"),
+            "server must strip any parent path components from cwd_basename"
+        );
+        if ch == "generic" {
+            assert_eq!(payload["cwd_basename"], "coda");
+            assert_eq!(payload["status"], "needs_you");
+        }
+    }
+
+    // Immediate duplicate within 60s for same (user, device, session, status) -> 429 rate limited!
+    let dup_resp = http
+        .post(format!("{base}/api/v1/daemon/alert"))
+        .bearer_auth(&daemon_cfg.daemon_relay_ticket)
+        .json(&json!({
+            "device_id": daemon_cfg.device_id,
+            "device_name": "Mac-Studio-090",
+            "session_name": "claude-refactor",
+            "status": "needs_you",
+            "cwd_basename": "coda",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(dup_resp.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+
+    // Distinct status ("finished") using `daemon_host` session token -> succeeds immediately!
+    let alert_resp_2: serde_json::Value = http
+        .post(format!("{base}/api/v1/daemon/alert"))
+        .bearer_auth(&daemon_session_tok)
+        .json(&json!({
+            "device_id": daemon_cfg.device_id,
+            "device_name": "Mac-Studio-090",
+            "session_name": "claude-refactor",
+            "status": "finished",
+            "cwd_basename": "coda",
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(alert_resp_2["dispatched"], 4);
+    for _ in 0..4 {
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), hook_rx.recv())
+            .await
+            .unwrap();
+    }
+
+    // Cross-tenant alert attempt MUST be rejected with 403
+    let cross_alert = http
+        .post(format!("{base}/api/v1/daemon/alert"))
+        .bearer_auth(&other_user.token)
+        .json(&json!({
+            "device_id": daemon_cfg.device_id,
+            "device_name": "Spoofed",
+            "session_name": "spoof",
+            "status": "needs_you",
+            "cwd_basename": "coda",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(cross_alert.status(), reqwest::StatusCode::FORBIDDEN);
+
+    // 5. Stale offline web device pruning (`login` 30-day auto-prune + `POST /api/v1/devices/prune-stale`)
+    let reg_client = |name: &str, platform: &str| {
+        let http = http.clone();
+        let base = base.clone();
+        let tok = owner.token.clone();
+        let name = name.to_string();
+        let platform = platform.to_string();
+        async move {
+            let id = StoredDeviceIdentity::generate(&name);
+            http.post(format!("{base}/api/v1/devices/register-client"))
+                .bearer_auth(&tok)
+                .json(&json!({
+                    "name": name,
+                    "platform": platform,
+                    "ed25519_pubkey": id.ed25519_public_b64,
+                    "x25519_pubkey": id.x25519_public_b64,
+                }))
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json::<DeviceRecord>()
+                .await
+                .unwrap()
+        }
+    };
+
+    let web_old = reg_client("Chrome 35d Old", "web").await;
+    let web_recent = reg_client("Safari 2d Recent", "web").await;
+    let web_online = reg_client("Arc Live Tab", "web").await;
+    let ios_offline = reg_client("iPhone Offline", "ios").await;
+
+    pg.execute(
+        "UPDATE devices SET last_seen_at = NOW() - INTERVAL '35 days', is_online = FALSE WHERE id = $1",
+        &[&web_old.id],
+    )
+    .await
+    .unwrap();
+    pg.execute(
+        "UPDATE devices SET last_seen_at = NOW() - INTERVAL '2 days', is_online = FALSE WHERE id = $1",
+        &[&web_recent.id],
+    )
+    .await
+    .unwrap();
+    pg.execute(
+        "UPDATE devices SET is_online = TRUE WHERE id = $1",
+        &[&web_online.id],
+    )
+    .await
+    .unwrap();
+    pg.execute(
+        "UPDATE devices SET last_seen_at = NOW() - INTERVAL '40 days', is_online = FALSE WHERE id = $1",
+        &[&ios_offline.id],
+    )
+    .await
+    .unwrap();
+
+    // Logging in auto-prunes >30d offline `web` client (`web_old`) while keeping `web_recent`, `web_online`, `ios_offline`, and `daemon`!
+    let _relogin: AuthResponse = http
+        .post(format!("{base}/api/v1/auth/login"))
+        .json(&json!({
+            "email_or_handle": "owner090",
+            "password": "password-090-owner",
+            "client_label": "web",
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let devs_after_login: Vec<DeviceRecord> = http
+        .get(format!("{base}/api/v1/devices"))
+        .bearer_auth(&owner.token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(!devs_after_login.iter().any(|d| d.id == web_old.id));
+    assert!(devs_after_login.iter().any(|d| d.id == web_recent.id));
+    assert!(devs_after_login.iter().any(|d| d.id == web_online.id));
+    assert!(devs_after_login.iter().any(|d| d.id == ios_offline.id));
+
+    // Manual `POST /api/v1/devices/prune-stale` with empty body defaults `max_idle_days` to 0 -> sweeps `web_recent`!
+    let prune_res: serde_json::Value = http
+        .post(format!("{base}/api/v1/devices/prune-stale"))
+        .bearer_auth(&owner.token)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(prune_res["ok"], true);
+    assert_eq!(prune_res["pruned_count"], 1);
+
+    let devs_after_prune: Vec<DeviceRecord> = http
+        .get(format!("{base}/api/v1/devices"))
+        .bearer_auth(&owner.token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(!devs_after_prune.iter().any(|d| d.id == web_recent.id));
+    assert!(devs_after_prune.iter().any(|d| d.id == web_online.id));
+    assert!(devs_after_prune.iter().any(|d| d.id == ios_offline.id));
+    assert!(devs_after_prune.iter().any(|d| d.id == daemon_cfg.device_id));
+
+    // 6. Verify live E2EE BootstrapWorkspace over Raw TCP Relay
+    let cfg_bg = daemon_cfg.clone();
+    let daemon_task = tokio::spawn(async move {
+        let _ = coda_daemon::run_daemon_once(&cfg_bg, Some("raw_tcp_no_sni")).await;
+    });
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let devs: Vec<DeviceRecord> = http
+            .get(format!("{base}/api/v1/devices"))
+            .bearer_auth(&owner.token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if devs.iter().any(|d| d.id == daemon_cfg.device_id && d.is_online) {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "daemon online timeout");
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+    }
+
+    let mut ctrl_id = StoredDeviceIdentity::generate("Controller Mac");
+    let ctrl_dev: DeviceRecord = http
+        .post(format!("{base}/api/v1/devices/register-client"))
+        .bearer_auth(&owner.token)
+        .json(&json!({
+            "name": "Controller Mac",
+            "platform": "macos",
+            "ed25519_pubkey": ctrl_id.ed25519_public_b64,
+            "x25519_pubkey": ctrl_id.x25519_public_b64,
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    ctrl_id.device_id = Some(ctrl_dev.id);
+
+    let relay_cfg = mint_peer_relay_config(
+        &base,
+        &owner.token,
+        ctrl_dev.id,
+        daemon_cfg.device_id,
+        &daemon_cfg.identity.ed25519_public_b64,
+        &daemon_cfg.identity.x25519_public_b64,
+    )
+    .await
+    .unwrap();
+    let mut smart = SmartPeerClient::connect_auto(
+        ctrl_id,
+        ctrl_dev.id,
+        daemon_cfg.device_id,
+        PeerIdentityPin {
+            ed25519_pub_b64: daemon_cfg.identity.ed25519_public_b64.clone(),
+            x25519_pub_b64: daemon_cfg.identity.x25519_public_b64.clone(),
+        },
+        vec![],
+        None,
+        Some(relay_cfg),
+    )
+    .await
+    .unwrap();
+
+    let tmp_parent = std::env::temp_dir().join(format!("coda-e2e-bw-{}", uuid::Uuid::new_v4()));
+    let bw_reply = smart
+        .request(
+            &PeerMessage::BootstrapWorkspace {
+                req_id: "e2e-bw-1".into(),
+                parent_dir: tmp_parent.to_string_lossy().to_string(),
+                folder_name: "new-agent-repo".into(),
+                git_clone_url: None,
+            },
+            TrafficLane::ControlP0,
+        )
+        .await
+        .unwrap();
+    match bw_reply {
+        PeerMessage::BootstrapWorkspaceResult {
+            ok, workspace_path, ..
+        } => {
+            assert!(ok);
+            assert!(std::path::Path::new(&workspace_path).is_dir());
+        }
+        other => panic!("unexpected reply: {other:?}"),
+    }
+    let _ = std::fs::remove_dir_all(&tmp_parent);
+
+    daemon_task.abort();
+    mock_server_task.abort();
+}

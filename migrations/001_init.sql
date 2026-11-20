@@ -114,6 +114,20 @@ CREATE TABLE IF NOT EXISTS device_auth_requests (
 CREATE INDEX IF NOT EXISTS idx_device_auth_user_code ON device_auth_requests (user_code, expires_at);
 CREATE INDEX IF NOT EXISTS idx_device_auth_expires ON device_auth_requests (expires_at);
 
+-- 8. User Offline Alert Notification Webhooks (Zero-Knowledge Metadata-Only Push)
+CREATE TABLE IF NOT EXISTS user_notification_settings (
+    user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    bark_url TEXT NOT NULL DEFAULT '',
+    telegram_bot_token TEXT NOT NULL DEFAULT '',
+    telegram_chat_id TEXT NOT NULL DEFAULT '',
+    feishu_webhook_url TEXT NOT NULL DEFAULT '',
+    discord_webhook_url TEXT NOT NULL DEFAULT '',
+    generic_webhook_url TEXT NOT NULL DEFAULT '',
+    notify_on_needs_you BOOLEAN NOT NULL DEFAULT TRUE,
+    notify_on_finished BOOLEAN NOT NULL DEFAULT TRUE,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 -- Idempotent schema hardening for databases created before these constraints existed.
 DO $$
 BEGIN

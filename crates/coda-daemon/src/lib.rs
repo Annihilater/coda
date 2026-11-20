@@ -9,7 +9,10 @@
 pub mod fs_sandbox;
 pub mod telemetry_ota;
 
-pub use fs_sandbox::is_sensitive_path;
+pub use fs_sandbox::{
+    expand_tilde_path, handle_bootstrap_workspace_rpc, is_sensitive_path, validate_git_clone_url,
+    validate_workspace_folder_name,
+};
 use fs_sandbox::{
     handle_list_directory_rpc, handle_read_file_preview_rpc, lossy_utf8_prefix,
     sanitize_upload_filename, validate_local_preview_target,
@@ -1701,12 +1704,282 @@ async fn send_e2ee_peer_message(
     true
 }
 
+const DAEMON_ALERT_COOLDOWN_SECS: u64 = 60;
+const MAX_GIT_DIFF_BYTES: usize = 256 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DaemonTermAlertPhase {
+    NeedsYou,
+    Working,
+    Done,
+    Idle,
+}
+
+impl DaemonTermAlertPhase {
+    pub fn from_herdr_status(status: &coda_protocol::HerdrAgentStatus) -> Self {
+        let raw = status.state.trim().to_ascii_lowercase();
+        match raw.as_str() {
+            "needs_you" | "needsyou" | "needs-you" | "blocked" | "waiting" | "attention"
+            | "prompt" | "permission" | "error" => Self::NeedsYou,
+            "working" | "running" | "busy" | "active" | "thinking" | "streaming" => Self::Working,
+            "done" | "completed" | "finished" | "success" => Self::Done,
+            _ => {
+                if status
+                    .kind
+                    .as_deref()
+                    .is_some_and(|k| matches!(k, "permission" | "question" | "auth"))
+                {
+                    Self::NeedsYou
+                } else {
+                    Self::Idle
+                }
+            }
+        }
+    }
+}
+
+/// Zero-Knowledge metadata-only alert payload sent to `POST /api/v1/daemon/alert` (ZERO terminal plaintext).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonAlertPayload {
+    pub device_id: Uuid,
+    pub device_name: String,
+    pub session_name: String,
+    pub status: String,
+    pub cwd_basename: String,
+}
+
+fn sanitize_alert_meta_field(raw: &str, max_chars: usize) -> String {
+    raw.trim()
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(max_chars)
+        .collect()
+}
+
+fn extract_safe_cwd_basename(cwd: &str) -> String {
+    let trimmed = cwd.trim().trim_end_matches(['/', '\\']);
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    Path::new(trimmed)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .map(|s| sanitize_alert_meta_field(s, 64))
+        .unwrap_or_default()
+}
+
+fn extract_safe_terminal_session_name(term: &HerdrTerminalSummary) -> String {
+    let candidate = term
+        .name
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            term.argv
+                .first()
+                .and_then(|bin| Path::new(bin).file_name())
+                .and_then(|s| s.to_str())
+                .filter(|s| !s.trim().is_empty())
+        })
+        .unwrap_or(&term.address);
+    sanitize_alert_meta_field(candidate, 64)
+}
+
+#[derive(Default)]
+pub struct DaemonAlertTracker {
+    last_phase: HashMap<String, DaemonTermAlertPhase>,
+    known_meta: HashMap<String, (String, String)>,
+    cooldowns: HashMap<(String, String), std::time::Instant>,
+}
+
+impl DaemonAlertTracker {
+    pub fn observe_live_event(
+        &mut self,
+        device_id: Uuid,
+        device_name: &str,
+        terminal: Option<&HerdrTerminalSummary>,
+        raw_event: &serde_json::Value,
+        now: std::time::Instant,
+    ) -> Option<(String, DaemonAlertPayload)> {
+        if let Some(t) = terminal {
+            if !t.address.trim().is_empty() {
+                if self.known_meta.len() >= 512 && !self.known_meta.contains_key(&t.address) {
+                    self.known_meta.clear();
+                }
+                self.known_meta.insert(
+                    t.address.clone(),
+                    (
+                        extract_safe_terminal_session_name(t),
+                        extract_safe_cwd_basename(&t.cwd),
+                    ),
+                );
+            }
+        }
+
+        let addr = terminal
+            .map(|t| t.address.as_str())
+            .or_else(|| raw_event.get("address").and_then(|v| v.as_str()))
+            .or_else(|| {
+                raw_event
+                    .get("terminal")
+                    .and_then(|t| t.get("address"))
+                    .and_then(|v| v.as_str())
+            })
+            .map(str::trim)
+            .filter(|s| !s.is_empty())?;
+
+        let status_obj = terminal
+            .and_then(|t| t.status.clone())
+            .or_else(|| {
+                raw_event
+                    .get("status")
+                    .and_then(|v| serde_json::from_value::<coda_protocol::HerdrAgentStatus>(v.clone()).ok())
+            })
+            .or_else(|| {
+                raw_event
+                    .get("terminal")
+                    .and_then(|t| t.get("status"))
+                    .and_then(|v| serde_json::from_value::<coda_protocol::HerdrAgentStatus>(v.clone()).ok())
+            })?;
+
+        let new_phase = DaemonTermAlertPhase::from_herdr_status(&status_obj);
+        if self.last_phase.len() >= 512 && !self.last_phase.contains_key(addr) {
+            self.last_phase.clear();
+        }
+        let prev_phase = self.last_phase.insert(addr.to_string(), new_phase);
+
+        let alert_status = if new_phase == DaemonTermAlertPhase::NeedsYou
+            && prev_phase != Some(DaemonTermAlertPhase::NeedsYou)
+        {
+            Some("needs_you")
+        } else if matches!(
+            new_phase,
+            DaemonTermAlertPhase::Idle | DaemonTermAlertPhase::Done
+        ) && prev_phase == Some(DaemonTermAlertPhase::Working)
+        {
+            Some("finished")
+        } else {
+            None
+        }?;
+
+        let cooldown_dur = std::time::Duration::from_secs(DAEMON_ALERT_COOLDOWN_SECS);
+        self.cooldowns
+            .retain(|_, ts| now.saturating_duration_since(*ts) < cooldown_dur * 2);
+        let cooldown_key = (addr.to_string(), alert_status.to_string());
+        if let Some(prev_ts) = self.cooldowns.get(&cooldown_key) {
+            if now.saturating_duration_since(*prev_ts) < cooldown_dur {
+                return None;
+            }
+        }
+        self.cooldowns.insert(cooldown_key, now);
+
+        let (session_name, cwd_basename) = self
+            .known_meta
+            .get(addr)
+            .cloned()
+            .unwrap_or_else(|| (sanitize_alert_meta_field(addr, 64), String::new()));
+
+        Some((
+            addr.to_string(),
+            DaemonAlertPayload {
+                device_id,
+                device_name: sanitize_alert_meta_field(device_name, 64),
+                session_name,
+                status: alert_status.to_string(),
+                cwd_basename,
+            },
+        ))
+    }
+
+    pub fn cache_terminal_meta(&mut self, term: &HerdrTerminalSummary) {
+        if !term.address.trim().is_empty() {
+            if self.known_meta.len() >= 512 && !self.known_meta.contains_key(&term.address) {
+                self.known_meta.clear();
+            }
+            self.known_meta.insert(
+                term.address.clone(),
+                (
+                    extract_safe_terminal_session_name(term),
+                    extract_safe_cwd_basename(&term.cwd),
+                ),
+            );
+        }
+    }
+}
+
+#[derive(Clone)]
+struct DaemonAlertPushAuth {
+    server_url: String,
+    device_id: Uuid,
+    device_name: String,
+    session_token: Option<String>,
+    relay_ticket: String,
+}
+
+impl DaemonAlertPushAuth {
+    fn from_config(cfg: &DaemonConfig) -> Self {
+        Self {
+            server_url: cfg.server_url.trim().trim_end_matches('/').to_string(),
+            device_id: cfg.device_id,
+            device_name: cfg.identity.name.clone(),
+            session_token: cfg.session_token.clone(),
+            relay_ticket: cfg.daemon_relay_ticket.clone(),
+        }
+    }
+}
+
+async fn post_daemon_alert_metadata(auth: &DaemonAlertPushAuth, payload: &DaemonAlertPayload) {
+    if auth.server_url.is_empty() {
+        return;
+    }
+    let url = format!("{}/api/v1/daemon/alert", auth.server_url);
+    let session_tok = auth
+        .session_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let ticket_tok = auth.relay_ticket.trim();
+
+    if let Some(tok) = session_tok {
+        match daemon_http_client()
+            .post(&url)
+            .bearer_auth(tok)
+            .json(payload)
+            .send()
+            .await
+        {
+            Ok(resp)
+                if matches!(
+                    resp.status(),
+                    reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+                ) && !ticket_tok.is_empty() =>
+            {
+                let _ = daemon_http_client()
+                    .post(&url)
+                    .bearer_auth(ticket_tok)
+                    .json(payload)
+                    .send()
+                    .await;
+            }
+            _ => {}
+        }
+    } else if !ticket_tok.is_empty() {
+        let _ = daemon_http_client()
+            .post(&url)
+            .bearer_auth(ticket_tok)
+            .json(payload)
+            .send()
+            .await;
+    }
+}
+
 fn spawn_herdr_event_forwarder(
     herdr: SharedHerdr,
     sessions: Arc<Mutex<HashMap<PeerSessionKey, PeerCryptoSession>>>,
-    my_device_id: Uuid,
+    alert_auth: DaemonAlertPushAuth,
+    alert_tracker: Arc<StdMutex<DaemonAlertTracker>>,
     stop_flag: Arc<std::sync::atomic::AtomicBool>,
 ) -> tokio::task::JoinHandle<()> {
+    let my_device_id = alert_auth.device_id;
     tokio::spawn(async move {
         let mut seq: u64 = 0;
         let mut backoff_secs = 1u64;
@@ -1741,6 +2014,40 @@ fn spawn_herdr_event_forwarder(
                     .get("terminal")
                     .and_then(|v| serde_json::from_value::<HerdrTerminalSummary>(v.clone()).ok())
                     .or_else(|| serde_json::from_value::<HerdrTerminalSummary>(raw_event.clone()).ok());
+
+                // Zero-Knowledge Offline Alert Push trigger (fires even when 0 E2EE client peers are online!).
+                let maybe_alert = alert_tracker
+                    .lock()
+                    .ok()
+                    .and_then(|mut tr| {
+                        tr.observe_live_event(
+                            alert_auth.device_id,
+                            &alert_auth.device_name,
+                            terminal.as_ref(),
+                            &raw_event,
+                            std::time::Instant::now(),
+                        )
+                    });
+                if let Some((term_addr, mut alert_payload)) = maybe_alert {
+                    let auth_c = alert_auth.clone();
+                    let hc_c = Arc::clone(&hc);
+                    let tracker_c = Arc::clone(&alert_tracker);
+                    tokio::spawn(async move {
+                        if alert_payload.cwd_basename.is_empty() {
+                            if let Ok(list) = hc_c.list_terminals(false).await {
+                                if let Some(found) = list.iter().find(|t| t.address == term_addr) {
+                                    alert_payload.session_name = extract_safe_terminal_session_name(found);
+                                    alert_payload.cwd_basename = extract_safe_cwd_basename(&found.cwd);
+                                    if let Ok(mut tr) = tracker_c.lock() {
+                                        tr.cache_terminal_meta(found);
+                                    }
+                                }
+                            }
+                        }
+                        post_daemon_alert_metadata(&auth_c, &alert_payload).await;
+                    });
+                }
+
                 let peer_keys: Vec<PeerSessionKey> = {
                     let map = sessions.lock().await;
                     map.keys().cloned().collect()
@@ -2127,6 +2434,7 @@ pub struct SharedHostRuntime {
     herdr: SharedHerdr,
     fallback_shells: Arc<Mutex<NativeFallbackShells>>,
     active_ptys: Arc<Mutex<HashMap<(PeerSessionKey, String), ActivePtySubscription>>>,
+    alert_tracker: Arc<StdMutex<DaemonAlertTracker>>,
     shutdown_tx: watch::Sender<bool>,
     reexec_tx: watch::Sender<bool>,
     started_at: std::time::Instant,
@@ -2142,6 +2450,7 @@ impl SharedHostRuntime {
             herdr,
             fallback_shells: Arc::new(Mutex::new(NativeFallbackShells::default())),
             active_ptys: Arc::new(Mutex::new(HashMap::new())),
+            alert_tracker: Arc::new(StdMutex::new(DaemonAlertTracker::default())),
             shutdown_tx,
             reexec_tx,
             started_at: std::time::Instant::now(),
@@ -2552,7 +2861,8 @@ pub async fn run_daemon_once_with_runtime(
     let event_forwarder = spawn_herdr_event_forwarder(
         Arc::clone(&herdr),
         Arc::clone(&sessions),
-        my_device_id,
+        DaemonAlertPushAuth::from_config(cfg),
+        Arc::clone(&runtime.alert_tracker),
         Arc::clone(&stop_events),
     );
     _task_guard.0.push(event_forwarder.abort_handle());
@@ -3119,7 +3429,8 @@ async fn handle_direct_p2p_socket(
     let event_forwarder = spawn_herdr_event_forwarder(
         Arc::clone(&herdr),
         Arc::clone(&sessions),
-        cfg.device_id,
+        DaemonAlertPushAuth::from_config(&cfg),
+        Arc::clone(&runtime.alert_tracker),
         Arc::clone(&stop_events),
     );
     // #3: Subscribe to live TrustedPeersStore updates so revoked devices disconnect immediately.
@@ -3310,7 +3621,8 @@ async fn handle_direct_p2p_ws_socket(
     let event_forwarder = spawn_herdr_event_forwarder(
         Arc::clone(&herdr),
         Arc::clone(&sessions),
-        cfg.device_id,
+        DaemonAlertPushAuth::from_config(&cfg),
+        Arc::clone(&runtime.alert_tracker),
         Arc::clone(&stop_events),
     );
     let mut peer_updates = peers_store.subscribe_updates();
@@ -4500,96 +4812,7 @@ async fn handle_peer_request(
                 TrafficLane::BulkP1,
             )
         }
-        PeerMessage::GitDiffRequest { req_id, cwd } => {
-            let safe_cwd = tokio::fs::canonicalize(&cwd)
-                .await
-                .ok()
-                .filter(|p| !is_sensitive_path(p));
-            let Some(canon_cwd) = safe_cwd else {
-                return (
-                    PeerMessage::GitDiffResponse {
-                        req_id,
-                        branch: String::new(),
-                        status_short: String::new(),
-                        diff_unified: String::new(),
-                    },
-                    TrafficLane::BulkP1,
-                );
-            };
-            let cwd_str = canon_cwd.to_string_lossy().to_string();
-            let branch = run_cmd_capture(
-                "git",
-                &[
-                    "-C",
-                    &cwd_str,
-                    "-c",
-                    "core.quotePath=false",
-                    "-c",
-                    "core.fsmonitor=false",
-                    "rev-parse",
-                    "--abbrev-ref",
-                    "HEAD",
-                ],
-            )
-            .await
-            .unwrap_or_default();
-            let status_short = run_cmd_capture(
-                "git",
-                &[
-                    "-C",
-                    &cwd_str,
-                    "-c",
-                    "core.quotePath=false",
-                    "-c",
-                    "core.fsmonitor=false",
-                    "status",
-                    "--short",
-                ],
-            )
-            .await
-            .unwrap_or_default();
-            // #41: Diff against HEAD (falls back to working tree diff on unborn repos) so staged changes show too.
-            let diff_unified = run_cmd_capture(
-                "git",
-                &[
-                    "-C",
-                    &cwd_str,
-                    "-c",
-                    "core.quotePath=false",
-                    "-c",
-                    "core.fsmonitor=false",
-                    "diff",
-                    "--no-color",
-                    "HEAD",
-                ],
-            )
-            .await
-            .filter(|s| !s.is_empty())
-            .or(run_cmd_capture(
-                "git",
-                &[
-                    "-C",
-                    &cwd_str,
-                    "-c",
-                    "core.quotePath=false",
-                    "-c",
-                    "core.fsmonitor=false",
-                    "diff",
-                    "--no-color",
-                ],
-            )
-            .await)
-            .unwrap_or_default();
-            (
-                PeerMessage::GitDiffResponse {
-                    req_id,
-                    branch: branch.trim().to_string(),
-                    status_short,
-                    diff_unified,
-                },
-                TrafficLane::BulkP1,
-            )
-        }
+        PeerMessage::GitDiffRequest { req_id, cwd } => handle_git_diff_rpc(req_id, cwd).await,
         PeerMessage::HttpLocalPreviewRequest { req_id, port, path } => {
             let target_url = match validate_local_preview_target(port, &path) {
                 Ok(u) => u,
@@ -4674,6 +4897,12 @@ async fn handle_peer_request(
             path,
             max_bytes,
         } => handle_read_file_preview_rpc(req_id, path, max_bytes).await,
+        PeerMessage::BootstrapWorkspace {
+            req_id,
+            parent_dir,
+            folder_name,
+            git_clone_url,
+        } => handle_bootstrap_workspace_rpc(req_id, parent_dir, folder_name, git_clone_url).await,
         other => (
             PeerMessage::ActionAck {
                 req_id: "unhandled".into(),
@@ -4683,6 +4912,162 @@ async fn handle_peer_request(
             TrafficLane::ControlP0,
         ),
     }
+}
+
+pub async fn handle_git_diff_rpc(req_id: String, cwd: String) -> (PeerMessage, TrafficLane) {
+    let empty_resp = |req_id: String| {
+        (
+            PeerMessage::GitDiffResponse {
+                req_id,
+                branch: String::new(),
+                status_short: String::new(),
+                diff_unified: String::new(),
+            },
+            TrafficLane::BulkP1,
+        )
+    };
+
+    let Ok(expanded) = expand_tilde_path(&cwd) else {
+        return empty_resp(req_id);
+    };
+    if is_sensitive_path(&expanded) {
+        return empty_resp(req_id);
+    }
+    let Ok(canon_cwd) = tokio::fs::canonicalize(&expanded).await else {
+        return empty_resp(req_id);
+    };
+    let is_dir = tokio::fs::metadata(&canon_cwd)
+        .await
+        .map(|m| m.is_dir())
+        .unwrap_or(false);
+    if !is_dir || is_sensitive_path(&canon_cwd) {
+        return empty_resp(req_id);
+    }
+
+    let cwd_str = canon_cwd.to_string_lossy().to_string();
+    let branch = match run_cmd_capture(
+        "git",
+        &[
+            "-C",
+            &cwd_str,
+            "-c",
+            "core.quotePath=false",
+            "-c",
+            "core.fsmonitor=false",
+            "rev-parse",
+            "--abbrev-ref",
+            "HEAD",
+        ],
+    )
+    .await
+    {
+        Some(b) if !b.trim().is_empty() => b,
+        _ => run_cmd_capture(
+            "git",
+            &[
+                "-C",
+                &cwd_str,
+                "-c",
+                "core.quotePath=false",
+                "-c",
+                "core.fsmonitor=false",
+                "symbolic-ref",
+                "--short",
+                "HEAD",
+            ],
+        )
+        .await
+        .unwrap_or_default(),
+    };
+
+    let status_raw = run_cmd_capture(
+        "git",
+        &[
+            "-C",
+            &cwd_str,
+            "-c",
+            "core.quotePath=false",
+            "-c",
+            "core.fsmonitor=false",
+            "status",
+            "--short",
+        ],
+    )
+    .await
+    .unwrap_or_default();
+    let status_short = lossy_utf8_prefix(status_raw.as_bytes(), MAX_GIT_DIFF_BYTES);
+
+    // #41: Diff against HEAD (falls back to working tree / staged diff on unborn repos) and truncate UTF-8 safely to 256 KiB.
+    let diff_raw = match run_cmd_capture(
+        "git",
+        &[
+            "-C",
+            &cwd_str,
+            "-c",
+            "core.quotePath=false",
+            "-c",
+            "core.fsmonitor=false",
+            "diff",
+            "--no-color",
+            "--no-ext-diff",
+            "HEAD",
+        ],
+    )
+    .await
+    {
+        Some(d) if !d.is_empty() => d,
+        Some(_) => String::new(),
+        None => {
+            let wt = run_cmd_capture(
+                "git",
+                &[
+                    "-C",
+                    &cwd_str,
+                    "-c",
+                    "core.quotePath=false",
+                    "-c",
+                    "core.fsmonitor=false",
+                    "diff",
+                    "--no-color",
+                    "--no-ext-diff",
+                ],
+            )
+            .await
+            .unwrap_or_default();
+            if !wt.is_empty() {
+                wt
+            } else {
+                run_cmd_capture(
+                    "git",
+                    &[
+                        "-C",
+                        &cwd_str,
+                        "-c",
+                        "core.quotePath=false",
+                        "-c",
+                        "core.fsmonitor=false",
+                        "diff",
+                        "--no-color",
+                        "--no-ext-diff",
+                        "--cached",
+                    ],
+                )
+                .await
+                .unwrap_or_default()
+            }
+        }
+    };
+    let diff_unified = lossy_utf8_prefix(diff_raw.as_bytes(), MAX_GIT_DIFF_BYTES);
+
+    (
+        PeerMessage::GitDiffResponse {
+            req_id,
+            branch: branch.trim().to_string(),
+            status_short,
+            diff_unified,
+        },
+        TrafficLane::BulkP1,
+    )
 }
 
 async fn run_cmd_capture(bin: &str, args: &[&str]) -> Option<String> {
@@ -5901,5 +6286,273 @@ mod tests {
         assert_eq!(parse_relay_ticket_exp_unix(&signed), Some(claims.exp_unix));
         assert!(ticket_needs_renewal(&signed, 7 * 86_400));
         assert!(!ticket_needs_renewal(&signed, 24 * 3600));
+    }
+
+    #[test]
+    fn test_bootstrap_workspace_folder_and_git_url_rce_guards() {
+        assert_eq!(
+            validate_workspace_folder_name("my-new_repo.v2").unwrap(),
+            "my-new_repo.v2"
+        );
+        assert!(validate_workspace_folder_name("").is_err());
+        assert!(validate_workspace_folder_name("   ").is_err());
+        assert!(validate_workspace_folder_name("..").is_err());
+        assert!(validate_workspace_folder_name("../escape").is_err());
+        assert!(validate_workspace_folder_name("a/b").is_err());
+        assert!(validate_workspace_folder_name("a\\b").is_err());
+        assert!(validate_workspace_folder_name("bad\0name").is_err());
+        assert!(validate_workspace_folder_name("-oProxyCommand=id").is_err());
+        assert!(validate_workspace_folder_name("--upload-pack=sh").is_err());
+
+        assert!(validate_git_clone_url("https://github.com/Annihilater/coda.git").is_ok());
+        assert!(validate_git_clone_url("ssh://git@github.com:22/Annihilater/coda.git").is_ok());
+        assert!(validate_git_clone_url("git@github.com:Annihilater/coda.git").is_ok());
+
+        // Block git RCE / SSRF / arbitrary transport schemes
+        assert!(validate_git_clone_url("ext::sh -c touch% /tmp/pwn").is_err());
+        assert!(validate_git_clone_url("ext::id").is_err());
+        assert!(validate_git_clone_url("file:///etc/passwd").is_err());
+        assert!(validate_git_clone_url("http://github.com/Annihilater/coda.git").is_err());
+        assert!(validate_git_clone_url("git://github.com/Annihilater/coda.git").is_err());
+        assert!(validate_git_clone_url("--upload-pack=touch").is_err());
+        assert!(validate_git_clone_url("-u./payload").is_err());
+        assert!(validate_git_clone_url("ssh://-oProxyCommand=id/repo.git").is_err());
+        assert!(validate_git_clone_url("git@-oProxyCommand=id:repo.git").is_err());
+        assert!(validate_git_clone_url("git@github.com:-upload-pack=id").is_err());
+        assert!(validate_git_clone_url("https://127.0.0.1/repo.git").is_err());
+        assert!(validate_git_clone_url("https://169.254.169.254/latest/meta-data").is_err());
+    }
+
+    #[tokio::test]
+    async fn test_bootstrap_workspace_mkdir_and_git_diff_truncation() {
+        let root = std::env::temp_dir().join(format!("coda-ws-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+
+        // 1. Valid mkdir workspace creation
+        let (msg, lane) = handle_bootstrap_workspace_rpc(
+            "bw-ok".into(),
+            root.to_string_lossy().to_string(),
+            "alpha-service".into(),
+            None,
+        )
+        .await;
+        assert_eq!(lane, TrafficLane::ControlP0);
+        let ws_path = match msg {
+            PeerMessage::BootstrapWorkspaceResult {
+                req_id,
+                ok,
+                workspace_path,
+                detail,
+            } => {
+                assert_eq!(req_id, "bw-ok");
+                assert!(ok, "unexpected bootstrap error: {detail}");
+                assert_eq!(detail, "created");
+                workspace_path
+            }
+            other => panic!("unexpected response: {other:?}"),
+        };
+        assert!(Path::new(&ws_path).is_dir());
+
+        // 2. Reject sensitive target folder (`.ssh`) and RCE git URL (`ext::`)
+        let (bad_sens, _) = handle_bootstrap_workspace_rpc(
+            "bw-ssh".into(),
+            root.to_string_lossy().to_string(),
+            ".ssh".into(),
+            None,
+        )
+        .await;
+        match bad_sens {
+            PeerMessage::BootstrapWorkspaceResult { ok, .. } => assert!(!ok),
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        let (bad_url, _) = handle_bootstrap_workspace_rpc(
+            "bw-rce".into(),
+            root.to_string_lossy().to_string(),
+            "safe-dir".into(),
+            Some("ext::sh -c id".into()),
+        )
+        .await;
+        match bad_url {
+            PeerMessage::BootstrapWorkspaceResult { ok, .. } => assert!(!ok),
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        // 3. Verify GitDiffRequest handles repo + >256 KiB multi-byte UTF-8 truncation + sensitive path block
+        let _ = Command::new("git")
+            .args(["-C", &ws_path, "init", "-b", "main"])
+            .output()
+            .await;
+        let _ = Command::new("git")
+            .args(["-C", &ws_path, "config", "user.email", "test@coda.dev"])
+            .output()
+            .await;
+        let _ = Command::new("git")
+            .args(["-C", &ws_path, "config", "user.name", "Coda Test"])
+            .output()
+            .await;
+        let file_path = Path::new(&ws_path).join("notes.txt");
+        std::fs::write(&file_path, "base line\n").unwrap();
+        let _ = Command::new("git")
+            .args(["-C", &ws_path, "add", "notes.txt"])
+            .output()
+            .await;
+        let _ = Command::new("git")
+            .args(["-C", &ws_path, "commit", "-m", "init"])
+            .output()
+            .await;
+
+        // Write > 300 KiB of multi-byte UTF-8 content so unified diff exceeds 256 KiB
+        let big_cjk = "零知识加密代码审查行🚀\n".repeat(12_000);
+        std::fs::write(&file_path, big_cjk).unwrap();
+
+        let (diff_msg, diff_lane) = handle_git_diff_rpc("gd-1".into(), ws_path.clone()).await;
+        assert_eq!(diff_lane, TrafficLane::BulkP1);
+        match diff_msg {
+            PeerMessage::GitDiffResponse {
+                req_id,
+                branch,
+                status_short,
+                diff_unified,
+            } => {
+                assert_eq!(req_id, "gd-1");
+                assert!(!branch.is_empty());
+                assert!(status_short.contains("notes.txt"));
+                assert!(!diff_unified.is_empty());
+                assert!(diff_unified.len() <= MAX_GIT_DIFF_BYTES);
+                assert!(!diff_unified.contains('\u{FFFD}'));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        let ssh_dir = root.join(".ssh");
+        std::fs::create_dir_all(&ssh_dir).unwrap();
+        let (sens_diff, _) =
+            handle_git_diff_rpc("gd-sens".into(), ssh_dir.to_string_lossy().to_string()).await;
+        match sens_diff {
+            PeerMessage::GitDiffResponse {
+                branch,
+                status_short,
+                diff_unified,
+                ..
+            } => {
+                assert!(branch.is_empty());
+                assert!(status_short.is_empty());
+                assert!(diff_unified.is_empty());
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_daemon_zero_knowledge_alert_tracker_edges_and_cooldown() {
+        let mut tracker = DaemonAlertTracker::default();
+        let dev_id = Uuid::new_v4();
+        let t0 = std::time::Instant::now();
+
+        let mk_term = |state: &str, msg: Option<&str>| HerdrTerminalSummary {
+            address: "term-42".into(),
+            name: Some("claude-auth-fix".into()),
+            argv: vec!["claude".into(), "--secret-prompt".into()],
+            cwd: "/Users/vampire/secret_org/coda".into(),
+            cols: 120,
+            rows: 40,
+            alive: true,
+            status: Some(coda_protocol::HerdrAgentStatus {
+                state: state.into(),
+                kind: None,
+                app: Some("claude".into()),
+                title: Some("SENSITIVE_TITLE_NEVER_SEND".into()),
+                msg: msg.map(str::to_string),
+                progress: None,
+            }),
+        };
+
+        // Initial Idle must NOT fire "finished"
+        assert!(tracker
+            .observe_live_event(dev_id, "Studio Mac", Some(&mk_term("idle", None)), &json!({}), t0)
+            .is_none());
+
+        // Idle -> Working must NOT fire
+        assert!(tracker
+            .observe_live_event(
+                dev_id,
+                "Studio Mac",
+                Some(&mk_term("working", Some("running tests"))),
+                &json!({}),
+                t0 + std::time::Duration::from_secs(2),
+            )
+            .is_none());
+
+        // Working -> Blocked (NeedsYou) MUST fire metadata-only "needs_you" with ZERO terminal plaintext!
+        let (_, alert1) = tracker
+            .observe_live_event(
+                dev_id,
+                "Studio Mac",
+                Some(&mk_term("blocked", Some("Allow rm -rf secret_file?"))),
+                &json!({}),
+                t0 + std::time::Duration::from_secs(5),
+            )
+            .expect("expected needs_you alert");
+        assert_eq!(alert1.status, "needs_you");
+        assert_eq!(alert1.session_name, "claude-auth-fix");
+        assert_eq!(alert1.cwd_basename, "coda");
+        let serialized = serde_json::to_string(&alert1).unwrap();
+        assert!(!serialized.contains("secret_org"));
+        assert!(!serialized.contains("SENSITIVE_TITLE"));
+        assert!(!serialized.contains("secret_file"));
+        assert!(!serialized.contains("--secret-prompt"));
+
+        // Back to Working then NeedsYou again within 60s -> suppressed by cooldown!
+        let _ = tracker.observe_live_event(
+            dev_id,
+            "Studio Mac",
+            Some(&mk_term("working", None)),
+            &json!({}),
+            t0 + std::time::Duration::from_secs(10),
+        );
+        assert!(tracker
+            .observe_live_event(
+                dev_id,
+                "Studio Mac",
+                Some(&mk_term("blocked", None)),
+                &json!({}),
+                t0 + std::time::Duration::from_secs(20),
+            )
+            .is_none());
+
+        // NeedsYou -> Working -> Idle -> fires "finished" once!
+        let _ = tracker.observe_live_event(
+            dev_id,
+            "Studio Mac",
+            Some(&mk_term("working", None)),
+            &json!({}),
+            t0 + std::time::Duration::from_secs(25),
+        );
+        let (_, fin_alert) = tracker
+            .observe_live_event(
+                dev_id,
+                "Studio Mac",
+                Some(&mk_term("idle", None)),
+                &json!({}),
+                t0 + std::time::Duration::from_secs(30),
+            )
+            .expect("expected finished alert on Working -> Idle");
+        assert_eq!(fin_alert.status, "finished");
+        assert_eq!(fin_alert.cwd_basename, "coda");
+
+        // After >60s cooldown expires, NeedsYou can fire again
+        let (_, alert_after_cooldown) = tracker
+            .observe_live_event(
+                dev_id,
+                "Studio Mac",
+                Some(&mk_term("needs_you", None)),
+                &json!({}),
+                t0 + std::time::Duration::from_secs(70),
+            )
+            .expect("expected needs_you after 60s cooldown");
+        assert_eq!(alert_after_cooldown.status, "needs_you");
     }
 }

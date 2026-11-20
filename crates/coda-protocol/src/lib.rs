@@ -1401,6 +1401,20 @@ pub enum PeerMessage {
         target_version: Option<String>,
         message: String,
     },
+    /// Creates a new remote workspace folder or runs a validated `git clone` over E2EE.
+    BootstrapWorkspace {
+        req_id: String,
+        parent_dir: String,
+        folder_name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        git_clone_url: Option<String>,
+    },
+    BootstrapWorkspaceResult {
+        req_id: String,
+        ok: bool,
+        workspace_path: String,
+        detail: String,
+    },
 }
 
 impl PeerMessage {
@@ -1425,7 +1439,8 @@ impl PeerMessage {
             | Self::ReadFilePreview { req_id, .. }
             | Self::HttpLocalPreviewRequest { req_id, .. }
             | Self::GetHostHealth { req_id, .. }
-            | Self::UpgradeDaemon { req_id, .. } => Some(req_id.as_str()),
+            | Self::UpgradeDaemon { req_id, .. }
+            | Self::BootstrapWorkspace { req_id, .. } => Some(req_id.as_str()),
             _ => None,
         }
     }
@@ -1447,7 +1462,8 @@ impl PeerMessage {
             | Self::FilePreviewResponse { req_id, .. }
             | Self::HttpLocalPreviewResponse { req_id, .. }
             | Self::HostHealthResult { req_id, .. }
-            | Self::UpgradeDaemonResult { req_id, .. } => Some(req_id.as_str()),
+            | Self::UpgradeDaemonResult { req_id, .. }
+            | Self::BootstrapWorkspaceResult { req_id, .. } => Some(req_id.as_str()),
             _ => None,
         }
     }
@@ -1845,5 +1861,43 @@ mod tests {
             kind: "lan_ipv4".into(),
             addr: "0.0.0.0:24444".into(),
         }));
+    }
+
+    #[test]
+    fn test_bootstrap_workspace_wire_roundtrip_and_req_ids() {
+        let req = PeerMessage::BootstrapWorkspace {
+            req_id: "bw-1".into(),
+            parent_dir: "~/code".into(),
+            folder_name: "coda".into(),
+            git_clone_url: None,
+        };
+        assert_eq!(req.request_id(), Some("bw-1"));
+        assert_eq!(req.response_req_id(), None);
+        let json_str = serde_json::to_string(&req).unwrap();
+        assert!(json_str.contains(r#""op":"bootstrap_workspace""#));
+        assert!(!json_str.contains("git_clone_url"));
+
+        let decoded_null: PeerMessage = serde_json::from_str(
+            r#"{"op":"bootstrap_workspace","req_id":"bw-2","parent_dir":"~","folder_name":"demo","git_clone_url":null}"#,
+        )
+        .unwrap();
+        assert_eq!(decoded_null.request_id(), Some("bw-2"));
+        match decoded_null {
+            PeerMessage::BootstrapWorkspace { git_clone_url, .. } => {
+                assert!(git_clone_url.is_none());
+            }
+            _ => panic!("expected BootstrapWorkspace"),
+        }
+
+        let res = PeerMessage::BootstrapWorkspaceResult {
+            req_id: "bw-1".into(),
+            ok: true,
+            workspace_path: "/Users/alice/code/coda".into(),
+            detail: "created".into(),
+        };
+        assert_eq!(res.request_id(), None);
+        assert_eq!(res.response_req_id(), Some("bw-1"));
+        let res_json = serde_json::to_string(&res).unwrap();
+        assert!(res_json.contains(r#""op":"bootstrap_workspace_result""#));
     }
 }

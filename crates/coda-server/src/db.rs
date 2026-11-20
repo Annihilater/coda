@@ -124,8 +124,36 @@ pub struct AuthSessionRecord {
 #[derive(Debug, Clone)]
 pub struct AuthenticatedSession {
     pub user: UserRecord,
+    pub device_id: Option<Uuid>,
     pub scope: String,
     pub token_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotificationSettingsRecord {
+    pub bark_url: String,
+    pub telegram_bot_token: String,
+    pub telegram_chat_id: String,
+    pub feishu_webhook_url: String,
+    pub discord_webhook_url: String,
+    pub generic_webhook_url: String,
+    pub notify_on_needs_you: bool,
+    pub notify_on_finished: bool,
+}
+
+impl Default for NotificationSettingsRecord {
+    fn default() -> Self {
+        Self {
+            bark_url: String::new(),
+            telegram_bot_token: String::new(),
+            telegram_chat_id: String::new(),
+            feishu_webhook_url: String::new(),
+            discord_webhook_url: String::new(),
+            generic_webhook_url: String::new(),
+            notify_on_needs_you: true,
+            notify_on_finished: true,
+        }
+    }
 }
 
 struct DbInner {
@@ -748,6 +776,8 @@ impl Db {
             .execute("UPDATE users SET last_login_at = NOW() WHERE id = $1", &[&user.id])
             .await?;
 
+        let _ = self.prune_stale_web_devices(user.id, None, 30).await;
+
         let token = self.issue_session_token(user.id, client_label).await?;
         Ok((user, token))
     }
@@ -791,7 +821,7 @@ impl Db {
             .query_opt(
                 r#"
                 SELECT u.id, u.email, u.handle, u.display_name, u.is_admin, u.bandwidth_quota_mbps, u.created_at,
-                       s.scope, s.expires_at, s.last_used_at
+                       s.scope, s.expires_at, s.last_used_at, s.device_id
                 FROM auth_sessions s
                 JOIN users u ON u.id = s.user_id
                 WHERE s.token_sha256 = $1 AND s.expires_at > NOW()
@@ -804,6 +834,7 @@ impl Db {
         let scope: String = row.get(7);
         let expires_at: DateTime<Utc> = row.get(8);
         let last_used_at: DateTime<Utc> = row.get(9);
+        let device_id: Option<Uuid> = row.get(10);
         let now = Utc::now();
 
         // Sliding renewal: refresh last_used_at at most hourly and extend active sessions with <15d left.
@@ -827,6 +858,7 @@ impl Db {
                 bandwidth_quota_mbps: row.get(5),
                 created_at: row.get(6),
             },
+            device_id,
             scope,
             token_sha256,
         })
@@ -1357,6 +1389,137 @@ impl Db {
             )
             .await?;
         Ok(deleted > 0)
+    }
+
+    /// Deletes offline `web` client devices belonging to `user_id` (excluding `exclude_device_id` if present).
+    /// When `max_idle_days > 0`, restricts deletion to rows with `COALESCE(last_seen_at, created_at) < NOW() - make_interval(days => max_idle_days)`.
+    pub async fn prune_stale_web_devices(
+        &self,
+        user_id: Uuid,
+        exclude_device_id: Option<Uuid>,
+        max_idle_days: i32,
+    ) -> Result<Vec<Uuid>> {
+        let client = self.client().await?;
+        let rows = if max_idle_days > 0 {
+            let days = max_idle_days.clamp(1, 3650);
+            client
+                .query(
+                    r#"
+                    DELETE FROM devices
+                    WHERE user_id = $1
+                      AND platform = 'web'
+                      AND role = 'client'
+                      AND is_online = FALSE
+                      AND ($2::uuid IS NULL OR id <> $2)
+                      AND COALESCE(last_seen_at, created_at) < NOW() - make_interval(days => $3)
+                    RETURNING id
+                    "#,
+                    &[&user_id, &exclude_device_id, &days],
+                )
+                .await?
+        } else {
+            client
+                .query(
+                    r#"
+                    DELETE FROM devices
+                    WHERE user_id = $1
+                      AND platform = 'web'
+                      AND role = 'client'
+                      AND is_online = FALSE
+                      AND ($2::uuid IS NULL OR id <> $2)
+                    RETURNING id
+                    "#,
+                    &[&user_id, &exclude_device_id],
+                )
+                .await?
+        };
+        Ok(rows.into_iter().map(|r| r.get(0)).collect())
+    }
+
+    pub async fn get_notification_settings(
+        &self,
+        user_id: Uuid,
+    ) -> Result<NotificationSettingsRecord> {
+        let client = self.client().await?;
+        let row = client
+            .query_opt(
+                r#"
+                SELECT bark_url, telegram_bot_token, telegram_chat_id,
+                       feishu_webhook_url, discord_webhook_url, generic_webhook_url,
+                       notify_on_needs_you, notify_on_finished
+                FROM user_notification_settings
+                WHERE user_id = $1
+                "#,
+                &[&user_id],
+            )
+            .await?;
+        Ok(match row {
+            Some(r) => NotificationSettingsRecord {
+                bark_url: r.get(0),
+                telegram_bot_token: r.get(1),
+                telegram_chat_id: r.get(2),
+                feishu_webhook_url: r.get(3),
+                discord_webhook_url: r.get(4),
+                generic_webhook_url: r.get(5),
+                notify_on_needs_you: r.get(6),
+                notify_on_finished: r.get(7),
+            },
+            None => NotificationSettingsRecord::default(),
+        })
+    }
+
+    pub async fn upsert_notification_settings(
+        &self,
+        user_id: Uuid,
+        settings: &NotificationSettingsRecord,
+    ) -> Result<NotificationSettingsRecord> {
+        let client = self.client().await?;
+        let row = client
+            .query_one(
+                r#"
+                INSERT INTO user_notification_settings (
+                    user_id, bark_url, telegram_bot_token, telegram_chat_id,
+                    feishu_webhook_url, discord_webhook_url, generic_webhook_url,
+                    notify_on_needs_you, notify_on_finished, updated_at
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+                ON CONFLICT (user_id) DO UPDATE
+                SET bark_url = EXCLUDED.bark_url,
+                    telegram_bot_token = EXCLUDED.telegram_bot_token,
+                    telegram_chat_id = EXCLUDED.telegram_chat_id,
+                    feishu_webhook_url = EXCLUDED.feishu_webhook_url,
+                    discord_webhook_url = EXCLUDED.discord_webhook_url,
+                    generic_webhook_url = EXCLUDED.generic_webhook_url,
+                    notify_on_needs_you = EXCLUDED.notify_on_needs_you,
+                    notify_on_finished = EXCLUDED.notify_on_finished,
+                    updated_at = NOW()
+                RETURNING bark_url, telegram_bot_token, telegram_chat_id,
+                          feishu_webhook_url, discord_webhook_url, generic_webhook_url,
+                          notify_on_needs_you, notify_on_finished
+                "#,
+                &[
+                    &user_id,
+                    &settings.bark_url,
+                    &settings.telegram_bot_token,
+                    &settings.telegram_chat_id,
+                    &settings.feishu_webhook_url,
+                    &settings.discord_webhook_url,
+                    &settings.generic_webhook_url,
+                    &settings.notify_on_needs_you,
+                    &settings.notify_on_finished,
+                ],
+            )
+            .await?;
+        Ok(NotificationSettingsRecord {
+            bark_url: row.get(0),
+            telegram_bot_token: row.get(1),
+            telegram_chat_id: row.get(2),
+            feishu_webhook_url: row.get(3),
+            discord_webhook_url: row.get(4),
+            generic_webhook_url: row.get(5),
+            notify_on_needs_you: row.get(6),
+            notify_on_finished: row.get(7),
+        })
     }
 
     pub async fn get_device_by_id(&self, device_id: Uuid) -> Result<Option<DeviceRecord>> {

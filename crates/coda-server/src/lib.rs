@@ -11,6 +11,7 @@ use std::{
 
 use anyhow::Result;
 use axum::{
+    body::Bytes,
     extract::{ConnectInfo, Extension, Path, Query, RawQuery, Request, State, WebSocketUpgrade},
     http::{
         header::{self, HeaderName, HeaderValue},
@@ -77,6 +78,7 @@ impl RateLimiter {
     }
 }
 
+pub use crate::db::NotificationSettingsRecord;
 use crate::{
     db::{
         AuthSessionRecord, AuthenticatedSession, Db, DeviceAuthPollState, DeviceAuthPublicInfo,
@@ -143,6 +145,8 @@ pub struct AppState {
     pub trust_proxy_mode: TrustProxyMode,
     pub allowed_origins: Vec<String>,
     pub http_no_redirect: reqwest::Client,
+    pub webhook_http: reqwest::Client,
+    pub allow_local_webhook_test: Arc<std::sync::atomic::AtomicBool>,
     pub latest_release_cache: Arc<RwLock<Option<(Option<String>, Instant)>>>,
     pub rate_limiter: Arc<RateLimiter>,
 }
@@ -433,6 +437,7 @@ pub fn build_router(state: AppState, web_dist_dir: Option<PathBuf>) -> Router {
         .allow_methods([
             Method::GET,
             Method::POST,
+            Method::PUT,
             Method::PATCH,
             Method::DELETE,
             Method::OPTIONS,
@@ -460,6 +465,15 @@ pub fn build_router(state: AppState, web_dist_dir: Option<PathBuf>) -> Router {
             "/api/v1/auth/me",
             get(me_handler).delete(delete_account_handler),
         )
+        .route(
+            "/api/v1/me/notifications",
+            get(get_notifications_handler).put(put_notifications_handler),
+        )
+        .route(
+            "/api/v1/me/notifications/test",
+            post(test_notifications_handler),
+        )
+        .route("/api/v1/daemon/alert", post(daemon_alert_handler))
         .route("/api/v1/auth/device/start", post(start_device_auth_handler))
         .route("/api/v1/auth/device/info", get(device_auth_info_handler))
         .route(
@@ -473,6 +487,10 @@ pub fn build_router(state: AppState, web_dist_dir: Option<PathBuf>) -> Router {
         )
         .route("/api/v1/invites/{code}", delete(delete_invite_handler))
         .route("/api/v1/devices", get(list_devices_handler))
+        .route(
+            "/api/v1/devices/prune-stale",
+            post(prune_stale_devices_handler),
+        )
         .route(
             "/api/v1/devices/{id}",
             patch(rename_device_handler).delete(delete_device_handler),
@@ -598,6 +616,17 @@ pub async fn start_full_server_with_options(
         .user_agent("coda-server")
         .build()?;
 
+    let webhook_http = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(6))
+        .no_proxy()
+        .user_agent("coda-server-webhook")
+        .build()?;
+
+    let allow_local_webhook_test = Arc::new(std::sync::atomic::AtomicBool::new(
+        env_allows_local_webhook_test(),
+    ));
+
     let state = AppState {
         db,
         relay_hub,
@@ -619,6 +648,8 @@ pub async fn start_full_server_with_options(
         },
         allowed_origins: options.allowed_origins,
         http_no_redirect,
+        webhook_http,
+        allow_local_webhook_test,
         latest_release_cache: Arc::new(RwLock::new(None)),
         rate_limiter: Arc::new(RateLimiter::default()),
     };
@@ -2059,6 +2090,677 @@ async fn require_auth(st: &AppState, headers: &HeaderMap) -> Result<UserRecord, 
     Ok(require_auth_session(st, headers).await?.user)
 }
 
+#[derive(Debug, Default, Deserialize)]
+pub struct UpdateNotificationSettingsRequest {
+    pub bark_url: Option<String>,
+    pub telegram_bot_token: Option<String>,
+    pub telegram_chat_id: Option<String>,
+    pub feishu_webhook_url: Option<String>,
+    pub discord_webhook_url: Option<String>,
+    pub generic_webhook_url: Option<String>,
+    pub notify_on_needs_you: Option<bool>,
+    pub notify_on_finished: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DaemonAlertRequest {
+    pub device_id: Uuid,
+    #[serde(default)]
+    pub device_name: String,
+    #[serde(default)]
+    pub session_name: String,
+    pub status: String,
+    #[serde(default)]
+    pub cwd_basename: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct PruneStaleDevicesRequest {
+    #[serde(default)]
+    pub max_idle_days: i32,
+}
+
+fn env_allows_local_webhook_test() -> bool {
+    std::env::var("CODA_ALLOW_LOCAL_WEBHOOK_TEST")
+        .ok()
+        .map(|v| v.trim() == "1" || v.trim().eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+fn effective_allow_local_webhook(st: &AppState) -> bool {
+    st.allow_local_webhook_test
+        .load(std::sync::atomic::Ordering::Relaxed)
+        || env_allows_local_webhook_test()
+}
+
+pub fn is_blocked_ssrf_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_multicast()
+                || o[0] == 0
+                || (o[0] == 100 && (o[1] & 0xc0) == 64)
+                || (o[0] == 198 && (o[1] == 18 || o[1] == 19))
+                || o[0] >= 240
+        }
+        IpAddr::V6(v6) => {
+            if let Some(mapped_v4) = v6.to_ipv4_mapped() {
+                return is_blocked_ssrf_ip(IpAddr::V4(mapped_v4));
+            }
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || (v6.segments()[0] & 0xfe00) == 0xfc00
+                || (v6.segments()[0] & 0xffc0) == 0xfe80
+        }
+    }
+}
+
+pub fn validate_webhook_url(
+    raw: &str,
+    label: &str,
+    allow_local_test: bool,
+) -> anyhow::Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(String::new());
+    }
+    if trimmed.len() > 1024 || trimmed.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        anyhow::bail!("{label} must be <= 1024 printable non-whitespace characters");
+    }
+    let parsed =
+        reqwest::Url::parse(trimmed).map_err(|e| anyhow::anyhow!("invalid {label}: {e}"))?;
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        anyhow::bail!("{label} must not embed credentials in URL authority");
+    }
+    let host_raw = parsed
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("{label} missing host"))?;
+    let host_clean = host_raw
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase();
+
+    if allow_local_test
+        && matches!(parsed.scheme(), "http" | "https")
+        && matches!(host_clean.as_str(), "127.0.0.1" | "localhost")
+    {
+        return Ok(trimmed.to_string());
+    }
+
+    if parsed.scheme() != "https" {
+        anyhow::bail!("{label} must use https://");
+    }
+    if host_clean == "localhost"
+        || host_clean.ends_with(".localhost")
+        || host_clean.ends_with(".local")
+        || host_clean.ends_with(".internal")
+        || host_clean == "metadata"
+        || host_clean == "instance-data"
+    {
+        anyhow::bail!("{label} host is blocked by SSRF policy");
+    }
+    if let Ok(ip) = host_clean.parse::<IpAddr>() {
+        if is_blocked_ssrf_ip(ip) {
+            anyhow::bail!("{label} IP address is blocked by SSRF policy");
+        }
+    }
+    Ok(trimmed.to_string())
+}
+
+fn validate_telegram_fields(bot_token: &str, chat_id: &str) -> anyhow::Result<(String, String)> {
+    let tok = bot_token.trim();
+    let cid = chat_id.trim();
+    if !tok.is_empty()
+        && (tok.len() > 256
+            || !tok
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, ':' | '_' | '-')))
+    {
+        anyhow::bail!("invalid telegram_bot_token format");
+    }
+    if !cid.is_empty()
+        && (cid.len() > 128
+            || !cid
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '@')))
+    {
+        anyhow::bail!("invalid telegram_chat_id format");
+    }
+    Ok((tok.to_string(), cid.to_string()))
+}
+
+fn sanitize_metadata_label(raw: &str, max_chars: usize) -> String {
+    raw.trim()
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(max_chars)
+        .collect()
+}
+
+fn sanitize_metadata_basename(raw: &str) -> String {
+    let trimmed = raw.trim().trim_end_matches(['/', '\\']);
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    std::path::Path::new(trimmed)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .map(|s| sanitize_metadata_label(s, 64))
+        .unwrap_or_default()
+}
+
+#[derive(Clone)]
+struct OutboundWebhookTask {
+    channel: &'static str,
+    url: String,
+    body: Value,
+}
+
+fn build_webhook_tasks(
+    settings: &NotificationSettingsRecord,
+    title: &str,
+    message: &str,
+    generic_payload: &Value,
+    allow_local_test: bool,
+) -> (Vec<OutboundWebhookTask>, Vec<String>) {
+    let mut tasks = Vec::new();
+    let mut errors = Vec::new();
+    let combined = format!("{title}\n{message}");
+
+    if !settings.bark_url.trim().is_empty() {
+        match validate_webhook_url(&settings.bark_url, "bark_url", allow_local_test) {
+            Ok(url) => tasks.push(OutboundWebhookTask {
+                channel: "bark",
+                url,
+                body: json!({
+                    "title": title,
+                    "body": message,
+                    "group": "Coda",
+                }),
+            }),
+            Err(e) => errors.push(format!("bark: {e}")),
+        }
+    }
+
+    let tg_tok = settings.telegram_bot_token.trim();
+    let tg_cid = settings.telegram_chat_id.trim();
+    if !tg_tok.is_empty() || !tg_cid.is_empty() {
+        if tg_tok.is_empty() || tg_cid.is_empty() {
+            errors.push("telegram: both telegram_bot_token and telegram_chat_id are required".into());
+        } else {
+            match validate_telegram_fields(tg_tok, tg_cid) {
+                Ok((clean_tok, clean_cid)) => {
+                    let api_base = if allow_local_test {
+                        std::env::var("CODA_TELEGRAM_API_BASE")
+                            .ok()
+                            .map(|s| s.trim().trim_end_matches('/').to_string())
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or_else(|| "https://api.telegram.org".to_string())
+                    } else {
+                        "https://api.telegram.org".to_string()
+                    };
+                    let tg_url = format!("{api_base}/bot{clean_tok}/sendMessage");
+                    match validate_webhook_url(&tg_url, "telegram_url", allow_local_test) {
+                        Ok(valid_url) => tasks.push(OutboundWebhookTask {
+                            channel: "telegram",
+                            url: valid_url,
+                            body: json!({
+                                "chat_id": clean_cid,
+                                "text": combined,
+                            }),
+                        }),
+                        Err(e) => errors.push(format!("telegram: {e}")),
+                    }
+                }
+                Err(e) => errors.push(format!("telegram: {e}")),
+            }
+        }
+    }
+
+    if !settings.feishu_webhook_url.trim().is_empty() {
+        match validate_webhook_url(
+            &settings.feishu_webhook_url,
+            "feishu_webhook_url",
+            allow_local_test,
+        ) {
+            Ok(url) => tasks.push(OutboundWebhookTask {
+                channel: "feishu",
+                url,
+                body: json!({
+                    "msg_type": "text",
+                    "content": { "text": combined },
+                }),
+            }),
+            Err(e) => errors.push(format!("feishu: {e}")),
+        }
+    }
+
+    if !settings.discord_webhook_url.trim().is_empty() {
+        match validate_webhook_url(
+            &settings.discord_webhook_url,
+            "discord_webhook_url",
+            allow_local_test,
+        ) {
+            Ok(url) => tasks.push(OutboundWebhookTask {
+                channel: "discord",
+                url,
+                body: json!({
+                    "content": format!("**{title}**\n{message}"),
+                }),
+            }),
+            Err(e) => errors.push(format!("discord: {e}")),
+        }
+    }
+
+    if !settings.generic_webhook_url.trim().is_empty() {
+        match validate_webhook_url(
+            &settings.generic_webhook_url,
+            "generic_webhook_url",
+            allow_local_test,
+        ) {
+            Ok(url) => tasks.push(OutboundWebhookTask {
+                channel: "generic",
+                url,
+                body: generic_payload.clone(),
+            }),
+            Err(e) => errors.push(format!("generic: {e}")),
+        }
+    }
+
+    (tasks, errors)
+}
+
+async fn execute_webhook_task(
+    client: &reqwest::Client,
+    task: &OutboundWebhookTask,
+    allow_local_test: bool,
+) -> std::result::Result<(), String> {
+    let parsed = reqwest::Url::parse(&task.url)
+        .map_err(|e| format!("{}: invalid URL ({e})", task.channel))?;
+    if !allow_local_test {
+        let host = parsed
+            .host_str()
+            .ok_or_else(|| format!("{}: missing host", task.channel))?
+            .trim_start_matches('[')
+            .trim_end_matches(']');
+        let port = parsed.port_or_known_default().unwrap_or(443);
+        let resolved = tokio::net::lookup_host((host, port))
+            .await
+            .map_err(|e| format!("{}: DNS lookup failed ({e})", task.channel))?;
+        let mut count = 0usize;
+        for sa in resolved {
+            count += 1;
+            if is_blocked_ssrf_ip(sa.ip()) {
+                return Err(format!(
+                    "{}: resolved IP {} blocked by SSRF guard",
+                    task.channel,
+                    sa.ip()
+                ));
+            }
+        }
+        if count == 0 {
+            return Err(format!("{}: DNS returned no addresses", task.channel));
+        }
+    }
+
+    let resp = client
+        .post(&task.url)
+        .json(&task.body)
+        .send()
+        .await
+        .map_err(|e| format!("{}: request failed ({e})", task.channel))?;
+    if !resp.status().is_success() {
+        return Err(format!(
+            "{}: webhook returned HTTP {}",
+            task.channel,
+            resp.status().as_u16()
+        ));
+    }
+    Ok(())
+}
+
+async fn get_notifications_handler(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<NotificationSettingsRecord>, ApiError> {
+    let session = require_auth_session(&st, &headers).await?;
+    let settings = st
+        .db
+        .get_notification_settings(session.user.id)
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(Json(settings))
+}
+
+async fn put_notifications_handler(
+    State(st): State<AppState>,
+    conn: Option<Extension<ConnectInfo<SocketAddr>>>,
+    headers: HeaderMap,
+    Json(req): Json<UpdateNotificationSettingsRequest>,
+) -> Result<Json<NotificationSettingsRecord>, ApiError> {
+    let ip = client_rate_key(&st, conn.as_ref(), &headers);
+    st.rate_limiter
+        .check(&format!("put_notif:{ip}"), 30, Duration::from_secs(60))
+        .await?;
+    let session = require_auth_session(&st, &headers).await?;
+    let allow_local = effective_allow_local_webhook(&st);
+
+    let current = st
+        .db
+        .get_notification_settings(session.user.id)
+        .await
+        .map_err(ApiError::internal)?;
+
+    let raw_bark = req.bark_url.as_deref().unwrap_or(&current.bark_url);
+    let raw_tg_tok = req
+        .telegram_bot_token
+        .as_deref()
+        .unwrap_or(&current.telegram_bot_token);
+    let raw_tg_cid = req
+        .telegram_chat_id
+        .as_deref()
+        .unwrap_or(&current.telegram_chat_id);
+    let raw_feishu = req
+        .feishu_webhook_url
+        .as_deref()
+        .unwrap_or(&current.feishu_webhook_url);
+    let raw_discord = req
+        .discord_webhook_url
+        .as_deref()
+        .unwrap_or(&current.discord_webhook_url);
+    let raw_generic = req
+        .generic_webhook_url
+        .as_deref()
+        .unwrap_or(&current.generic_webhook_url);
+
+    let bark_url =
+        validate_webhook_url(raw_bark, "bark_url", allow_local).map_err(ApiError::bad_request)?;
+    let (telegram_bot_token, telegram_chat_id) =
+        validate_telegram_fields(raw_tg_tok, raw_tg_cid).map_err(ApiError::bad_request)?;
+    let feishu_webhook_url = validate_webhook_url(raw_feishu, "feishu_webhook_url", allow_local)
+        .map_err(ApiError::bad_request)?;
+    let discord_webhook_url = validate_webhook_url(raw_discord, "discord_webhook_url", allow_local)
+        .map_err(ApiError::bad_request)?;
+    let generic_webhook_url = validate_webhook_url(raw_generic, "generic_webhook_url", allow_local)
+        .map_err(ApiError::bad_request)?;
+
+    let next = NotificationSettingsRecord {
+        bark_url,
+        telegram_bot_token,
+        telegram_chat_id,
+        feishu_webhook_url,
+        discord_webhook_url,
+        generic_webhook_url,
+        notify_on_needs_you: req
+            .notify_on_needs_you
+            .unwrap_or(current.notify_on_needs_you),
+        notify_on_finished: req.notify_on_finished.unwrap_or(current.notify_on_finished),
+    };
+
+    let saved = st
+        .db
+        .upsert_notification_settings(session.user.id, &next)
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(Json(saved))
+}
+
+async fn test_notifications_handler(
+    State(st): State<AppState>,
+    conn: Option<Extension<ConnectInfo<SocketAddr>>>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let ip = client_rate_key(&st, conn.as_ref(), &headers);
+    st.rate_limiter
+        .check(&format!("test_notif:{ip}"), 15, Duration::from_secs(60))
+        .await?;
+    let session = require_auth_session(&st, &headers).await?;
+    let allow_local = effective_allow_local_webhook(&st);
+    let settings = st
+        .db
+        .get_notification_settings(session.user.id)
+        .await
+        .map_err(ApiError::internal)?;
+
+    let title = "Coda · Zero-Knowledge Alert Test";
+    let message = format!(
+        "Offline webhook push is active for @{} (metadata-only, zero terminal plaintext).",
+        session.user.handle
+    );
+    let generic_payload = json!({
+        "event": "test",
+        "title": title,
+        "text": message,
+        "status": "test",
+        "handle": session.user.handle,
+        "timestamp_ms": current_unix_ms(),
+    });
+
+    let (tasks, mut errors) =
+        build_webhook_tasks(&settings, title, &message, &generic_payload, allow_local);
+    let mut delivered_channels = Vec::new();
+
+    for task in &tasks {
+        match execute_webhook_task(&st.webhook_http, task, allow_local).await {
+            Ok(()) => delivered_channels.push(task.channel.to_string()),
+            Err(err_msg) => errors.push(err_msg),
+        }
+    }
+
+    Ok(Json(json!({
+        "ok": true,
+        "delivered_channels": delivered_channels,
+        "errors": errors,
+    })))
+}
+
+async fn authenticate_daemon_or_full_or_ticket(
+    st: &AppState,
+    headers: &HeaderMap,
+) -> Result<(Uuid, Option<Uuid>), ApiError> {
+    let bearer_tok = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.strip_prefix("Bearer ").unwrap_or(s).trim())
+        .filter(|s| !s.is_empty());
+    let header_ticket = headers
+        .get("x-coda-relay-ticket")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let Some(token) = bearer_tok.or(header_ticket) else {
+        return Err(ApiError::unauthorized(anyhow::anyhow!(
+            "missing Authorization bearer token or relay ticket"
+        )));
+    };
+
+    if let Ok(sess) = st.db.authenticate_session(token).await {
+        let bound_dev = if sess.scope == "daemon_host" {
+            sess.device_id
+        } else {
+            None
+        };
+        return Ok((sess.user.id, bound_dev));
+    }
+
+    let claims = RelayTicketClaims::verify(token, &st.relay_secret, Utc::now().timestamp())
+        .map_err(ApiError::unauthorized)?;
+    let dev = st
+        .db
+        .get_device_by_id(claims.device_id)
+        .await
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::unauthorized(anyhow::anyhow!("device revoked")))?;
+    if dev.user_id != claims.user_id {
+        return Err(ApiError::unauthorized(anyhow::anyhow!(
+            "device tenant mismatch"
+        )));
+    }
+    Ok((claims.user_id, Some(claims.device_id)))
+}
+
+async fn daemon_alert_handler(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<DaemonAlertRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let (user_id, bound_device_id) = authenticate_daemon_or_full_or_ticket(&st, &headers).await?;
+    if let Some(bound_id) = bound_device_id {
+        if bound_id != req.device_id {
+            return Err(ApiError::forbidden(anyhow::anyhow!(
+                "daemon token/ticket device_id mismatch"
+            )));
+        }
+    }
+
+    let dev = st
+        .db
+        .get_device_by_id(req.device_id)
+        .await
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::forbidden(anyhow::anyhow!("device not found")))?;
+    if dev.user_id != user_id {
+        return Err(ApiError::forbidden(anyhow::anyhow!(
+            "device belongs to another tenant"
+        )));
+    }
+
+    let status_norm = req.status.trim().to_ascii_lowercase();
+    if !matches!(status_norm.as_str(), "needs_you" | "finished") {
+        return Err(ApiError::bad_request(anyhow::anyhow!(
+            "invalid status; expected 'needs_you' or 'finished'"
+        )));
+    }
+
+    let clean_device_name = {
+        let s = sanitize_metadata_label(&req.device_name, 64);
+        if s.is_empty() {
+            sanitize_metadata_label(&dev.name, 64)
+        } else {
+            s
+        }
+    };
+    let clean_session_name = {
+        let s = sanitize_metadata_label(&req.session_name, 64);
+        if s.is_empty() {
+            "terminal".to_string()
+        } else {
+            s
+        }
+    };
+    let clean_cwd = sanitize_metadata_basename(&req.cwd_basename);
+
+    // Overall flood guard + 60s rate-limit cooldown per (user_id, device_id, session_name, status)
+    st.rate_limiter
+        .check(&format!("daemon_alert_user:{user_id}"), 60, Duration::from_secs(60))
+        .await?;
+    let cooldown_key = format!(
+        "daemon_alert:{}:{}:{}:{}",
+        user_id, req.device_id, clean_session_name, status_norm
+    );
+    st.rate_limiter
+        .check(&cooldown_key, 1, Duration::from_secs(60))
+        .await?;
+
+    let settings = st
+        .db
+        .get_notification_settings(user_id)
+        .await
+        .map_err(ApiError::internal)?;
+    if (status_norm == "needs_you" && !settings.notify_on_needs_you)
+        || (status_norm == "finished" && !settings.notify_on_finished)
+    {
+        return Ok(Json(json!({ "ok": true, "dispatched": 0 })));
+    }
+
+    let (title, body) = if status_norm == "needs_you" {
+        let title = format!("Coda · Needs Your Approval ({clean_device_name})");
+        let body = if clean_cwd.is_empty() {
+            format!("Session `{clean_session_name}` on `{clean_device_name}` is waiting for your input.")
+        } else {
+            format!("Session `{clean_session_name}` ({clean_cwd}) on `{clean_device_name}` is waiting for your input.")
+        };
+        (title, body)
+    } else {
+        let title = format!("Coda · Task Finished ({clean_device_name})");
+        let body = if clean_cwd.is_empty() {
+            format!("Session `{clean_session_name}` on `{clean_device_name}` finished running.")
+        } else {
+            format!("Session `{clean_session_name}` ({clean_cwd}) on `{clean_device_name}` finished running.")
+        };
+        (title, body)
+    };
+
+    let generic_payload = json!({
+        "event": "daemon_alert",
+        "title": title,
+        "text": body,
+        "device_id": req.device_id,
+        "device_name": clean_device_name,
+        "session_name": clean_session_name,
+        "status": status_norm,
+        "cwd_basename": clean_cwd,
+        "timestamp_ms": current_unix_ms(),
+    });
+
+    let allow_local = effective_allow_local_webhook(&st);
+    let (tasks, _errs) =
+        build_webhook_tasks(&settings, &title, &body, &generic_payload, allow_local);
+    let dispatched = tasks.len();
+
+    for task in tasks {
+        let http = st.webhook_http.clone();
+        tokio::spawn(async move {
+            let _ = execute_webhook_task(&http, &task, allow_local).await;
+        });
+    }
+
+    Ok(Json(json!({
+        "ok": true,
+        "dispatched": dispatched,
+    })))
+}
+
+async fn prune_stale_devices_handler(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<Value>, ApiError> {
+    let session = require_auth_session(&st, &headers).await?;
+    let trimmed_body = std::str::from_utf8(&body).unwrap_or("").trim();
+    let req: PruneStaleDevicesRequest = if trimmed_body.is_empty() {
+        PruneStaleDevicesRequest { max_idle_days: 0 }
+    } else {
+        serde_json::from_slice(&body)
+            .map_err(|e| ApiError::bad_request(anyhow::anyhow!("invalid JSON body: {e}")))?
+    };
+
+    let pruned_ids = st
+        .db
+        .prune_stale_web_devices(session.user.id, session.device_id, req.max_idle_days.max(0))
+        .await
+        .map_err(ApiError::internal)?;
+    let pruned_count = pruned_ids.len();
+
+    for dev_id in pruned_ids {
+        st.relay_hub
+            .notify_device_enrolled(session.user.id, dev_id, "", "client", Some(false))
+            .await;
+    }
+
+    Ok(Json(json!({
+        "ok": true,
+        "pruned_count": pruned_count,
+    })))
+}
+
 pub struct ApiError {
     status: StatusCode,
     message: String,
@@ -2161,5 +2863,58 @@ mod tests {
         assert!(!is_shell_safe_base_url("javascript://evil.com"));
         assert!(!is_shell_safe_base_url("https://evil.com/foo"));
         assert!(is_shell_safe_base_url("https://coda.example.com:8443"));
+    }
+
+    #[test]
+    fn webhook_ssrf_validator_blocks_internal_ips_and_allows_https_or_test_loopback() {
+        assert_eq!(validate_webhook_url("", "bark_url", false).unwrap(), "");
+        assert!(
+            validate_webhook_url("https://api.day.app/my-device-key", "bark_url", false).is_ok()
+        );
+        assert!(validate_webhook_url(
+            "https://discord.com/api/webhooks/123/abc",
+            "discord_webhook_url",
+            false
+        )
+        .is_ok());
+
+        // Block plain http:// and SSRF targets when allow_local_test == false
+        assert!(validate_webhook_url("http://api.day.app/key", "bark_url", false).is_err());
+        assert!(validate_webhook_url("http://127.0.0.1:9000/hook", "generic", false).is_err());
+        assert!(validate_webhook_url("https://127.0.0.1:9000/hook", "generic", false).is_err());
+        assert!(validate_webhook_url("https://localhost/hook", "generic", false).is_err());
+        assert!(validate_webhook_url("https://[::1]/hook", "generic", false).is_err());
+        assert!(
+            validate_webhook_url("https://169.254.169.254/latest/meta-data", "generic", false)
+                .is_err()
+        );
+        assert!(
+            validate_webhook_url("https://100.100.100.200/latest/meta-data", "generic", false)
+                .is_err()
+        );
+        assert!(validate_webhook_url("https://10.0.0.8/hook", "generic", false).is_err());
+        assert!(validate_webhook_url("https://192.168.1.1/hook", "generic", false).is_err());
+        assert!(
+            validate_webhook_url("https://metadata.google.internal/v1", "generic", false).is_err()
+        );
+        assert!(
+            validate_webhook_url("https://user:pass@api.day.app/key", "bark_url", false).is_err()
+        );
+
+        // Allow http://127.0.0.1 ONLY when allow_local_test == true, while still blocking metadata IPs
+        assert!(validate_webhook_url("http://127.0.0.1:18080/hook", "generic", true).is_ok());
+        assert!(
+            validate_webhook_url("http://169.254.169.254/latest/meta-data", "generic", true)
+                .is_err()
+        );
+
+        // Telegram token & basename sanitization
+        assert!(validate_telegram_fields("123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11", "-100987654")
+            .is_ok());
+        assert!(validate_telegram_fields("../../evil", "12345").is_err());
+        assert_eq!(
+            sanitize_metadata_basename("/Users/vampire/secret/coda"),
+            "coda"
+        );
     }
 }
