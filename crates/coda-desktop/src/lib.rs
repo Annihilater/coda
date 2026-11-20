@@ -499,6 +499,29 @@ impl CodaDesktopState {
             action: PaletteAction::LaunchAgent("codex"),
         });
         items.push(PaletteItem {
+            kind_tag: "AGENT",
+            label: tr(self.locale, "Launch Grok Agent", "启动 Grok Agent").to_string(),
+            detail: "agent · grok".to_string(),
+            action: PaletteAction::LaunchAgent("grok"),
+        });
+        items.push(PaletteItem {
+            kind_tag: "AGENT",
+            label: tr(
+                self.locale,
+                "Launch Antigravity (AGY) Agent",
+                "启动 Antigravity (AGY) Agent",
+            )
+            .to_string(),
+            detail: "agent · agy".to_string(),
+            action: PaletteAction::LaunchAgent("agy"),
+        });
+        items.push(PaletteItem {
+            kind_tag: "AGENT",
+            label: tr(self.locale, "Launch Gemini CLI Agent", "启动 Gemini CLI Agent").to_string(),
+            detail: "agent · gemini".to_string(),
+            action: PaletteAction::LaunchAgent("gemini"),
+        });
+        items.push(PaletteItem {
             kind_tag: "ACTION",
             label: tr(self.locale, "Add Workspace Folder...", "添加本地工作区...").to_string(),
             detail: "Finder picker".to_string(),
@@ -2560,24 +2583,27 @@ impl CodaGpuWorkspaceView {
         }
 
         // Local PTY fallback: spawn interactive login shell and invoke agent CLI directly
-        let before_id = self
+        let (before_active, before_split) = self
             .state
             .lock()
             .ok()
-            .and_then(|g| g.active_session_id.clone());
+            .map(|g| (g.active_session_id.clone(), g.split_session_id.clone()))
+            .unwrap_or((None, None));
         self.spawn_terminal_in_active_space(Some(agent_cmd));
-        let mut renamed_id = None;
         if let Ok(mut g) = self.state.lock() {
-            if g.active_session_id != before_id {
-                if let Some(id) = g.active_session_id.clone() {
-                    if let Some(sess) = g.sessions.iter_mut().find(|s| s.id == id) {
-                        sess.title = format!("{space_name} · {agent_cmd}");
-                    }
-                    renamed_id = Some(id);
+            let spawned_id = if g.split_session_id != before_split {
+                g.split_session_id.clone()
+            } else if g.active_session_id != before_active {
+                g.active_session_id.clone()
+            } else {
+                None
+            };
+            if let Some(id) = spawned_id {
+                if let Some(sess) = g.sessions.iter_mut().find(|s| s.id == id) {
+                    sess.title = format!("{space_name} · {agent_cmd}");
                 }
             }
         }
-        let _ = renamed_id;
     }
 
     fn select_session(&self, session_id: &str) {
@@ -8796,6 +8822,17 @@ mod tests {
                 .any(|item| matches!(item.action, PaletteAction::OpenSettings)),
             "searching 'settings' in Command Palette must match OpenSettings"
         );
+
+        state.palette_query = "agent".to_string();
+        let agent_items = state.palette_items();
+        for expected in ["claude", "codex", "grok", "agy", "gemini"] {
+            assert!(
+                agent_items
+                    .iter()
+                    .any(|item| matches!(item.action, PaletteAction::LaunchAgent(cmd) if cmd == expected)),
+                "'+ Agent' Command Palette filter must include LaunchAgent({expected:?})"
+            );
+        }
     }
 
     #[test]

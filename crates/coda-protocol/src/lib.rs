@@ -1191,7 +1191,7 @@ pub enum PeerMessage {
     },
     LaunchAgent {
         req_id: String,
-        /// Preset or binary: "claude", "codex", "grok", "gemini", or "zsh"/"bash"
+        /// Preset or binary: "claude", "codex", "grok", "agy", "gemini", or "shell"/"zsh"/"bash"
         agent: String,
         name: Option<String>,
         cwd: Option<String>,

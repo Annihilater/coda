@@ -43,6 +43,12 @@ pub fn build_augmented_path() -> String {
     if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
         for rel in [
             ".local/bin",
+            ".grok/bin",
+            ".antigravity/antigravity/bin",
+            ".antigravity/bin",
+            ".claude/local",
+            ".claude/bin",
+            ".codex/bin",
             ".cargo/bin",
             ".bun/bin",
             ".volta/bin",
@@ -89,6 +95,7 @@ pub fn build_augmented_path() -> String {
     }
 
     for sys in [
+        "/Applications/Antigravity.app/Contents/Resources/app/bin",
         "/opt/homebrew/bin",
         "/opt/homebrew/sbin",
         "/usr/local/bin",
@@ -453,6 +460,80 @@ fn next_unique_hc_name(prefix: Option<&str>) -> String {
     format!("{base}-{suffix}")
 }
 
+/// Maps a Coda agent preset (`claude`, `codex`, `grok`, `agy`, `gemini`, `shell`) into its
+/// interactive CLI argv, applying each CLI's native interactive prompt flag when `initial_prompt` is set:
+/// - `claude`, `codex`, `grok`: positional `<prompt>`
+/// - `agy` (Antigravity CLI), `gemini` (Gemini CLI): `-i <prompt>` (`--prompt-interactive`)
+pub fn resolve_agent_command(agent: &str, initial_prompt: Option<&str>) -> Vec<String> {
+    let normalized = agent.trim();
+    let lower = normalized.to_ascii_lowercase();
+    let prompt = initial_prompt
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    match lower.as_str() {
+        "shell" | "" => Vec::new(),
+        "claude" | "claude-code" => {
+            let mut argv = vec!["claude".to_string()];
+            if let Some(p) = prompt {
+                argv.push(p.to_string());
+            }
+            argv
+        }
+        "codex" => {
+            let mut argv = vec!["codex".to_string()];
+            if let Some(p) = prompt {
+                argv.push(p.to_string());
+            }
+            argv
+        }
+        "grok" | "grok-build" | "grok-cli" => {
+            let mut argv = vec!["grok".to_string()];
+            if let Some(p) = prompt {
+                argv.push(p.to_string());
+            }
+            argv
+        }
+        "agy" | "antigravity" | "agy-cli" => {
+            let mut argv = vec!["agy".to_string()];
+            if let Some(p) = prompt {
+                argv.push("-i".to_string());
+                argv.push(p.to_string());
+            }
+            argv
+        }
+        "gemini" | "gemini-cli" => {
+            let mut argv = vec!["gemini".to_string()];
+            if let Some(p) = prompt {
+                argv.push("-i".to_string());
+                argv.push(p.to_string());
+            }
+            argv
+        }
+        _ => {
+            let mut argv = vec![normalized.to_string()];
+            if let Some(p) = prompt {
+                argv.push(p.to_string());
+            }
+            argv
+        }
+    }
+}
+
+fn resolve_executable_in_augmented_path(program: &str, path_env: &str) -> PathBuf {
+    let p = Path::new(program);
+    if p.components().count() > 1 {
+        return p.to_path_buf();
+    }
+    for dir in std::env::split_paths(path_env) {
+        let candidate = dir.join(program);
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    p.to_path_buf()
+}
+
 impl HerdrClient {
     async fn spawn_transport(hc_path: &Path) -> Result<HerdrTransport> {
         let mut child = Command::new(hc_path)
@@ -644,7 +725,7 @@ impl HerdrClient {
         Ok(raw_list.into_iter().map(Into::into).collect())
     }
 
-    /// Launches an AI Coding Agent (`claude`, `codex`, `grok`, `gemini`) or shell inside `herdr-core`
+    /// Launches an AI Coding Agent (`claude`, `codex`, `grok`, `agy`, `gemini`) or shell inside `herdr-core`
     /// with `outlive_parent: true` and `keep: true` so sessions survive network/daemon restarts.
     pub async fn launch_agent(
         &self,
@@ -655,22 +736,14 @@ impl HerdrClient {
         cols: u16,
         rows: u16,
     ) -> Result<HerdrTerminalSummary> {
-        let mut argv: Vec<String> = match agent {
-            "claude" | "claude-code" => vec!["claude".into()],
-            "codex" => vec!["codex".into()],
-            "grok" | "grok-build" => vec!["grok".into()],
-            "gemini" | "gemini-cli" => vec!["gemini".into()],
-            "shell" | "" => vec![],
-            other => vec![other.to_string()],
-        };
-        if let Some(prompt) = initial_prompt.filter(|s| !s.trim().is_empty()) {
-            if !argv.is_empty() {
-                argv.push(prompt.to_string());
-            }
-        }
+        let argv = resolve_agent_command(agent, initial_prompt);
+        let augmented_path = build_augmented_path();
 
         let mut params = json!({
             "argv": argv,
+            "env": {
+                "PATH": augmented_path,
+            },
             "keep": true,
             "outlive_parent": true,
             "no_parent": true,
@@ -1327,19 +1400,14 @@ pub fn spawn_native_shell_pty(
         })
         .unwrap_or_else(|| "/bin/sh".to_string());
 
-    let mut argv: Vec<String> = match agent {
-        "claude" | "claude-code" => vec!["claude".into()],
-        "codex" => vec!["codex".into()],
-        "grok" | "grok-build" => vec!["grok".into()],
-        "gemini" | "gemini-cli" => vec!["gemini".into()],
-        "shell" | "" => vec![default_shell.clone(), "-i".into()],
-        other => vec![other.to_string()],
-    };
-    if let Some(prompt) = initial_prompt.filter(|s| !s.trim().is_empty()) {
-        if agent != "shell" && !agent.is_empty() {
-            argv.push(prompt.to_string());
+    let argv: Vec<String> = {
+        let resolved = resolve_agent_command(agent, initial_prompt);
+        if resolved.is_empty() {
+            vec![default_shell.clone(), "-i".into()]
+        } else {
+            resolved
         }
-    }
+    };
 
     let resolved_cwd = cwd
         .filter(|s| !s.trim().is_empty() && Path::new(s).is_dir())
@@ -1347,7 +1415,9 @@ pub fn spawn_native_shell_pty(
         .or_else(|| std::env::var("HOME").ok().filter(|s| Path::new(s).is_dir()))
         .unwrap_or_else(|| "/".to_string());
 
-    let mut cmd = std::process::Command::new(&argv[0]);
+    let augmented_path = build_augmented_path();
+    let resolved_prog = resolve_executable_in_augmented_path(&argv[0], &augmented_path);
+    let mut cmd = std::process::Command::new(&resolved_prog);
     if argv.len() > 1 {
         cmd.args(&argv[1..]);
     }
@@ -1813,6 +1883,38 @@ mod tests {
                 .any(|t| t.address == term1.address || t.address == term2.address),
             "killed+removed terminals must not remain in list_terminals(true): {:?}",
             remaining.iter().map(|t| &t.address).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_resolve_agent_command_supports_claude_codex_grok_agy_and_gemini() {
+        assert!(resolve_agent_command("shell", Some("ignored")).is_empty());
+        assert_eq!(resolve_agent_command("claude", None), vec!["claude"]);
+        assert_eq!(
+            resolve_agent_command("claude", Some("inspect repo")),
+            vec!["claude", "inspect repo"]
+        );
+        assert_eq!(
+            resolve_agent_command("codex", Some("run tests")),
+            vec!["codex", "run tests"]
+        );
+        assert_eq!(resolve_agent_command("grok", None), vec!["grok"]);
+        assert_eq!(
+            resolve_agent_command("grok", Some("fix build")),
+            vec!["grok", "fix build"]
+        );
+        assert_eq!(resolve_agent_command("agy", None), vec!["agy"]);
+        assert_eq!(
+            resolve_agent_command("agy", Some("audit code")),
+            vec!["agy", "-i", "audit code"]
+        );
+        assert_eq!(
+            resolve_agent_command("antigravity", Some("plan")),
+            vec!["agy", "-i", "plan"]
+        );
+        assert_eq!(
+            resolve_agent_command("gemini", Some("explain")),
+            vec!["gemini", "-i", "explain"]
         );
     }
 }

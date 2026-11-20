@@ -4205,6 +4205,8 @@ pub fn is_sensitive_path(path: &Path) -> bool {
                 | ".docker"
                 | ".claude"
                 | ".codex"
+                | ".grok"
+                | ".antigravity"
                 | ".gemini"
         ) {
             return true;
@@ -4212,7 +4214,10 @@ pub fn is_sensitive_path(path: &Path) -> bool {
     }
     for win in comps.windows(2) {
         if (win[0] == ".config"
-            && matches!(win[1].as_str(), "coda" | "gcloud" | "gh" | "herdr" | "herdr-core"))
+            && matches!(
+                win[1].as_str(),
+                "coda" | "gcloud" | "gh" | "herdr" | "herdr-core" | "grok" | "antigravity"
+            ))
             || (win[0] == ".cargo" && win[1].starts_with("credentials"))
             || (win[0] == "library" && win[1] == "keychains")
             || (win[0] == "application support" && matches!(win[1].as_str(), "herdr" | "herdr-core"))
@@ -6191,6 +6196,8 @@ mod tests {
         assert!(is_sensitive_path(Path::new("/Users/alice/.config/coda/desktop_client_identity.json")));
         assert!(is_sensitive_path(Path::new("/Users/alice/.claude/credentials.json")));
         assert!(is_sensitive_path(Path::new("/Users/alice/.codex/auth.json")));
+        assert!(is_sensitive_path(Path::new("/Users/alice/.grok/auth.json")));
+        assert!(is_sensitive_path(Path::new("/Users/alice/.antigravity/settings.json")));
         assert!(is_sensitive_path(Path::new("/Users/alice/.gemini/settings.json")));
         assert!(is_sensitive_path(Path::new("/Users/alice/.config/gh/hosts.yml")));
         assert!(is_sensitive_path(Path::new("/Users/alice/.cargo/credentials.toml")));
