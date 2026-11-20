@@ -788,7 +788,15 @@ impl RemoteMeshHub {
                     });
                 }
             }
-            g.remote_hosts = hosts.clone();
+            let mut merged_hosts = hosts.clone();
+            for h in &mut merged_hosts {
+                if h.is_online && h.health.is_none() {
+                    if let Some(prev) = g.remote_hosts.iter().find(|p| p.id == h.id) {
+                        h.health = prev.health.clone();
+                    }
+                }
+            }
+            g.remote_hosts = merged_hosts;
         }
         if !pruned_sids.is_empty() {
             if let Ok(mut mgr) = self.pty_mgr.lock() {
@@ -1479,10 +1487,33 @@ impl RemoteMeshHub {
                 Duration::from_secs(10),
             )
             .await;
-        let repos = match ws_reply {
-            Ok(PeerMessage::WorkspacesSnapshot { repos, .. }) => repos,
-            _ => Vec::new(),
+        let (repos, voice_cfg_opt, host_health_opt) = match ws_reply {
+            Ok(PeerMessage::WorkspacesSnapshot {
+                repos,
+                voice_config,
+                host_health,
+                ..
+            }) => (repos, voice_config, host_health),
+            _ => (Vec::new(), None, None),
         };
+        if host_health_opt.is_some() || voice_cfg_opt.is_some() {
+            if let Ok(mut g) = self.state.lock() {
+                if let Some(ref hh) = host_health_opt {
+                    if let Some(entry) = g.remote_hosts.iter_mut().find(|h| h.id == host.id) {
+                        entry.health = Some(hh.clone());
+                    }
+                }
+                if let Some(vc) = voice_cfg_opt {
+                    if !vc.base_url.trim().is_empty() && g.voice_api_key.trim().is_empty() {
+                        g.voice_base_url = vc.base_url;
+                        if !vc.model.trim().is_empty() {
+                            g.voice_model = vc.model;
+                        }
+                    }
+                }
+            }
+            self.ui_dirty.store(true, Ordering::Release);
+        }
 
         let terms_reply = peer
             .request(
@@ -2309,6 +2340,86 @@ impl RemoteMeshHub {
                         g.remote_probe_status =
                             Some(format!("{} · {route} · {term_count} sessions", host.name));
                         g.status_notice = g.remote_probe_status.clone();
+                    }
+                }
+                Err(err) => {
+                    if let Ok(mut g) = hub.state.lock() {
+                        g.status_notice = Some(format!("{} unreachable: {err}", host.name));
+                    }
+                }
+            }
+            hub.ui_dirty.store(true, Ordering::Release);
+        });
+    }
+
+    pub fn upgrade_remote_daemon(self: &Arc<Self>, host: RemoteHostSummary) {
+        let hub = Arc::clone(self);
+        if let Ok(mut g) = hub.state.lock() {
+            g.status_notice = Some(format!(
+                "Upgrading coda-daemon on {} (zero-downtime OTA)…",
+                host.name
+            ));
+        }
+        hub.ui_dirty.store(true, Ordering::Release);
+
+        self.spawn_bg(async move {
+            let Ok(cfg) = load_desktop_daemon_config(&DaemonConfig::default_path()) else {
+                if let Ok(mut g) = hub.state.lock() {
+                    g.status_notice = Some("Sign in required before remote OTA upgrade.".into());
+                }
+                hub.ui_dirty.store(true, Ordering::Release);
+                return;
+            };
+            match hub.get_or_connect_peer(&cfg, &host).await {
+                Ok(peer) => {
+                    let reply = peer
+                        .request(
+                            PeerMessage::UpgradeDaemon {
+                                req_id: format!("ota-{}", Uuid::new_v4().simple()),
+                                target_version: None,
+                            },
+                            TrafficLane::ControlP0,
+                            Duration::from_secs(75),
+                        )
+                        .await;
+                    match reply {
+                        Ok(PeerMessage::UpgradeDaemonResult {
+                            ok,
+                            previous_version,
+                            target_version,
+                            message,
+                            ..
+                        }) => {
+                            let target_label = target_version.as_deref().unwrap_or("latest");
+                            if let Ok(mut g) = hub.state.lock() {
+                                g.status_notice = Some(if ok {
+                                    format!(
+                                        "{}: v{} -> v{} ({message})",
+                                        host.name, previous_version, target_label
+                                    )
+                                } else {
+                                    format!("{} OTA failed: {message}", host.name)
+                                });
+                            }
+                            if ok {
+                                // Drop cached peer so the re-exec'd daemon negotiates a fresh E2EE session cleanly.
+                                hub.drop_peer(host.id).await;
+                                tokio::time::sleep(Duration::from_millis(1200)).await;
+                                hub.sync_single_remote_host(&cfg, &host).await;
+                            }
+                        }
+                        Ok(_) => {
+                            if let Ok(mut g) = hub.state.lock() {
+                                g.status_notice =
+                                    Some(format!("{} returned unexpected OTA response", host.name));
+                            }
+                        }
+                        Err(err) => {
+                            if let Ok(mut g) = hub.state.lock() {
+                                g.status_notice =
+                                    Some(format!("{} OTA error: {err}", host.name));
+                            }
+                        }
                     }
                 }
                 Err(err) => {

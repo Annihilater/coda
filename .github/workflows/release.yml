@@ -192,6 +192,7 @@ jobs:
             <key>LSMinimumSystemVersion</key><string>14.0</string>
             <key>NSHighResolutionCapable</key><true/>
             <key>NSLocalNetworkUsageDescription</key><string>Coda discovers and connects directly to your paired Macs and Linux workstations on your local network over end-to-end encrypted P2P.</string>
+            <key>NSMicrophoneUsageDescription</key><string>Coda records voice prompts locally only when you click the microphone button to transcribe commands for your coding agents.</string>
           </dict>
           </plist>
           EOF

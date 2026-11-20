@@ -245,6 +245,14 @@ fn default_desktop_notifications() -> bool {
     true
 }
 
+fn default_voice_base_url() -> String {
+    "https://api.openai.com/v1".to_string()
+}
+
+fn default_voice_model() -> String {
+    "whisper-1".to_string()
+}
+
 /// Persisted user desktop preferences stored at `~/.config/coda/desktop.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DesktopPreferences {
@@ -264,6 +272,12 @@ pub struct DesktopPreferences {
     /// Native macOS OSC 7501 agent notifications (`needs_you`, `error`, background `done`).
     #[serde(default = "default_desktop_notifications")]
     pub desktop_notifications: bool,
+    #[serde(default = "default_voice_base_url")]
+    pub voice_base_url: String,
+    #[serde(default = "default_voice_model")]
+    pub voice_model: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub voice_api_key: String,
 }
 
 fn default_server_url() -> String {
@@ -280,6 +294,9 @@ impl Default for DesktopPreferences {
             dismissed_spaces: Vec::new(),
             allow_remote_control: true,
             desktop_notifications: true,
+            voice_base_url: default_voice_base_url(),
+            voice_model: default_voice_model(),
+            voice_api_key: String::new(),
         }
     }
 }
@@ -293,15 +310,25 @@ impl DesktopPreferences {
 
     pub fn load_or_default() -> Self {
         let path = Self::default_path();
-        std::fs::read_to_string(&path)
+        let mut prefs = std::fs::read_to_string(&path)
             .ok()
             .and_then(|txt| serde_json::from_str::<Self>(&txt).ok())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        if let Some(kc_key) = load_secret_from_keychain("desktop-voice-api-key") {
+            prefs.voice_api_key = kc_key;
+        }
+        prefs
     }
 
     pub fn save(&self) -> anyhow::Result<()> {
         let path = Self::default_path();
-        let body = serde_json::to_string_pretty(self)?;
+        let mut copy = self.clone();
+        if !copy.voice_api_key.is_empty() && save_secret_in_keychain("desktop-voice-api-key", &copy.voice_api_key) {
+            copy.voice_api_key.clear();
+        } else if copy.voice_api_key.is_empty() {
+            delete_secret_from_keychain("desktop-voice-api-key");
+        }
+        let body = serde_json::to_string_pretty(&copy)?;
         write_file_atomic_mode(&path, body.as_bytes(), 0o600)?;
         Ok(())
     }

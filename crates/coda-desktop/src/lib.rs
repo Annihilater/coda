@@ -11,10 +11,13 @@
 pub mod config;
 pub mod git_inspector;
 pub mod helpers;
+pub mod modals;
 pub mod notify;
 pub mod pty;
 pub mod remote_mesh;
+pub mod search_export;
 pub mod smart_path;
+pub mod voice_dock;
 
 pub use crate::remote_mesh::RemoteMeshHub;
 
@@ -37,8 +40,8 @@ use gpui::{
 use uuid::Uuid;
 
 use crate::config::{
-    config_root_dir, detect_local_machine_name, discover_local_git_repositories,
-    display_compact_path, ensure_agents_md_manual, ensure_macos_gui_path, is_safe_http_url,
+    detect_local_machine_name, discover_local_git_repositories, display_compact_path,
+    ensure_agents_md_manual, ensure_macos_gui_path, is_safe_http_url,
     pick_folder_via_native_dialog, reveal_in_finder, space_avatar_color, tr, DesktopPreferences,
     LayoutMode, MalleableLayoutConfig, UiLocale,
 };
@@ -75,6 +78,9 @@ actions!(
         ZoomInTerminal,
         ZoomOutTerminal,
         ZoomResetTerminal,
+        ToggleTerminalSearch,
+        ExportActiveSession,
+        ToggleVoiceDictation,
     ]
 );
 
@@ -102,12 +108,16 @@ pub enum ActiveInputTarget {
     #[default]
     TerminalDirect,
     CommandPalette,
+    TerminalSearch,
     AuthServerUrl,
     AuthAccount,
     AuthPassword,
     RenameDeviceInput,
     ChangePwCurrent,
     ChangePwNew,
+    VoiceBaseUrl,
+    VoiceModel,
+    VoiceApiKey,
 }
 
 /// Primary or Secondary split terminal pane.
@@ -236,6 +246,9 @@ pub enum PaletteAction {
     OpenDrawer(RightDrawerTab),
     OpenSettings,
     ToggleLocale,
+    OpenTerminalSearch,
+    ExportActiveSession,
+    ToggleVoiceDictation,
 }
 
 /// Root serializable-free desktop state backing the Coda GPUI workbench.
@@ -305,6 +318,14 @@ pub struct CodaDesktopState {
     pub pw_change_expanded: bool,
     pub pw_current_input: String,
     pub pw_new_input: String,
+    pub terminal_search_open: bool,
+    pub terminal_search_query: String,
+    pub terminal_search_index: usize,
+    pub voice_base_url: String,
+    pub voice_model: String,
+    pub voice_api_key: String,
+    pub voice_recording: bool,
+    pub voice_transcribing: bool,
     pub status_notice: Option<String>,
 }
 
@@ -366,6 +387,14 @@ impl Default for CodaDesktopState {
             pw_change_expanded: false,
             pw_current_input: String::new(),
             pw_new_input: String::new(),
+            terminal_search_open: false,
+            terminal_search_query: String::new(),
+            terminal_search_index: 0,
+            voice_base_url: DesktopPreferences::default().voice_base_url,
+            voice_model: DesktopPreferences::default().voice_model,
+            voice_api_key: String::new(),
+            voice_recording: false,
+            voice_transcribing: false,
             status_notice: None,
         }
     }
@@ -408,6 +437,9 @@ impl CodaDesktopState {
                 | ActiveInputTarget::AuthServerUrl
                 | ActiveInputTarget::AuthAccount
                 | ActiveInputTarget::AuthPassword
+                | ActiveInputTarget::VoiceBaseUrl
+                | ActiveInputTarget::VoiceModel
+                | ActiveInputTarget::VoiceApiKey
         ) {
             self.input_target = ActiveInputTarget::TerminalDirect;
         }
@@ -553,6 +585,34 @@ impl CodaDesktopState {
         });
         items.push(PaletteItem {
             kind_tag: "ACTION",
+            label: tr(self.locale, "Find in Terminal…", "终端内搜索…").to_string(),
+            detail: "Cmd+F · search".to_string(),
+            action: PaletteAction::OpenTerminalSearch,
+        });
+        items.push(PaletteItem {
+            kind_tag: "ACTION",
+            label: tr(
+                self.locale,
+                "Export Session Log (.md)",
+                "导出当前会话日志 (.md)",
+            )
+            .to_string(),
+            detail: "Cmd+Shift+E · markdown export".to_string(),
+            action: PaletteAction::ExportActiveSession,
+        });
+        items.push(PaletteItem {
+            kind_tag: "ACTION",
+            label: tr(
+                self.locale,
+                "Voice Dictation (Start / Stop)",
+                "语音听写（开始 / 停止录音）",
+            )
+            .to_string(),
+            detail: "Whisper · mic".to_string(),
+            action: PaletteAction::ToggleVoiceDictation,
+        });
+        items.push(PaletteItem {
+            kind_tag: "ACTION",
             label: tr(self.locale, "Switch Language (EN / 中文)", "切换界面语言 (EN / 中文)").to_string(),
             detail: self.locale.label().to_string(),
             action: PaletteAction::ToggleLocale,
@@ -621,6 +681,7 @@ pub struct CodaGpuWorkspaceView {
     scroll_pixel_acc: Mutex<HashMap<String, f32>>,
     pty_synced_gen: Mutex<HashMap<String, (u64, bool, u64)>>,
     inspector_seq: Arc<AtomicU64>,
+    voice_ctrl: Arc<crate::voice_dock::DesktopVoiceController>,
 }
 
 impl Focusable for CodaGpuWorkspaceView {
@@ -739,6 +800,9 @@ impl CodaGpuWorkspaceView {
         init_state.server_url = prefs.server_url.clone();
         init_state.allow_remote_control = prefs.allow_remote_control;
         init_state.desktop_notifications = prefs.desktop_notifications;
+        init_state.voice_base_url = prefs.voice_base_url.clone();
+        init_state.voice_model = prefs.voice_model.clone();
+        init_state.voice_api_key = prefs.voice_api_key.clone();
         init_state.layout = layout_cfg;
         init_state.layout_mtime = layout_mtime;
         init_state.hc_path = discover_hc_binary();
@@ -835,6 +899,7 @@ impl CodaGpuWorkspaceView {
             scroll_pixel_acc: Mutex::new(HashMap::new()),
             pty_synced_gen: Mutex::new(HashMap::new()),
             inspector_seq: Arc::clone(&inspector_seq),
+            voice_ctrl: crate::voice_dock::DesktopVoiceController::new(),
         };
 
         // Run filesystem/git discovery and default config creation off the GPUI UI thread.
@@ -1168,9 +1233,20 @@ impl CodaGpuWorkspaceView {
                 ActiveInputTarget::RenameDeviceInput => {
                     (!g.rename_host_input.is_empty()).then(|| (g.rename_host_input.clone(), false))
                 }
+                ActiveInputTarget::TerminalSearch => {
+                    (!g.terminal_search_query.is_empty())
+                        .then(|| (g.terminal_search_query.clone(), false))
+                }
+                ActiveInputTarget::VoiceBaseUrl => {
+                    (!g.voice_base_url.is_empty()).then(|| (g.voice_base_url.clone(), false))
+                }
+                ActiveInputTarget::VoiceModel => {
+                    (!g.voice_model.is_empty()).then(|| (g.voice_model.clone(), false))
+                }
                 ActiveInputTarget::AuthPassword
                 | ActiveInputTarget::ChangePwCurrent
-                | ActiveInputTarget::ChangePwNew => None,
+                | ActiveInputTarget::ChangePwNew
+                | ActiveInputTarget::VoiceApiKey => None,
                 ActiveInputTarget::TerminalDirect if !g.settings_open => {
                     let id = g.focused_session_id()?.to_string();
                     drop(g);
@@ -1261,9 +1337,12 @@ impl CodaGpuWorkspaceView {
                 || matches!(
                     target,
                     ActiveInputTarget::CommandPalette
+                        | ActiveInputTarget::TerminalSearch
                         | ActiveInputTarget::AuthServerUrl
                         | ActiveInputTarget::AuthAccount
                         | ActiveInputTarget::RenameDeviceInput
+                        | ActiveInputTarget::VoiceBaseUrl
+                        | ActiveInputTarget::VoiceModel
                 ) {
                 txt.trim().to_string()
             } else if matches!(
@@ -1271,6 +1350,7 @@ impl CodaGpuWorkspaceView {
                 ActiveInputTarget::AuthPassword
                     | ActiveInputTarget::ChangePwCurrent
                     | ActiveInputTarget::ChangePwNew
+                    | ActiveInputTarget::VoiceApiKey
             ) {
                 // #39: Strip trailing newline when pasting from password managers.
                 txt.trim_end_matches(&['\r', '\n'][..]).to_string()
@@ -1388,6 +1468,44 @@ impl CodaGpuWorkspaceView {
                     g.pw_new_input.push_str(text);
                 }
             }
+            ActiveInputTarget::TerminalSearch => {
+                if let Ok(mut g) = self.state.lock() {
+                    if g.input_selected_all {
+                        g.terminal_search_query.clear();
+                        g.input_selected_all = false;
+                    }
+                    g.terminal_search_query.push_str(text);
+                    g.terminal_search_index = 0;
+                }
+                self.jump_to_current_search_match();
+            }
+            ActiveInputTarget::VoiceBaseUrl => {
+                if let Ok(mut g) = self.state.lock() {
+                    if g.input_selected_all {
+                        g.voice_base_url.clear();
+                        g.input_selected_all = false;
+                    }
+                    g.voice_base_url.push_str(text);
+                }
+            }
+            ActiveInputTarget::VoiceModel => {
+                if let Ok(mut g) = self.state.lock() {
+                    if g.input_selected_all {
+                        g.voice_model.clear();
+                        g.input_selected_all = false;
+                    }
+                    g.voice_model.push_str(text);
+                }
+            }
+            ActiveInputTarget::VoiceApiKey => {
+                if let Ok(mut g) = self.state.lock() {
+                    if g.input_selected_all {
+                        g.voice_api_key.clear();
+                        g.input_selected_all = false;
+                    }
+                    g.voice_api_key.push_str(text);
+                }
+            }
             ActiveInputTarget::CommandPalette => {}
         }
     }
@@ -1429,6 +1547,13 @@ impl CodaGpuWorkspaceView {
                                 ActiveInputTarget::RenameDeviceInput => g.rename_host_input.clear(),
                                 ActiveInputTarget::ChangePwCurrent => g.pw_current_input.clear(),
                                 ActiveInputTarget::ChangePwNew => g.pw_new_input.clear(),
+                                ActiveInputTarget::TerminalSearch => {
+                                    g.terminal_search_query.clear();
+                                    g.terminal_search_index = 0;
+                                }
+                                ActiveInputTarget::VoiceBaseUrl => g.voice_base_url.clear(),
+                                ActiveInputTarget::VoiceModel => g.voice_model.clear(),
+                                ActiveInputTarget::VoiceApiKey => g.voice_api_key.clear(),
                                 _ => {}
                             }
                         }
@@ -1448,6 +1573,11 @@ impl CodaGpuWorkspaceView {
                 }
                 "0" => {
                     self.adjust_terminal_font_size(None);
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                "f" => {
+                    self.toggle_terminal_search();
                     cx.notify();
                     cx.stop_propagation();
                 }
@@ -1770,6 +1900,147 @@ impl CodaGpuWorkspaceView {
                         g.pw_change_expanded = false;
                         g.pw_current_input.clear();
                         g.pw_new_input.clear();
+                        g.input_selected_all = false;
+                        g.input_target = ActiveInputTarget::TerminalDirect;
+                    }
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                _ => {}
+            },
+            ActiveInputTarget::TerminalSearch => match key {
+                "backspace" => {
+                    if let Ok(mut g) = self.state.lock() {
+                        if g.input_selected_all {
+                            g.terminal_search_query.clear();
+                            g.input_selected_all = false;
+                        } else {
+                            g.terminal_search_query.pop();
+                        }
+                        g.terminal_search_index = 0;
+                    }
+                    self.jump_to_current_search_match();
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                "enter" | "return" => {
+                    self.step_terminal_search(!mods.shift);
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                "up" => {
+                    self.step_terminal_search(false);
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                "down" => {
+                    self.step_terminal_search(true);
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                "escape" => {
+                    if let Ok(mut g) = self.state.lock() {
+                        g.terminal_search_open = false;
+                        g.input_selected_all = false;
+                        g.input_target = ActiveInputTarget::TerminalDirect;
+                    }
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                _ => {}
+            },
+            ActiveInputTarget::VoiceBaseUrl => match key {
+                "backspace" => {
+                    if let Ok(mut g) = self.state.lock() {
+                        if g.input_selected_all {
+                            g.voice_base_url.clear();
+                            g.input_selected_all = false;
+                        } else {
+                            g.voice_base_url.pop();
+                        }
+                    }
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                "tab" => {
+                    if let Ok(mut g) = self.state.lock() {
+                        g.input_selected_all = false;
+                        g.input_target = ActiveInputTarget::VoiceModel;
+                    }
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                "enter" | "return" => {
+                    self.save_voice_preferences();
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                "escape" => {
+                    if let Ok(mut g) = self.state.lock() {
+                        g.input_selected_all = false;
+                        g.input_target = ActiveInputTarget::TerminalDirect;
+                    }
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                _ => {}
+            },
+            ActiveInputTarget::VoiceModel => match key {
+                "backspace" => {
+                    if let Ok(mut g) = self.state.lock() {
+                        if g.input_selected_all {
+                            g.voice_model.clear();
+                            g.input_selected_all = false;
+                        } else {
+                            g.voice_model.pop();
+                        }
+                    }
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                "tab" => {
+                    if let Ok(mut g) = self.state.lock() {
+                        g.input_selected_all = false;
+                        g.input_target = ActiveInputTarget::VoiceApiKey;
+                    }
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                "enter" | "return" => {
+                    self.save_voice_preferences();
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                "escape" => {
+                    if let Ok(mut g) = self.state.lock() {
+                        g.input_selected_all = false;
+                        g.input_target = ActiveInputTarget::TerminalDirect;
+                    }
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                _ => {}
+            },
+            ActiveInputTarget::VoiceApiKey => match key {
+                "backspace" => {
+                    if let Ok(mut g) = self.state.lock() {
+                        if g.input_selected_all {
+                            g.voice_api_key.clear();
+                            g.input_selected_all = false;
+                        } else {
+                            g.voice_api_key.pop();
+                        }
+                    }
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                "enter" | "return" => {
+                    self.save_voice_preferences();
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                "escape" => {
+                    if let Ok(mut g) = self.state.lock() {
                         g.input_selected_all = false;
                         g.input_target = ActiveInputTarget::TerminalDirect;
                     }
@@ -3075,6 +3346,20 @@ impl CodaGpuWorkspaceView {
                 }
             }
             PaletteAction::ToggleLocale => self.toggle_locale(),
+            PaletteAction::OpenTerminalSearch => {
+                if let Ok(mut g) = self.state.lock() {
+                    g.palette_open = false;
+                    g.palette_query.clear();
+                    g.palette_selected = 0;
+                    g.settings_open = false;
+                    g.terminal_search_open = true;
+                    g.input_selected_all = !g.terminal_search_query.is_empty();
+                    g.input_target = ActiveInputTarget::TerminalSearch;
+                }
+                return;
+            }
+            PaletteAction::ExportActiveSession => self.export_focused_session_markdown(),
+            PaletteAction::ToggleVoiceDictation => self.toggle_voice_recording(),
         }
         if let Ok(mut g) = self.state.lock() {
             g.palette_open = false;
@@ -3112,6 +3397,318 @@ impl CodaGpuWorkspaceView {
             g.input_target = ActiveInputTarget::TerminalDirect;
         }
         self.ui_dirty.store(true, Ordering::Release);
+    }
+
+    fn toggle_terminal_search(&self) {
+        let should_jump = if let Ok(mut g) = self.state.lock() {
+            if g.settings_open {
+                return;
+            }
+            g.palette_open = false;
+            if g.terminal_search_open && g.input_target == ActiveInputTarget::TerminalSearch {
+                g.terminal_search_open = false;
+                g.input_selected_all = false;
+                g.input_target = ActiveInputTarget::TerminalDirect;
+                false
+            } else {
+                g.terminal_search_open = true;
+                g.input_selected_all = !g.terminal_search_query.is_empty();
+                g.input_target = ActiveInputTarget::TerminalSearch;
+                !g.terminal_search_query.trim().is_empty()
+            }
+        } else {
+            false
+        };
+        if should_jump {
+            self.jump_to_current_search_match();
+        }
+        self.ui_dirty.store(true, Ordering::Release);
+    }
+
+    fn step_terminal_search(&self, forward: bool) {
+        if let Ok(mut g) = self.state.lock() {
+            let Some(fid) = g.focused_session_id().map(|s| s.to_string()) else {
+                return;
+            };
+            let matches = g
+                .session_by_id(&fid)
+                .map(|s| {
+                    crate::search_export::find_terminal_matches(
+                        &s.styled_lines,
+                        &g.terminal_search_query,
+                    )
+                })
+                .unwrap_or_default();
+            if matches.is_empty() {
+                g.terminal_search_index = 0;
+                return;
+            }
+            let len = matches.len();
+            let cur = g.terminal_search_index % len;
+            g.terminal_search_index = if forward {
+                (cur + 1) % len
+            } else {
+                (cur + len - 1) % len
+            };
+        }
+        self.jump_to_current_search_match();
+    }
+
+    fn jump_to_current_search_match(&self) {
+        let pane_rows = self
+            .visible_rows_by_pane
+            .lock()
+            .ok()
+            .and_then(|m| {
+                let pane = self
+                    .state
+                    .lock()
+                    .ok()
+                    .map(|g| g.focused_pane)
+                    .unwrap_or(SplitPane::Primary);
+                m.get(&pane).copied()
+            })
+            .unwrap_or(36);
+
+        if let Ok(mut g) = self.state.lock() {
+            let Some(fid) = g.focused_session_id().map(|s| s.to_string()) else {
+                return;
+            };
+            let query = g.terminal_search_query.clone();
+            let idx = g.terminal_search_index;
+            if let Some(sess) = g.sessions.iter_mut().find(|s| s.id == fid) {
+                let matches =
+                    crate::search_export::find_terminal_matches(&sess.styled_lines, &query);
+                if let Some(m) = matches.get(idx % matches.len().max(1)) {
+                    let total = sess.styled_lines.len();
+                    let max_off = total.saturating_sub(pane_rows);
+                    let desired_end = (m.line_idx + pane_rows / 2 + 1).min(total);
+                    sess.scroll_offset = total.saturating_sub(desired_end).min(max_off);
+                }
+            }
+        }
+    }
+
+    fn export_focused_session_markdown(&self) {
+        let snapshot = self.state.lock().ok().and_then(|g| {
+            let id = g.focused_session_id()?;
+            let s = g.session_by_id(id)?;
+            Some((g.locale, s.title.clone(), s.cwd.clone(), s.styled_lines.clone()))
+        });
+        let Some((loc, title, cwd, styled)) = snapshot else {
+            return;
+        };
+        match crate::search_export::export_session_markdown_file(&title, &cwd, &styled) {
+            Ok(path) => {
+                if let Ok(mut g) = self.state.lock() {
+                    g.status_notice = Some(format!(
+                        "{}: {}",
+                        tr(loc, "Exported session log", "已导出会话日志"),
+                        display_compact_path(&path.to_string_lossy())
+                    ));
+                }
+            }
+            Err(err) => {
+                if let Ok(mut g) = self.state.lock() {
+                    g.status_notice = Some(format!(
+                        "{}: {err}",
+                        tr(loc, "Export failed", "导出失败")
+                    ));
+                }
+            }
+        }
+        self.ui_dirty.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn save_voice_preferences(&self) {
+        let (loc, base_url, model, api_key) = match self.state.lock() {
+            Ok(g) => (
+                g.locale,
+                g.voice_base_url.trim().to_string(),
+                g.voice_model.trim().to_string(),
+                g.voice_api_key.trim().to_string(),
+            ),
+            Err(_) => return,
+        };
+        if let Err(err) = crate::voice_dock::validated_transcription_endpoint(&base_url) {
+            if let Ok(mut g) = self.state.lock() {
+                g.status_notice = Some(err);
+            }
+            self.ui_dirty.store(true, Ordering::Release);
+            return;
+        }
+        let eff_url = if base_url.is_empty() {
+            "https://api.openai.com/v1".to_string()
+        } else {
+            base_url
+        };
+        let eff_model = if model.is_empty() {
+            "whisper-1".to_string()
+        } else {
+            model
+        };
+        if let Ok(mut g) = self.state.lock() {
+            g.voice_base_url = eff_url.clone();
+            g.voice_model = eff_model.clone();
+            g.voice_api_key = api_key.clone();
+            g.input_selected_all = false;
+            g.input_target = ActiveInputTarget::TerminalDirect;
+            g.status_notice = Some(
+                tr(
+                    loc,
+                    "Saved Whisper voice configuration",
+                    "已保存 Whisper 语音听写配置",
+                )
+                .to_string(),
+            );
+        }
+        Self::update_prefs_async(move |prefs| {
+            prefs.voice_base_url = eff_url;
+            prefs.voice_model = eff_model;
+            prefs.voice_api_key = api_key;
+        });
+        self.ui_dirty.store(true, Ordering::Release);
+    }
+
+    fn toggle_voice_recording(&self) {
+        if self.voice_ctrl.is_transcribing.load(Ordering::Acquire) {
+            return;
+        }
+        if self.voice_ctrl.is_recording.load(Ordering::Acquire) {
+            let Some(audio_path) = self.voice_ctrl.stop_recording_to_path() else {
+                return;
+            };
+            let (loc, base_url, model, api_key, target_sid) = match self.state.lock() {
+                Ok(mut g) => {
+                    g.voice_recording = false;
+                    g.voice_transcribing = true;
+                    g.status_notice = Some(
+                        tr(g.locale, "Transcribing voice…", "正在进行 Whisper 语音转写…")
+                            .to_string(),
+                    );
+                    (
+                        g.locale,
+                        g.voice_base_url.clone(),
+                        g.voice_model.clone(),
+                        g.voice_api_key.clone(),
+                        g.focused_session_id().map(|s| s.to_string()),
+                    )
+                }
+                Err(_) => return,
+            };
+            self.voice_ctrl.is_transcribing.store(true, Ordering::Release);
+            let voice_ctrl_bg = Arc::clone(&self.voice_ctrl);
+            let state_bg = Arc::clone(&self.state);
+            let pty_mgr_bg = Arc::clone(&self.pty_mgr);
+            let mesh_hub_bg = Arc::clone(&self.mesh_hub);
+            let ui_dirty_bg = Arc::clone(&self.ui_dirty);
+            std::thread::spawn(move || {
+                let res = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| e.to_string())
+                    .and_then(|rt| {
+                        rt.block_on(crate::voice_dock::transcribe_audio_file(
+                            &audio_path,
+                            &base_url,
+                            &api_key,
+                            &model,
+                        ))
+                    });
+                let _ = std::fs::remove_file(&audio_path);
+                voice_ctrl_bg.is_transcribing.store(false, Ordering::Release);
+
+                match res {
+                    Ok(transcript) if !transcript.is_empty() => {
+                        let sid = target_sid.or_else(|| {
+                            state_bg
+                                .lock()
+                                .ok()
+                                .and_then(|g| g.focused_session_id().map(|s| s.to_string()))
+                        });
+                        if let Some(id) = sid {
+                            let bracketed = pty_mgr_bg
+                                .lock()
+                                .map(|m| m.terminal_modes(&id).1)
+                                .unwrap_or(false);
+                            let safe_txt = transcript.replace("\x1b[201~", "");
+                            let payload = if bracketed {
+                                let mut b = Vec::with_capacity(safe_txt.len() + 12);
+                                b.extend_from_slice(b"\x1b[200~");
+                                b.extend_from_slice(safe_txt.as_bytes());
+                                b.extend_from_slice(b"\x1b[201~");
+                                b
+                            } else {
+                                safe_txt.into_bytes()
+                            };
+                            let remote_info = state_bg.lock().ok().and_then(|g| {
+                                g.session_by_id(&id).and_then(|s| {
+                                    Some((
+                                        Uuid::parse_str(s.remote_host_id.as_deref()?).ok()?,
+                                        s.hc_addr.clone()?,
+                                    ))
+                                })
+                            });
+                            if let Some((hid, addr)) = remote_info {
+                                mesh_hub_bg.send_remote_pty_input(hid, &addr, payload);
+                            } else if let Ok(mgr) = pty_mgr_bg.lock() {
+                                let _ = mgr.write_input(&id, &payload);
+                            }
+                        }
+                        if let Ok(mut g) = state_bg.lock() {
+                            g.voice_transcribing = false;
+                            g.status_notice = Some(
+                                tr(
+                                    loc,
+                                    "Inserted voice transcript into terminal",
+                                    "已将语音转写文本填入当前终端",
+                                )
+                                .to_string(),
+                            );
+                        }
+                    }
+                    Ok(_) => {
+                        if let Ok(mut g) = state_bg.lock() {
+                            g.voice_transcribing = false;
+                            g.status_notice = Some(
+                                tr(loc, "No speech detected", "未识别到有效语音内容").to_string(),
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        if let Ok(mut g) = state_bg.lock() {
+                            g.voice_transcribing = false;
+                            g.status_notice = Some(err);
+                        }
+                    }
+                }
+                ui_dirty_bg.store(true, Ordering::Release);
+            });
+            self.ui_dirty.store(true, Ordering::Release);
+        } else {
+            match self.voice_ctrl.start_recording() {
+                Ok(()) => {
+                    if let Ok(mut g) = self.state.lock() {
+                        g.voice_recording = true;
+                        g.status_notice = Some(
+                            tr(
+                                g.locale,
+                                "Recording voice… click Stop to transcribe",
+                                "正在录音… 再次点击停止并转写到终端",
+                            )
+                            .to_string(),
+                        );
+                    }
+                }
+                Err(err) => {
+                    if let Ok(mut g) = self.state.lock() {
+                        g.voice_recording = false;
+                        g.status_notice = Some(err);
+                    }
+                }
+            }
+            self.ui_dirty.store(true, Ordering::Release);
+        }
     }
 
     fn save_server_url_preference(&self, url: &str) {
@@ -3227,6 +3824,13 @@ impl Render for CodaGpuWorkspaceView {
             }
             Err(_) => CodaDesktopState::default(),
         };
+
+        let needs_you_count = st
+            .sessions
+            .iter()
+            .filter(|s| s.alive && s.effective_state() == AgentLifecycleState::NeedsYou)
+            .count();
+        crate::voice_dock::update_macos_dock_badge(needs_you_count);
 
         let focused_pane_has_sess = if st.layout.split_terminals && st.focused_pane == SplitPane::Secondary {
             st.split_session_id
@@ -3377,6 +3981,18 @@ impl Render for CodaGpuWorkspaceView {
             }))
             .on_action(cx.listener(|this, _: &ZoomResetTerminal, _, cx| {
                 this.adjust_terminal_font_size(None);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &ToggleTerminalSearch, _, cx| {
+                this.toggle_terminal_search();
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &ExportActiveSession, _, cx| {
+                this.export_focused_session_markdown();
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &ToggleVoiceDictation, _, cx| {
+                this.toggle_voice_recording();
                 cx.notify();
             }))
             .size_full()
@@ -4297,7 +4913,54 @@ impl CodaGpuWorkspaceView {
                                 }
                                 cx.notify();
                             })),
-                    ),
+                    )
+                    .child({
+                        let v_rec = st.voice_recording;
+                        let v_tx = st.voice_transcribing;
+                        let v_label = if v_rec {
+                            tr(loc, "● Stop", "● 停止")
+                        } else if v_tx {
+                            tr(loc, "🎙 …", "🎙 转写…")
+                        } else {
+                            tr(loc, "🎙 Voice", "🎙 语音")
+                        };
+                        div()
+                            .id("btn-voice-dictation")
+                            .occlude()
+                            .h(px(22.0))
+                            .px(px(7.0))
+                            .rounded(px(5.0))
+                            .bg(rgb(if v_rec {
+                                palette::HOVER_BG
+                            } else {
+                                palette::SURFACE_BG
+                            }))
+                            .border_1()
+                            .border_color(rgb(if v_rec {
+                                palette::ERROR_RED
+                            } else if v_tx {
+                                accent
+                            } else {
+                                palette::BORDER
+                            }))
+                            .hover(|h| h.bg(rgb(palette::HOVER_BG)))
+                            .cursor_pointer()
+                            .flex()
+                            .items_center()
+                            .text_size(px(10.5))
+                            .text_color(rgb(if v_rec {
+                                palette::ERROR_RED
+                            } else if v_tx {
+                                accent
+                            } else {
+                                palette::TEXT_MUTED
+                            }))
+                            .child(v_label)
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                this.toggle_voice_recording();
+                                cx.notify();
+                            }))
+                    }),
             )
             .child({
                 // Right side: Split + Divider + Herdr-style Side Panel toggles (Files / Changes / Nodes)
@@ -4629,6 +5292,29 @@ impl CodaGpuWorkspaceView {
             .and_then(|s| s.clone())
             .filter(|sel| sel.session_id == sess.id && sel.is_non_empty());
 
+        let show_search_bar = st.terminal_search_open && is_focused;
+        let search_matches = if show_search_bar && !st.terminal_search_query.trim().is_empty() {
+            crate::search_export::find_terminal_matches(
+                &sess.styled_lines,
+                &st.terminal_search_query,
+            )
+        } else {
+            Vec::new()
+        };
+        let active_match_idx = if search_matches.is_empty() {
+            None
+        } else {
+            Some(st.terminal_search_index % search_matches.len())
+        };
+        let search_focused = st.input_target == ActiveInputTarget::TerminalSearch;
+        let search_count_label = if st.terminal_search_query.trim().is_empty() {
+            "0/0".to_string()
+        } else if let Some(mi) = active_match_idx {
+            format!("{}/{}", mi + 1, search_matches.len())
+        } else {
+            "0/0".to_string()
+        };
+
         div()
             .id(SharedString::from(format!("term-pane-{pane_slot:?}-{}", sess.id)))
             .size_full()
@@ -4719,6 +5405,27 @@ impl CodaGpuWorkspaceView {
                             let vis_row = (rel_y / geo.row_step).floor() as usize;
                             let col = (rel_x / geo.cell_w).floor() as usize;
                             let abs_line = (geo.start_line + vis_row).min(geo.total_lines.saturating_sub(1));
+                            if ev.modifiers.platform {
+                                let clicked_url = this.state.lock().ok().and_then(|g| {
+                                    let line = g
+                                        .session_by_id(&sid_sel_down)?
+                                        .styled_lines
+                                        .get(abs_line)?;
+                                    crate::search_export::url_at_display_col(&line.text, col)
+                                });
+                                if let Some(url) = clicked_url {
+                                    if crate::search_export::open_external_url_safely(&url) {
+                                        if let Ok(mut g) = this.state.lock() {
+                                            g.status_notice = Some(format!(
+                                                "{}: {url}",
+                                                tr(g.locale, "Opened URL", "已打开链接")
+                                            ));
+                                        }
+                                    }
+                                    cx.notify();
+                                    return;
+                                }
+                            }
                             if let Ok(mut sel) = this.terminal_selection.lock() {
                                 *sel = Some(TerminalSelection {
                                     session_id: sid_sel_down.clone(),
@@ -4780,6 +5487,174 @@ impl CodaGpuWorkspaceView {
                     cx.notify();
                 }),
             )
+            .when(show_search_bar, |el| {
+                let q_display = if st.terminal_search_query.is_empty() {
+                    tr(loc, "Find in terminal…", "在终端滚动缓存中搜索…").to_string()
+                } else {
+                    format!(
+                        "{}{}",
+                        st.terminal_search_query,
+                        if search_focused { "▏" } else { "" }
+                    )
+                };
+                el.child(
+                    div()
+                        .id(SharedString::from(format!("term-search-bar-{pane_slot:?}")))
+                        .occlude()
+                        .flex_shrink_0()
+                        .px(px(12.0))
+                        .py(px(5.0))
+                        .bg(rgb(palette::CHROME_BG))
+                        .border_b_1()
+                        .border_color(rgb(palette::BORDER))
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(8.0))
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                            cx.stop_propagation();
+                        })
+                        .child(
+                            div()
+                                .id(SharedString::from(format!(
+                                    "term-search-input-{pane_slot:?}"
+                                )))
+                                .occlude()
+                                .flex_1()
+                                .min_w_0()
+                                .px(px(8.0))
+                                .py(px(3.0))
+                                .rounded(px(4.0))
+                                .bg(rgb(palette::SURFACE_BG))
+                                .border_1()
+                                .border_color(rgb(if search_focused {
+                                    accent
+                                } else {
+                                    palette::BORDER
+                                }))
+                                .cursor_pointer()
+                                .text_size(px(11.5))
+                                .text_color(rgb(if st.terminal_search_query.is_empty() {
+                                    palette::TEXT_DIM
+                                } else {
+                                    palette::TEXT_PRIMARY
+                                }))
+                                .truncate()
+                                .child(format!("🔍 {q_display}"))
+                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                    if let Ok(mut g) = this.state.lock() {
+                                        g.input_selected_all = false;
+                                        g.input_target = ActiveInputTarget::TerminalSearch;
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .flex()
+                                .items_center()
+                                .gap(px(5.0))
+                                .child(
+                                    div()
+                                        .text_size(px(10.5))
+                                        .text_color(rgb(palette::TEXT_DIM))
+                                        .child(search_count_label),
+                                )
+                                .child(
+                                    div()
+                                        .id(SharedString::from(format!(
+                                            "term-search-prev-{pane_slot:?}"
+                                        )))
+                                        .occlude()
+                                        .px(px(6.0))
+                                        .py(px(2.0))
+                                        .rounded(px(4.0))
+                                        .bg(rgb(palette::SURFACE_BG))
+                                        .border_1()
+                                        .border_color(rgb(palette::BORDER))
+                                        .hover(|h| h.bg(rgb(palette::HOVER_BG)))
+                                        .cursor_pointer()
+                                        .text_size(px(10.5))
+                                        .text_color(rgb(palette::TEXT_MUTED))
+                                        .child("↑")
+                                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                            this.step_terminal_search(false);
+                                            cx.notify();
+                                        })),
+                                )
+                                .child(
+                                    div()
+                                        .id(SharedString::from(format!(
+                                            "term-search-next-{pane_slot:?}"
+                                        )))
+                                        .occlude()
+                                        .px(px(6.0))
+                                        .py(px(2.0))
+                                        .rounded(px(4.0))
+                                        .bg(rgb(palette::SURFACE_BG))
+                                        .border_1()
+                                        .border_color(rgb(palette::BORDER))
+                                        .hover(|h| h.bg(rgb(palette::HOVER_BG)))
+                                        .cursor_pointer()
+                                        .text_size(px(10.5))
+                                        .text_color(rgb(palette::TEXT_MUTED))
+                                        .child("↓")
+                                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                            this.step_terminal_search(true);
+                                            cx.notify();
+                                        })),
+                                )
+                                .child(
+                                    div()
+                                        .id(SharedString::from(format!(
+                                            "term-export-md-{pane_slot:?}"
+                                        )))
+                                        .occlude()
+                                        .px(px(7.0))
+                                        .py(px(2.0))
+                                        .rounded(px(4.0))
+                                        .bg(rgb(palette::SURFACE_BG))
+                                        .border_1()
+                                        .border_color(rgb(palette::BORDER))
+                                        .hover(|h| {
+                                            h.border_color(rgb(accent))
+                                                .text_color(rgb(palette::TEXT_PRIMARY))
+                                        })
+                                        .cursor_pointer()
+                                        .text_size(px(10.5))
+                                        .text_color(rgb(palette::TEXT_MUTED))
+                                        .child(tr(loc, "Export .md", "导出 .md"))
+                                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                            this.export_focused_session_markdown();
+                                            cx.notify();
+                                        })),
+                                )
+                                .child(
+                                    div()
+                                        .id(SharedString::from(format!(
+                                            "term-search-close-{pane_slot:?}"
+                                        )))
+                                        .occlude()
+                                        .px(px(6.0))
+                                        .py(px(2.0))
+                                        .rounded(px(4.0))
+                                        .hover(|h| h.bg(rgb(palette::HOVER_BG)))
+                                        .cursor_pointer()
+                                        .text_size(px(11.0))
+                                        .text_color(rgb(palette::TEXT_DIM))
+                                        .child("×")
+                                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                            if let Ok(mut g) = this.state.lock() {
+                                                g.terminal_search_open = false;
+                                                g.input_target = ActiveInputTarget::TerminalDirect;
+                                            }
+                                            cx.notify();
+                                        })),
+                                ),
+                        ),
+                )
+            })
             .child(
                 // Terminal ANSI viewport (top-aligned, newest lines when at bottom)
                 div()
@@ -4811,7 +5686,13 @@ impl CodaGpuWorkspaceView {
                             let e_col = if abs_idx == r1 { c1 } else { line_cols };
                             (s_col < e_col).then_some((s_col, e_col))
                         });
-                        render_styled_terminal_line(line, line_h, sel_cols)
+                        let line_matches: Vec<(usize, usize, bool)> = search_matches
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, m)| m.line_idx == abs_idx)
+                            .map(|(mi, m)| (m.byte_start, m.byte_end, Some(mi) == active_match_idx))
+                            .collect();
+                        render_styled_terminal_line(line, line_h, sel_cols, &line_matches)
                     }))
                     .child(
                         div().absolute().inset_0().child(
@@ -5336,7 +6217,9 @@ impl CodaGpuWorkspaceView {
                                 let start = total.saturating_sub(32);
                                 sess.styled_lines[start..]
                                     .iter()
-                                    .map(|line| render_styled_terminal_line(line, tile_line_h, None))
+                                    .map(|line| {
+                                        render_styled_terminal_line(line, tile_line_h, None, &[])
+                                    })
                             }),
                     )
             }))
@@ -6285,6 +7168,17 @@ impl CodaGpuWorkspaceView {
         })
         .children(st.remote_hosts.iter().map(|host| {
             let host_clone = host.clone();
+            let ota_host = host.clone();
+            let can_ota = host.is_online
+                && host
+                    .health
+                    .as_ref()
+                    .map(|h| h.ota_supported)
+                    .unwrap_or(true);
+            let meta_line = match host.health.as_ref() {
+                Some(hh) => crate::search_export::format_host_health_compact(hh),
+                None => format!("{} · {}", host.platform, host.role),
+            };
             div()
                 .id(SharedString::from(format!("mesh-host-{}", host.id)))
                 .occlude()
@@ -6304,41 +7198,78 @@ impl CodaGpuWorkspaceView {
                         .min_w_0()
                         .flex_1()
                         .flex()
-                        .items_center()
-                        .gap(px(6.0))
+                        .flex_col()
+                        .gap(px(2.0))
                         .child(
                             div()
-                                .w(px(6.0))
-                                .h(px(6.0))
-                                .flex_shrink_0()
-                                .rounded(px(99.0))
-                                .bg(rgb(if host.is_online {
-                                    palette::DONE_GREEN
-                                } else {
-                                    palette::TEXT_DIM
-                                })),
-                        )
-                        .child(
-                            div()
-                                .text_size(px(12.0))
-                                .text_color(rgb(palette::TEXT_PRIMARY))
-                                .truncate()
-                                .child(host.name.clone()),
+                                .flex()
+                                .items_center()
+                                .gap(px(6.0))
+                                .child(
+                                    div()
+                                        .w(px(6.0))
+                                        .h(px(6.0))
+                                        .flex_shrink_0()
+                                        .rounded(px(99.0))
+                                        .bg(rgb(if host.is_online {
+                                            palette::DONE_GREEN
+                                        } else {
+                                            palette::TEXT_DIM
+                                        })),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(12.0))
+                                        .text_color(rgb(palette::TEXT_PRIMARY))
+                                        .truncate()
+                                        .child(host.name.clone()),
+                                ),
                         )
                         .child(
                             div()
                                 .text_size(px(10.0))
                                 .text_color(rgb(palette::TEXT_DIM))
                                 .truncate()
-                                .child(format!("{} · {}", host.platform, host.role)),
+                                .child(meta_line),
                         ),
                 )
                 .child(
                     div()
                         .flex_shrink_0()
-                        .text_size(px(10.5))
-                        .text_color(rgb(st.layout.accent_color_u32()))
-                        .child(tr(loc, "Open", "进入")),
+                        .flex()
+                        .items_center()
+                        .gap(px(5.0))
+                        .when(can_ota, |el| {
+                            el.child(
+                                div()
+                                    .id(SharedString::from(format!("mesh-ota-{}", host.id)))
+                                    .occlude()
+                                    .px(px(6.0))
+                                    .py(px(2.0))
+                                    .rounded(px(4.0))
+                                    .bg(rgb(palette::CHROME_BG))
+                                    .border_1()
+                                    .border_color(rgb(palette::BORDER))
+                                    .hover(|h| h.border_color(rgb(st.layout.accent_color_u32())))
+                                    .text_size(px(10.0))
+                                    .text_color(rgb(palette::TEXT_MUTED))
+                                    .child(tr(loc, "Upgrade", "升级"))
+                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                        cx.stop_propagation();
+                                    })
+                                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                        cx.stop_propagation();
+                                        this.mesh_hub.upgrade_remote_daemon(ota_host.clone());
+                                        cx.notify();
+                                    })),
+                            )
+                        })
+                        .child(
+                            div()
+                                .text_size(px(10.5))
+                                .text_color(rgb(st.layout.accent_color_u32()))
+                                .child(tr(loc, "Open", "进入")),
+                        ),
                 )
                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                     this.mesh_hub.probe_host(host_clone.clone());
@@ -6347,1917 +7278,14 @@ impl CodaGpuWorkspaceView {
         }))
     }
 
-    fn render_command_palette_overlay(
-        &self,
-        st: &CodaDesktopState,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let loc = st.locale;
-        let accent = st.layout.accent_color_u32();
-        let items = st.palette_items();
-        let selected = st.palette_selected.min(items.len().saturating_sub(1));
-
-        div()
-            .id("palette-backdrop")
-            .occlude()
-            .absolute()
-            .inset_0()
-            .bg(rgba(0x00000099))
-            .pt(px(72.0))
-            .flex()
-            .justify_center()
-            .items_start()
-            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                if let Ok(mut g) = this.state.lock() {
-                    g.palette_open = false;
-                    g.input_target = ActiveInputTarget::TerminalDirect;
-                }
-                cx.notify();
-            }))
-            .child(
-                div()
-                    .id("palette-modal")
-                    .occlude()
-                    .w(px(540.0))
-                    .rounded(px(10.0))
-                    .bg(rgb(palette::CHROME_BG))
-                    .border_1()
-                    .border_color(rgb(palette::BORDER_STRONG))
-                    .overflow_hidden()
-                    .flex()
-                    .flex_col()
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                        cx.stop_propagation();
-                    })
-                    .on_click(|_, _, cx| {
-                        cx.stop_propagation();
-                    })
-                    .child(
-                        div()
-                            .h(px(42.0))
-                            .px(px(14.0))
-                            .border_b_1()
-                            .border_color(rgb(palette::BORDER))
-                            .flex()
-                            .items_center()
-                            .gap(px(8.0))
-                            .child(
-                                div()
-                                    .text_size(px(12.0))
-                                    .text_color(rgb(accent))
-                                    .child("⌘P"),
-                            )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .text_size(px(13.0))
-                                    .text_color(rgb(if st.palette_query.is_empty() {
-                                        palette::TEXT_DIM
-                                    } else {
-                                        palette::TEXT_PRIMARY
-                                    }))
-                                    .child(if st.palette_query.is_empty() {
-                                        tr(
-                                            loc,
-                                            "Jump to space, terminal, layout, or command...",
-                                            "搜索工作区、终端会话、视图或命令...",
-                                        )
-                                        .to_string()
-                                    } else {
-                                        format!("{}|", st.palette_query)
-                                    }),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .id("palette-list")
-                            .max_h(px(360.0))
-                            .p(px(6.0))
-                            .overflow_y_scroll()
-                            .flex()
-                            .flex_col()
-                            .gap(px(2.0))
-                            .children(items.into_iter().enumerate().map(|(idx, item)| {
-                                let is_sel = idx == selected;
-                                let action = item.action.clone();
-                                div()
-                                    .id(SharedString::from(format!("pal-item-{idx}")))
-                                    .occlude()
-                                    .px(px(10.0))
-                                    .py(px(7.0))
-                                    .rounded(px(6.0))
-                                    .bg(rgb(if is_sel {
-                                        palette::HOVER_BG
-                                    } else {
-                                        palette::CHROME_BG
-                                    }))
-                                    .hover(|h| h.bg(rgb(palette::HOVER_BG)))
-                                    .cursor_pointer()
-                                    .flex()
-                                    .items_center()
-                                    .justify_between()
-                                    .gap(px(8.0))
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .items_center()
-                                            .gap(px(8.0))
-                                            .child(
-                                                div()
-                                                    .px(px(5.0))
-                                                    .py(px(1.0))
-                                                    .rounded(px(3.0))
-                                                    .bg(rgb(palette::SURFACE_BG))
-                                                    .text_size(px(9.5))
-                                                    .text_color(rgb(accent))
-                                                    .child(item.kind_tag),
-                                            )
-                                            .child(
-                                                div()
-                                                    .text_size(px(12.5))
-                                                    .text_color(rgb(palette::TEXT_PRIMARY))
-                                                    .child(item.label),
-                                            ),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(px(11.0))
-                                            .text_color(rgb(palette::TEXT_DIM))
-                                            .truncate()
-                                            .child(item.detail),
-                                    )
-                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                        cx.stop_propagation();
-                                    })
-                                    .on_click(cx.listener(
-                                        move |this, _: &ClickEvent, _, cx| {
-                                            cx.stop_propagation();
-                                            this.execute_palette_action(action.clone());
-                                            cx.notify();
-                                        },
-                                    ))
-                            })),
-                    ),
-            )
-    }
-
-    fn render_settings_modal_overlay(
-        &self,
-        st: &CodaDesktopState,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let loc = st.locale;
-        let accent = st.layout.accent_color_u32();
-        let active_sec = st.settings_section;
-        let section_title = match active_sec {
-            SettingsSection::Appearance => tr(loc, "Appearance & Layout", "外观与布局"),
-            SettingsSection::Runtime => tr(loc, "Terminals & Spaces", "终端与工作区"),
-            SettingsSection::Machines => tr(loc, "Account & Remote Nodes", "账号与远端节点"),
-            SettingsSection::Shortcuts => tr(loc, "Keyboard Shortcuts", "快捷键"),
-        };
-
-        let nav_items: &[(SettingsSection, &str, &str)] = &[
-            (SettingsSection::Appearance, "Appearance", "外观与布局"),
-            (SettingsSection::Runtime, "Terminals & Spaces", "终端与工作区"),
-            (SettingsSection::Machines, "Account & Nodes", "账号与远端节点"),
-            (SettingsSection::Shortcuts, "Shortcuts", "快捷键"),
-        ];
-
-        let content = match active_sec {
-            SettingsSection::Appearance => {
-                self.render_settings_appearance_pane(st, cx).into_any_element()
-            }
-            SettingsSection::Runtime => {
-                self.render_settings_runtime_pane(st, cx).into_any_element()
-            }
-            SettingsSection::Machines => {
-                self.render_settings_machines_pane(st, cx).into_any_element()
-            }
-            SettingsSection::Shortcuts => self.render_settings_shortcuts_pane(st).into_any_element(),
-        };
-
-        div()
-            .id("settings-backdrop")
-            .occlude()
-            .absolute()
-            .inset_0()
-            .bg(rgba(0x000000aa))
-            .flex()
-            .items_center()
-            .justify_center()
-            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                if let Ok(mut g) = this.state.lock() {
-                    g.settings_open = false;
-                    g.clear_settings_ephemeral_inputs();
-                    g.input_target = ActiveInputTarget::TerminalDirect;
-                }
-                cx.notify();
-            }))
-            .child(
-                div()
-                    .id("settings-modal")
-                    .occlude()
-                    .w(px(720.0))
-                    .h(px(500.0))
-                    .rounded(px(10.0))
-                    .bg(rgb(palette::CHROME_BG))
-                    .border_1()
-                    .border_color(rgb(palette::BORDER_STRONG))
-                    .overflow_hidden()
-                    .flex()
-                    .flex_row()
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                        cx.stop_propagation();
-                    })
-                    .on_click(|_, _, cx| {
-                        cx.stop_propagation();
-                    })
-                    .child(
-                        // Left navigation rail (184px)
-                        div()
-                            .w(px(184.0))
-                            .h_full()
-                            .flex_shrink_0()
-                            .bg(rgb(palette::SIDEBAR_BG))
-                            .border_r_1()
-                            .border_color(rgb(palette::BORDER))
-                            .p(px(10.0))
-                            .flex()
-                            .flex_col()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap(px(4.0))
-                                    .child(
-                                        div()
-                                            .px(px(8.0))
-                                            .py(px(6.0))
-                                            .flex()
-                                            .items_center()
-                                            .justify_between()
-                                            .child(
-                                                div()
-                                                    .text_size(px(13.0))
-                                                    .font_weight(FontWeight::SEMIBOLD)
-                                                    .text_color(rgb(palette::TEXT_PRIMARY))
-                                                    .child(tr(loc, "Settings", "设置")),
-                                            )
-                                            .child(
-                                                div()
-                                                    .text_size(px(10.5))
-                                                    .text_color(rgb(palette::TEXT_DIM))
-                                                    .child("⌘,"),
-                                            ),
-                                    )
-                                    .children(nav_items.iter().map(|&(sec, en, zh)| {
-                                        let is_active = active_sec == sec;
-                                        div()
-                                            .id(SharedString::from(format!("settings-nav-{sec:?}")))
-                                            .occlude()
-                                            .px(px(9.0))
-                                            .py(px(6.0))
-                                            .rounded(px(6.0))
-                                            .bg(rgb(if is_active {
-                                                palette::HOVER_BG
-                                            } else {
-                                                palette::SIDEBAR_BG
-                                            }))
-                                            .border_1()
-                                            .border_color(rgb(if is_active {
-                                                accent
-                                            } else {
-                                                palette::SIDEBAR_BG
-                                            }))
-                                            .hover(|h| h.bg(rgb(palette::HOVER_BG)))
-                                            .cursor_pointer()
-                                            .text_size(px(12.0))
-                                            .text_color(rgb(if is_active {
-                                                palette::TEXT_PRIMARY
-                                            } else {
-                                                palette::TEXT_MUTED
-                                            }))
-                                            .child(tr(loc, en, zh))
-                                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                                if let Ok(mut g) = this.state.lock() {
-                                                    if g.settings_section != sec {
-                                                        g.clear_settings_ephemeral_inputs();
-                                                    }
-                                                    g.settings_section = sec;
-                                                    g.input_target =
-                                                        ActiveInputTarget::TerminalDirect;
-                                                }
-                                                cx.notify();
-                                            }))
-                                    })),
-                            )
-                            .child(
-                                div()
-                                    .id("btn-settings-open-config-dir")
-                                    .occlude()
-                                    .px(px(8.0))
-                                    .py(px(6.0))
-                                    .rounded(px(6.0))
-                                    .bg(rgb(palette::SURFACE_BG))
-                                    .border_1()
-                                    .border_color(rgb(palette::BORDER))
-                                    .hover(|h| h.bg(rgb(palette::HOVER_BG)))
-                                    .cursor_pointer()
-                                    .text_size(px(11.0))
-                                    .text_color(rgb(palette::TEXT_MUTED))
-                                    .child(tr(
-                                        loc,
-                                        "Open ~/.config/coda",
-                                        "打开 ~/.config/coda",
-                                    ))
-                                    .on_click(cx.listener(|_, _: &ClickEvent, _, _| {
-                                        if let Some(dir) = config_root_dir() {
-                                            let _ = std::fs::create_dir_all(&dir);
-                                            reveal_in_finder(&dir.to_string_lossy());
-                                        }
-                                    })),
-                            ),
-                    )
-                    .child(
-                        // Right section content column
-                        div()
-                            .flex_1()
-                            .h_full()
-                            .min_w_0()
-                            .flex()
-                            .flex_col()
-                            .child(
-                                div()
-                                    .h(px(42.0))
-                                    .flex_shrink_0()
-                                    .px(px(16.0))
-                                    .border_b_1()
-                                    .border_color(rgb(palette::BORDER))
-                                    .flex()
-                                    .items_center()
-                                    .justify_between()
-                                    .gap(px(8.0))
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .items_center()
-                                            .gap(px(10.0))
-                                            .child(
-                                                div()
-                                                    .text_size(px(13.0))
-                                                    .font_weight(FontWeight::SEMIBOLD)
-                                                    .text_color(rgb(palette::TEXT_PRIMARY))
-                                                    .child(section_title),
-                                            )
-                                            .child(
-                                                div()
-                                                    .text_size(px(10.5))
-                                                    .text_color(rgb(palette::TEXT_DIM))
-                                                    .child(tr(
-                                                        loc,
-                                                        "Changes save & apply immediately",
-                                                        "更改自动保存并实时生效",
-                                                    )),
-                                            ),
-                                    )
-                                    .child(
-                                        div()
-                                            .id("btn-close-settings")
-                                            .occlude()
-                                            .w(px(24.0))
-                                            .h(px(24.0))
-                                            .rounded(px(5.0))
-                                            .hover(|h| h.bg(rgb(palette::HOVER_BG)))
-                                            .cursor_pointer()
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .text_size(px(14.0))
-                                            .text_color(rgb(palette::TEXT_MUTED))
-                                            .child("×")
-                                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                                if let Ok(mut g) = this.state.lock() {
-                                                    g.settings_open = false;
-                                                    g.clear_settings_ephemeral_inputs();
-                                                    g.input_target =
-                                                        ActiveInputTarget::TerminalDirect;
-                                                }
-                                                cx.notify();
-                                            })),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_h_0()
-                                    .p(px(14.0))
-                                    .flex()
-                                    .flex_col()
-                                    .gap(px(8.0))
-                                    .overflow_hidden()
-                                    .child(content),
-                            ),
-                    ),
-            )
-    }
-
-    fn render_settings_appearance_pane(
-        &self,
-        st: &CodaDesktopState,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let loc = st.locale;
-        let accent = st.layout.accent_color_u32();
-        let font_px = st.layout.terminal_font_size_px.clamp(10.0, 22.0);
-        let sidebar_w_px = st.layout.sidebar_width_px.clamp(200.0, 320.0);
-
-        let accent_swatches: &[(&str, u32)] = &[
-            ("#38bdf8", 0x38bdf8),
-            ("#22c55e", 0x22c55e),
-            ("#a78bfa", 0xa78bfa),
-            ("#f59e0b", 0xf59e0b),
-            ("#f472b6", 0xf472b6),
-            ("#2dd4bf", 0x2dd4bf),
-        ];
-        let font_choices: &[&str] = &["Menlo", "SF Mono", "JetBrains Mono", "Monaco"];
-
-        div()
-            .flex()
-            .flex_col()
-            .gap(px(8.0))
-            .child(render_settings_row(
-                tr(loc, "Language", "界面语言"),
-                tr(loc, "Desktop UI localization", "切换桌面客户端显示语言"),
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(4.0))
-                    .child(self.render_setting_pill(
-                        "settings-lang-zh",
-                        "中文",
-                        loc == UiLocale::Zh,
-                        accent,
-                        cx.listener(|this, _: &ClickEvent, _, cx| {
-                            this.set_locale(UiLocale::Zh);
-                            cx.notify();
-                        }),
-                    ))
-                    .child(self.render_setting_pill(
-                        "settings-lang-en",
-                        "English",
-                        loc == UiLocale::En,
-                        accent,
-                        cx.listener(|this, _: &ClickEvent, _, cx| {
-                            this.set_locale(UiLocale::En);
-                            cx.notify();
-                        }),
-                    )),
-            ))
-            .child(render_settings_row(
-                tr(loc, "Workspace Layout", "默认主视图"),
-                tr(
-                    loc,
-                    "Main workbench or terminals grid",
-                    "选择专注终端工作台或平铺网格",
-                ),
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(4.0))
-                    .child(self.render_setting_pill(
-                        "settings-layout-workbench",
-                        tr(loc, "Main", "主工作台"),
-                        st.layout.layout == LayoutMode::Workbench,
-                        accent,
-                        cx.listener(|this, _: &ClickEvent, _, cx| {
-                            if let Ok(mut g) = this.state.lock() {
-                                g.layout.layout = LayoutMode::Workbench;
-                            }
-                            this.persist_layout_config();
-                            cx.notify();
-                        }),
-                    ))
-                    .child(self.render_setting_pill(
-                        "settings-layout-terminals",
-                        tr(loc, "Terminals", "终端平铺"),
-                        st.layout.layout == LayoutMode::Terminals,
-                        accent,
-                        cx.listener(|this, _: &ClickEvent, _, cx| {
-                            if let Ok(mut g) = this.state.lock() {
-                                g.layout.layout = LayoutMode::Terminals;
-                            }
-                            this.persist_layout_config();
-                            cx.notify();
-                        }),
-                    )),
-            ))
-            .child(render_settings_row(
-                tr(loc, "Accent Color", "主题强调色"),
-                tr(loc, "Active indicators & focus rings", "用于高亮标签、边框和活动指示器"),
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(6.0))
-                    .children(accent_swatches.iter().map(|&(hex, color_val)| {
-                        let is_sel = st.layout.accent_hex.eq_ignore_ascii_case(hex);
-                        let hex_owned = hex.to_string();
-                        div()
-                            .id(SharedString::from(format!("settings-swatch-{hex}")))
-                            .occlude()
-                            .w(px(20.0))
-                            .h(px(20.0))
-                            .rounded(px(99.0))
-                            .bg(rgb(color_val))
-                            .border_2()
-                            .border_color(rgb(if is_sel {
-                                palette::TEXT_PRIMARY
-                            } else {
-                                palette::SURFACE_BG
-                            }))
-                            .cursor_pointer()
-                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                if let Ok(mut g) = this.state.lock() {
-                                    g.layout.accent_hex = hex_owned.clone();
-                                }
-                                this.persist_layout_config();
-                                cx.notify();
-                            }))
-                    })),
-            ))
-            .child(render_settings_row(
-                tr(loc, "Terminal Font", "终端字体"),
-                tr(loc, "Monospace font family", "终端渲染使用的等宽字体"),
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(4.0))
-                    .children(font_choices.iter().map(|&font| {
-                        let is_sel = st.layout.font_family.eq_ignore_ascii_case(font);
-                        let font_owned = font.to_string();
-                        self.render_setting_pill(
-                            SharedString::from(format!("settings-font-{font}")),
-                            font,
-                            is_sel,
-                            accent,
-                            cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                if let Ok(mut g) = this.state.lock() {
-                                    g.layout.font_family = font_owned.clone();
-                                }
-                                this.persist_layout_config();
-                                cx.notify();
-                            }),
-                        )
-                    })),
-            ))
-            .child(render_settings_row(
-                tr(loc, "Terminal Font Size", "终端字号"),
-                tr(loc, "10 px – 22 px", "可调节范围 10 px – 22 px"),
-                self.render_stepper_control(
-                    "font-size",
-                    format!("{} px", font_px as u32),
-                    cx.listener(|this, _: &ClickEvent, _, cx| {
-                        if let Ok(mut g) = this.state.lock() {
-                            g.layout.terminal_font_size_px =
-                                (g.layout.terminal_font_size_px - 1.0).max(10.0);
-                        }
-                        this.persist_layout_config();
-                        cx.notify();
-                    }),
-                    cx.listener(|this, _: &ClickEvent, _, cx| {
-                        if let Ok(mut g) = this.state.lock() {
-                            g.layout.terminal_font_size_px =
-                                (g.layout.terminal_font_size_px + 1.0).min(22.0);
-                        }
-                        this.persist_layout_config();
-                        cx.notify();
-                    }),
-                ),
-            ))
-            .child(render_settings_row(
-                tr(loc, "Sidebar", "左侧边栏"),
-                tr(
-                    loc,
-                    "Toggle visibility and width (200–320 px)",
-                    "控制显示状态与宽度 (200–320 px)",
-                ),
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(6.0))
-                    .child(self.render_setting_pill(
-                        "settings-sidebar-toggle",
-                        if st.layout.sidebar_visible {
-                            tr(loc, "Visible", "显示")
-                        } else {
-                            tr(loc, "Hidden", "隐藏")
-                        },
-                        st.layout.sidebar_visible,
-                        accent,
-                        cx.listener(|this, _: &ClickEvent, _, cx| {
-                            if let Ok(mut g) = this.state.lock() {
-                                g.layout.sidebar_visible = !g.layout.sidebar_visible;
-                            }
-                            this.persist_layout_config();
-                            cx.notify();
-                        }),
-                    ))
-                    .child(self.render_stepper_control(
-                        "sidebar-width",
-                        format!("{} px", sidebar_w_px as u32),
-                        cx.listener(|this, _: &ClickEvent, _, cx| {
-                            if let Ok(mut g) = this.state.lock() {
-                                g.layout.sidebar_width_px =
-                                    (g.layout.sidebar_width_px - 12.0).max(200.0);
-                            }
-                            this.persist_layout_config();
-                            cx.notify();
-                        }),
-                        cx.listener(|this, _: &ClickEvent, _, cx| {
-                            if let Ok(mut g) = this.state.lock() {
-                                g.layout.sidebar_width_px =
-                                    (g.layout.sidebar_width_px + 12.0).min(320.0);
-                            }
-                            this.persist_layout_config();
-                            cx.notify();
-                        }),
-                    )),
-            ))
-    }
-
-    fn render_settings_runtime_pane(
-        &self,
-        st: &CodaDesktopState,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let loc = st.locale;
-        let accent = st.layout.accent_color_u32();
-        let local_spaces_count = st.spaces.iter().filter(|s| !s.is_remote).count();
-        let hidden_count = st.dismissed_spaces.len();
-        let hc_ver = st
-            .hc_version
-            .as_deref()
-            .unwrap_or_else(|| tr(loc, "not detected", "未检测到"));
-        let hc_path_label = st
-            .hc_path
-            .as_ref()
-            .map(|p| display_compact_path(&p.to_string_lossy()))
-            .unwrap_or_else(|| "—".to_string());
-
-        div()
-            .flex()
-            .flex_col()
-            .gap(px(8.0))
-            .child(
-                div()
-                    .p(px(11.0))
-                    .rounded(px(7.0))
-                    .bg(rgb(palette::SURFACE_BG))
-                    .border_1()
-                    .border_color(rgb(palette::BORDER))
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap(px(10.0))
-                    .child(
-                        div()
-                            .min_w_0()
-                            .flex_1()
-                            .flex()
-                            .flex_col()
-                            .gap(px(3.0))
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(6.0))
-                                    .child(
-                                        div()
-                                            .w(px(7.0))
-                                            .h(px(7.0))
-                                            .rounded(px(99.0))
-                                            .bg(rgb(if st.hc_available {
-                                                palette::DONE_GREEN
-                                            } else {
-                                                palette::TEXT_DIM
-                                            })),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(px(12.0))
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(rgb(palette::TEXT_PRIMARY))
-                                            .child(format!("herdr-core (hc) · {hc_ver}")),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(11.0))
-                                    .text_color(rgb(palette::TEXT_DIM))
-                                    .truncate()
-                                    .child(hc_path_label),
-                            ),
-                    )
-                    .child(self.render_setting_pill(
-                        "settings-recheck-hc",
-                        tr(loc, "Re-check", "重新检测"),
-                        false,
-                        accent,
-                        cx.listener(|this, _: &ClickEvent, _, cx| {
-                            let detected = discover_hc_binary();
-                            if let Ok(mut g) = this.state.lock() {
-                                g.hc_available = detected.is_some();
-                                g.hc_path = detected;
-                            }
-                            cx.notify();
-                        }),
-                    )),
-            )
-            .child(render_settings_row(
-                tr(loc, "Split Terminals", "双栏终端分屏"),
-                tr(loc, "Show two panes side by side (Cmd+D)", "并排显示左右两个终端窗口 (Cmd+D)"),
-                self.render_setting_pill(
-                    "settings-split-toggle",
-                    if st.layout.split_terminals {
-                        tr(loc, "Enabled", "开启")
-                    } else {
-                        tr(loc, "Off", "关闭")
-                    },
-                    st.layout.split_terminals,
-                    accent,
-                    cx.listener(|this, _: &ClickEvent, _, cx| {
-                        this.toggle_split_terminals();
-                        cx.notify();
-                    }),
-                ),
-            ))
-            .child(render_settings_row(
-                tr(loc, "Local Workspaces", "本地工作区"),
-                &format!(
-                    "{}: {local_spaces_count}",
-                    tr(loc, "Active local spaces", "当前本地工作区数量")
-                ),
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(6.0))
-                    .when(hidden_count > 0, |el| {
-                        el.child(self.render_setting_pill(
-                            "settings-restore-spaces",
-                            &format!(
-                                "{} ({hidden_count})",
-                                tr(loc, "Restore Hidden", "恢复已隐藏工作区")
-                            ),
-                            false,
-                            accent,
-                            cx.listener(|this, _: &ClickEvent, _, cx| {
-                                this.restore_dismissed_spaces();
-                                cx.notify();
-                            }),
-                        ))
-                    })
-                    .child(self.render_setting_pill(
-                        "settings-add-folder",
-                        tr(loc, "+ Add Folder…", "+ 添加本地目录…"),
-                        false,
-                        accent,
-                        cx.listener(|this, _: &ClickEvent, _, cx| {
-                            this.add_workspace_folder();
-                            cx.notify();
-                        }),
-                    )),
-            ))
-            .child(render_settings_row(
-                tr(loc, "Reset Appearance", "重置外观配置"),
-                tr(
-                    loc,
-                    "Restore default layout.json parameters",
-                    "恢复 layout.json 默认字体、布局与强调色",
-                ),
-                self.render_setting_pill(
-                    "settings-reset-layout",
-                    tr(loc, "Reset Layout Defaults", "恢复默认布局参数"),
-                    false,
-                    accent,
-                    cx.listener(|this, _: &ClickEvent, _, cx| {
-                        if let Ok(mut g) = this.state.lock() {
-                            g.layout = MalleableLayoutConfig::default();
-                        }
-                        this.persist_layout_config();
-                        cx.notify();
-                    }),
-                ),
-            ))
-    }
-
-    fn render_settings_machines_pane(
-        &self,
-        st: &CodaDesktopState,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let loc = st.locale;
-        let accent = st.layout.accent_color_u32();
-        let show_auth_form = !st.is_logged_in || st.auth_form_expanded;
-        let host_mode_on = st.allow_remote_control;
-        let srv_focused = st.input_target == ActiveInputTarget::AuthServerUrl;
-        let acct_focused = st.input_target == ActiveInputTarget::AuthAccount;
-        let pass_focused = st.input_target == ActiveInputTarget::AuthPassword;
-
-        div()
-            .id("settings-machines-scroll")
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
-            .flex()
-            .flex_col()
-            .gap(px(8.0))
-            .child(
-                // Control-plane Server URL + quick presets
-                div()
-                    .p(px(10.0))
-                    .rounded(px(7.0))
-                    .bg(rgb(palette::SURFACE_BG))
-                    .border_1()
-                    .border_color(rgb(palette::BORDER))
-                    .flex()
-                    .flex_col()
-                    .gap(px(6.0))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .gap(px(8.0))
-                            .child(
-                                div()
-                                    .text_size(px(11.5))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(rgb(palette::TEXT_PRIMARY))
-                                    .child(tr(loc, "Control-Plane Server", "控制面服务器")),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(4.0))
-                                    .child(self.render_setting_pill(
-                                        "settings-srv-local",
-                                        "Local :8080",
-                                        st.server_url == "http://127.0.0.1:8080",
-                                        accent,
-                                        cx.listener(|this, _: &ClickEvent, _, cx| {
-                                            this.save_server_url_preference(
-                                                "http://127.0.0.1:8080",
-                                            );
-                                            cx.notify();
-                                        }),
-                                    ))
-                                    .child(self.render_setting_pill(
-                                        "settings-srv-cloud",
-                                        "codahub.dev",
-                                        st.server_url == "https://codahub.dev",
-                                        accent,
-                                        cx.listener(|this, _: &ClickEvent, _, cx| {
-                                            this.save_server_url_preference("https://codahub.dev");
-                                            cx.notify();
-                                        }),
-                                    )),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .id("settings-input-auth-server")
-                            .occlude()
-                            .px(px(8.0))
-                            .py(px(5.0))
-                            .rounded(px(5.0))
-                            .bg(rgb(palette::CANVAS_BG))
-                            .border_1()
-                            .border_color(rgb(if srv_focused {
-                                accent
-                            } else {
-                                palette::BORDER
-                            }))
-                            .cursor_pointer()
-                            .text_size(px(11.5))
-                            .text_color(rgb(palette::TEXT_PRIMARY))
-                            .child(if srv_focused {
-                                format!("{}|", st.server_url)
-                            } else {
-                                st.server_url.clone()
-                            })
-                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                if let Ok(mut g) = this.state.lock() {
-                                    g.input_target = ActiveInputTarget::AuthServerUrl;
-                                    g.input_selected_all = false;
-                                }
-                                cx.notify();
-                            })),
-                    ),
-            )
-            .child(
-                // Account card (signed in vs login form)
-                div()
-                    .p(px(10.0))
-                    .rounded(px(7.0))
-                    .bg(rgb(palette::SURFACE_BG))
-                    .border_1()
-                    .border_color(rgb(palette::BORDER))
-                    .flex()
-                    .flex_col()
-                    .gap(px(6.0))
-                    .when(!show_auth_form, |el| {
-                        el.child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .justify_between()
-                                .gap(px(8.0))
-                                .child(
-                                    div()
-                                        .min_w_0()
-                                        .flex_1()
-                                        .flex()
-                                        .items_center()
-                                        .gap(px(6.0))
-                                        .child(
-                                            div()
-                                                .w(px(7.0))
-                                                .h(px(7.0))
-                                                .rounded(px(99.0))
-                                                .bg(rgb(palette::DONE_GREEN)),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_size(px(12.0))
-                                                .font_weight(FontWeight::SEMIBOLD)
-                                                .text_color(rgb(palette::TEXT_PRIMARY))
-                                                .truncate()
-                                                .child(st.account_email.clone()),
-                                        ),
-                                )
-                                .child(
-                                    div()
-                                        .flex_shrink_0()
-                                        .flex()
-                                        .items_center()
-                                        .gap(px(6.0))
-                                        .child(self.render_setting_pill(
-                                            "settings-toggle-pw-change",
-                                            tr(loc, "Password", "改密"),
-                                            st.pw_change_expanded,
-                                            accent,
-                                            cx.listener(|this, _: &ClickEvent, _, cx| {
-                                                if let Ok(mut g) = this.state.lock() {
-                                                    g.pw_change_expanded = !g.pw_change_expanded;
-                                                    g.auth_error = None;
-                                                    if g.pw_change_expanded {
-                                                        g.input_target = ActiveInputTarget::ChangePwCurrent;
-                                                    } else {
-                                                        g.pw_current_input.clear();
-                                                        g.pw_new_input.clear();
-                                                        g.input_target = ActiveInputTarget::TerminalDirect;
-                                                    }
-                                                }
-                                                cx.notify();
-                                            }),
-                                        ))
-                                        .child(self.render_setting_pill(
-                                            "settings-switch-acct",
-                                            tr(loc, "Switch Account", "切换账号"),
-                                            false,
-                                            accent,
-                                            cx.listener(|this, _: &ClickEvent, _, cx| {
-                                                if let Ok(mut g) = this.state.lock() {
-                                                    g.auth_form_expanded = true;
-                                                }
-                                                cx.notify();
-                                            }),
-                                        ))
-                                        .child(self.render_setting_pill(
-                                            "settings-sign-out",
-                                            tr(loc, "Sign Out", "退出登录"),
-                                            false,
-                                            accent,
-                                            cx.listener(|this, _: &ClickEvent, _, cx| {
-                                                this.mesh_hub.sign_out();
-                                                cx.notify();
-                                            }),
-                                        )),
-                                ),
-                        )
-                        .when(st.pw_change_expanded, |el2| {
-                            let cur_focused = st.input_target == ActiveInputTarget::ChangePwCurrent;
-                            let new_focused = st.input_target == ActiveInputTarget::ChangePwNew;
-                            let cur_mask = "•".repeat(st.pw_current_input.chars().count());
-                            let new_mask = "•".repeat(st.pw_new_input.chars().count());
-                            el2.child(
-                                div()
-                                    .mt(px(4.0))
-                                    .p(px(8.0))
-                                    .rounded(px(6.0))
-                                    .bg(rgb(palette::CHROME_BG))
-                                    .border_1()
-                                    .border_color(rgb(palette::BORDER))
-                                    .flex()
-                                    .flex_col()
-                                    .gap(px(6.0))
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .items_center()
-                                            .gap(px(6.0))
-                                            .child(
-                                                div()
-                                                    .id("settings-pw-current")
-                                                    .occlude()
-                                                    .flex_1()
-                                                    .px(px(8.0))
-                                                    .py(px(5.0))
-                                                    .rounded(px(4.0))
-                                                    .bg(rgb(palette::CANVAS_BG))
-                                                    .border_1()
-                                                    .border_color(rgb(if cur_focused {
-                                                        accent
-                                                    } else {
-                                                        palette::BORDER
-                                                    }))
-                                                    .cursor_pointer()
-                                                    .text_size(px(11.0))
-                                                    .text_color(rgb(if st.pw_current_input.is_empty() {
-                                                        palette::TEXT_DIM
-                                                    } else {
-                                                        palette::TEXT_PRIMARY
-                                                    }))
-                                                    .child(if st.pw_current_input.is_empty() {
-                                                        if cur_focused {
-                                                            "|".to_string()
-                                                        } else {
-                                                            tr(loc, "Current password", "当前密码").to_string()
-                                                        }
-                                                    } else if cur_focused {
-                                                        format!("{cur_mask}|")
-                                                    } else {
-                                                        cur_mask
-                                                    })
-                                                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                                        if let Ok(mut g) = this.state.lock() {
-                                                            g.input_target = ActiveInputTarget::ChangePwCurrent;
-                                                            g.input_selected_all = false;
-                                                        }
-                                                        cx.notify();
-                                                    })),
-                                            )
-                                            .child(
-                                                div()
-                                                    .id("settings-pw-new")
-                                                    .occlude()
-                                                    .flex_1()
-                                                    .px(px(8.0))
-                                                    .py(px(5.0))
-                                                    .rounded(px(4.0))
-                                                    .bg(rgb(palette::CANVAS_BG))
-                                                    .border_1()
-                                                    .border_color(rgb(if new_focused {
-                                                        accent
-                                                    } else {
-                                                        palette::BORDER
-                                                    }))
-                                                    .cursor_pointer()
-                                                    .text_size(px(11.0))
-                                                    .text_color(rgb(if st.pw_new_input.is_empty() {
-                                                        palette::TEXT_DIM
-                                                    } else {
-                                                        palette::TEXT_PRIMARY
-                                                    }))
-                                                    .child(if st.pw_new_input.is_empty() {
-                                                        if new_focused {
-                                                            "|".to_string()
-                                                        } else {
-                                                            tr(loc, "New password (8+ chars)", "新密码（至少 8 位）").to_string()
-                                                        }
-                                                    } else if new_focused {
-                                                        format!("{new_mask}|")
-                                                    } else {
-                                                        new_mask
-                                                    })
-                                                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                                        if let Ok(mut g) = this.state.lock() {
-                                                            g.input_target = ActiveInputTarget::ChangePwNew;
-                                                            g.input_selected_all = false;
-                                                        }
-                                                        cx.notify();
-                                                    })),
-                                            )
-                                            .child(self.render_setting_pill(
-                                                "settings-pw-submit",
-                                                tr(loc, "Update", "确认更新"),
-                                                true,
-                                                accent,
-                                                cx.listener(|this, _: &ClickEvent, _, cx| {
-                                                    this.submit_change_password();
-                                                    cx.notify();
-                                                }),
-                                            )),
-                                    )
-                                    .when_some(st.auth_error.clone(), |err_el, err_msg| {
-                                        err_el.child(
-                                            div()
-                                                .text_size(px(10.5))
-                                                .text_color(rgb(palette::ERROR_RED))
-                                                .child(err_msg),
-                                        )
-                                    }),
-                            )
-                        })
-                    })
-                    .when(show_auth_form, |el| {
-                        el.child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .justify_between()
-                                .child(
-                                    div()
-                                        .text_size(px(11.5))
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(rgb(palette::TEXT_PRIMARY))
-                                        .child(tr(loc, "Coda Account Sign In", "Coda 账号登录")),
-                                )
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .gap(px(6.0))
-                                        .child(self.render_setting_pill(
-                                            "settings-btn-browser-signin",
-                                            tr(
-                                                loc,
-                                                "Sign in via Browser",
-                                                "浏览器一键授权登录",
-                                            ),
-                                            false,
-                                            accent,
-                                            cx.listener(|this, _: &ClickEvent, _, cx| {
-                                                let srv = this
-                                                    .state
-                                                    .lock()
-                                                    .map(|mut g| {
-                                                        g.auth_loading = true;
-                                                        g.auth_error = None;
-                                                        g.server_url.clone()
-                                                    })
-                                                    .unwrap_or_default();
-                                                spawn_device_login(
-                                                    Arc::clone(&this.state),
-                                                    Arc::clone(&this.ui_dirty),
-                                                    Arc::clone(&this.mesh_hub),
-                                                    srv,
-                                                );
-                                                cx.notify();
-                                            }),
-                                        ))
-                                        .when(st.is_logged_in, |c| {
-                                            c.child(self.render_setting_pill(
-                                                "settings-collapse-auth",
-                                                tr(loc, "Cancel", "取消"),
-                                                false,
-                                                accent,
-                                                cx.listener(|this, _: &ClickEvent, _, cx| {
-                                                    if let Ok(mut g) = this.state.lock() {
-                                                        g.auth_form_expanded = false;
-                                                        g.input_target =
-                                                            ActiveInputTarget::TerminalDirect;
-                                                    }
-                                                    cx.notify();
-                                                }),
-                                            ))
-                                        }),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap(px(6.0))
-                                .child(
-                                    div()
-                                        .id("settings-input-auth-email")
-                                        .occlude()
-                                        .flex_1()
-                                        .px(px(8.0))
-                                        .py(px(5.0))
-                                        .rounded(px(4.0))
-                                        .bg(rgb(palette::CANVAS_BG))
-                                        .border_1()
-                                        .border_color(rgb(if acct_focused {
-                                            accent
-                                        } else {
-                                            palette::BORDER
-                                        }))
-                                        .cursor_pointer()
-                                        .text_size(px(11.0))
-                                        .text_color(rgb(
-                                            if st.auth_account_input.is_empty() && !acct_focused {
-                                                palette::TEXT_DIM
-                                            } else {
-                                                palette::TEXT_PRIMARY
-                                            },
-                                        ))
-                                        .child(if st.auth_account_input.is_empty() {
-                                            if acct_focused {
-                                                "|".to_string()
-                                            } else {
-                                                tr(loc, "Email / Username", "账号邮箱").to_string()
-                                            }
-                                        } else if acct_focused {
-                                            format!("{}|", st.auth_account_input)
-                                        } else {
-                                            st.auth_account_input.clone()
-                                        })
-                                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                            if let Ok(mut g) = this.state.lock() {
-                                                g.input_target = ActiveInputTarget::AuthAccount;
-                                                g.input_selected_all = false;
-                                            }
-                                            cx.notify();
-                                        })),
-                                )
-                                .child(
-                                    div()
-                                        .id("settings-input-auth-pass")
-                                        .occlude()
-                                        .flex_1()
-                                        .px(px(8.0))
-                                        .py(px(5.0))
-                                        .rounded(px(4.0))
-                                        .bg(rgb(palette::CANVAS_BG))
-                                        .border_1()
-                                        .border_color(rgb(if pass_focused {
-                                            accent
-                                        } else {
-                                            palette::BORDER
-                                        }))
-                                        .cursor_pointer()
-                                        .text_size(px(11.0))
-                                        .text_color(rgb(
-                                            if st.auth_password_input.is_empty() && !pass_focused {
-                                                palette::TEXT_DIM
-                                            } else {
-                                                palette::TEXT_PRIMARY
-                                            },
-                                        ))
-                                        .child(if st.auth_password_input.is_empty() {
-                                            if pass_focused {
-                                                "|".to_string()
-                                            } else {
-                                                tr(loc, "Password", "密码").to_string()
-                                            }
-                                        } else {
-                                            let dots =
-                                                "*".repeat(st.auth_password_input.chars().count());
-                                            if pass_focused {
-                                                format!("{dots}|")
-                                            } else {
-                                                dots
-                                            }
-                                        })
-                                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                            if let Ok(mut g) = this.state.lock() {
-                                                g.input_target = ActiveInputTarget::AuthPassword;
-                                                g.input_selected_all = false;
-                                            }
-                                            cx.notify();
-                                        })),
-                                )
-                                .child(
-                                    div()
-                                        .id("settings-btn-password-signin")
-                                        .occlude()
-                                        .flex_shrink_0()
-                                        .px(px(12.0))
-                                        .py(px(5.0))
-                                        .rounded(px(4.0))
-                                        .bg(rgb(accent))
-                                        .hover(|h| h.opacity(0.9))
-                                        .cursor_pointer()
-                                        .text_size(px(11.0))
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(rgb(palette::CANVAS_BG))
-                                        .child(if st.auth_loading {
-                                            tr(loc, "Signing in…", "登录中…")
-                                        } else {
-                                            tr(loc, "Sign In", "登录")
-                                        })
-                                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                            this.submit_password_login();
-                                            cx.notify();
-                                        })),
-                                ),
-                        )
-                        .when_some(st.auth_error.clone(), |el, err| {
-                            el.child(
-                                div()
-                                    .px(px(8.0))
-                                    .py(px(4.0))
-                                    .rounded(px(4.0))
-                                    .bg(rgb(palette::CANVAS_BG))
-                                    .border_1()
-                                    .border_color(rgb(palette::ERROR_RED))
-                                    .text_size(px(10.5))
-                                    .text_color(rgb(palette::ERROR_RED))
-                                    .child(err),
-                            )
-                        })
-                        .when_some(st.device_login_code.clone(), |el, code| {
-                            el.child(
-                                div()
-                                    .text_size(px(11.0))
-                                    .text_color(rgb(palette::WORKING_SKY))
-                                    .child(format!("Code: {code}")),
-                            )
-                        })
-                    }),
-            )
-            .child(
-                // Machines list (local Mac + Host Mode toggle + ALL remote hosts with Remove action)
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(4.0))
-                    .child(
-                        div()
-                            .text_size(px(10.5))
-                            .text_color(rgb(palette::TEXT_DIM))
-                            .child(format!(
-                                "{} ({})",
-                                tr(loc, "ONLINE MACHINES", "在线设备列表"),
-                                st.remote_hosts.len() + 1
-                            )),
-                    )
-                    .child(
-                        div()
-                            .px(px(10.0))
-                            .py(px(6.0))
-                            .rounded(px(6.0))
-                            .bg(rgb(palette::SURFACE_BG))
-                            .border_1()
-                            .border_color(rgb(palette::BORDER))
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .gap(px(8.0))
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .flex_1()
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(6.0))
-                                    .child(
-                                        div()
-                                            .w(px(6.0))
-                                            .h(px(6.0))
-                                            .flex_shrink_0()
-                                            .rounded(px(99.0))
-                                            .bg(rgb(if st.embedded_host_active || st.external_daemon_running {
-                                                palette::DONE_GREEN
-                                            } else {
-                                                palette::TEXT_DIM
-                                            })),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(px(11.5))
-                                            .text_color(rgb(palette::TEXT_PRIMARY))
-                                            .truncate()
-                                            .child(format!(
-                                                "{} · {}",
-                                                tr(loc, "This Mac", "本机"),
-                                                st.local_machine_name
-                                            )),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .flex_shrink_0()
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(6.0))
-                                    .child(
-                                        div()
-                                            .text_size(px(10.5))
-                                            .text_color(rgb(palette::TEXT_DIM))
-                                            .child(if st.external_daemon_running {
-                                                "daemon"
-                                            } else if host_mode_on {
-                                                "hybrid"
-                                            } else {
-                                                "client"
-                                            }),
-                                    )
-                                    .child(self.render_setting_pill(
-                                        "settings-toggle-remote-host",
-                                        if host_mode_on {
-                                            tr(loc, "Allow Control: ON", "允许被控: 开")
-                                        } else {
-                                            tr(loc, "Allow Control: OFF", "允许被控: 关")
-                                        },
-                                        host_mode_on,
-                                        accent,
-                                        cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                            this.mesh_hub.set_allow_remote_control(!host_mode_on);
-                                            cx.notify();
-                                        }),
-                                    ))
-                                    .child({
-                                        let notify_on = st.desktop_notifications;
-                                        self.render_setting_pill(
-                                            "settings-toggle-desktop-notify",
-                                            if notify_on {
-                                                tr(loc, "Alerts: ON", "通知: 开")
-                                            } else {
-                                                tr(loc, "Alerts: OFF", "通知: 关")
-                                            },
-                                            notify_on,
-                                            accent,
-                                            cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                                let next = !notify_on;
-                                                if let Ok(mut g) = this.state.lock() {
-                                                    g.desktop_notifications = next;
-                                                    g.status_notice = Some(
-                                                        if next {
-                                                            tr(
-                                                                g.locale,
-                                                                "Native macOS OSC 7501 alerts enabled",
-                                                                "已开启 macOS 原生 OSC 7501 系统通知",
-                                                            )
-                                                        } else {
-                                                            tr(
-                                                                g.locale,
-                                                                "Native macOS OSC 7501 alerts muted",
-                                                                "已关闭 macOS 原生系统通知",
-                                                            )
-                                                        }
-                                                        .to_string(),
-                                                    );
-                                                }
-                                                CodaGpuWorkspaceView::update_prefs_async(move |p| {
-                                                    p.desktop_notifications = next;
-                                                });
-                                                cx.notify();
-                                            }),
-                                        )
-                                    })
-                                    .child(self.render_setting_pill(
-                                        "settings-probe-lan-now",
-                                        tr(loc, "Probe LAN", "探测直连"),
-                                        false,
-                                        accent,
-                                        cx.listener(|this, _: &ClickEvent, _, cx| {
-                                            this.mesh_hub.probe_all_relay_peers_now();
-                                            cx.notify();
-                                        }),
-                                    )),
-                            ),
-                    )
-                    .children(st.remote_hosts.iter().map(|host| {
-                        let host_clone = host.clone();
-                        let rename_id = host.id;
-                        let rename_cur_name = host.name.clone();
-                        let remove_id = host.id;
-                        let is_renaming = st.renaming_host_id == Some(host.id);
-                        let rename_focused = st.input_target == ActiveInputTarget::RenameDeviceInput;
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap(px(4.0))
-                            .child(
-                                div()
-                                    .id(SharedString::from(format!(
-                                        "settings-mesh-host-{}",
-                                        host.id
-                                    )))
-                                    .occlude()
-                                    .px(px(10.0))
-                                    .py(px(6.0))
-                                    .rounded(px(6.0))
-                                    .bg(rgb(palette::SURFACE_BG))
-                                    .border_1()
-                                    .border_color(rgb(palette::BORDER))
-                                    .hover(|h| h.bg(rgb(palette::HOVER_BG)))
-                                    .cursor_pointer()
-                                    .flex()
-                                    .items_center()
-                                    .justify_between()
-                                    .gap(px(8.0))
-                                    .child(
-                                        div()
-                                            .min_w_0()
-                                            .flex_1()
-                                            .flex()
-                                            .items_center()
-                                            .gap(px(6.0))
-                                            .child(
-                                                div()
-                                                    .w(px(6.0))
-                                                    .h(px(6.0))
-                                                    .flex_shrink_0()
-                                                    .rounded(px(99.0))
-                                                    .bg(rgb(if host.is_online {
-                                                        palette::DONE_GREEN
-                                                    } else {
-                                                        palette::TEXT_DIM
-                                                    })),
-                                            )
-                                            .child(
-                                                div()
-                                                    .text_size(px(11.5))
-                                                    .text_color(rgb(palette::TEXT_PRIMARY))
-                                                    .truncate()
-                                                    .child(host.name.clone()),
-                                            )
-                                            .child(
-                                                div()
-                                                    .text_size(px(10.5))
-                                                    .text_color(rgb(palette::TEXT_DIM))
-                                                    .truncate()
-                                                    .child(format!("{} · {}", host.platform, host.role)),
-                                            ),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex_shrink_0()
-                                            .flex()
-                                            .items_center()
-                                            .gap(px(6.0))
-                                            .child(
-                                                div()
-                                                    .text_size(px(11.0))
-                                                    .text_color(rgb(accent))
-                                                    .child(tr(loc, "Open Workspace", "进入工作区")),
-                                            )
-                                            .child(
-                                                div()
-                                                    .id(SharedString::from(format!(
-                                                        "settings-rename-host-{}",
-                                                        host.id
-                                                    )))
-                                                    .occlude()
-                                                    .px(px(6.0))
-                                                    .py(px(2.0))
-                                                    .rounded(px(4.0))
-                                                    .bg(rgb(palette::CHROME_BG))
-                                                    .border_1()
-                                                    .border_color(rgb(if is_renaming {
-                                                        accent
-                                                    } else {
-                                                        palette::BORDER
-                                                    }))
-                                                    .hover(|h| {
-                                                        h.border_color(rgb(accent))
-                                                            .text_color(rgb(palette::TEXT_PRIMARY))
-                                                    })
-                                                    .cursor_pointer()
-                                                    .text_size(px(10.0))
-                                                    .text_color(rgb(palette::TEXT_MUTED))
-                                                    .child(tr(loc, "Rename", "改名"))
-                                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                                        cx.stop_propagation();
-                                                    })
-                                                    .on_click(cx.listener(
-                                                        move |this, _: &ClickEvent, _, cx| {
-                                                            cx.stop_propagation();
-                                                            if let Ok(mut g) = this.state.lock() {
-                                                                if g.renaming_host_id == Some(rename_id) {
-                                                                    g.renaming_host_id = None;
-                                                                    g.rename_host_input.clear();
-                                                                    g.input_target = ActiveInputTarget::TerminalDirect;
-                                                                } else {
-                                                                    g.renaming_host_id = Some(rename_id);
-                                                                    g.rename_host_input = rename_cur_name.clone();
-                                                                    g.input_selected_all = true;
-                                                                    g.input_target = ActiveInputTarget::RenameDeviceInput;
-                                                                }
-                                                            }
-                                                            cx.notify();
-                                                        },
-                                                    )),
-                                            )
-                                            .child(
-                                                div()
-                                                    .id(SharedString::from(format!(
-                                                        "settings-remove-host-{}",
-                                                        host.id
-                                                    )))
-                                                    .occlude()
-                                                    .px(px(6.0))
-                                                    .py(px(2.0))
-                                                    .rounded(px(4.0))
-                                                    .bg(rgb(palette::CHROME_BG))
-                                                    .border_1()
-                                                    .border_color(rgb(palette::BORDER))
-                                                    .hover(|h| {
-                                                        h.border_color(rgb(palette::ERROR_RED))
-                                                            .text_color(rgb(palette::ERROR_RED))
-                                                    })
-                                                    .cursor_pointer()
-                                                    .text_size(px(10.0))
-                                                    .text_color(rgb(palette::TEXT_MUTED))
-                                                    .child(tr(loc, "Remove", "移除"))
-                                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                                        cx.stop_propagation();
-                                                    })
-                                                    .on_click(cx.listener(
-                                                        move |this, _: &ClickEvent, _, cx| {
-                                                            cx.stop_propagation();
-                                                            this.mesh_hub.delete_remote_device(remove_id);
-                                                            cx.notify();
-                                                        },
-                                                    )),
-                                            ),
-                                    )
-                                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                        this.mesh_hub.probe_host(host_clone.clone());
-                                        if let Ok(mut g) = this.state.lock() {
-                                            g.settings_open = false;
-                                            g.clear_settings_ephemeral_inputs();
-                                            g.input_target = ActiveInputTarget::TerminalDirect;
-                                        }
-                                        cx.notify();
-                                    })),
-                            )
-                            .when(is_renaming, |row_el| {
-                                row_el.child(
-                                    div()
-                                        .px(px(10.0))
-                                        .py(px(5.0))
-                                        .rounded(px(5.0))
-                                        .bg(rgb(palette::CHROME_BG))
-                                        .border_1()
-                                        .border_color(rgb(palette::BORDER))
-                                        .flex()
-                                        .items_center()
-                                        .gap(px(6.0))
-                                        .child(
-                                            div()
-                                                .id("settings-rename-input")
-                                                .occlude()
-                                                .flex_1()
-                                                .px(px(8.0))
-                                                .py(px(4.0))
-                                                .rounded(px(4.0))
-                                                .bg(rgb(palette::CANVAS_BG))
-                                                .border_1()
-                                                .border_color(rgb(if rename_focused {
-                                                    accent
-                                                } else {
-                                                    palette::BORDER
-                                                }))
-                                                .cursor_pointer()
-                                                .text_size(px(11.0))
-                                                .text_color(rgb(palette::TEXT_PRIMARY))
-                                                .child(if rename_focused {
-                                                    format!("{}|", st.rename_host_input)
-                                                } else {
-                                                    st.rename_host_input.clone()
-                                                })
-                                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                                    if let Ok(mut g) = this.state.lock() {
-                                                        g.input_target = ActiveInputTarget::RenameDeviceInput;
-                                                        g.input_selected_all = false;
-                                                    }
-                                                    cx.notify();
-                                                })),
-                                        )
-                                        .child(self.render_setting_pill(
-                                            "settings-rename-save",
-                                            tr(loc, "Save", "保存"),
-                                            true,
-                                            accent,
-                                            cx.listener(|this, _: &ClickEvent, _, cx| {
-                                                this.submit_rename_device();
-                                                cx.notify();
-                                            }),
-                                        ))
-                                        .child(self.render_setting_pill(
-                                            "settings-rename-cancel",
-                                            tr(loc, "Cancel", "取消"),
-                                            false,
-                                            accent,
-                                            cx.listener(|this, _: &ClickEvent, _, cx| {
-                                                if let Ok(mut g) = this.state.lock() {
-                                                    g.renaming_host_id = None;
-                                                    g.rename_host_input.clear();
-                                                    g.input_target = ActiveInputTarget::TerminalDirect;
-                                                }
-                                                cx.notify();
-                                            }),
-                                        )),
-                                )
-                            })
-                    })),
-            )
-    }
-
-    fn render_settings_shortcuts_pane(&self, st: &CodaDesktopState) -> impl IntoElement {
-        let loc = st.locale;
-        let left_col: &[(&str, &str, &str)] = &[
-            ("⌘ ,", "Open Settings", "打开设置"),
-            ("⌘ P / ⌘ K", "Command Palette", "命令面板"),
-            ("⌘ N / ⌘ T", "New Terminal", "新建终端"),
-            ("⌘ W", "Close Active Terminal", "关闭当前终端"),
-            ("⌘ D", "Toggle Split Panes", "分屏终端"),
-        ];
-        let right_col: &[(&str, &str, &str)] = &[
-            ("⌘ B", "Toggle Left Sidebar", "显示/隐藏侧边栏"),
-            ("⌘ 1", "Main Workbench", "主工作台"),
-            ("⌘ 2", "Terminals Grid", "终端平铺"),
-            ("⌃ C", "Interrupt Terminal (SIGINT)", "中断终端进程"),
-            ("⌘ V", "Paste into Terminal / Input", "粘贴"),
-        ];
-
-        div()
-            .flex()
-            .flex_row()
-            .gap(px(10.0))
-            .children([left_col, right_col].into_iter().map(|col| {
-                div()
-                    .flex_1()
-                    .flex()
-                    .flex_col()
-                    .gap(px(6.0))
-                    .children(col.iter().map(|&(keys, en, zh)| {
-                        div()
-                            .px(px(10.0))
-                            .py(px(8.0))
-                            .rounded(px(6.0))
-                            .bg(rgb(palette::SURFACE_BG))
-                            .border_1()
-                            .border_color(rgb(palette::BORDER))
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .gap(px(8.0))
-                            .child(
-                                div()
-                                    .text_size(px(11.5))
-                                    .text_color(rgb(palette::TEXT_PRIMARY))
-                                    .child(tr(loc, en, zh)),
-                            )
-                            .child(
-                                div()
-                                    .px(px(6.0))
-                                    .py(px(2.0))
-                                    .rounded(px(4.0))
-                                    .bg(rgb(palette::CHROME_BG))
-                                    .border_1()
-                                    .border_color(rgb(palette::BORDER_STRONG))
-                                    .text_size(px(10.5))
-                                    .text_color(rgb(palette::TEXT_MUTED))
-                                    .child(keys),
-                            )
-                    }))
-            }))
-    }
-
-    fn render_setting_pill(
-        &self,
-        id: impl Into<SharedString>,
-        label: &str,
-        active: bool,
-        accent: u32,
-        on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-    ) -> impl IntoElement {
-        div()
-            .id(id.into())
-            .occlude()
-            .px(px(8.0))
-            .py(px(4.0))
-            .rounded(px(5.0))
-            .bg(rgb(if active {
-                palette::HOVER_BG
-            } else {
-                palette::CHROME_BG
-            }))
-            .border_1()
-            .border_color(rgb(if active { accent } else { palette::BORDER }))
-            .hover(|h| h.bg(rgb(palette::HOVER_BG)))
-            .cursor_pointer()
-            .text_size(px(11.0))
-            .text_color(rgb(if active {
-                palette::TEXT_PRIMARY
-            } else {
-                palette::TEXT_MUTED
-            }))
-            .child(label.to_string())
-            .on_click(on_click)
-    }
-
-    fn render_stepper_control(
-        &self,
-        slug: &'static str,
-        value_label: String,
-        on_dec: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-        on_inc: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-    ) -> impl IntoElement {
-        div()
-            .flex()
-            .items_center()
-            .gap(px(4.0))
-            .child(
-                div()
-                    .id(SharedString::from(format!("settings-{slug}-dec")))
-                    .occlude()
-                    .w(px(24.0))
-                    .h(px(24.0))
-                    .rounded(px(5.0))
-                    .bg(rgb(palette::CHROME_BG))
-                    .border_1()
-                    .border_color(rgb(palette::BORDER))
-                    .hover(|h| h.bg(rgb(palette::HOVER_BG)))
-                    .cursor_pointer()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_size(px(12.0))
-                    .text_color(rgb(palette::TEXT_PRIMARY))
-                    .child("−")
-                    .on_click(on_dec),
-            )
-            .child(
-                div()
-                    .min_w(px(52.0))
-                    .flex()
-                    .justify_center()
-                    .text_size(px(11.5))
-                    .text_color(rgb(palette::TEXT_PRIMARY))
-                    .child(value_label),
-            )
-            .child(
-                div()
-                    .id(SharedString::from(format!("settings-{slug}-inc")))
-                    .occlude()
-                    .w(px(24.0))
-                    .h(px(24.0))
-                    .rounded(px(5.0))
-                    .bg(rgb(palette::CHROME_BG))
-                    .border_1()
-                    .border_color(rgb(palette::BORDER))
-                    .hover(|h| h.bg(rgb(palette::HOVER_BG)))
-                    .cursor_pointer()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_size(px(12.0))
-                    .text_color(rgb(palette::TEXT_PRIMARY))
-                    .child("+")
-                    .on_click(on_inc),
-            )
-    }
 }
 
-fn render_settings_row(label: &str, hint: &str, control: impl IntoElement) -> impl IntoElement {
-    div()
-        .px(px(11.0))
-        .py(px(8.0))
-        .rounded(px(7.0))
-        .bg(rgb(palette::SURFACE_BG))
-        .border_1()
-        .border_color(rgb(palette::BORDER))
-        .flex()
-        .items_center()
-        .justify_between()
-        .gap(px(12.0))
-        .child(
-            div()
-                .min_w_0()
-                .flex_1()
-                .flex()
-                .flex_col()
-                .gap(px(2.0))
-                .child(
-                    div()
-                        .text_size(px(12.0))
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(rgb(palette::TEXT_PRIMARY))
-                        .child(label.to_string()),
-                )
-                .child(
-                    div()
-                        .text_size(px(10.5))
-                        .text_color(rgb(palette::TEXT_DIM))
-                        .truncate()
-                        .child(hint.to_string()),
-                ),
-        )
-        .child(div().flex_shrink_0().child(control))
-}
 
 fn render_styled_terminal_line(
     line: &StyledTerminalLine,
     line_height_px: f32,
     selection_cols: Option<(usize, usize)>,
+    search_matches: &[(usize, usize, bool)],
 ) -> impl IntoElement {
     if line.text.is_empty() {
         return div()
@@ -8310,6 +7338,24 @@ fn render_styled_terminal_line(
                     ));
                 }
             }
+        }
+    }
+
+    for &(bs, be, is_active) in search_matches {
+        if bs < be && be <= line.text.len() {
+            highlights.push((
+                bs..be,
+                HighlightStyle {
+                    color: is_active.then(|| Hsla::from(rgb(0x09090b))),
+                    background_color: Some(Hsla::from(if is_active {
+                        rgba(0xf59e0bee)
+                    } else {
+                        rgba(0xf59e0b55)
+                    })),
+                    font_weight: is_active.then_some(FontWeight::SEMIBOLD),
+                    ..Default::default()
+                },
+            ));
         }
     }
 
@@ -8714,6 +7760,8 @@ pub fn launch_gpui_desktop_app() {
             KeyBinding::new("cmd-+", ZoomInTerminal, None),
             KeyBinding::new("cmd--", ZoomOutTerminal, None),
             KeyBinding::new("cmd-0", ZoomResetTerminal, None),
+            KeyBinding::new("cmd-f", ToggleTerminalSearch, None),
+            KeyBinding::new("cmd-shift-e", ExportActiveSession, None),
         ]);
         cx.set_menus(vec![
             Menu {
@@ -8732,6 +7780,7 @@ pub fn launch_gpui_desktop_app() {
                     MenuItem::action("Copy", CopyTerminalAction),
                     MenuItem::action("Paste", PasteTerminalAction),
                     MenuItem::separator(),
+                    MenuItem::action("Find in Terminal…", ToggleTerminalSearch),
                     MenuItem::action("Select All", SelectAllAction),
                 ],
             },
@@ -8741,6 +7790,8 @@ pub fn launch_gpui_desktop_app() {
                     MenuItem::action("New Window", NewWindow),
                     MenuItem::action("New Terminal", NewTerminal),
                     MenuItem::action("Toggle Split Terminals", ToggleSplit),
+                    MenuItem::action("Export Session Log (.md)", ExportActiveSession),
+                    MenuItem::action("Voice Dictation (Start / Stop)", ToggleVoiceDictation),
                     MenuItem::separator(),
                     MenuItem::action("Close Terminal", CloseActiveTerminal),
                 ],
@@ -8833,6 +7884,24 @@ mod tests {
                 "'+ Agent' Command Palette filter must include LaunchAgent({expected:?})"
             );
         }
+
+        state.palette_query = "search".to_string();
+        assert!(
+            state
+                .palette_items()
+                .iter()
+                .any(|item| matches!(item.action, PaletteAction::OpenTerminalSearch)),
+            "Command Palette must expose OpenTerminalSearch"
+        );
+
+        state.palette_query = "export".to_string();
+        assert!(
+            state
+                .palette_items()
+                .iter()
+                .any(|item| matches!(item.action, PaletteAction::ExportActiveSession)),
+            "Command Palette must expose ExportActiveSession"
+        );
     }
 
     #[test]
