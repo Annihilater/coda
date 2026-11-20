@@ -2136,6 +2136,8 @@ export class CodaTerminalWebApp {
       const agents: Array<{ key: string; label: string }> = [
         { key: "claude", label: "Claude Code" },
         { key: "codex", label: "Codex CLI" },
+        { key: "grok", label: "Grok CLI" },
+        { key: "agy", label: "Antigravity (AGY)" },
         { key: "gemini", label: "Gemini CLI" },
         { key: "shell", label: "Interactive Shell" },
       ];
@@ -4171,8 +4173,8 @@ export class CodaTerminalWebApp {
     const initialVtHtml = isVtStream && activeVt
       ? activeVt.renderInitialRowsHtml(true)
       : this.tr(
-          `  - Connected to PostgreSQL 18 multi-tenant control plane &amp; E2EE tunnel (X25519 + ChaCha20-Poly1305)\n  - Local Herdr Core online. Use '+' on the right rail to launch Shell / Claude Code / Codex / Gemini CLI.\n\n* Ready · ${this.rttMs !== null ? `RTT ${this.rttMs}ms` : "Relay WSS :443 Ready"}`,
-          `  - 已连接 PostgreSQL 18 多租户控制面与端到端加密隧道 (X25519 + ChaCha20-Poly1305)\n  - 本机 Herdr Core 在线，随时可通过右侧「+」拉起 Shell / Claude Code / Codex / Gemini CLI\n\n* Ready · ${this.rttMs !== null ? `RTT ${this.rttMs}ms` : "Relay WSS :443 Ready"}`
+          `  - Connected to PostgreSQL 18 multi-tenant control plane &amp; E2EE tunnel (X25519 + ChaCha20-Poly1305)\n  - Local Herdr Core online. Use '+' on the right rail to launch Shell / Claude Code / Codex / Grok / AGY / Gemini CLI.\n\n* Ready · ${this.rttMs !== null ? `RTT ${this.rttMs}ms` : "Relay WSS :443 Ready"}`,
+          `  - 已连接 PostgreSQL 18 多租户控制面与端到端加密隧道 (X25519 + ChaCha20-Poly1305)\n  - 本机 Herdr Core 在线，随时可通过右侧「+」拉起 Shell / Claude Code / Codex / Grok / AGY / Gemini CLI\n\n* Ready · ${this.rttMs !== null ? `RTT ${this.rttMs}ms` : "Relay WSS :443 Ready"}`
         );
     const modeLabel =
       this.activeTransportMode === "lan_ws"
@@ -4469,7 +4471,7 @@ export class CodaTerminalWebApp {
               this.showSidebar ? svgIcon("chevronLeft", 14) : svgIcon("chevronRight", 14)
             }</button>
             <div class="rail-capsule">
-              <button id="rail-spawn-btn" title="${this.tr("Launch Shell / Claude / Codex / Gemini", "新建 Shell / Claude / Codex / Gemini 终端")}">${svgIcon("plus", 15)}</button>
+              <button id="rail-spawn-btn" title="${this.tr("Launch Shell / Claude / Codex / Grok / AGY / Gemini", "新建 Shell / Claude / Codex / Grok / AGY / Gemini 终端")}">${svgIcon("plus", 15)}</button>
               <span style="width:16px;height:1px;background:var(--border-primary);"></span>
               <button id="rail-more-btn" title="${this.tr("System settings &amp; account", "系统设置与账号管理")}">${svgIcon("more", 15)}</button>
             </div>
@@ -4500,6 +4502,8 @@ export class CodaTerminalWebApp {
                   <option value="shell">Shell (Interactive PTY)</option>
                   <option value="claude">Claude Code</option>
                   <option value="codex">Codex CLI</option>
+                  <option value="grok">Grok CLI</option>
+                  <option value="agy">Antigravity (AGY)</option>
                   <option value="gemini">Gemini CLI</option>
                 </select>
               </div>
