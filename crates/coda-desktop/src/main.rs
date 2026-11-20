@@ -20,8 +20,29 @@ struct Cli {
     self_test: bool,
 }
 
+fn filtered_cli_args() -> Vec<std::ffi::OsString> {
+    let mut out = Vec::new();
+    let mut iter = std::env::args_os();
+    if let Some(bin) = iter.next() {
+        out.push(bin);
+    }
+    while let Some(arg) = iter.next() {
+        let s = arg.to_string_lossy();
+        // #16: macOS LaunchServices passes `-psn_0_...` and `-NS*` / `-Apple*` defaults flags to `.app` bundles.
+        if s.starts_with("-psn_") {
+            continue;
+        }
+        if s.starts_with("-NS") || s.starts_with("-Apple") {
+            let _ = iter.next();
+            continue;
+        }
+        out.push(arg);
+    }
+    out
+}
+
 fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let cli = Cli::parse_from(filtered_cli_args());
     if cli.self_test {
         ensure_macos_gui_path();
         let tmp_cfg = std::env::temp_dir().join(format!("coda-desktop-selftest-{}", std::process::id()));

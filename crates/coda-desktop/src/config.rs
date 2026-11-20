@@ -29,6 +29,12 @@ pub fn write_file_atomic_mode(path: &Path, bytes: &[u8], mode: u32) -> anyhow::R
         .parent()
         .ok_or_else(|| anyhow::anyhow!("target path has no parent: {}", path.display()))?;
     std::fs::create_dir_all(parent)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // #8: Always enforce owner-only 0700 on ~/.config/coda so private keys & sessions are never group/world listable.
+        let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+    }
     let seq = ATOMIC_WRITE_SEQ.fetch_add(1, Ordering::Relaxed);
     let pid = std::process::id();
     let file_name = path
@@ -113,52 +119,126 @@ pub fn tr<'a>(locale: UiLocale, en: &'a str, zh: &'a str) -> &'a str {
 }
 
 /// Computes an augmented `PATH` string suitable for child processes launched from a macOS
-/// `.app` bundle (where launchd only passes `/usr/bin:/bin:/usr/sbin:/sbin`) WITHOUT mutating
-/// the global process environment (`std::env::set_var`), eliminating multi-threaded getenv/setenv UB.
+/// `.app` bundle (where launchd only passes `/usr/bin:/bin:/usr/sbin:/sbin`), covering Homebrew,
+/// Cargo, Bun, NVM, Volta, FNM, PNPM, Mise, ASDF, Nix, Pyenv, and Go without unsafe `set_var`.
 pub fn augmented_gui_path_string() -> String {
-    let home = std::env::var("HOME").unwrap_or_default();
-    let current = std::env::var("PATH").unwrap_or_default();
-
-    let mut ordered: Vec<String> = Vec::new();
-    let mut seen: HashSet<String> = HashSet::new();
-
-    let mut candidates = vec![
-        "/opt/homebrew/bin".to_string(),
-        "/opt/homebrew/sbin".to_string(),
-        "/usr/local/bin".to_string(),
-    ];
-    if !home.is_empty() {
-        candidates.push(format!("{home}/.local/bin"));
-        candidates.push(format!("{home}/.cargo/bin"));
-        candidates.push(format!("{home}/.bun/bin"));
-        candidates.push(format!("{home}/.nvm/current/bin"));
-    }
-    for dir in current.split(':').filter(|s| !s.is_empty()) {
-        candidates.push(dir.to_string());
-    }
-    candidates.extend(
-        ["/usr/bin", "/bin", "/usr/sbin", "/sbin"]
-            .into_iter()
-            .map(String::from),
-    );
-
-    for dir in candidates {
-        if seen.insert(dir.clone()) && Path::new(&dir).is_dir() {
-            ordered.push(dir);
-        }
-    }
-
-    if ordered.is_empty() {
-        current
-    } else {
-        ordered.join(":")
-    }
+    coda_herdr::build_augmented_path()
 }
 
 /// Retained for API compatibility; child spawns use `augmented_gui_path_string()` directly so no
 /// unsafe global `std::env::set_var("PATH", ...)` mutation occurs after threads start.
 pub fn ensure_macos_gui_path() {
     let _ = augmented_gui_path_string();
+}
+
+/// Returns true when executing inside a packaged macOS `.app` bundle.
+pub fn is_macos_app_bundle() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        std::env::current_exe()
+            .ok()
+            .map(|p| p.to_string_lossy().contains(".app/Contents/MacOS/"))
+            .unwrap_or(false)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
+/// Persists a sensitive token/secret in the macOS Keychain when running inside `Coda.app` (`#8`).
+pub fn save_secret_in_keychain(account: &str, secret: &str) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        if !is_macos_app_bundle() {
+            return false;
+        }
+        std::process::Command::new("/usr/bin/security")
+            .args([
+                "add-generic-password",
+                "-U",
+                "-s",
+                "dev.coda.desktop",
+                "-a",
+                account,
+                "-w",
+                secret,
+            ])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (account, secret);
+        false
+    }
+}
+
+/// Loads a sensitive token/secret from the macOS Keychain when running inside `Coda.app` (`#8`).
+pub fn load_secret_from_keychain(account: &str) -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        if !is_macos_app_bundle() {
+            return None;
+        }
+        let out = std::process::Command::new("/usr/bin/security")
+            .args([
+                "find-generic-password",
+                "-s",
+                "dev.coda.desktop",
+                "-a",
+                account,
+                "-w",
+            ])
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if s.is_empty() { None } else { Some(s) }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = account;
+        None
+    }
+}
+
+/// Deletes a sensitive token/secret from the macOS Keychain (`#8`).
+pub fn delete_secret_from_keychain(account: &str) {
+    #[cfg(target_os = "macos")]
+    {
+        if !is_macos_app_bundle() {
+            return;
+        }
+        let _ = std::process::Command::new("/usr/bin/security")
+            .args([
+                "delete-generic-password",
+                "-s",
+                "dev.coda.desktop",
+                "-a",
+                account,
+            ])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = account;
+    }
+}
+
+fn default_allow_remote_control() -> bool {
+    true
 }
 
 /// Persisted user desktop preferences stored at `~/.config/coda/desktop.json`.
@@ -174,6 +254,9 @@ pub struct DesktopPreferences {
     pub selected_repo_path: Option<String>,
     #[serde(default)]
     pub dismissed_spaces: Vec<String>,
+    /// #8 / #31: Explicit user toggle controlling whether this Mac accepts incoming remote control.
+    #[serde(default = "default_allow_remote_control")]
+    pub allow_remote_control: bool,
 }
 
 fn default_server_url() -> String {
@@ -188,6 +271,7 @@ impl Default for DesktopPreferences {
             workspace_roots: Vec::new(),
             selected_repo_path: None,
             dismissed_spaces: Vec::new(),
+            allow_remote_control: true,
         }
     }
 }
@@ -283,7 +367,11 @@ pub fn discover_local_git_repositories(saved_roots: &[String]) -> Vec<String> {
     if found.is_empty() {
         if let Ok(cwd) = std::env::current_dir() {
             if cwd.join(".git").exists() {
-                let s = cwd.to_string_lossy().to_string();
+                let s = cwd
+                    .canonicalize()
+                    .unwrap_or(cwd)
+                    .to_string_lossy()
+                    .to_string();
                 if seen.insert(s.clone()) {
                     found.push(s);
                 }

@@ -140,6 +140,9 @@ pub struct PtySnapshot {
     pub started_at: Instant,
     pub attached_hc: bool,
     pub generation: u64,
+    pub in_alt_screen: bool,
+    pub bracketed_paste: bool,
+    pub app_cursor_keys: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -150,6 +153,8 @@ enum ParseState {
     Csi,
     Osc,
     OscEsc,
+    StringSkip,
+    StringSkipEsc,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -183,6 +188,25 @@ struct SavedScreenState {
     style: SgrStyle,
 }
 
+fn resize_cell_grid(grid: &Vec<Vec<VtCell>>, new_cols: usize, new_rows: usize) -> Vec<Vec<VtCell>> {
+    let mut next = vec![vec![VtCell::default(); new_cols]; new_rows];
+    let copy_rows = grid.len().min(new_rows);
+    for r in 0..copy_rows {
+        let copy_cols = grid[r].len().min(new_cols);
+        for c in 0..copy_cols {
+            next[r][c] = grid[r][c];
+        }
+        if copy_cols > 0 {
+            if next[r][copy_cols - 1].continuation {
+                next[r][copy_cols - 1] = VtCell::default();
+            } else if char_display_width(next[r][copy_cols - 1].ch) == 2 && copy_cols == new_cols {
+                next[r][copy_cols - 1] = VtCell::default();
+            }
+        }
+    }
+    next
+}
+
 /// Compact VT100/ANSI screen emulator with 16/256/TrueColor SGR, alternate screen, and OSC 7501.
 pub struct VtScreenBuffer {
     cols: usize,
@@ -196,6 +220,10 @@ pub struct VtScreenBuffer {
     scroll_top: usize,
     scroll_bottom: usize,
     style: SgrStyle,
+    cursor_visible: bool,
+    bracketed_paste: bool,
+    app_cursor_keys: bool,
+    pending_replies: Vec<Vec<u8>>,
     alt_saved: Option<SavedScreenState>,
     parse_state: ParseState,
     csi_buf: String,
@@ -214,14 +242,18 @@ impl VtScreenBuffer {
             cols,
             rows,
             grid: vec![vec![VtCell::default(); cols]; rows],
-            scrollback: VecDeque::with_capacity(1200),
-            max_scrollback: 1200,
+            scrollback: VecDeque::with_capacity(1600),
+            max_scrollback: 1600,
             cursor_row: 0,
             cursor_col: 0,
             saved_cursor: (0, 0),
             scroll_top: 0,
             scroll_bottom: rows - 1,
             style: SgrStyle::default(),
+            cursor_visible: true,
+            bracketed_paste: false,
+            app_cursor_keys: false,
+            pending_replies: Vec::new(),
             alt_saved: None,
             parse_state: ParseState::Ground,
             csi_buf: String::new(),
@@ -237,35 +269,53 @@ impl VtScreenBuffer {
         self.generation
     }
 
+    pub fn in_alt_screen(&self) -> bool {
+        self.alt_saved.is_some()
+    }
+
+    pub fn bracketed_paste_enabled(&self) -> bool {
+        self.bracketed_paste
+    }
+
+    pub fn app_cursor_keys_enabled(&self) -> bool {
+        self.app_cursor_keys
+    }
+
+    pub fn drain_pending_replies(&mut self) -> Vec<Vec<u8>> {
+        std::mem::take(&mut self.pending_replies)
+    }
+
     pub fn resize(&mut self, cols: usize, rows: usize) {
         let new_cols = cols.max(20);
         let new_rows = rows.max(4);
         if new_cols == self.cols && new_rows == self.rows {
             return;
         }
-        let mut next = vec![vec![VtCell::default(); new_cols]; new_rows];
-        let copy_rows = self.rows.min(new_rows);
-        let copy_cols = self.cols.min(new_cols);
-        for r in 0..copy_rows {
-            for c in 0..copy_cols {
-                next[r][c] = self.grid[r][c];
-            }
-            // Drop dangling trailing wide half if resize cut between wide char & continuation.
-            if copy_cols > 0 {
-                if next[r][copy_cols - 1].continuation {
-                    next[r][copy_cols - 1] = VtCell::default();
-                } else if char_display_width(next[r][copy_cols - 1].ch) == 2 {
-                    next[r][copy_cols - 1] = VtCell::default();
-                }
-            }
+        self.grid = resize_cell_grid(&self.grid, new_cols, new_rows);
+        // #13: Also resize saved primary screen grid while inside alt screen so leave_alt_screen never panics OOB.
+        if let Some(ref mut saved) = self.alt_saved {
+            saved.grid = resize_cell_grid(&saved.grid, new_cols, new_rows);
+            saved.cursor_row = saved.cursor_row.min(new_rows - 1);
+            saved.cursor_col = saved.cursor_col.min(new_cols - 1);
+            saved.scroll_top = 0;
+            saved.scroll_bottom = new_rows - 1;
         }
-        self.grid = next;
         self.cols = new_cols;
         self.rows = new_rows;
         self.cursor_row = self.cursor_row.min(new_rows - 1);
         self.cursor_col = self.cursor_col.min(new_cols - 1);
         self.scroll_top = 0;
         self.scroll_bottom = new_rows - 1;
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    /// Clears only the visible viewport while preserving scrollback history (#18 Ctrl+L).
+    pub fn clear_viewport(&mut self) {
+        for row in &mut self.grid {
+            row.fill(VtCell::default());
+        }
+        self.cursor_row = 0;
+        self.cursor_col = 0;
         self.generation = self.generation.wrapping_add(1);
     }
 
@@ -358,7 +408,14 @@ impl VtScreenBuffer {
                 b'c' => {
                     self.clear_all();
                     self.style = SgrStyle::default();
+                    self.cursor_visible = true;
+                    self.bracketed_paste = false;
+                    self.app_cursor_keys = false;
                     self.parse_state = ParseState::Ground;
+                }
+                b'P' | b'_' | b'^' | b'X' => {
+                    // #18: Skip DCS / APC / PM / SOS control strings until ST (`ESC \`) or BEL.
+                    self.parse_state = ParseState::StringSkip;
                 }
                 b'(' | b')' | b'*' | b'+' | b'#' => {
                     self.parse_state = ParseState::EscCharset;
@@ -368,6 +425,18 @@ impl VtScreenBuffer {
             ParseState::EscCharset => {
                 // Consume the charset/line-drawing designator byte (e.g., 'B', '0', '8').
                 self.parse_state = ParseState::Ground;
+            }
+            ParseState::StringSkip => match byte {
+                0x07 => self.parse_state = ParseState::Ground,
+                0x1b => self.parse_state = ParseState::StringSkipEsc,
+                _ => {}
+            },
+            ParseState::StringSkipEsc => {
+                if byte == b'\\' {
+                    self.parse_state = ParseState::Ground;
+                } else if byte != 0x1b {
+                    self.parse_state = ParseState::StringSkip;
+                }
             }
             ParseState::Csi => {
                 if (0x40..=0x7e).contains(&byte) {
@@ -525,10 +594,31 @@ impl VtScreenBuffer {
     }
 
     fn dispatch_osc(&mut self, seq: &str) {
-        // Format: 7501;state=working;task=Running cargo test (also accepts title= / msg=)
+        // Format: 7501;state=working;task=Running cargo test OR 7501;{"state":"working","task":"..."}
         let Some(rest) = seq.strip_prefix("7501;") else {
             return;
         };
+        let trimmed_rest = rest.trim();
+        if trimmed_rest.starts_with('{') {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed_rest) {
+                if let Some(st_raw) = v.get("state").and_then(|s| s.as_str()) {
+                    let task = v
+                        .get("task")
+                        .or_else(|| v.get("title"))
+                        .or_else(|| v.get("msg"))
+                        .and_then(|s| s.as_str())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(String::from);
+                    self.osc_status = Some(Osc7501Status {
+                        state: AgentLifecycleState::from_str_lossy(st_raw),
+                        task,
+                        updated_at: Instant::now(),
+                    });
+                }
+            }
+            return;
+        }
         let mut state: Option<AgentLifecycleState> = None;
         let mut task: Option<String> = None;
         for part in rest.split(';') {
@@ -577,31 +667,61 @@ impl VtScreenBuffer {
 
     fn leave_alt_screen(&mut self) {
         if let Some(saved) = self.alt_saved.take() {
-            self.grid = saved.grid;
+            // #13: Always ensure restored grid strictly matches current (rows, cols).
+            let grid = if saved.grid.len() == self.rows
+                && saved.grid.first().map(|r| r.len()) == Some(self.cols)
+            {
+                saved.grid
+            } else {
+                resize_cell_grid(&saved.grid, self.cols, self.rows)
+            };
+            self.grid = grid;
             self.cursor_row = saved.cursor_row.min(self.rows - 1);
             self.cursor_col = saved.cursor_col.min(self.cols - 1);
-            self.saved_cursor = saved.saved_cursor;
+            self.saved_cursor = (
+                saved.saved_cursor.0.min(self.rows - 1),
+                saved.saved_cursor.1.min(self.cols - 1),
+            );
             self.scroll_top = saved.scroll_top.min(self.rows - 1);
-            self.scroll_bottom = saved.scroll_bottom.min(self.rows - 1);
+            self.scroll_bottom = saved.scroll_bottom.min(self.rows - 1).max(self.scroll_top);
             self.style = saved.style;
         }
     }
 
     fn dispatch_csi(&mut self, params_raw: &str, cmd: char) {
+        // #15 / #18: Separate private prefixes ('?', '>', '<', '=') and intermediate bytes (0x20..=0x2F).
         if let Some(priv_params) = params_raw.strip_prefix('?') {
+            if priv_params
+                .bytes()
+                .any(|b| (0x20..=0x2f).contains(&b))
+            {
+                return;
+            }
             let codes: Vec<usize> = priv_params
                 .split(';')
                 .filter_map(|s| s.parse::<usize>().ok())
                 .collect();
             match cmd {
                 'h' => {
-                    if codes.iter().any(|c| matches!(c, 1049 | 1047 | 47)) {
-                        self.enter_alt_screen();
+                    for code in codes {
+                        match code {
+                            1 => self.app_cursor_keys = true,
+                            25 => self.cursor_visible = true,
+                            1049 | 1047 | 47 => self.enter_alt_screen(),
+                            2004 => self.bracketed_paste = true,
+                            _ => {}
+                        }
                     }
                 }
                 'l' => {
-                    if codes.iter().any(|c| matches!(c, 1049 | 1047 | 47)) {
-                        self.leave_alt_screen();
+                    for code in codes {
+                        match code {
+                            1 => self.app_cursor_keys = false,
+                            25 => self.cursor_visible = false,
+                            1049 | 1047 | 47 => self.leave_alt_screen(),
+                            2004 => self.bracketed_paste = false,
+                            _ => {}
+                        }
                     }
                 }
                 _ => {}
@@ -609,11 +729,23 @@ impl VtScreenBuffer {
             return;
         }
 
-        let clean = params_raw.trim_start_matches('>');
-        let params: Vec<usize> = if clean.is_empty() {
+        // Ignore private `>`, `<`, `=` prefixes (Kitty keyboard protocol `CSI >1u`, `modifyOtherKeys` `CSI >4;2m`, DA2)
+        // and intermediate-byte sequences (e.g. `CSI 2 q` DECSCUSR).
+        if params_raw.starts_with(['>', '<', '='])
+            || params_raw.bytes().any(|b| (0x20..=0x2f).contains(&b))
+        {
+            return;
+        }
+
+        if cmd == 'm' {
+            self.apply_sgr_raw(params_raw);
+            return;
+        }
+
+        let params: Vec<usize> = if params_raw.is_empty() {
             Vec::new()
         } else {
-            clean
+            params_raw
                 .split(';')
                 .map(|s| s.parse::<usize>().unwrap_or(0))
                 .collect()
@@ -622,11 +754,18 @@ impl VtScreenBuffer {
         let p0_one = p0.max(1);
 
         match cmd {
-            'm' => self.apply_sgr(&params),
             'A' => self.cursor_row = self.cursor_row.saturating_sub(p0_one),
             'B' => self.cursor_row = (self.cursor_row + p0_one).min(self.rows - 1),
             'C' => self.cursor_col = (self.cursor_col + p0_one).min(self.cols - 1),
             'D' => self.cursor_col = self.cursor_col.saturating_sub(p0_one),
+            'E' => {
+                self.cursor_row = (self.cursor_row + p0_one).min(self.rows - 1);
+                self.cursor_col = 0;
+            }
+            'F' => {
+                self.cursor_row = self.cursor_row.saturating_sub(p0_one);
+                self.cursor_col = 0;
+            }
             'G' => self.cursor_col = p0_one.saturating_sub(1).min(self.cols - 1),
             'd' => self.cursor_row = p0_one.saturating_sub(1).min(self.rows - 1),
             'H' | 'f' => {
@@ -699,19 +838,33 @@ impl VtScreenBuffer {
             'P' => {
                 let row = self.cursor_row;
                 let col = self.cursor_col;
-                let count = p0_one.min(self.cols.saturating_sub(col));
-                for _ in 0..count {
-                    self.grid[row].remove(col);
-                    self.grid[row].push(VtCell::default());
+                if col < self.cols {
+                    self.clear_cell_preserving_wide(row, col);
+                    let count = p0_one.min(self.cols.saturating_sub(col));
+                    if col + count < self.cols && self.grid[row][col + count].continuation {
+                        self.clear_cell_preserving_wide(row, col + count);
+                    }
+                    for _ in 0..count {
+                        self.grid[row].remove(col);
+                        self.grid[row].push(VtCell::default());
+                    }
                 }
             }
             '@' => {
                 let row = self.cursor_row;
                 let col = self.cursor_col;
-                let count = p0_one.min(self.cols.saturating_sub(col));
-                for _ in 0..count {
-                    self.grid[row].pop();
-                    self.grid[row].insert(col, VtCell::default());
+                if col < self.cols {
+                    self.clear_cell_preserving_wide(row, col);
+                    let count = p0_one.min(self.cols.saturating_sub(col));
+                    for _ in 0..count {
+                        self.grid[row].pop();
+                        self.grid[row].insert(col, VtCell::default());
+                    }
+                    if let Some(last) = self.grid[row].last_mut() {
+                        if last.continuation || char_display_width(last.ch) == 2 {
+                            *last = VtCell::default();
+                        }
+                    }
                 }
             }
             'X' => {
@@ -737,8 +890,18 @@ impl VtScreenBuffer {
                     self.scroll_top = 0;
                     self.scroll_bottom = self.rows - 1;
                 }
-                self.cursor_row = self.scroll_top;
+                // Standard DECSTBM homes cursor to (0, 0) when DECOM is off (#18).
+                self.cursor_row = 0;
                 self.cursor_col = 0;
+            }
+            'n' => {
+                // #38: Device Status Report (DSR): reply to `\x1b[6n` with `\x1b[row;colR` & `\x1b[5n` with `\x1b[0n`.
+                if p0 == 6 && self.pending_replies.len() < 8 {
+                    let reply = format!("\x1b[{};{}R", self.cursor_row + 1, self.cursor_col + 1);
+                    self.pending_replies.push(reply.into_bytes());
+                } else if p0 == 5 && self.pending_replies.len() < 8 {
+                    self.pending_replies.push(b"\x1b[0n".to_vec());
+                }
             }
             's' => self.saved_cursor = (self.cursor_row, self.cursor_col),
             'u' => {
@@ -749,37 +912,80 @@ impl VtScreenBuffer {
         }
     }
 
-    fn apply_sgr(&mut self, params: &[usize]) {
-        if params.is_empty() {
+    fn apply_sgr_raw(&mut self, params_raw: &str) {
+        if params_raw.is_empty() {
             self.style = SgrStyle::default();
             return;
         }
+        // #18: Support ISO 8613-6 colon-separated TrueColor/256-color SGR (`38:2::R:G:B`, `38:2:R:G:B`, `38:5:N`).
+        let tokens: Vec<&str> = params_raw.split(';').collect();
         let mut i = 0;
-        while i < params.len() {
-            match params[i] {
+        while i < tokens.len() {
+            let tok = tokens[i];
+            if tok.contains(':') {
+                let subs: Vec<Option<usize>> = tok
+                    .split(':')
+                    .map(|s| if s.is_empty() { None } else { s.parse::<usize>().ok() })
+                    .collect();
+                if let Some(Some(code @ (38 | 48))) = subs.first() {
+                    let color = match subs.get(1).copied().flatten() {
+                        Some(5) => subs.get(2).copied().flatten().map(ansi256_color),
+                        Some(2) => {
+                            let (r_idx, g_idx, b_idx) = if subs.len() >= 6 {
+                                (3, 4, 5)
+                            } else {
+                                (2, 3, 4)
+                            };
+                            let r = subs.get(r_idx).copied().flatten().unwrap_or(0).min(255) as u32;
+                            let g = subs.get(g_idx).copied().flatten().unwrap_or(0).min(255) as u32;
+                            let b = subs.get(b_idx).copied().flatten().unwrap_or(0).min(255) as u32;
+                            Some((r << 16) | (g << 8) | b)
+                        }
+                        _ => None,
+                    };
+                    if let Some(c) = color {
+                        if *code == 38 {
+                            self.style.fg = Some(c);
+                        } else {
+                            self.style.bg = Some(c);
+                        }
+                    }
+                }
+                i += 1;
+                continue;
+            }
+            let code = if tok.is_empty() {
+                0
+            } else {
+                tok.parse::<usize>().unwrap_or(usize::MAX)
+            };
+            match code {
                 0 => self.style = SgrStyle::default(),
                 1 => self.style.bold = true,
                 7 => self.style.inverse = true,
                 22 => self.style.bold = false,
                 27 => self.style.inverse = false,
-                30..=37 => self.style.fg = Some(ansi16_color(params[i] - 30, false)),
-                38 => {
-                    if let Some((color, consumed)) = parse_extended_color(&params[i + 1..]) {
-                        self.style.fg = Some(color);
+                30..=37 => self.style.fg = Some(ansi16_color(code - 30, false)),
+                38 | 48 => {
+                    let rest: Vec<usize> = tokens[i + 1..]
+                        .iter()
+                        .take(4)
+                        .map(|s| s.parse::<usize>().unwrap_or(0))
+                        .collect();
+                    if let Some((color, consumed)) = parse_extended_color(&rest) {
+                        if code == 38 {
+                            self.style.fg = Some(color);
+                        } else {
+                            self.style.bg = Some(color);
+                        }
                         i += consumed;
                     }
                 }
                 39 => self.style.fg = None,
-                40..=47 => self.style.bg = Some(ansi16_color(params[i] - 40, false)),
-                48 => {
-                    if let Some((color, consumed)) = parse_extended_color(&params[i + 1..]) {
-                        self.style.bg = Some(color);
-                        i += consumed;
-                    }
-                }
+                40..=47 => self.style.bg = Some(ansi16_color(code - 40, false)),
                 49 => self.style.bg = None,
-                90..=97 => self.style.fg = Some(ansi16_color(params[i] - 90, true)),
-                100..=107 => self.style.bg = Some(ansi16_color(params[i] - 100, true)),
+                90..=97 => self.style.fg = Some(ansi16_color(code - 90, true)),
+                100..=107 => self.style.bg = Some(ansi16_color(code - 100, true)),
                 _ => {}
             }
             i += 1;
@@ -800,8 +1006,9 @@ impl VtScreenBuffer {
                 raw_rows.push((sb_row.clone(), None));
             }
         }
+        let draw_cursor = show_cursor && self.cursor_visible;
         for (r_idx, row) in self.grid.iter().enumerate() {
-            let cursor_col = if show_cursor && r_idx == self.cursor_row {
+            let cursor_col = if draw_cursor && r_idx == self.cursor_row {
                 Some(self.cursor_col.min(self.cols - 1))
             } else {
                 None
@@ -1380,6 +1587,7 @@ impl LocalPtyManager {
         let ui_dirty = Arc::clone(&self.ui_dirty);
 
         let (writer_tx, writer_rx) = mpsc::sync_channel::<PtyWriteCmd>(512);
+        let writer_tx_for_dsr = writer_tx.clone();
         std::thread::spawn(move || {
             while let Ok(cmd) = writer_rx.recv() {
                 match cmd {
@@ -1413,8 +1621,14 @@ impl LocalPtyManager {
                 if n == 0 {
                     break;
                 }
-                if let Ok(mut guard) = screen_bg.lock() {
+                let replies = if let Ok(mut guard) = screen_bg.lock() {
                     guard.feed_bytes(&buf[..n as usize]);
+                    guard.drain_pending_replies()
+                } else {
+                    Vec::new()
+                };
+                for rep in replies {
+                    let _ = writer_tx_for_dsr.try_send(PtyWriteCmd::Bytes(rep));
                 }
                 ui_dirty.store(true, Ordering::SeqCst);
             }
@@ -1480,6 +1694,20 @@ impl LocalPtyManager {
         self.write_input(id, &[0x03])
     }
 
+    pub fn clear_viewport(&self, id: &str) {
+        if let Some(session) = self.sessions.get(id) {
+            if let Ok(mut guard) = session.screen.lock() {
+                guard.clear_viewport();
+            }
+            self.ui_dirty.store(true, Ordering::SeqCst);
+        } else if let Some(remote) = self.remote_buffers.get(id) {
+            if let Ok(mut guard) = remote.screen.lock() {
+                guard.clear_viewport();
+            }
+            self.ui_dirty.store(true, Ordering::SeqCst);
+        }
+    }
+
     pub fn clear_buffer(&self, id: &str) {
         if let Some(session) = self.sessions.get(id) {
             if let Ok(mut guard) = session.screen.lock() {
@@ -1492,6 +1720,35 @@ impl LocalPtyManager {
             }
             self.ui_dirty.store(true, Ordering::SeqCst);
         }
+    }
+
+    /// Returns `(in_alt_screen, bracketed_paste, app_cursor_keys)` for session `id`.
+    pub fn terminal_modes(&self, id: &str) -> (bool, bool, bool) {
+        let screen = self
+            .sessions
+            .get(id)
+            .map(|s| &s.screen)
+            .or_else(|| self.remote_buffers.get(id).map(|r| &r.screen));
+        if let Some(s) = screen {
+            if let Ok(guard) = s.lock() {
+                return (
+                    guard.in_alt_screen(),
+                    guard.bracketed_paste_enabled(),
+                    guard.app_cursor_keys_enabled(),
+                );
+            }
+        }
+        (false, false, false)
+    }
+
+    /// Drains any pending DSR responses (`\x1b[row;colR`) queued by a remote VT buffer (`#38`).
+    pub fn drain_remote_replies(&self, id: &str) -> Vec<Vec<u8>> {
+        if let Some(remote) = self.remote_buffers.get(id) {
+            if let Ok(mut guard) = remote.screen.lock() {
+                return guard.drain_pending_replies();
+            }
+        }
+        Vec::new()
     }
 
     pub fn resize(&mut self, id: &str, cols: u16, rows: u16) {
@@ -1590,6 +1847,9 @@ fn build_pty_snapshot_cached(
             started_at,
             attached_hc,
             generation: 0,
+            in_alt_screen: false,
+            bracketed_paste: false,
+            app_cursor_keys: false,
         };
     };
     let generation = guard.generation();
@@ -1602,6 +1862,9 @@ fn build_pty_snapshot_cached(
     }
     let styled_lines = guard.render_styled_lines(max_lines, alive);
     let osc_status = guard.osc_status();
+    let in_alt_screen = guard.in_alt_screen();
+    let bracketed_paste = guard.bracketed_paste_enabled();
+    let app_cursor_keys = guard.app_cursor_keys_enabled();
     drop(guard);
     let lines = styled_lines.iter().map(|l| l.text.clone()).collect();
     let snap = PtySnapshot {
@@ -1612,6 +1875,9 @@ fn build_pty_snapshot_cached(
         started_at,
         attached_hc,
         generation,
+        in_alt_screen,
+        bracketed_paste,
+        app_cursor_keys,
     };
     if let Ok(mut c) = cache.lock() {
         *c = Some(CachedSnapshot {
@@ -1654,5 +1920,37 @@ mod tests {
         assert!(!mgr.snapshot_all(40)[id].alive);
         mgr.remove_remote_buffer(id);
         assert!(!mgr.has_session(id));
+    }
+
+    #[test]
+    fn test_vt_alt_screen_resize_leave_no_panic_and_modern_sequences() {
+        // #13: Enter alt screen -> resize larger & smaller -> leave alt screen -> write at bottom-right.
+        let mut vt = VtScreenBuffer::new(80, 24);
+        vt.feed_bytes(b"primary line\r\n");
+        vt.feed_bytes(b"\x1b[?1049h");
+        assert!(vt.in_alt_screen());
+        vt.resize(120, 40);
+        vt.feed_bytes(b"\x1b[40;120HX");
+        vt.feed_bytes(b"\x1b[?1049l");
+        assert!(!vt.in_alt_screen());
+        // Must not panic even after writing at new larger bounds!
+        vt.feed_bytes(b"\x1b[40;118HOK");
+        assert!(vt.render_lines(60).iter().any(|l| l.contains("OK")));
+
+        // #15 / #18: CSI >1u and CSI >4;2m must be ignored without corrupting cursor or SGR
+        vt.feed_bytes(b"\x1b[5;10H\x1b[>1u\x1b[>4;2mHELLO");
+        let lines = vt.render_lines(60);
+        assert!(lines.iter().any(|l| l.contains("HELLO")));
+
+        // #18: Colon SGR `38:2::255:128:64` + DCS skip + DSR 6n + Bracketed paste + DECCKM
+        vt.feed_bytes(b"\x1bP1$r0m\x1b\\\x1b[38:2::255:128:64mCOLOR\x1b[0m\x1b[?2004h\x1b[?1h\x1b[6n");
+        assert!(vt.bracketed_paste_enabled());
+        assert!(vt.app_cursor_keys_enabled());
+        let replies = vt.drain_pending_replies();
+        assert_eq!(replies.len(), 1);
+        assert!(replies[0].starts_with(b"\x1b[") && replies[0].ends_with(b"R"));
+        let styled = vt.render_styled_lines(60, false);
+        assert!(styled.iter().any(|l| l.text.contains("COLOR")
+            && l.spans.iter().any(|s| s.fg == Some(0xff8040))));
     }
 }

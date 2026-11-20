@@ -20,10 +20,11 @@ use std::time::{Duration, Instant, SystemTime};
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use coda_daemon::{
-    list_account_hosts, login_with_password_and_enroll, mint_peer_relay_config,
-    poll_device_login_until_approved, start_device_login_flow, start_embedded_host_with_handle,
-    subscribe_account_events_ws, DaemonConfig, EmbeddedHostHandle, LivePeerSession, PeerAsyncEvent,
-    RemoteHostSummary,
+    active_daemon_lock_pid, change_account_password, delete_account_device, list_account_hosts,
+    login_with_password_and_enroll_with_identity, mint_peer_relay_config,
+    poll_device_login_until_approved, rename_account_device, start_device_login_flow,
+    start_embedded_host_with_handle, subscribe_account_events_ws, DaemonConfig, EmbeddedHostHandle,
+    LivePeerSession, PeerAsyncEvent, RemoteHostSummary,
 };
 use coda_herdr::{discover_hc_binary, ensure_or_install_hc_binary, HerdrClient};
 use coda_protocol::{HerdrTerminalSummary, PeerMessage, RemoteFileItem, TrafficLane};
@@ -31,16 +32,19 @@ use gpui::{
     actions, canvas, div, point, prelude::*, px, rgb, rgba, size, App, Application, Bounds,
     ClickEvent, ClipboardItem, Context, ElementInputHandler, EntityInputHandler, FocusHandle,
     Focusable, FontWeight, HighlightStyle, Hsla, KeyBinding, KeyDownEvent, Menu, MenuItem,
-    MouseButton, MouseDownEvent, Pixels, ScrollDelta, ScrollWheelEvent, SharedString, StyledText,
-    SystemMenuType, TitlebarOptions, UTF16Selection, Window, WindowBounds, WindowOptions,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, ScrollDelta,
+    ScrollWheelEvent, SharedString, StyledText, SystemMenuType, TitlebarOptions, UTF16Selection,
+    Window, WindowBounds, WindowOptions,
 };
 use uuid::Uuid;
 
 use crate::config::{
-    config_root_dir, detect_local_machine_name, discover_local_git_repositories,
-    display_compact_path, ensure_agents_md_manual, ensure_macos_gui_path, is_safe_http_url,
-    pick_folder_via_native_dialog, reveal_in_finder, space_avatar_color, tr,
-    DesktopClientIdentityRecord, DesktopPreferences, LayoutMode, MalleableLayoutConfig, UiLocale,
+    config_root_dir, delete_secret_from_keychain, detect_local_machine_name,
+    discover_local_git_repositories, display_compact_path, ensure_agents_md_manual,
+    ensure_macos_gui_path, is_safe_http_url, load_secret_from_keychain,
+    pick_folder_via_native_dialog, reveal_in_finder, save_secret_in_keychain, space_avatar_color,
+    tr, DesktopClientIdentityRecord, DesktopPreferences, LayoutMode, MalleableLayoutConfig,
+    UiLocale,
 };
 use crate::git_inspector::{
     compute_repo_snapshot, list_workspace_dir, read_workspace_file_preview, resolve_contained_path,
@@ -52,6 +56,7 @@ actions!(
     coda_desktop,
     [
         QuitApp,
+        NewWindow,
         ToggleSettings,
         ToggleSidebar,
         NewTerminal,
@@ -61,6 +66,12 @@ actions!(
         SwitchLayoutWorkbench,
         SwitchLayoutTerminals,
         InterruptActiveTerminal,
+        CopyTerminalAction,
+        PasteTerminalAction,
+        SelectAllAction,
+        ZoomInTerminal,
+        ZoomOutTerminal,
+        ZoomResetTerminal,
     ]
 );
 
@@ -91,6 +102,43 @@ pub enum ActiveInputTarget {
     AuthServerUrl,
     AuthAccount,
     AuthPassword,
+    RenameDeviceInput,
+    ChangePwCurrent,
+    ChangePwNew,
+}
+
+fn load_desktop_daemon_config(path: &Path) -> anyhow::Result<DaemonConfig> {
+    let mut cfg = DaemonConfig::load(path)?;
+    if cfg.session_token.is_none() {
+        cfg.session_token = load_secret_from_keychain("session_token");
+    } else if let Some(ref tok) = cfg.session_token {
+        // Migrate existing plaintext disk token into macOS Keychain when running inside Coda.app
+        // without an external standalone coda-daemon holding the lock.
+        let external_owns = active_daemon_lock_pid(path)
+            .map(|pid| pid != std::process::id())
+            .unwrap_or(false);
+        if !external_owns && save_secret_in_keychain("session_token", tok) {
+            let mut scrubbed = cfg.clone();
+            scrubbed.session_token = None;
+            let _ = scrubbed.save(path);
+        }
+    }
+    Ok(cfg)
+}
+
+fn save_desktop_daemon_config(cfg: &DaemonConfig, path: &Path) -> anyhow::Result<()> {
+    let external_owns = active_daemon_lock_pid(path)
+        .map(|pid| pid != std::process::id())
+        .unwrap_or(false);
+    if let Some(ref tok) = cfg.session_token {
+        let stored_in_keychain = save_secret_in_keychain("session_token", tok);
+        if stored_in_keychain && !external_owns {
+            let mut scrubbed = cfg.clone();
+            scrubbed.session_token = None;
+            return scrubbed.save(path);
+        }
+    }
+    cfg.save(path)
 }
 
 /// Primary or Secondary split terminal pane.
@@ -265,14 +313,26 @@ pub struct CodaDesktopState {
     pub server_url: String,
     pub auth_account_input: String,
     pub auth_password_input: String,
+    pub input_selected_all: bool,
     pub is_logged_in: bool,
+    pub auth_loading: bool,
+    pub auth_error: Option<String>,
     pub auth_form_expanded: bool,
     pub account_email: String,
+    pub allow_remote_control: bool,
+    pub embedded_host_active: bool,
+    pub external_daemon_running: bool,
+    pub local_host_device_id: Option<Uuid>,
     pub remote_hosts: Vec<RemoteHostSummary>,
     pub selected_remote_host_id: Option<String>,
     pub remote_probe_status: Option<String>,
     pub device_login_code: Option<String>,
     pub device_login_uri: Option<String>,
+    pub renaming_host_id: Option<Uuid>,
+    pub rename_host_input: String,
+    pub pw_change_expanded: bool,
+    pub pw_current_input: String,
+    pub pw_new_input: String,
     pub status_notice: Option<String>,
 }
 
@@ -311,14 +371,26 @@ impl Default for CodaDesktopState {
             server_url: DesktopPreferences::default().server_url,
             auth_account_input: String::new(),
             auth_password_input: String::new(),
+            input_selected_all: false,
             is_logged_in: false,
+            auth_loading: false,
+            auth_error: None,
             auth_form_expanded: false,
             account_email: String::new(),
+            allow_remote_control: true,
+            embedded_host_active: false,
+            external_daemon_running: false,
+            local_host_device_id: None,
             remote_hosts: Vec::new(),
             selected_remote_host_id: None,
             remote_probe_status: None,
             device_login_code: None,
             device_login_uri: None,
+            renaming_host_id: None,
+            rename_host_input: String::new(),
+            pw_change_expanded: false,
+            pw_current_input: String::new(),
+            pw_new_input: String::new(),
             status_notice: None,
         }
     }
@@ -459,6 +531,37 @@ impl CodaDesktopState {
     }
 }
 
+#[derive(Debug, Clone)]
+struct TerminalSelection {
+    session_id: String,
+    anchor: (usize, usize),
+    focus: (usize, usize),
+    dragging: bool,
+}
+
+impl TerminalSelection {
+    fn ordered(&self) -> ((usize, usize), (usize, usize)) {
+        if self.anchor <= self.focus {
+            (self.anchor, self.focus)
+        } else {
+            (self.focus, self.anchor)
+        }
+    }
+
+    fn is_non_empty(&self) -> bool {
+        self.anchor != self.focus
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PaneGeometry {
+    bounds: Bounds<Pixels>,
+    start_line: usize,
+    total_lines: usize,
+    cell_w: f32,
+    row_step: f32,
+}
+
 /// Primary GPUI workbench view.
 pub struct CodaGpuWorkspaceView {
     pub state: Arc<Mutex<CodaDesktopState>>,
@@ -470,6 +573,9 @@ pub struct CodaGpuWorkspaceView {
     marked_text: String,
     viewport_dims: Arc<Mutex<HashMap<String, (u16, u16)>>>,
     visible_rows_by_pane: Arc<Mutex<HashMap<SplitPane, usize>>>,
+    pane_geometry: Arc<Mutex<HashMap<SplitPane, PaneGeometry>>>,
+    terminal_selection: Arc<Mutex<Option<TerminalSelection>>>,
+    scroll_pixel_acc: Mutex<HashMap<String, f32>>,
     pty_synced_gen: Mutex<HashMap<String, (u64, bool)>>,
     inspector_seq: Arc<AtomicU64>,
 }
@@ -595,14 +701,18 @@ impl CodaGpuWorkspaceView {
         let mut init_state = CodaDesktopState::default();
         init_state.locale = prefs.locale;
         init_state.server_url = prefs.server_url.clone();
+        init_state.allow_remote_control = prefs.allow_remote_control;
         init_state.layout = layout_cfg;
         init_state.layout_mtime = layout_mtime;
         init_state.hc_path = discover_hc_binary();
         init_state.hc_available = init_state.hc_path.is_some();
 
-        // Hydrate daemon login identity if configured on disk
-        if let Ok(dcfg) = DaemonConfig::load(&DaemonConfig::default_path()) {
+        // Hydrate daemon login identity if configured on disk (with macOS Keychain token read-back)
+        let daemon_cfg_path = DaemonConfig::default_path();
+        init_state.external_daemon_running = active_daemon_lock_pid(&daemon_cfg_path).is_some();
+        if let Ok(dcfg) = load_desktop_daemon_config(&daemon_cfg_path) {
             init_state.server_url = dcfg.server_url.clone();
+            init_state.local_host_device_id = Some(dcfg.device_id);
             if dcfg.session_token.is_some() {
                 init_state.is_logged_in = true;
                 init_state.account_email = dcfg
@@ -616,18 +726,23 @@ impl CodaGpuWorkspaceView {
 
         // Seed fast placeholder local spaces from saved roots so GPUI first paint never blocks on git subprocesses.
         let machine_label = init_state.local_machine_name.clone();
+        let mut seen_local_paths: HashSet<String> = HashSet::new();
         for raw_root in &prefs.workspace_roots {
             let p = PathBuf::from(raw_root.trim());
             if !p.is_dir() {
                 continue;
             }
-            let path_str = p.to_string_lossy().to_string();
+            let canon = p.canonicalize().unwrap_or(p);
+            let path_str = canon.to_string_lossy().to_string();
+            if !seen_local_paths.insert(path_str.clone()) {
+                continue;
+            }
             if init_state.dismissed_spaces.contains(&path_str)
                 || init_state.dismissed_spaces.contains(&format!("local:{path_str}"))
             {
                 continue;
             }
-            let name = p
+            let name = canon
                 .file_name()
                 .and_then(|s| s.to_str())
                 .unwrap_or("workspace")
@@ -678,6 +793,9 @@ impl CodaGpuWorkspaceView {
             marked_text: String::new(),
             viewport_dims: Arc::new(Mutex::new(HashMap::new())),
             visible_rows_by_pane: Arc::new(Mutex::new(HashMap::new())),
+            pane_geometry: Arc::new(Mutex::new(HashMap::new())),
+            terminal_selection: Arc::new(Mutex::new(None)),
+            scroll_pixel_acc: Mutex::new(HashMap::new()),
             pty_synced_gen: Mutex::new(HashMap::new()),
             inspector_seq: Arc::clone(&inspector_seq),
         };
@@ -870,10 +988,18 @@ impl CodaGpuWorkspaceView {
         key: &str,
         mods: &gpui::Modifiers,
         key_char: Option<&str>,
+        app_cursor_keys: bool,
     ) -> Option<Vec<u8>> {
         if mods.control && !mods.platform && !mods.alt {
-            if key == "space" {
-                return Some(vec![0x00]);
+            match key {
+                "space" => return Some(vec![0x00]),
+                "up" => return Some(b"\x1b[1;5A".to_vec()),
+                "down" => return Some(b"\x1b[1;5B".to_vec()),
+                "right" => return Some(b"\x1b[1;5C".to_vec()),
+                "left" => return Some(b"\x1b[1;5D".to_vec()),
+                "home" => return Some(b"\x1b[1;5H".to_vec()),
+                "end" => return Some(b"\x1b[1;5F".to_vec()),
+                _ => {}
             }
             if key.len() == 1 {
                 let b = key.as_bytes()[0].to_ascii_lowercase();
@@ -916,26 +1042,217 @@ impl CodaGpuWorkspaceView {
             return None;
         }
 
+        if mods.shift {
+            match key {
+                "up" => return Some(b"\x1b[1;2A".to_vec()),
+                "down" => return Some(b"\x1b[1;2B".to_vec()),
+                "right" => return Some(b"\x1b[1;2C".to_vec()),
+                "left" => return Some(b"\x1b[1;2D".to_vec()),
+                "tab" => return Some(b"\x1b[Z".to_vec()),
+                _ => {}
+            }
+        }
+
         match key {
             "enter" | "return" => Some(b"\r".to_vec()),
             "backspace" => Some(vec![0x7f]),
             "delete" => Some(b"\x1b[3~".to_vec()),
-            "tab" => Some(if mods.shift {
-                b"\x1b[Z".to_vec()
-            } else {
-                b"\t".to_vec()
-            }),
+            "tab" => Some(b"\t".to_vec()),
             "escape" => Some(vec![0x1b]),
-            "up" => Some(b"\x1b[A".to_vec()),
-            "down" => Some(b"\x1b[B".to_vec()),
-            "right" => Some(b"\x1b[C".to_vec()),
-            "left" => Some(b"\x1b[D".to_vec()),
-            "home" => Some(b"\x1b[H".to_vec()),
-            "end" => Some(b"\x1b[F".to_vec()),
+            "up" => Some(if app_cursor_keys { b"\x1bOA" } else { b"\x1b[A" }.to_vec()),
+            "down" => Some(if app_cursor_keys { b"\x1bOB" } else { b"\x1b[B" }.to_vec()),
+            "right" => Some(if app_cursor_keys { b"\x1bOC" } else { b"\x1b[C" }.to_vec()),
+            "left" => Some(if app_cursor_keys { b"\x1bOD" } else { b"\x1b[D" }.to_vec()),
+            "home" => Some(if app_cursor_keys { b"\x1bOH" } else { b"\x1b[H" }.to_vec()),
+            "end" => Some(if app_cursor_keys { b"\x1bOF" } else { b"\x1b[F" }.to_vec()),
             "pageup" => Some(b"\x1b[5~".to_vec()),
             "pagedown" => Some(b"\x1b[6~".to_vec()),
+            "f1" => Some(b"\x1bOP".to_vec()),
+            "f2" => Some(b"\x1bOQ".to_vec()),
+            "f3" => Some(b"\x1bOR".to_vec()),
+            "f4" => Some(b"\x1bOS".to_vec()),
+            "f5" => Some(b"\x1b[15~".to_vec()),
+            "f6" => Some(b"\x1b[17~".to_vec()),
+            "f7" => Some(b"\x1b[18~".to_vec()),
+            "f8" => Some(b"\x1b[19~".to_vec()),
+            "f9" => Some(b"\x1b[20~".to_vec()),
+            "f10" => Some(b"\x1b[21~".to_vec()),
+            "f11" => Some(b"\x1b[23~".to_vec()),
+            "f12" => Some(b"\x1b[24~".to_vec()),
             _ => None,
         }
+    }
+
+    fn extract_selected_terminal_text(&self, session_id: &str) -> Option<String> {
+        let sel = self.terminal_selection.lock().ok()?.clone()?;
+        if sel.session_id != session_id || !sel.is_non_empty() {
+            return None;
+        }
+        let ((r0, c0), (r1, c1)) = sel.ordered();
+        let g = self.state.lock().ok()?;
+        let sess = g.session_by_id(session_id)?;
+        if sess.lines.is_empty() {
+            return None;
+        }
+        let last_row = r1.min(sess.lines.len().saturating_sub(1));
+        let first_row = r0.min(last_row);
+        let mut out_lines = Vec::new();
+        for r in first_row..=last_row {
+            let line = &sess.lines[r];
+            let start_col = if r == first_row { c0 } else { 0 };
+            let end_col = if r == last_row { c1 } else { usize::MAX };
+            let mut col = 0usize;
+            let mut seg = String::new();
+            for ch in line.chars() {
+                let w = crate::pty::char_display_width(ch).max(1);
+                if col + w > start_col && col < end_col {
+                    seg.push(ch);
+                }
+                col += w;
+            }
+            out_lines.push(seg.trim_end().to_string());
+        }
+        let joined = out_lines.join("\n");
+        if joined.is_empty() { None } else { Some(joined) }
+    }
+
+    fn perform_copy_action(&self, force_all_screen: bool, cx: &mut Context<Self>) {
+        let copy_res = self.state.lock().ok().and_then(|g| {
+            if g.palette_open {
+                return (!g.palette_query.is_empty()).then(|| (g.palette_query.clone(), false));
+            }
+            match g.input_target {
+                ActiveInputTarget::AuthServerUrl => {
+                    (!g.server_url.is_empty()).then(|| (g.server_url.clone(), false))
+                }
+                ActiveInputTarget::AuthAccount => {
+                    (!g.auth_account_input.is_empty()).then(|| (g.auth_account_input.clone(), false))
+                }
+                ActiveInputTarget::RenameDeviceInput => {
+                    (!g.rename_host_input.is_empty()).then(|| (g.rename_host_input.clone(), false))
+                }
+                ActiveInputTarget::AuthPassword
+                | ActiveInputTarget::ChangePwCurrent
+                | ActiveInputTarget::ChangePwNew => None,
+                ActiveInputTarget::TerminalDirect if !g.settings_open => {
+                    let id = g.focused_session_id()?.to_string();
+                    drop(g);
+                    if let Some(selected) = self.extract_selected_terminal_text(&id) {
+                        return Some((selected, false));
+                    }
+                    if force_all_screen {
+                        let g2 = self.state.lock().ok()?;
+                        let sess = g2.session_by_id(&id)?;
+                        let joined = sess.lines.join("\n").trim_end().to_string();
+                        return (!joined.is_empty()).then_some((joined, true));
+                    }
+                    None
+                }
+                _ => None,
+            }
+        });
+        if let Some((text, copied_all)) = copy_res {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+            if let Ok(mut g) = self.state.lock() {
+                g.status_notice = Some(if copied_all {
+                    tr(g.locale, "Copied terminal screen", "已复制终端整屏输出").to_string()
+                } else {
+                    tr(g.locale, "Copied selection", "已复制选中内容").to_string()
+                });
+            }
+            cx.notify();
+        } else if let Ok(mut g) = self.state.lock() {
+            if g.input_target == ActiveInputTarget::TerminalDirect
+                && !g.settings_open
+                && !g.palette_open
+            {
+                g.status_notice = Some(
+                    tr(
+                        g.locale,
+                        "Drag to select terminal text (or ⌘⇧C to copy screen)",
+                        "拖拽选中终端文本后再 ⌘C（或 ⌘⇧C 复制整屏）",
+                    )
+                    .to_string(),
+                );
+                cx.notify();
+            }
+        }
+    }
+
+    fn perform_paste_action(&self, cx: &mut Context<Self>) {
+        if let Some(txt) = cx.read_from_clipboard().and_then(|i| i.text()) {
+            let (target, palette_open, settings_open, focused_id) = self
+                .state
+                .lock()
+                .map(|g| {
+                    (
+                        g.input_target,
+                        g.palette_open,
+                        g.settings_open,
+                        g.focused_session_id().map(|s| s.to_string()),
+                    )
+                })
+                .unwrap_or((ActiveInputTarget::TerminalDirect, false, false, None));
+            if !palette_open && !settings_open && target == ActiveInputTarget::TerminalDirect {
+                if let Some(id) = focused_id {
+                    let bracketed = self
+                        .pty_mgr
+                        .lock()
+                        .map(|m| m.terminal_modes(&id).1)
+                        .unwrap_or(false);
+                    if let Ok(mut g) = self.state.lock() {
+                        if let Some(s) = g.sessions.iter_mut().find(|s| s.id == id) {
+                            s.scroll_offset = 0;
+                        }
+                    }
+                    if bracketed {
+                        // #38: Wrap paste in ?2004h bracketed paste markers & strip any forged terminator.
+                        let safe_txt = txt.replace("\x1b[201~", "");
+                        let mut bytes = Vec::with_capacity(safe_txt.len() + 12);
+                        bytes.extend_from_slice(b"\x1b[200~");
+                        bytes.extend_from_slice(safe_txt.as_bytes());
+                        bytes.extend_from_slice(b"\x1b[201~");
+                        self.send_bytes_to_session(&id, &bytes);
+                    } else {
+                        self.send_bytes_to_session(&id, txt.as_bytes());
+                    }
+                    cx.notify();
+                }
+                return;
+            }
+            let payload = if palette_open
+                || matches!(
+                    target,
+                    ActiveInputTarget::CommandPalette
+                        | ActiveInputTarget::AuthServerUrl
+                        | ActiveInputTarget::AuthAccount
+                        | ActiveInputTarget::RenameDeviceInput
+                ) {
+                txt.trim().to_string()
+            } else if matches!(
+                target,
+                ActiveInputTarget::AuthPassword
+                    | ActiveInputTarget::ChangePwCurrent
+                    | ActiveInputTarget::ChangePwNew
+            ) {
+                // #39: Strip trailing newline when pasting from password managers.
+                txt.trim_end_matches(&['\r', '\n'][..]).to_string()
+            } else {
+                txt
+            };
+            self.commit_text_to_active_target(&payload);
+            cx.notify();
+        }
+    }
+
+    fn adjust_terminal_font_size(&self, delta: Option<f32>) {
+        if let Ok(mut g) = self.state.lock() {
+            g.layout.terminal_font_size_px = match delta {
+                Some(d) => (g.layout.terminal_font_size_px + d).clamp(10.0, 22.0),
+                None => 13.0,
+            };
+        }
+        self.persist_layout_config();
     }
 
     fn commit_text_to_active_target(&self, text: &str) {
@@ -954,6 +1271,10 @@ impl CodaGpuWorkspaceView {
 
         if palette_open || target == ActiveInputTarget::CommandPalette {
             if let Ok(mut g) = self.state.lock() {
+                if g.input_selected_all {
+                    g.palette_query.clear();
+                    g.input_selected_all = false;
+                }
                 g.palette_query.push_str(text);
                 g.palette_selected = 0;
             }
@@ -964,6 +1285,9 @@ impl CodaGpuWorkspaceView {
             ActiveInputTarget::TerminalDirect => {
                 if !settings_open {
                     if let Some(id) = focused_id {
+                        if let Ok(mut sel) = self.terminal_selection.lock() {
+                            *sel = None;
+                        }
                         if let Ok(mut g) = self.state.lock() {
                             if let Some(s) = g.sessions.iter_mut().find(|s| s.id == id) {
                                 s.scroll_offset = 0;
@@ -975,17 +1299,56 @@ impl CodaGpuWorkspaceView {
             }
             ActiveInputTarget::AuthServerUrl => {
                 if let Ok(mut g) = self.state.lock() {
+                    if g.input_selected_all {
+                        g.server_url.clear();
+                        g.input_selected_all = false;
+                    }
                     g.server_url.push_str(text);
                 }
             }
             ActiveInputTarget::AuthAccount => {
                 if let Ok(mut g) = self.state.lock() {
+                    if g.input_selected_all {
+                        g.auth_account_input.clear();
+                        g.input_selected_all = false;
+                    }
                     g.auth_account_input.push_str(text);
                 }
             }
             ActiveInputTarget::AuthPassword => {
                 if let Ok(mut g) = self.state.lock() {
+                    if g.input_selected_all {
+                        g.auth_password_input.clear();
+                        g.input_selected_all = false;
+                    }
                     g.auth_password_input.push_str(text);
+                }
+            }
+            ActiveInputTarget::RenameDeviceInput => {
+                if let Ok(mut g) = self.state.lock() {
+                    if g.input_selected_all {
+                        g.rename_host_input.clear();
+                        g.input_selected_all = false;
+                    }
+                    g.rename_host_input.push_str(text);
+                }
+            }
+            ActiveInputTarget::ChangePwCurrent => {
+                if let Ok(mut g) = self.state.lock() {
+                    if g.input_selected_all {
+                        g.pw_current_input.clear();
+                        g.input_selected_all = false;
+                    }
+                    g.pw_current_input.push_str(text);
+                }
+            }
+            ActiveInputTarget::ChangePwNew => {
+                if let Ok(mut g) = self.state.lock() {
+                    if g.input_selected_all {
+                        g.pw_new_input.clear();
+                        g.input_selected_all = false;
+                    }
+                    g.pw_new_input.push_str(text);
                 }
             }
             ActiveInputTarget::CommandPalette => {}
@@ -997,51 +1360,61 @@ impl CodaGpuWorkspaceView {
         let mods = &ev.keystroke.modifiers;
 
         if mods.platform {
-            if key == "v" {
-                if let Some(txt) = cx.read_from_clipboard().and_then(|i| i.text()) {
-                    let (target, palette_open) = self
-                        .state
-                        .lock()
-                        .map(|g| (g.input_target, g.palette_open))
-                        .unwrap_or((ActiveInputTarget::TerminalDirect, false));
-                    let payload = if palette_open
-                        || matches!(
-                            target,
-                            ActiveInputTarget::CommandPalette
-                                | ActiveInputTarget::AuthServerUrl
-                                | ActiveInputTarget::AuthAccount
-                        ) {
-                        txt.trim().to_string()
-                    } else {
-                        txt
-                    };
-                    self.commit_text_to_active_target(&payload);
-                    cx.notify();
+            match key {
+                "v" => {
+                    self.perform_paste_action(cx);
+                    cx.stop_propagation();
                 }
-                cx.stop_propagation();
-            } else if key == "c" {
-                let copy_text = self.state.lock().ok().and_then(|g| {
-                    if g.input_target != ActiveInputTarget::TerminalDirect
-                        || g.settings_open
-                        || g.palette_open
-                    {
-                        return None;
-                    }
-                    let id = g.focused_session_id()?;
-                    let sess = g.session_by_id(id)?;
-                    let joined = sess.lines.join("\n").trim_end().to_string();
-                    if joined.is_empty() { None } else { Some(joined) }
-                });
-                if let Some(text) = copy_text {
-                    cx.write_to_clipboard(ClipboardItem::new_string(text));
+                "c" => {
+                    self.perform_copy_action(mods.shift, cx);
+                    cx.stop_propagation();
+                }
+                "a" => {
                     if let Ok(mut g) = self.state.lock() {
-                        g.status_notice = Some(
-                            tr(g.locale, "Copied terminal output", "已复制终端输出").to_string(),
-                        );
+                        if g.palette_open || g.input_target != ActiveInputTarget::TerminalDirect {
+                            g.input_selected_all = true;
+                        }
                     }
                     cx.notify();
                     cx.stop_propagation();
                 }
+                "backspace" => {
+                    if let Ok(mut g) = self.state.lock() {
+                        g.input_selected_all = false;
+                        if g.palette_open || g.input_target == ActiveInputTarget::CommandPalette {
+                            g.palette_query.clear();
+                            g.palette_selected = 0;
+                        } else {
+                            match g.input_target {
+                                ActiveInputTarget::AuthServerUrl => g.server_url.clear(),
+                                ActiveInputTarget::AuthAccount => g.auth_account_input.clear(),
+                                ActiveInputTarget::AuthPassword => g.auth_password_input.clear(),
+                                ActiveInputTarget::RenameDeviceInput => g.rename_host_input.clear(),
+                                ActiveInputTarget::ChangePwCurrent => g.pw_current_input.clear(),
+                                ActiveInputTarget::ChangePwNew => g.pw_new_input.clear(),
+                                _ => {}
+                            }
+                        }
+                    }
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                "=" | "+" => {
+                    self.adjust_terminal_font_size(Some(1.0));
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                "-" => {
+                    self.adjust_terminal_font_size(Some(-1.0));
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                "0" => {
+                    self.adjust_terminal_font_size(None);
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                _ => {}
             }
             return;
         }
@@ -1065,6 +1438,7 @@ impl CodaGpuWorkspaceView {
                     if let Ok(mut g) = self.state.lock() {
                         g.palette_open = false;
                         g.palette_query.clear();
+                        g.input_selected_all = false;
                         g.input_target = ActiveInputTarget::TerminalDirect;
                     }
                     cx.notify();
@@ -1102,7 +1476,12 @@ impl CodaGpuWorkspaceView {
                 }
                 "backspace" => {
                     if let Ok(mut g) = self.state.lock() {
-                        g.palette_query.pop();
+                        if g.input_selected_all {
+                            g.palette_query.clear();
+                            g.input_selected_all = false;
+                        } else {
+                            g.palette_query.pop();
+                        }
                         g.palette_selected = 0;
                     }
                     cx.notify();
@@ -1137,9 +1516,29 @@ impl CodaGpuWorkspaceView {
                     cx.stop_propagation();
                     return;
                 }
-                if let Some(bytes) =
-                    Self::keystroke_to_terminal_bytes(key, mods, ev.keystroke.key_char.as_deref())
-                {
+                if mods.control && !mods.alt && key == "l" {
+                    if let Ok(mgr) = self.pty_mgr.lock() {
+                        mgr.clear_viewport(&id);
+                    }
+                    self.send_bytes_to_session(&id, &[0x0c]);
+                    cx.notify();
+                    cx.stop_propagation();
+                    return;
+                }
+                let app_cursor_keys = self
+                    .pty_mgr
+                    .lock()
+                    .map(|m| m.terminal_modes(&id).2)
+                    .unwrap_or(false);
+                if let Some(bytes) = Self::keystroke_to_terminal_bytes(
+                    key,
+                    mods,
+                    ev.keystroke.key_char.as_deref(),
+                    app_cursor_keys,
+                ) {
+                    if let Ok(mut sel) = self.terminal_selection.lock() {
+                        *sel = None;
+                    }
                     if let Ok(mut g) = self.state.lock() {
                         if let Some(s) = g.sessions.iter_mut().find(|s| s.id == id) {
                             s.scroll_offset = 0;
@@ -1157,7 +1556,12 @@ impl CodaGpuWorkspaceView {
             ActiveInputTarget::AuthServerUrl => match key {
                 "backspace" => {
                     if let Ok(mut g) = self.state.lock() {
-                        g.server_url.pop();
+                        if g.input_selected_all {
+                            g.server_url.clear();
+                            g.input_selected_all = false;
+                        } else {
+                            g.server_url.pop();
+                        }
                     }
                     cx.notify();
                     cx.stop_propagation();
@@ -1174,6 +1578,7 @@ impl CodaGpuWorkspaceView {
                 }
                 "escape" => {
                     if let Ok(mut g) = self.state.lock() {
+                        g.input_selected_all = false;
                         g.input_target = ActiveInputTarget::TerminalDirect;
                     }
                     cx.notify();
@@ -1184,13 +1589,19 @@ impl CodaGpuWorkspaceView {
             ActiveInputTarget::AuthAccount => match key {
                 "backspace" => {
                     if let Ok(mut g) = self.state.lock() {
-                        g.auth_account_input.pop();
+                        if g.input_selected_all {
+                            g.auth_account_input.clear();
+                            g.input_selected_all = false;
+                        } else {
+                            g.auth_account_input.pop();
+                        }
                     }
                     cx.notify();
                     cx.stop_propagation();
                 }
                 "tab" | "enter" | "return" => {
                     if let Ok(mut g) = self.state.lock() {
+                        g.input_selected_all = false;
                         g.input_target = ActiveInputTarget::AuthPassword;
                     }
                     cx.notify();
@@ -1198,6 +1609,7 @@ impl CodaGpuWorkspaceView {
                 }
                 "escape" => {
                     if let Ok(mut g) = self.state.lock() {
+                        g.input_selected_all = false;
                         g.input_target = ActiveInputTarget::TerminalDirect;
                     }
                     cx.notify();
@@ -1208,35 +1620,113 @@ impl CodaGpuWorkspaceView {
             ActiveInputTarget::AuthPassword => match key {
                 "backspace" => {
                     if let Ok(mut g) = self.state.lock() {
-                        g.auth_password_input.pop();
+                        if g.input_selected_all {
+                            g.auth_password_input.clear();
+                            g.input_selected_all = false;
+                        } else {
+                            g.auth_password_input.pop();
+                        }
                     }
                     cx.notify();
                     cx.stop_propagation();
                 }
                 "enter" | "return" => {
-                    let (srv, acc, pw) = {
-                        let Ok(g) = self.state.lock() else {
-                            return;
-                        };
-                        (
-                            g.server_url.clone(),
-                            g.auth_account_input.clone(),
-                            g.auth_password_input.clone(),
-                        )
-                    };
-                    spawn_password_login(
-                        Arc::clone(&self.state),
-                        Arc::clone(&self.ui_dirty),
-                        Arc::clone(&self.mesh_hub),
-                        srv,
-                        acc,
-                        pw,
-                    );
+                    self.submit_password_login();
                     cx.notify();
                     cx.stop_propagation();
                 }
                 "escape" => {
                     if let Ok(mut g) = self.state.lock() {
+                        g.input_selected_all = false;
+                        g.input_target = ActiveInputTarget::TerminalDirect;
+                    }
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                _ => {}
+            },
+            ActiveInputTarget::RenameDeviceInput => match key {
+                "backspace" => {
+                    if let Ok(mut g) = self.state.lock() {
+                        if g.input_selected_all {
+                            g.rename_host_input.clear();
+                            g.input_selected_all = false;
+                        } else {
+                            g.rename_host_input.pop();
+                        }
+                    }
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                "enter" | "return" => {
+                    self.submit_rename_device();
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                "escape" => {
+                    if let Ok(mut g) = self.state.lock() {
+                        g.input_selected_all = false;
+                        g.renaming_host_id = None;
+                        g.rename_host_input.clear();
+                        g.input_target = ActiveInputTarget::TerminalDirect;
+                    }
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                _ => {}
+            },
+            ActiveInputTarget::ChangePwCurrent => match key {
+                "backspace" => {
+                    if let Ok(mut g) = self.state.lock() {
+                        if g.input_selected_all {
+                            g.pw_current_input.clear();
+                            g.input_selected_all = false;
+                        } else {
+                            g.pw_current_input.pop();
+                        }
+                    }
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                "tab" | "enter" | "return" => {
+                    if let Ok(mut g) = self.state.lock() {
+                        g.input_selected_all = false;
+                        g.input_target = ActiveInputTarget::ChangePwNew;
+                    }
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                "escape" => {
+                    if let Ok(mut g) = self.state.lock() {
+                        g.input_selected_all = false;
+                        g.input_target = ActiveInputTarget::TerminalDirect;
+                    }
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                _ => {}
+            },
+            ActiveInputTarget::ChangePwNew => match key {
+                "backspace" => {
+                    if let Ok(mut g) = self.state.lock() {
+                        if g.input_selected_all {
+                            g.pw_new_input.clear();
+                            g.input_selected_all = false;
+                        } else {
+                            g.pw_new_input.pop();
+                        }
+                    }
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                "enter" | "return" => {
+                    self.submit_change_password();
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                "escape" => {
+                    if let Ok(mut g) = self.state.lock() {
+                        g.input_selected_all = false;
                         g.input_target = ActiveInputTarget::TerminalDirect;
                     }
                     cx.notify();
@@ -1246,6 +1736,99 @@ impl CodaGpuWorkspaceView {
             },
             ActiveInputTarget::TerminalDirect | ActiveInputTarget::CommandPalette => {}
         }
+    }
+
+    fn submit_rename_device(&self) {
+        let req = {
+            let Ok(mut g) = self.state.lock() else {
+                return;
+            };
+            let Some(id) = g.renaming_host_id else {
+                return;
+            };
+            let next_name = g.rename_host_input.trim().to_string();
+            if next_name.is_empty() {
+                g.status_notice = Some(
+                    tr(g.locale, "Host name cannot be empty", "主机名称不能为空").to_string(),
+                );
+                return;
+            }
+            g.renaming_host_id = None;
+            g.rename_host_input.clear();
+            g.input_selected_all = false;
+            g.input_target = ActiveInputTarget::TerminalDirect;
+            (id, next_name)
+        };
+        self.mesh_hub.rename_remote_device(req.0, req.1);
+    }
+
+    fn submit_change_password(&self) {
+        let req = {
+            let Ok(mut g) = self.state.lock() else {
+                return;
+            };
+            let cur = g.pw_current_input.clone();
+            let next = g.pw_new_input.clone();
+            if cur.is_empty() || next.len() < 8 {
+                g.auth_error = Some(
+                    tr(
+                        g.locale,
+                        "Enter current password and a new password (min 8 chars)",
+                        "请输入当前密码与至少 8 位的新密码",
+                    )
+                    .to_string(),
+                );
+                return;
+            }
+            g.auth_error = None;
+            g.pw_current_input.clear();
+            g.pw_new_input.clear();
+            g.input_selected_all = false;
+            g.input_target = ActiveInputTarget::TerminalDirect;
+            (cur, next)
+        };
+        self.mesh_hub.change_password(req.0, req.1);
+    }
+
+    fn submit_password_login(&self) {
+        let (srv, acc, pw) = {
+            let Ok(mut g) = self.state.lock() else {
+                return;
+            };
+            let s = g.server_url.trim().to_string();
+            let a = g.auth_account_input.trim().to_string();
+            let p = g.auth_password_input.clone();
+            if !is_safe_http_url(&s) {
+                g.auth_error = Some(
+                    tr(
+                        g.locale,
+                        "Invalid server URL (must start with http:// or https://)",
+                        "无效的服务端地址（必须以 http:// 或 https:// 开头）",
+                    )
+                    .to_string(),
+                );
+                return;
+            }
+            if a.is_empty() || p.is_empty() {
+                g.auth_error = Some(
+                    tr(g.locale, "Please enter account and password", "请输入账号和密码")
+                        .to_string(),
+                );
+                return;
+            }
+            g.auth_loading = true;
+            g.auth_error = None;
+            g.input_selected_all = false;
+            (s, a, p)
+        };
+        spawn_password_login(
+            Arc::clone(&self.state),
+            Arc::clone(&self.ui_dirty),
+            Arc::clone(&self.mesh_hub),
+            srv,
+            acc,
+            pw,
+        );
     }
 
     fn persist_layout_config(&self) {
@@ -1264,7 +1847,7 @@ impl CodaGpuWorkspaceView {
 
     fn sync_pty_snapshots_into_state(&self) {
         let snaps = match self.pty_mgr.lock() {
-            Ok(mgr) => mgr.snapshot_all(250),
+            Ok(mgr) => mgr.snapshot_all(1200),
             Err(_) => return,
         };
         let Ok(mut synced) = self.pty_synced_gen.lock() else {
@@ -1281,6 +1864,14 @@ impl CodaGpuWorkspaceView {
                     continue;
                 }
                 synced.insert(sess.id.clone(), (snap.generation, snap.alive));
+                let old_total = sess.styled_lines.len();
+                let new_total = snap.styled_lines.len();
+                // #41: Keep scrollback viewport pinned while user is reading history instead of jumping.
+                if sess.scroll_offset > 0 && !snap.in_alt_screen && new_total > old_total {
+                    sess.scroll_offset = (sess.scroll_offset + (new_total - old_total)).min(1200);
+                } else if snap.in_alt_screen {
+                    sess.scroll_offset = 0;
+                }
                 let sig = snap
                     .lines
                     .iter()
@@ -2415,26 +3006,40 @@ impl CodaGpuWorkspaceView {
     }
 
     fn save_server_url_preference(&self, url: &str) {
-        let trimmed = url.trim().to_string();
+        let trimmed = url.trim().trim_end_matches('/').to_string();
         if trimmed.is_empty() {
             return;
         }
         if !is_safe_http_url(&trimmed) {
             if let Ok(mut g) = self.state.lock() {
-                g.status_notice = Some(
-                    tr(
-                        g.locale,
-                        "Invalid server URL (must start with http:// or https://)",
-                        "无效的服务端地址（必须以 http:// 或 https:// 开头）",
-                    )
-                    .to_string(),
-                );
+                let msg = tr(
+                    g.locale,
+                    "Invalid server URL (must start with http:// or https://)",
+                    "无效的服务端地址（必须以 http:// 或 https:// 开头）",
+                )
+                .to_string();
+                g.auth_error = Some(msg.clone());
+                g.status_notice = Some(msg);
             }
             self.ui_dirty.store(true, Ordering::Release);
             return;
         }
+        // #41: Switching to a different server URL while logged in cleanly signs out of the old server.
+        let switching_while_logged_in = self
+            .state
+            .lock()
+            .map(|g| {
+                g.is_logged_in
+                    && g.server_url.trim().trim_end_matches('/') != trimmed.as_str()
+            })
+            .unwrap_or(false);
+        if switching_while_logged_in {
+            self.mesh_hub.sign_out();
+        }
         if let Ok(mut g) = self.state.lock() {
             g.server_url = trimmed.clone();
+            g.auth_error = None;
+            g.input_selected_all = false;
             g.input_target = ActiveInputTarget::TerminalDirect;
         }
         Self::update_prefs_async(move |prefs| {
@@ -2604,6 +3209,51 @@ impl Render for CodaGpuWorkspaceView {
                 if let Some(id) = target_id {
                     this.interrupt_session(&id);
                 }
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &CopyTerminalAction, _, cx| {
+                this.perform_copy_action(false, cx);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &PasteTerminalAction, _, cx| {
+                this.perform_paste_action(cx);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &SelectAllAction, _, cx| {
+                if let Ok(mut g) = this.state.lock() {
+                    if g.input_target != ActiveInputTarget::TerminalDirect {
+                        g.input_selected_all = true;
+                    } else if let Some(sid) = g.focused_session_id().map(str::to_string) {
+                        if let Some(sess) = g.session_by_id(&sid) {
+                            let last_line = sess.styled_lines.len().saturating_sub(1);
+                            let last_col = sess
+                                .styled_lines
+                                .get(last_line)
+                                .map(|l| l.text.chars().count())
+                                .unwrap_or(0);
+                            if let Ok(mut sel) = this.terminal_selection.lock() {
+                                *sel = Some(TerminalSelection {
+                                    session_id: sid,
+                                    anchor: (0, 0),
+                                    focus: (last_line, last_col),
+                                    dragging: false,
+                                });
+                            }
+                        }
+                    }
+                }
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &ZoomInTerminal, _, cx| {
+                this.adjust_terminal_font_size(Some(1.0));
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &ZoomOutTerminal, _, cx| {
+                this.adjust_terminal_font_size(Some(-1.0));
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &ZoomResetTerminal, _, cx| {
+                this.adjust_terminal_font_size(None);
                 cx.notify();
             }))
             .size_full()
@@ -3661,12 +4311,19 @@ impl CodaGpuWorkspaceView {
             }))
             .child(label.to_string())
             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                if let Ok(mut g) = this.state.lock() {
-                    g.right_drawer = if g.right_drawer == Some(tab) {
-                        None
+                let opened = if let Ok(mut g) = this.state.lock() {
+                    if g.right_drawer == Some(tab) {
+                        g.right_drawer = None;
+                        false
                     } else {
-                        Some(tab)
-                    };
+                        g.right_drawer = Some(tab);
+                        true
+                    }
+                } else {
+                    false
+                };
+                if opened && matches!(tab, RightDrawerTab::Changes | RightDrawerTab::Files) {
+                    this.refresh_active_space_inspector();
                 }
                 cx.notify();
             }))
@@ -3772,6 +4429,8 @@ impl CodaGpuWorkspaceView {
         let sid_clear_scroll = sess.id.clone();
         let sid_sigint = sess.id.clone();
         let sid_focus = sess.id.clone();
+        let sid_sel_down = sess.id.clone();
+        let sid_sel_move = sess.id.clone();
         let sid_scroll = sess.id.clone();
         let sid_jump_bottom = sess.id.clone();
         let sid_resize = sess.id.clone();
@@ -3788,6 +4447,7 @@ impl CodaGpuWorkspaceView {
         let ime_marked = self.marked_text.clone();
         let viewport_dims_bg = Arc::clone(&self.viewport_dims);
         let visible_rows_bg = Arc::clone(&self.visible_rows_by_pane);
+        let pane_geometry_bg = Arc::clone(&self.pane_geometry);
         let ime_bounds_bg = Arc::clone(&self.ime_bounds);
         let pty_mgr_bg = Arc::clone(&self.pty_mgr);
         let mesh_hub_bg = Arc::clone(&self.mesh_hub);
@@ -3817,6 +4477,12 @@ impl CodaGpuWorkspaceView {
         let end = total_lines.saturating_sub(eff_off);
         let start = end.saturating_sub(measured_rows);
         let visible_slice = &sess.styled_lines[start..end];
+        let active_sel = self
+            .terminal_selection
+            .lock()
+            .ok()
+            .and_then(|s| s.clone())
+            .filter(|sel| sel.session_id == sess.id && sel.is_non_empty());
 
         div()
             .id(SharedString::from(format!("term-pane-{pane_slot:?}-{}", sess.id)))
@@ -3826,21 +4492,31 @@ impl CodaGpuWorkspaceView {
             .flex_col()
             .overflow_hidden()
             .on_scroll_wheel(cx.listener(move |this, ev: &ScrollWheelEvent, _, cx| {
+                let (in_alt, app_cursor, _) = this
+                    .pty_mgr
+                    .lock()
+                    .map(|mgr| mgr.terminal_modes(&sid_scroll))
+                    .unwrap_or((false, false, false));
+
                 let step: isize = match ev.delta {
                     ScrollDelta::Lines(pt) => {
-                        if pt.y > 0.1 {
-                            3
-                        } else if pt.y < -0.1 {
-                            -3
+                        if pt.y.abs() > 0.05 {
+                            (pt.y * 3.0).round() as isize
                         } else {
                             0
                         }
                     }
                     ScrollDelta::Pixels(pt) => {
-                        if pt.y > px(2.0) {
-                            2
-                        } else if pt.y < px(-2.0) {
-                            -2
+                        let dy = f32::from(pt.y);
+                        let row_px = (line_h + 1.5).max(12.0);
+                        if let Ok(mut acc_map) = this.scroll_pixel_acc.lock() {
+                            let acc = acc_map.entry(sid_scroll.clone()).or_insert(0.0);
+                            *acc += dy;
+                            let lines = (*acc / row_px).trunc() as isize;
+                            if lines != 0 {
+                                *acc -= (lines as f32) * row_px;
+                            }
+                            lines
                         } else {
                             0
                         }
@@ -3849,10 +4525,28 @@ impl CodaGpuWorkspaceView {
                 if step == 0 {
                     return;
                 }
+                if in_alt {
+                    // Forward wheel scroll as arrow keys inside TUI / alt-screen apps (vim, less, htop).
+                    let key_seq: &[u8] = if step > 0 {
+                        if app_cursor { b"\x1bOA" } else { b"\x1b[A" }
+                    } else if app_cursor {
+                        b"\x1bOB"
+                    } else {
+                        b"\x1b[B"
+                    };
+                    let repeats = step.unsigned_abs().min(5);
+                    let mut payload = Vec::with_capacity(key_seq.len() * repeats);
+                    for _ in 0..repeats {
+                        payload.extend_from_slice(key_seq);
+                    }
+                    this.send_bytes_to_session(&sid_scroll, &payload);
+                    return;
+                }
                 if let Ok(mut g) = this.state.lock() {
                     if let Some(s) = g.sessions.iter_mut().find(|s| s.id == sid_scroll) {
+                        let max_scroll = s.styled_lines.len().saturating_sub(measured_rows).min(1200);
                         if step > 0 {
-                            s.scroll_offset = (s.scroll_offset + step as usize).min(200);
+                            s.scroll_offset = (s.scroll_offset + step as usize).min(max_scroll);
                         } else {
                             s.scroll_offset = s.scroll_offset.saturating_sub((-step) as usize);
                         }
@@ -3862,7 +4556,7 @@ impl CodaGpuWorkspaceView {
             }))
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
                     if let Ok(mut g) = this.state.lock() {
                         g.focused_pane = pane_slot;
                         g.input_target = ActiveInputTarget::TerminalDirect;
@@ -3870,6 +4564,71 @@ impl CodaGpuWorkspaceView {
                             g.split_session_id = Some(sid_focus.clone());
                         } else {
                             g.active_session_id = Some(sid_focus.clone());
+                        }
+                    }
+                    if let Ok(geo_map) = this.pane_geometry.lock() {
+                        if let Some(geo) = geo_map.get(&pane_slot).copied() {
+                            let rel_x = (f32::from(ev.position.x - geo.bounds.origin.x) - 14.0).max(0.0);
+                            let rel_y = (f32::from(ev.position.y - geo.bounds.origin.y) - 10.0).max(0.0);
+                            let vis_row = (rel_y / geo.row_step).floor() as usize;
+                            let col = (rel_x / geo.cell_w).floor() as usize;
+                            let abs_line = (geo.start_line + vis_row).min(geo.total_lines.saturating_sub(1));
+                            if let Ok(mut sel) = this.terminal_selection.lock() {
+                                *sel = Some(TerminalSelection {
+                                    session_id: sid_sel_down.clone(),
+                                    anchor: (abs_line, col),
+                                    focus: (abs_line, col),
+                                    dragging: true,
+                                });
+                            }
+                        }
+                    }
+                    cx.notify();
+                }),
+            )
+            .on_mouse_move(cx.listener(move |this, ev: &MouseMoveEvent, _, cx| {
+                let is_dragging = this
+                    .terminal_selection
+                    .lock()
+                    .ok()
+                    .and_then(|s| s.as_ref().map(|x| x.dragging && x.session_id == sid_sel_move))
+                    .unwrap_or(false);
+                if !is_dragging {
+                    return;
+                }
+                if !ev.dragging() {
+                    if let Ok(mut sel) = this.terminal_selection.lock() {
+                        if let Some(ref mut cur) = *sel {
+                            cur.dragging = false;
+                        }
+                    }
+                    return;
+                }
+                if let Ok(geo_map) = this.pane_geometry.lock() {
+                    if let Some(geo) = geo_map.get(&pane_slot).copied() {
+                        let rel_x = (f32::from(ev.position.x - geo.bounds.origin.x) - 14.0).max(0.0);
+                        let rel_y = (f32::from(ev.position.y - geo.bounds.origin.y) - 10.0).max(0.0);
+                        let vis_row = (rel_y / geo.row_step).floor() as usize;
+                        let col = (rel_x / geo.cell_w).floor() as usize;
+                        let abs_line = (geo.start_line + vis_row).min(geo.total_lines.saturating_sub(1));
+                        if let Ok(mut sel) = this.terminal_selection.lock() {
+                            if let Some(ref mut cur) = *sel {
+                                cur.focus = (abs_line, col);
+                            }
+                        }
+                        cx.notify();
+                    }
+                }
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                    if let Ok(mut sel) = this.terminal_selection.lock() {
+                        if let Some(ref mut cur) = *sel {
+                            cur.dragging = false;
+                            if !cur.is_non_empty() {
+                                *sel = None;
+                            }
                         }
                     }
                     cx.notify();
@@ -3890,11 +4649,20 @@ impl CodaGpuWorkspaceView {
                     .flex()
                     .flex_col()
                     .gap(px(1.5))
-                    .children(
-                        visible_slice
-                            .iter()
-                            .map(|line| render_styled_terminal_line(line, line_h)),
-                    )
+                    .children(visible_slice.iter().enumerate().map(|(vis_idx, line)| {
+                        let abs_idx = start + vis_idx;
+                        let sel_cols = active_sel.as_ref().and_then(|sel| {
+                            let ((r0, c0), (r1, c1)) = sel.ordered();
+                            if abs_idx < r0 || abs_idx > r1 {
+                                return None;
+                            }
+                            let line_len = line.text.chars().count();
+                            let s_col = if abs_idx == r0 { c0 } else { 0 };
+                            let e_col = if abs_idx == r1 { c1 } else { line_len };
+                            (s_col < e_col).then_some((s_col, e_col))
+                        });
+                        render_styled_terminal_line(line, line_h, sel_cols)
+                    }))
                     .child(
                         div().absolute().inset_0().child(
                             canvas(
@@ -3906,6 +4674,19 @@ impl CodaGpuWorkspaceView {
                                     let row_step = (line_h + 1.5).max(10.0);
                                     let cols = (inner_w / cell_w).floor().clamp(24.0, 400.0) as u16;
                                     let rows = (inner_h / row_step).floor().clamp(6.0, 200.0) as u16;
+
+                                    if let Ok(mut geos) = pane_geometry_bg.lock() {
+                                        geos.insert(
+                                            pane_slot,
+                                            PaneGeometry {
+                                                bounds,
+                                                start_line: start,
+                                                total_lines,
+                                                cell_w,
+                                                row_step,
+                                            },
+                                        );
+                                    }
 
                                     if let Ok(mut map) = visible_rows_bg.lock() {
                                         let r = rows as usize;
@@ -4116,7 +4897,7 @@ impl CodaGpuWorkspaceView {
                                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                                         cx.stop_propagation();
                                         if let Ok(mgr) = this.pty_mgr.lock() {
-                                            mgr.clear_buffer(&sid_clear);
+                                            mgr.clear_viewport(&sid_clear);
                                         }
                                         if let Ok(mut g) = this.state.lock() {
                                             if let Some(s) = g
@@ -4281,7 +5062,7 @@ impl CodaGpuWorkspaceView {
                                 let start = total.saturating_sub(32);
                                 sess.styled_lines[start..]
                                     .iter()
-                                    .map(|line| render_styled_terminal_line(line, tile_line_h))
+                                    .map(|line| render_styled_terminal_line(line, tile_line_h, None))
                             }),
                     )
             }))
@@ -4438,6 +5219,26 @@ impl CodaGpuWorkspaceView {
                             .flex()
                             .items_center()
                             .gap(px(4.0))
+                            .when(tab != RightDrawerTab::Mesh, |el| {
+                                el.child(
+                                    div()
+                                        .id("btn-drawer-refresh")
+                                        .occlude()
+                                        .px(px(6.0))
+                                        .py(px(2.0))
+                                        .rounded(px(4.0))
+                                        .bg(rgb(palette::SURFACE_BG))
+                                        .hover(|h| h.bg(rgb(palette::HOVER_BG)))
+                                        .cursor_pointer()
+                                        .text_size(px(11.0))
+                                        .text_color(rgb(palette::TEXT_MUTED))
+                                        .child("↻")
+                                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                            this.refresh_active_space_inspector();
+                                            cx.notify();
+                                        })),
+                                )
+                            })
                             .when(tab != RightDrawerTab::Mesh && is_local_space, |el| {
                                 let path_for_finder = active_path.to_string_lossy().to_string();
                                 el.child(
@@ -4495,7 +5296,21 @@ impl CodaGpuWorkspaceView {
                     .gap(px(10.0))
                     .when(tab == RightDrawerTab::Changes, |el| {
                         let snap = &st.repo_snapshot;
-                        if snap.changed_files.is_empty() {
+                        if !snap.is_git_repo {
+                            el.child(
+                                div()
+                                    .p(px(10.0))
+                                    .rounded(px(6.0))
+                                    .bg(rgb(palette::SURFACE_BG))
+                                    .text_size(px(11.5))
+                                    .text_color(rgb(palette::TEXT_DIM))
+                                    .child(tr(
+                                        loc,
+                                        "Not a Git repository",
+                                        "当前工作区不是 Git 仓库",
+                                    )),
+                            )
+                        } else if snap.changed_files.is_empty() {
                             el.child(
                                 div()
                                     .p(px(10.0))
@@ -4758,7 +5573,34 @@ impl CodaGpuWorkspaceView {
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let loc = st.locale;
+        let accent = st.layout.accent_color_u32();
         let show_auth_form = !st.is_logged_in || st.auth_form_expanded;
+        let host_mode_on = st.allow_remote_control;
+        let host_status_hint = if st.external_daemon_running {
+            tr(
+                loc,
+                "Standalone coda-daemon running",
+                "独立 coda-daemon 后台服务运行中",
+            )
+        } else if st.embedded_host_active {
+            tr(
+                loc,
+                "Remote control active (E2EE)",
+                "已开启远端被控 (E2EE 在线)",
+            )
+        } else if host_mode_on {
+            tr(
+                loc,
+                "Sign in to accept remote control",
+                "登录后即允许其他设备控制本机",
+            )
+        } else {
+            tr(
+                loc,
+                "Controller-only (this Mac is hidden)",
+                "仅控制端模式（本机不对外被控）",
+            )
+        };
         el.when(!show_auth_form, |el| {
             el.child(
                 div()
@@ -4830,7 +5672,81 @@ impl CodaGpuWorkspaceView {
                     ),
             )
         })
+        .child(
+            div()
+                .p(px(9.0))
+                .rounded(px(6.0))
+                .bg(rgb(palette::SURFACE_BG))
+                .border_1()
+                .border_color(rgb(palette::BORDER))
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(8.0))
+                .child(
+                    div()
+                        .min_w_0()
+                        .flex_1()
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.0))
+                        .child(
+                            div()
+                                .text_size(px(11.5))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(rgb(palette::TEXT_PRIMARY))
+                                .child(tr(loc, "Allow Remote Control", "允许远端控制本机")),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(10.0))
+                                .text_color(rgb(palette::TEXT_DIM))
+                                .truncate()
+                                .child(host_status_hint),
+                        ),
+                )
+                .child(
+                    div()
+                        .id("drawer-toggle-remote-host")
+                        .occlude()
+                        .flex_shrink_0()
+                        .px(px(8.0))
+                        .py(px(4.0))
+                        .rounded(px(5.0))
+                        .bg(rgb(if host_mode_on {
+                            palette::HOVER_BG
+                        } else {
+                            palette::CHROME_BG
+                        }))
+                        .border_1()
+                        .border_color(rgb(if host_mode_on {
+                            accent
+                        } else {
+                            palette::BORDER
+                        }))
+                        .hover(|h| h.bg(rgb(palette::HOVER_BG)))
+                        .cursor_pointer()
+                        .text_size(px(10.5))
+                        .text_color(rgb(if host_mode_on {
+                            palette::DONE_GREEN
+                        } else {
+                            palette::TEXT_MUTED
+                        }))
+                        .child(if host_mode_on {
+                            tr(loc, "Enabled", "已开启")
+                        } else {
+                            tr(loc, "Off", "已关闭")
+                        })
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            this.mesh_hub.set_allow_remote_control(!host_mode_on);
+                            cx.notify();
+                        })),
+                ),
+        )
         .when(show_auth_form, |el| {
+            let srv_focused = st.input_target == ActiveInputTarget::AuthServerUrl;
+            let acct_focused = st.input_target == ActiveInputTarget::AuthAccount;
+            let pass_focused = st.input_target == ActiveInputTarget::AuthPassword;
             el.child(
                 div()
                     .p(px(10.0))
@@ -4884,18 +5800,23 @@ impl CodaGpuWorkspaceView {
                             .rounded(px(4.0))
                             .bg(rgb(palette::CANVAS_BG))
                             .border_1()
-                            .border_color(rgb(if st.input_target == ActiveInputTarget::AuthServerUrl {
-                                st.layout.accent_color_u32()
+                            .border_color(rgb(if srv_focused {
+                                accent
                             } else {
                                 palette::BORDER
                             }))
                             .cursor_pointer()
                             .text_size(px(11.0))
                             .text_color(rgb(palette::TEXT_PRIMARY))
-                            .child(st.server_url.clone())
+                            .child(if srv_focused {
+                                format!("{}|", st.server_url)
+                            } else {
+                                st.server_url.clone()
+                            })
                             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                                 if let Ok(mut g) = this.state.lock() {
                                     g.input_target = ActiveInputTarget::AuthServerUrl;
+                                    g.input_selected_all = false;
                                 }
                                 cx.notify();
                             })),
@@ -4919,7 +5840,11 @@ impl CodaGpuWorkspaceView {
                                 let srv = this
                                     .state
                                     .lock()
-                                    .map(|g| g.server_url.clone())
+                                    .map(|mut g| {
+                                        g.auth_loading = true;
+                                        g.auth_error = None;
+                                        g.server_url.clone()
+                                    })
                                     .unwrap_or_default();
                                 spawn_device_login(
                                     Arc::clone(&this.state),
@@ -4939,26 +5864,33 @@ impl CodaGpuWorkspaceView {
                             .rounded(px(4.0))
                             .bg(rgb(palette::CANVAS_BG))
                             .border_1()
-                            .border_color(rgb(if st.input_target == ActiveInputTarget::AuthAccount {
-                                st.layout.accent_color_u32()
+                            .border_color(rgb(if acct_focused {
+                                accent
                             } else {
                                 palette::BORDER
                             }))
                             .cursor_pointer()
                             .text_size(px(11.0))
-                            .text_color(rgb(if st.auth_account_input.is_empty() {
+                            .text_color(rgb(if st.auth_account_input.is_empty() && !acct_focused {
                                 palette::TEXT_DIM
                             } else {
                                 palette::TEXT_PRIMARY
                             }))
                             .child(if st.auth_account_input.is_empty() {
-                                tr(loc, "Email / Username", "账号邮箱").to_string()
+                                if acct_focused {
+                                    "|".to_string()
+                                } else {
+                                    tr(loc, "Email / Username", "账号邮箱").to_string()
+                                }
+                            } else if acct_focused {
+                                format!("{}|", st.auth_account_input)
                             } else {
                                 st.auth_account_input.clone()
                             })
                             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                                 if let Ok(mut g) = this.state.lock() {
                                     g.input_target = ActiveInputTarget::AuthAccount;
+                                    g.input_selected_all = false;
                                 }
                                 cx.notify();
                             })),
@@ -4972,30 +5904,80 @@ impl CodaGpuWorkspaceView {
                             .rounded(px(4.0))
                             .bg(rgb(palette::CANVAS_BG))
                             .border_1()
-                            .border_color(rgb(if st.input_target == ActiveInputTarget::AuthPassword {
-                                st.layout.accent_color_u32()
+                            .border_color(rgb(if pass_focused {
+                                accent
                             } else {
                                 palette::BORDER
                             }))
                             .cursor_pointer()
                             .text_size(px(11.0))
-                            .text_color(rgb(if st.auth_password_input.is_empty() {
+                            .text_color(rgb(if st.auth_password_input.is_empty() && !pass_focused {
                                 palette::TEXT_DIM
                             } else {
                                 palette::TEXT_PRIMARY
                             }))
                             .child(if st.auth_password_input.is_empty() {
-                                tr(loc, "Password (Enter submits)", "密码 (回车登录)").to_string()
+                                if pass_focused {
+                                    "|".to_string()
+                                } else {
+                                    tr(loc, "Password", "密码").to_string()
+                                }
                             } else {
-                                "*".repeat(st.auth_password_input.chars().count())
+                                let dots = "*".repeat(st.auth_password_input.chars().count());
+                                if pass_focused {
+                                    format!("{dots}|")
+                                } else {
+                                    dots
+                                }
                             })
                             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                                 if let Ok(mut g) = this.state.lock() {
                                     g.input_target = ActiveInputTarget::AuthPassword;
+                                    g.input_selected_all = false;
                                 }
                                 cx.notify();
                             })),
                     )
+                    .child(
+                        div()
+                            .id("btn-drawer-password-signin")
+                            .occlude()
+                            .px(px(10.0))
+                            .py(px(6.0))
+                            .rounded(px(5.0))
+                            .bg(rgb(accent))
+                            .hover(|h| h.opacity(0.9))
+                            .cursor_pointer()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_size(px(11.5))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(palette::CANVAS_BG))
+                            .child(if st.auth_loading {
+                                tr(loc, "Signing in…", "正在登录…")
+                            } else {
+                                tr(loc, "Sign In", "登录")
+                            })
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                this.submit_password_login();
+                                cx.notify();
+                            })),
+                    )
+                    .when_some(st.auth_error.clone(), |el, err| {
+                        el.child(
+                            div()
+                                .px(px(8.0))
+                                .py(px(5.0))
+                                .rounded(px(4.0))
+                                .bg(rgb(palette::CANVAS_BG))
+                                .border_1()
+                                .border_color(rgb(palette::ERROR_RED))
+                                .text_size(px(10.5))
+                                .text_color(rgb(palette::ERROR_RED))
+                                .child(err),
+                        )
+                    })
                     .when_some(st.device_login_code.clone(), |el, code| {
                         el.child(
                             div()
@@ -5168,19 +6150,20 @@ impl CodaGpuWorkspaceView {
                                         )
                                         .to_string()
                                     } else {
-                                        st.palette_query.clone()
+                                        format!("{}|", st.palette_query)
                                     }),
                             ),
                     )
                     .child(
                         div()
+                            .id("palette-list")
                             .max_h(px(360.0))
                             .p(px(6.0))
-                            .overflow_hidden()
+                            .overflow_y_scroll()
                             .flex()
                             .flex_col()
                             .gap(px(2.0))
-                            .children(items.into_iter().take(12).enumerate().map(|(idx, item)| {
+                            .children(items.into_iter().enumerate().map(|(idx, item)| {
                                 let is_sel = idx == selected;
                                 let action = item.action.clone();
                                 div()
@@ -5896,8 +6879,16 @@ impl CodaGpuWorkspaceView {
         let loc = st.locale;
         let accent = st.layout.accent_color_u32();
         let show_auth_form = !st.is_logged_in || st.auth_form_expanded;
+        let host_mode_on = st.allow_remote_control;
+        let srv_focused = st.input_target == ActiveInputTarget::AuthServerUrl;
+        let acct_focused = st.input_target == ActiveInputTarget::AuthAccount;
+        let pass_focused = st.input_target == ActiveInputTarget::AuthPassword;
 
         div()
+            .id("settings-machines-scroll")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
             .flex()
             .flex_col()
             .gap(px(8.0))
@@ -5963,7 +6954,7 @@ impl CodaGpuWorkspaceView {
                             .rounded(px(5.0))
                             .bg(rgb(palette::CANVAS_BG))
                             .border_1()
-                            .border_color(rgb(if st.input_target == ActiveInputTarget::AuthServerUrl {
+                            .border_color(rgb(if srv_focused {
                                 accent
                             } else {
                                 palette::BORDER
@@ -5971,10 +6962,15 @@ impl CodaGpuWorkspaceView {
                             .cursor_pointer()
                             .text_size(px(11.5))
                             .text_color(rgb(palette::TEXT_PRIMARY))
-                            .child(st.server_url.clone())
+                            .child(if srv_focused {
+                                format!("{}|", st.server_url)
+                            } else {
+                                st.server_url.clone()
+                            })
                             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                                 if let Ok(mut g) = this.state.lock() {
                                     g.input_target = ActiveInputTarget::AuthServerUrl;
+                                    g.input_selected_all = false;
                                 }
                                 cx.notify();
                             })),
@@ -6028,6 +7024,26 @@ impl CodaGpuWorkspaceView {
                                         .items_center()
                                         .gap(px(6.0))
                                         .child(self.render_setting_pill(
+                                            "settings-toggle-pw-change",
+                                            tr(loc, "Password", "改密"),
+                                            st.pw_change_expanded,
+                                            accent,
+                                            cx.listener(|this, _: &ClickEvent, _, cx| {
+                                                if let Ok(mut g) = this.state.lock() {
+                                                    g.pw_change_expanded = !g.pw_change_expanded;
+                                                    g.auth_error = None;
+                                                    if g.pw_change_expanded {
+                                                        g.input_target = ActiveInputTarget::ChangePwCurrent;
+                                                    } else {
+                                                        g.pw_current_input.clear();
+                                                        g.pw_new_input.clear();
+                                                        g.input_target = ActiveInputTarget::TerminalDirect;
+                                                    }
+                                                }
+                                                cx.notify();
+                                            }),
+                                        ))
+                                        .child(self.render_setting_pill(
                                             "settings-switch-acct",
                                             tr(loc, "Switch Account", "切换账号"),
                                             false,
@@ -6051,6 +7067,130 @@ impl CodaGpuWorkspaceView {
                                         )),
                                 ),
                         )
+                        .when(st.pw_change_expanded, |el2| {
+                            let cur_focused = st.input_target == ActiveInputTarget::ChangePwCurrent;
+                            let new_focused = st.input_target == ActiveInputTarget::ChangePwNew;
+                            let cur_mask = "•".repeat(st.pw_current_input.chars().count());
+                            let new_mask = "•".repeat(st.pw_new_input.chars().count());
+                            el2.child(
+                                div()
+                                    .mt(px(4.0))
+                                    .p(px(8.0))
+                                    .rounded(px(6.0))
+                                    .bg(rgb(palette::CHROME_BG))
+                                    .border_1()
+                                    .border_color(rgb(palette::BORDER))
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(6.0))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(6.0))
+                                            .child(
+                                                div()
+                                                    .id("settings-pw-current")
+                                                    .occlude()
+                                                    .flex_1()
+                                                    .px(px(8.0))
+                                                    .py(px(5.0))
+                                                    .rounded(px(4.0))
+                                                    .bg(rgb(palette::CANVAS_BG))
+                                                    .border_1()
+                                                    .border_color(rgb(if cur_focused {
+                                                        accent
+                                                    } else {
+                                                        palette::BORDER
+                                                    }))
+                                                    .cursor_pointer()
+                                                    .text_size(px(11.0))
+                                                    .text_color(rgb(if st.pw_current_input.is_empty() {
+                                                        palette::TEXT_DIM
+                                                    } else {
+                                                        palette::TEXT_PRIMARY
+                                                    }))
+                                                    .child(if st.pw_current_input.is_empty() {
+                                                        if cur_focused {
+                                                            "|".to_string()
+                                                        } else {
+                                                            tr(loc, "Current password", "当前密码").to_string()
+                                                        }
+                                                    } else if cur_focused {
+                                                        format!("{cur_mask}|")
+                                                    } else {
+                                                        cur_mask
+                                                    })
+                                                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                                        if let Ok(mut g) = this.state.lock() {
+                                                            g.input_target = ActiveInputTarget::ChangePwCurrent;
+                                                            g.input_selected_all = false;
+                                                        }
+                                                        cx.notify();
+                                                    })),
+                                            )
+                                            .child(
+                                                div()
+                                                    .id("settings-pw-new")
+                                                    .occlude()
+                                                    .flex_1()
+                                                    .px(px(8.0))
+                                                    .py(px(5.0))
+                                                    .rounded(px(4.0))
+                                                    .bg(rgb(palette::CANVAS_BG))
+                                                    .border_1()
+                                                    .border_color(rgb(if new_focused {
+                                                        accent
+                                                    } else {
+                                                        palette::BORDER
+                                                    }))
+                                                    .cursor_pointer()
+                                                    .text_size(px(11.0))
+                                                    .text_color(rgb(if st.pw_new_input.is_empty() {
+                                                        palette::TEXT_DIM
+                                                    } else {
+                                                        palette::TEXT_PRIMARY
+                                                    }))
+                                                    .child(if st.pw_new_input.is_empty() {
+                                                        if new_focused {
+                                                            "|".to_string()
+                                                        } else {
+                                                            tr(loc, "New password (8+ chars)", "新密码（至少 8 位）").to_string()
+                                                        }
+                                                    } else if new_focused {
+                                                        format!("{new_mask}|")
+                                                    } else {
+                                                        new_mask
+                                                    })
+                                                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                                        if let Ok(mut g) = this.state.lock() {
+                                                            g.input_target = ActiveInputTarget::ChangePwNew;
+                                                            g.input_selected_all = false;
+                                                        }
+                                                        cx.notify();
+                                                    })),
+                                            )
+                                            .child(self.render_setting_pill(
+                                                "settings-pw-submit",
+                                                tr(loc, "Update", "确认更新"),
+                                                true,
+                                                accent,
+                                                cx.listener(|this, _: &ClickEvent, _, cx| {
+                                                    this.submit_change_password();
+                                                    cx.notify();
+                                                }),
+                                            )),
+                                    )
+                                    .when_some(st.auth_error.clone(), |err_el, err_msg| {
+                                        err_el.child(
+                                            div()
+                                                .text_size(px(10.5))
+                                                .text_color(rgb(palette::ERROR_RED))
+                                                .child(err_msg),
+                                        )
+                                    }),
+                            )
+                        })
                     })
                     .when(show_auth_form, |el| {
                         el.child(
@@ -6083,7 +7223,11 @@ impl CodaGpuWorkspaceView {
                                                 let srv = this
                                                     .state
                                                     .lock()
-                                                    .map(|g| g.server_url.clone())
+                                                    .map(|mut g| {
+                                                        g.auth_loading = true;
+                                                        g.auth_error = None;
+                                                        g.server_url.clone()
+                                                    })
                                                     .unwrap_or_default();
                                                 spawn_device_login(
                                                     Arc::clone(&this.state),
@@ -6127,28 +7271,35 @@ impl CodaGpuWorkspaceView {
                                         .rounded(px(4.0))
                                         .bg(rgb(palette::CANVAS_BG))
                                         .border_1()
-                                        .border_color(rgb(
-                                            if st.input_target == ActiveInputTarget::AuthAccount {
-                                                accent
-                                            } else {
-                                                palette::BORDER
-                                            },
-                                        ))
+                                        .border_color(rgb(if acct_focused {
+                                            accent
+                                        } else {
+                                            palette::BORDER
+                                        }))
                                         .cursor_pointer()
                                         .text_size(px(11.0))
-                                        .text_color(rgb(if st.auth_account_input.is_empty() {
-                                            palette::TEXT_DIM
-                                        } else {
-                                            palette::TEXT_PRIMARY
-                                        }))
+                                        .text_color(rgb(
+                                            if st.auth_account_input.is_empty() && !acct_focused {
+                                                palette::TEXT_DIM
+                                            } else {
+                                                palette::TEXT_PRIMARY
+                                            },
+                                        ))
                                         .child(if st.auth_account_input.is_empty() {
-                                            tr(loc, "Email / Username", "账号邮箱").to_string()
+                                            if acct_focused {
+                                                "|".to_string()
+                                            } else {
+                                                tr(loc, "Email / Username", "账号邮箱").to_string()
+                                            }
+                                        } else if acct_focused {
+                                            format!("{}|", st.auth_account_input)
                                         } else {
                                             st.auth_account_input.clone()
                                         })
                                         .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                                             if let Ok(mut g) = this.state.lock() {
                                                 g.input_target = ActiveInputTarget::AuthAccount;
+                                                g.input_selected_all = false;
                                             }
                                             cx.notify();
                                         })),
@@ -6163,34 +7314,82 @@ impl CodaGpuWorkspaceView {
                                         .rounded(px(4.0))
                                         .bg(rgb(palette::CANVAS_BG))
                                         .border_1()
-                                        .border_color(rgb(
-                                            if st.input_target == ActiveInputTarget::AuthPassword {
-                                                accent
-                                            } else {
-                                                palette::BORDER
-                                            },
-                                        ))
+                                        .border_color(rgb(if pass_focused {
+                                            accent
+                                        } else {
+                                            palette::BORDER
+                                        }))
                                         .cursor_pointer()
                                         .text_size(px(11.0))
-                                        .text_color(rgb(if st.auth_password_input.is_empty() {
-                                            palette::TEXT_DIM
-                                        } else {
-                                            palette::TEXT_PRIMARY
-                                        }))
+                                        .text_color(rgb(
+                                            if st.auth_password_input.is_empty() && !pass_focused {
+                                                palette::TEXT_DIM
+                                            } else {
+                                                palette::TEXT_PRIMARY
+                                            },
+                                        ))
                                         .child(if st.auth_password_input.is_empty() {
-                                            tr(loc, "Password (Enter submits)", "密码 (回车登录)")
-                                                .to_string()
+                                            if pass_focused {
+                                                "|".to_string()
+                                            } else {
+                                                tr(loc, "Password", "密码").to_string()
+                                            }
                                         } else {
-                                            "*".repeat(st.auth_password_input.chars().count())
+                                            let dots =
+                                                "*".repeat(st.auth_password_input.chars().count());
+                                            if pass_focused {
+                                                format!("{dots}|")
+                                            } else {
+                                                dots
+                                            }
                                         })
                                         .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                                             if let Ok(mut g) = this.state.lock() {
                                                 g.input_target = ActiveInputTarget::AuthPassword;
+                                                g.input_selected_all = false;
                                             }
+                                            cx.notify();
+                                        })),
+                                )
+                                .child(
+                                    div()
+                                        .id("settings-btn-password-signin")
+                                        .occlude()
+                                        .flex_shrink_0()
+                                        .px(px(12.0))
+                                        .py(px(5.0))
+                                        .rounded(px(4.0))
+                                        .bg(rgb(accent))
+                                        .hover(|h| h.opacity(0.9))
+                                        .cursor_pointer()
+                                        .text_size(px(11.0))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(rgb(palette::CANVAS_BG))
+                                        .child(if st.auth_loading {
+                                            tr(loc, "Signing in…", "登录中…")
+                                        } else {
+                                            tr(loc, "Sign In", "登录")
+                                        })
+                                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                            this.submit_password_login();
                                             cx.notify();
                                         })),
                                 ),
                         )
+                        .when_some(st.auth_error.clone(), |el, err| {
+                            el.child(
+                                div()
+                                    .px(px(8.0))
+                                    .py(px(4.0))
+                                    .rounded(px(4.0))
+                                    .bg(rgb(palette::CANVAS_BG))
+                                    .border_1()
+                                    .border_color(rgb(palette::ERROR_RED))
+                                    .text_size(px(10.5))
+                                    .text_color(rgb(palette::ERROR_RED))
+                                    .child(err),
+                            )
+                        })
                         .when_some(st.device_login_code.clone(), |el, code| {
                             el.child(
                                 div()
@@ -6202,7 +7401,7 @@ impl CodaGpuWorkspaceView {
                     }),
             )
             .child(
-                // Machines list
+                // Machines list (local Mac + Host Mode toggle + ALL remote hosts with Remove action)
                 div()
                     .flex()
                     .flex_col()
@@ -6228,55 +7427,6 @@ impl CodaGpuWorkspaceView {
                             .flex()
                             .items_center()
                             .justify_between()
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(6.0))
-                                    .child(
-                                        div()
-                                            .w(px(6.0))
-                                            .h(px(6.0))
-                                            .rounded(px(99.0))
-                                            .bg(rgb(palette::DONE_GREEN)),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(px(11.5))
-                                            .text_color(rgb(palette::TEXT_PRIMARY))
-                                            .child(format!(
-                                                "{} · {}",
-                                                tr(loc, "This Mac", "本机"),
-                                                st.local_machine_name
-                                            )),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(10.5))
-                                    .text_color(rgb(palette::TEXT_DIM))
-                                    .child("macos · hybrid"),
-                            ),
-                    )
-                    .children(st.remote_hosts.iter().take(4).map(|host| {
-                        let host_clone = host.clone();
-                        div()
-                            .id(SharedString::from(format!(
-                                "settings-mesh-host-{}",
-                                host.id
-                            )))
-                            .occlude()
-                            .px(px(10.0))
-                            .py(px(6.0))
-                            .rounded(px(6.0))
-                            .bg(rgb(palette::SURFACE_BG))
-                            .border_1()
-                            .border_color(rgb(palette::BORDER))
-                            .hover(|h| h.bg(rgb(palette::HOVER_BG)))
-                            .cursor_pointer()
-                            .flex()
-                            .items_center()
-                            .justify_between()
                             .gap(px(8.0))
                             .child(
                                 div()
@@ -6291,7 +7441,7 @@ impl CodaGpuWorkspaceView {
                                             .h(px(6.0))
                                             .flex_shrink_0()
                                             .rounded(px(99.0))
-                                            .bg(rgb(if host.is_online {
+                                            .bg(rgb(if st.embedded_host_active || st.external_daemon_running {
                                                 palette::DONE_GREEN
                                             } else {
                                                 palette::TEXT_DIM
@@ -6302,31 +7452,281 @@ impl CodaGpuWorkspaceView {
                                             .text_size(px(11.5))
                                             .text_color(rgb(palette::TEXT_PRIMARY))
                                             .truncate()
-                                            .child(host.name.clone()),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(px(10.5))
-                                            .text_color(rgb(palette::TEXT_DIM))
-                                            .truncate()
-                                            .child(format!("{} · {}", host.platform, host.role)),
+                                            .child(format!(
+                                                "{} · {}",
+                                                tr(loc, "This Mac", "本机"),
+                                                st.local_machine_name
+                                            )),
                                     ),
                             )
                             .child(
                                 div()
                                     .flex_shrink_0()
-                                    .text_size(px(11.0))
-                                    .text_color(rgb(accent))
-                                    .child(tr(loc, "Open Workspace", "进入工作区")),
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(6.0))
+                                    .child(
+                                        div()
+                                            .text_size(px(10.5))
+                                            .text_color(rgb(palette::TEXT_DIM))
+                                            .child(if st.external_daemon_running {
+                                                "daemon"
+                                            } else if host_mode_on {
+                                                "hybrid"
+                                            } else {
+                                                "client"
+                                            }),
+                                    )
+                                    .child(self.render_setting_pill(
+                                        "settings-toggle-remote-host",
+                                        if host_mode_on {
+                                            tr(loc, "Allow Control: ON", "允许被控: 开")
+                                        } else {
+                                            tr(loc, "Allow Control: OFF", "允许被控: 关")
+                                        },
+                                        host_mode_on,
+                                        accent,
+                                        cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                            this.mesh_hub.set_allow_remote_control(!host_mode_on);
+                                            cx.notify();
+                                        }),
+                                    )),
+                            ),
+                    )
+                    .children(st.remote_hosts.iter().map(|host| {
+                        let host_clone = host.clone();
+                        let rename_id = host.id;
+                        let rename_cur_name = host.name.clone();
+                        let remove_id = host.id;
+                        let is_renaming = st.renaming_host_id == Some(host.id);
+                        let rename_focused = st.input_target == ActiveInputTarget::RenameDeviceInput;
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(4.0))
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!(
+                                        "settings-mesh-host-{}",
+                                        host.id
+                                    )))
+                                    .occlude()
+                                    .px(px(10.0))
+                                    .py(px(6.0))
+                                    .rounded(px(6.0))
+                                    .bg(rgb(palette::SURFACE_BG))
+                                    .border_1()
+                                    .border_color(rgb(palette::BORDER))
+                                    .hover(|h| h.bg(rgb(palette::HOVER_BG)))
+                                    .cursor_pointer()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .gap(px(8.0))
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .flex_1()
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(6.0))
+                                            .child(
+                                                div()
+                                                    .w(px(6.0))
+                                                    .h(px(6.0))
+                                                    .flex_shrink_0()
+                                                    .rounded(px(99.0))
+                                                    .bg(rgb(if host.is_online {
+                                                        palette::DONE_GREEN
+                                                    } else {
+                                                        palette::TEXT_DIM
+                                                    })),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_size(px(11.5))
+                                                    .text_color(rgb(palette::TEXT_PRIMARY))
+                                                    .truncate()
+                                                    .child(host.name.clone()),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_size(px(10.5))
+                                                    .text_color(rgb(palette::TEXT_DIM))
+                                                    .truncate()
+                                                    .child(format!("{} · {}", host.platform, host.role)),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_shrink_0()
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(6.0))
+                                            .child(
+                                                div()
+                                                    .text_size(px(11.0))
+                                                    .text_color(rgb(accent))
+                                                    .child(tr(loc, "Open Workspace", "进入工作区")),
+                                            )
+                                            .child(
+                                                div()
+                                                    .id(SharedString::from(format!(
+                                                        "settings-rename-host-{}",
+                                                        host.id
+                                                    )))
+                                                    .occlude()
+                                                    .px(px(6.0))
+                                                    .py(px(2.0))
+                                                    .rounded(px(4.0))
+                                                    .bg(rgb(palette::CHROME_BG))
+                                                    .border_1()
+                                                    .border_color(rgb(if is_renaming {
+                                                        accent
+                                                    } else {
+                                                        palette::BORDER
+                                                    }))
+                                                    .hover(|h| {
+                                                        h.border_color(rgb(accent))
+                                                            .text_color(rgb(palette::TEXT_PRIMARY))
+                                                    })
+                                                    .cursor_pointer()
+                                                    .text_size(px(10.0))
+                                                    .text_color(rgb(palette::TEXT_MUTED))
+                                                    .child(tr(loc, "Rename", "改名"))
+                                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                                        cx.stop_propagation();
+                                                    })
+                                                    .on_click(cx.listener(
+                                                        move |this, _: &ClickEvent, _, cx| {
+                                                            cx.stop_propagation();
+                                                            if let Ok(mut g) = this.state.lock() {
+                                                                if g.renaming_host_id == Some(rename_id) {
+                                                                    g.renaming_host_id = None;
+                                                                    g.rename_host_input.clear();
+                                                                    g.input_target = ActiveInputTarget::TerminalDirect;
+                                                                } else {
+                                                                    g.renaming_host_id = Some(rename_id);
+                                                                    g.rename_host_input = rename_cur_name.clone();
+                                                                    g.input_selected_all = true;
+                                                                    g.input_target = ActiveInputTarget::RenameDeviceInput;
+                                                                }
+                                                            }
+                                                            cx.notify();
+                                                        },
+                                                    )),
+                                            )
+                                            .child(
+                                                div()
+                                                    .id(SharedString::from(format!(
+                                                        "settings-remove-host-{}",
+                                                        host.id
+                                                    )))
+                                                    .occlude()
+                                                    .px(px(6.0))
+                                                    .py(px(2.0))
+                                                    .rounded(px(4.0))
+                                                    .bg(rgb(palette::CHROME_BG))
+                                                    .border_1()
+                                                    .border_color(rgb(palette::BORDER))
+                                                    .hover(|h| {
+                                                        h.border_color(rgb(palette::ERROR_RED))
+                                                            .text_color(rgb(palette::ERROR_RED))
+                                                    })
+                                                    .cursor_pointer()
+                                                    .text_size(px(10.0))
+                                                    .text_color(rgb(palette::TEXT_MUTED))
+                                                    .child(tr(loc, "Remove", "移除"))
+                                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                                        cx.stop_propagation();
+                                                    })
+                                                    .on_click(cx.listener(
+                                                        move |this, _: &ClickEvent, _, cx| {
+                                                            cx.stop_propagation();
+                                                            this.mesh_hub.delete_remote_device(remove_id);
+                                                            cx.notify();
+                                                        },
+                                                    )),
+                                            ),
+                                    )
+                                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                        this.mesh_hub.probe_host(host_clone.clone());
+                                        if let Ok(mut g) = this.state.lock() {
+                                            g.settings_open = false;
+                                            g.input_target = ActiveInputTarget::TerminalDirect;
+                                        }
+                                        cx.notify();
+                                    })),
                             )
-                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                this.mesh_hub.probe_host(host_clone.clone());
-                                if let Ok(mut g) = this.state.lock() {
-                                    g.settings_open = false;
-                                    g.input_target = ActiveInputTarget::TerminalDirect;
-                                }
-                                cx.notify();
-                            }))
+                            .when(is_renaming, |row_el| {
+                                row_el.child(
+                                    div()
+                                        .px(px(10.0))
+                                        .py(px(5.0))
+                                        .rounded(px(5.0))
+                                        .bg(rgb(palette::CHROME_BG))
+                                        .border_1()
+                                        .border_color(rgb(palette::BORDER))
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(6.0))
+                                        .child(
+                                            div()
+                                                .id("settings-rename-input")
+                                                .occlude()
+                                                .flex_1()
+                                                .px(px(8.0))
+                                                .py(px(4.0))
+                                                .rounded(px(4.0))
+                                                .bg(rgb(palette::CANVAS_BG))
+                                                .border_1()
+                                                .border_color(rgb(if rename_focused {
+                                                    accent
+                                                } else {
+                                                    palette::BORDER
+                                                }))
+                                                .cursor_pointer()
+                                                .text_size(px(11.0))
+                                                .text_color(rgb(palette::TEXT_PRIMARY))
+                                                .child(if rename_focused {
+                                                    format!("{}|", st.rename_host_input)
+                                                } else {
+                                                    st.rename_host_input.clone()
+                                                })
+                                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                                    if let Ok(mut g) = this.state.lock() {
+                                                        g.input_target = ActiveInputTarget::RenameDeviceInput;
+                                                        g.input_selected_all = false;
+                                                    }
+                                                    cx.notify();
+                                                })),
+                                        )
+                                        .child(self.render_setting_pill(
+                                            "settings-rename-save",
+                                            tr(loc, "Save", "保存"),
+                                            true,
+                                            accent,
+                                            cx.listener(|this, _: &ClickEvent, _, cx| {
+                                                this.submit_rename_device();
+                                                cx.notify();
+                                            }),
+                                        ))
+                                        .child(self.render_setting_pill(
+                                            "settings-rename-cancel",
+                                            tr(loc, "Cancel", "取消"),
+                                            false,
+                                            accent,
+                                            cx.listener(|this, _: &ClickEvent, _, cx| {
+                                                if let Ok(mut g) = this.state.lock() {
+                                                    g.renaming_host_id = None;
+                                                    g.rename_host_input.clear();
+                                                    g.input_target = ActiveInputTarget::TerminalDirect;
+                                                }
+                                                cx.notify();
+                                            }),
+                                        )),
+                                )
+                            })
                     })),
             )
     }
@@ -6525,11 +7925,20 @@ fn render_settings_row(label: &str, hint: &str, control: impl IntoElement) -> im
         .child(div().flex_shrink_0().child(control))
 }
 
-fn render_styled_terminal_line(line: &StyledTerminalLine, line_height_px: f32) -> impl IntoElement {
+fn render_styled_terminal_line(
+    line: &StyledTerminalLine,
+    line_height_px: f32,
+    selection_cols: Option<(usize, usize)>,
+) -> impl IntoElement {
     if line.text.is_empty() {
-        return div().h(px(line_height_px)).child(" ").into_any_element();
+        return div()
+            .h(px(line_height_px))
+            .overflow_hidden()
+            .whitespace_nowrap()
+            .child(" ")
+            .into_any_element();
     }
-    let highlights: Vec<(std::ops::Range<usize>, HighlightStyle)> = line
+    let mut highlights: Vec<(std::ops::Range<usize>, HighlightStyle)> = line
         .spans
         .iter()
         .filter(|s| s.start < s.end && s.end <= line.text.len())
@@ -6544,8 +7953,33 @@ fn render_styled_terminal_line(line: &StyledTerminalLine, line_height_px: f32) -
         })
         .collect();
 
+    if let Some((col_start, col_end)) = selection_cols {
+        if col_start < col_end {
+            let char_offsets: Vec<usize> = line
+                .text
+                .char_indices()
+                .map(|(i, _)| i)
+                .chain(std::iter::once(line.text.len()))
+                .collect();
+            let last_idx = char_offsets.len().saturating_sub(1);
+            let b_start = char_offsets[col_start.min(last_idx)];
+            let b_end = char_offsets[col_end.min(last_idx)];
+            if b_start < b_end {
+                highlights.push((
+                    b_start..b_end,
+                    HighlightStyle {
+                        background_color: Some(Hsla::from(rgba(0x38bdf855))),
+                        ..Default::default()
+                    },
+                ));
+            }
+        }
+    }
+
     div()
-        .min_h(px(line_height_px))
+        .h(px(line_height_px))
+        .overflow_hidden()
+        .whitespace_nowrap()
         .text_color(rgb(palette::TEXT_PRIMARY))
         .child(StyledText::new(line.text.clone()).with_highlights(highlights))
         .into_any_element()
@@ -6968,7 +8402,24 @@ impl RemoteMeshHub {
 
     pub fn ensure_embedded_host(self: &Arc<Self>) {
         let cfg_path = DaemonConfig::default_path();
-        if DaemonConfig::load(&cfg_path).is_err() {
+        let Ok(cfg) = load_desktop_daemon_config(&cfg_path) else {
+            return;
+        };
+        let allow_remote = self
+            .state
+            .lock()
+            .map(|mut g| {
+                g.local_host_device_id = Some(cfg.device_id);
+                g.allow_remote_control
+            })
+            .unwrap_or(true);
+        let ext_pid = active_daemon_lock_pid(&cfg_path);
+        let external_running = ext_pid.map(|p| p != std::process::id()).unwrap_or(false);
+        if let Ok(mut g) = self.state.lock() {
+            g.external_daemon_running = external_running;
+        }
+        if !allow_remote || external_running {
+            self.ui_dirty.store(true, Ordering::Release);
             return;
         }
         if EMBEDDED_HOST_STARTED
@@ -6985,9 +8436,198 @@ impl RemoteMeshHub {
                     return;
                 }
                 *hub.embedded_host_handle.lock().await = Some(handle);
+                if let Ok(mut g) = hub.state.lock() {
+                    g.embedded_host_active = true;
+                    g.external_daemon_running = false;
+                }
+                hub.ui_dirty.store(true, Ordering::Release);
             } else {
                 EMBEDDED_HOST_STARTED.store(false, Ordering::Release);
+                if let Ok(mut g) = hub.state.lock() {
+                    g.embedded_host_active = false;
+                    g.external_daemon_running = active_daemon_lock_pid(&cfg_path)
+                        .map(|p| p != std::process::id())
+                        .unwrap_or(false);
+                }
+                hub.ui_dirty.store(true, Ordering::Release);
             }
+        });
+    }
+
+    pub fn set_allow_remote_control(self: &Arc<Self>, enabled: bool) {
+        if let Ok(mut g) = self.state.lock() {
+            g.allow_remote_control = enabled;
+            let notice = if enabled {
+                tr(
+                    g.locale,
+                    "Remote control enabled for this Mac",
+                    "已允许其他设备远端控制本机",
+                )
+            } else if g.external_daemon_running {
+                tr(
+                    g.locale,
+                    "Embedded host off (standalone coda-daemon is still running)",
+                    "已关闭内嵌被控（独立 coda-daemon 仍在后台运行）",
+                )
+            } else {
+                tr(
+                    g.locale,
+                    "Remote control disabled (controller-only mode)",
+                    "已关闭本机远端被控（仅控制端模式）",
+                )
+            };
+            g.status_notice = Some(notice.to_string());
+        }
+        CodaGpuWorkspaceView::update_prefs_async(move |p| {
+            p.allow_remote_control = enabled;
+        });
+        if enabled {
+            self.ensure_embedded_host();
+        } else {
+            EMBEDDED_HOST_STARTED.store(false, Ordering::Release);
+            let hub = Arc::clone(self);
+            self.spawn_bg(async move {
+                if let Some(handle) = hub.embedded_host_handle.lock().await.take() {
+                    handle.stop();
+                }
+                if let Ok(mut g) = hub.state.lock() {
+                    g.embedded_host_active = false;
+                }
+                hub.ui_dirty.store(true, Ordering::Release);
+            });
+        }
+        self.ui_dirty.store(true, Ordering::Release);
+    }
+
+    pub fn rename_remote_device(self: &Arc<Self>, device_id: Uuid, new_name: String) {
+        let hub = Arc::clone(self);
+        self.spawn_bg(async move {
+            let Ok(cfg) = load_desktop_daemon_config(&DaemonConfig::default_path()) else {
+                return;
+            };
+            let Some(ref tok) = cfg.session_token else {
+                return;
+            };
+            match rename_account_device(&cfg.server_url, tok, device_id, &new_name).await {
+                Ok(()) => {
+                    let host_str = device_id.to_string();
+                    if let Ok(mut g) = hub.state.lock() {
+                        for h in &mut g.remote_hosts {
+                            if h.id == device_id {
+                                h.name = new_name.clone();
+                            }
+                        }
+                        for sp in &mut g.spaces {
+                            if sp.machine_id == host_str {
+                                sp.machine_label = new_name.clone();
+                                if sp.id == format!("remote:{device_id}") {
+                                    sp.name = new_name.clone();
+                                }
+                            }
+                        }
+                        g.status_notice = Some(format!(
+                            "{}: {new_name}",
+                            tr(g.locale, "Renamed machine", "主机已重命名")
+                        ));
+                    }
+                }
+                Err(err) => {
+                    if let Ok(mut g) = hub.state.lock() {
+                        g.status_notice = Some(format!("Rename device failed: {err}"));
+                    }
+                }
+            }
+            hub.ui_dirty.store(true, Ordering::Release);
+        });
+    }
+
+    pub fn change_password(self: &Arc<Self>, current_password: String, new_password: String) {
+        let hub = Arc::clone(self);
+        self.spawn_bg(async move {
+            let cfg_path = DaemonConfig::default_path();
+            let Ok(mut cfg) = load_desktop_daemon_config(&cfg_path) else {
+                return;
+            };
+            let Some(ref tok) = cfg.session_token else {
+                return;
+            };
+            match change_account_password(&cfg.server_url, tok, &current_password, &new_password)
+                .await
+            {
+                Ok(rotated_tok) => {
+                    if let Some(new_tok) = rotated_tok {
+                        cfg.session_token = Some(new_tok);
+                        let _ = save_desktop_daemon_config(&cfg, &cfg_path);
+                    }
+                    if let Ok(mut g) = hub.state.lock() {
+                        g.pw_change_expanded = false;
+                        g.auth_error = None;
+                        g.status_notice = Some(
+                            tr(g.locale, "Password updated", "密码已更新").to_string(),
+                        );
+                    }
+                }
+                Err(err) => {
+                    if let Ok(mut g) = hub.state.lock() {
+                        let msg = format!("{err}");
+                        g.auth_error = Some(msg.clone());
+                        g.status_notice = Some(msg);
+                    }
+                }
+            }
+            hub.ui_dirty.store(true, Ordering::Release);
+        });
+    }
+
+    pub fn delete_remote_device(self: &Arc<Self>, device_id: Uuid) {
+        let hub = Arc::clone(self);
+        self.spawn_bg(async move {
+            let Ok(cfg) = load_desktop_daemon_config(&DaemonConfig::default_path()) else {
+                return;
+            };
+            let Some(ref tok) = cfg.session_token else {
+                return;
+            };
+            match delete_account_device(&cfg.server_url, tok, device_id).await {
+                Ok(()) => {
+                    hub.drop_peer(device_id).await;
+                    let host_str = device_id.to_string();
+                    let mut removed_sids = Vec::new();
+                    if let Ok(mut g) = hub.state.lock() {
+                        g.remote_hosts.retain(|h| h.id != device_id);
+                        g.spaces.retain(|sp| sp.machine_id != host_str);
+                        for s in &g.sessions {
+                            if s.remote_host_id.as_deref() == Some(host_str.as_str()) {
+                                removed_sids.push(s.id.clone());
+                            }
+                        }
+                        g.sessions
+                            .retain(|s| s.remote_host_id.as_deref() != Some(host_str.as_str()));
+                        if g.active_space().is_none() {
+                            g.active_space_id = g.spaces.first().map(|sp| sp.id.clone());
+                        }
+                        if let Some(ref aid) = g.active_session_id {
+                            if !g.sessions.iter().any(|s| s.id == *aid) {
+                                g.active_session_id = g.sessions.first().map(|s| s.id.clone());
+                            }
+                        }
+                        g.status_notice = Some(
+                            tr(g.locale, "Removed remote machine", "已移除远端主机").to_string(),
+                        );
+                    }
+                    if let Ok(mut mgr) = hub.pty_mgr.lock() {
+                        for sid in removed_sids {
+                            mgr.remove_remote_buffer(&sid);
+                        }
+                    }
+                }
+                Err(err) => {
+                    if let Ok(mut g) = hub.state.lock() {
+                        g.status_notice = Some(format!("Remove device failed: {err}"));
+                    }
+                }
+            }
+            hub.ui_dirty.store(true, Ordering::Release);
         });
     }
 
@@ -6996,8 +8636,14 @@ impl RemoteMeshHub {
         EMBEDDED_HOST_STARTED.store(false, Ordering::Release);
 
         let cfg_path = DaemonConfig::default_path();
-        let prev_cfg = DaemonConfig::load(&cfg_path).ok();
-        let _ = std::fs::remove_file(&cfg_path);
+        let prev_cfg = load_desktop_daemon_config(&cfg_path).ok();
+        let external_daemon_owns_cfg = active_daemon_lock_pid(&cfg_path)
+            .map(|pid| pid != std::process::id())
+            .unwrap_or(false);
+        if !external_daemon_owns_cfg {
+            let _ = std::fs::remove_file(&cfg_path);
+        }
+        delete_secret_from_keychain("session_token");
         DesktopClientIdentityRecord::remove_saved();
 
         let mut removed_remote_sids = Vec::new();
@@ -7009,6 +8655,10 @@ impl RemoteMeshHub {
             }
             g.is_logged_in = false;
             g.auth_form_expanded = false;
+            g.auth_loading = false;
+            g.auth_error = None;
+            g.embedded_host_active = false;
+            g.external_daemon_running = external_daemon_owns_cfg;
             g.account_email.clear();
             g.auth_account_input.clear();
             g.auth_password_input.clear();
@@ -7033,7 +8683,16 @@ impl RemoteMeshHub {
             }
             g.input_target = ActiveInputTarget::TerminalDirect;
             g.status_notice = Some(
-                tr(g.locale, "Signed out", "已退出登录").to_string(),
+                if external_daemon_owns_cfg {
+                    tr(
+                        g.locale,
+                        "Signed out (kept standalone coda-daemon config)",
+                        "已退出登录（保留独立 coda-daemon 后台配置）",
+                    )
+                } else {
+                    tr(g.locale, "Signed out", "已退出登录")
+                }
+                .to_string(),
             );
         }
         if let Ok(mut mgr) = self.pty_mgr.lock() {
@@ -7056,9 +8715,11 @@ impl RemoteMeshHub {
             hub.attached_terms.lock().await.clear();
             hub.client_identities.lock().await.clear();
             hub.peer_connect_locks.lock().await.clear();
-            if let Some(cfg) = prev_cfg {
-                if let Some(ref tok) = cfg.session_token {
-                    let _ = coda_daemon::logout_account_session(&cfg.server_url, tok).await;
+            if !external_daemon_owns_cfg {
+                if let Some(cfg) = prev_cfg {
+                    if let Some(ref tok) = cfg.session_token {
+                        let _ = coda_daemon::logout_account_session(&cfg.server_url, tok).await;
+                    }
                 }
             }
         });
@@ -7074,7 +8735,7 @@ impl RemoteMeshHub {
                 if hub.watcher_gen.load(Ordering::Acquire) != my_gen {
                     break;
                 }
-                let Ok(cfg) = DaemonConfig::load(&DaemonConfig::default_path()) else {
+                let Ok(cfg) = load_desktop_daemon_config(&DaemonConfig::default_path()) else {
                     break;
                 };
                 let Some(ref tok) = cfg.session_token else {
@@ -7108,7 +8769,7 @@ impl RemoteMeshHub {
     }
 
     async fn sync_all_hosts_and_sessions(self: &Arc<Self>) {
-        let Ok(cfg) = DaemonConfig::load(&DaemonConfig::default_path()) else {
+        let Ok(cfg) = load_desktop_daemon_config(&DaemonConfig::default_path()) else {
             return;
         };
         let Some(ref tok) = cfg.session_token else {
@@ -7117,8 +8778,15 @@ impl RemoteMeshHub {
         let Ok(list) = list_account_hosts(&cfg.server_url, tok).await else {
             return;
         };
-        let hosts: Vec<RemoteHostSummary> =
-            list.into_iter().filter(|h| h.id != cfg.device_id).collect();
+        let local_host_id = self
+            .state
+            .lock()
+            .ok()
+            .and_then(|g| g.local_host_device_id);
+        let hosts: Vec<RemoteHostSummary> = list
+            .into_iter()
+            .filter(|h| h.id != cfg.device_id && Some(h.id) != local_host_id)
+            .collect();
 
         {
             let Ok(mut g) = self.state.lock() else {
@@ -7333,6 +9001,32 @@ impl RemoteMeshHub {
         let host_id = host.id;
         let host_clone = host.clone();
         let peer_for_task = Arc::clone(&arc_sess);
+        let sync_notify = Arc::new(tokio::sync::Notify::new());
+        let sync_stop = Arc::new(AtomicBool::new(false));
+        {
+            // Decouple `HerdrLiveEvent` full-list RPC sync into a coalesced background task so
+            // high-frequency PTY output chunks are never blocked waiting on RPC round-trips.
+            let hub_sync = Arc::clone(self);
+            let peer_sync = Arc::clone(&arc_sess);
+            let host_sync = host.clone();
+            let notify_rx = Arc::clone(&sync_notify);
+            let stop_flag = Arc::clone(&sync_stop);
+            self.spawn_bg(async move {
+                loop {
+                    notify_rx.notified().await;
+                    if stop_flag.load(Ordering::Acquire) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    if stop_flag.load(Ordering::Acquire) {
+                        break;
+                    }
+                    hub_sync
+                        .sync_with_connected_peer(Arc::clone(&peer_sync), &host_sync)
+                        .await;
+                }
+            });
+        }
         self.spawn_bg(async move {
             loop {
                 match rx.recv().await {
@@ -7343,9 +9037,15 @@ impl RemoteMeshHub {
                     }) => {
                         if let Ok(bytes) = B64.decode(&data_b64) {
                             let sid = format!("remote:{host_id}:{terminal}");
-                            if let Ok(mut mgr) = hub.pty_mgr.lock() {
+                            let replies = if let Ok(mut mgr) = hub.pty_mgr.lock() {
                                 mgr.ensure_remote_buffer(&sid, 120, 36);
                                 mgr.feed_remote_output(&sid, &bytes);
+                                mgr.drain_remote_replies(&sid)
+                            } else {
+                                Vec::new()
+                            };
+                            for reply in replies {
+                                hub.send_remote_pty_input(host_id, &terminal, reply);
                             }
                         }
                     }
@@ -7365,15 +9065,55 @@ impl RemoteMeshHub {
                             }
                             hub.ui_dirty.store(true, Ordering::Release);
                         }
-                        hub.sync_with_connected_peer(Arc::clone(&peer_for_task), &host_clone)
-                            .await;
+                        sync_notify.notify_one();
                     }
                     Ok(PeerAsyncEvent::Disconnected(_))
                     | Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        sync_stop.store(true, Ordering::Release);
+                        sync_notify.notify_one();
                         hub.drop_peer(host_id).await;
                         break;
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        // Recover from dropped broadcast chunks by fetching a clean screen snapshot.
+                        let hub_resync = Arc::clone(&hub);
+                        let peer_resync = Arc::clone(&peer_for_task);
+                        let host_resync = host_clone.clone();
+                        hub.spawn_bg(async move {
+                            let terms: Vec<String> = hub_resync
+                                .attached_terms
+                                .lock()
+                                .await
+                                .iter()
+                                .filter(|(hid, _)| *hid == host_resync.id)
+                                .map(|(_, t)| t.clone())
+                                .collect();
+                            for term_addr in terms {
+                                let sid = format!("remote:{}:{term_addr}", host_resync.id);
+                                if let Ok(PeerMessage::TerminalScreenSnapshot { text, .. }) =
+                                    peer_resync
+                                        .request(
+                                            PeerMessage::ReadTerminalScreen {
+                                                req_id: format!("lag-{}", Uuid::new_v4().simple()),
+                                                terminal: term_addr.clone(),
+                                                history_lines: 120,
+                                            },
+                                            TrafficLane::BulkP1,
+                                            Duration::from_secs(6),
+                                        )
+                                        .await
+                                {
+                                    if !text.is_empty() {
+                                        let norm = normalize_newlines_for_vt(&text);
+                                        if let Ok(mgr) = hub_resync.pty_mgr.lock() {
+                                            mgr.clear_buffer(&sid);
+                                            mgr.feed_remote_output(&sid, &norm);
+                                        }
+                                    }
+                                }
+                            }
+                        });
+                    }
                 }
             }
         });
@@ -7670,7 +9410,7 @@ impl RemoteMeshHub {
         if let Some(p) = self.peers.lock().await.get(&host_id).cloned() {
             return Some(p);
         }
-        let cfg = DaemonConfig::load(&DaemonConfig::default_path()).ok()?;
+        let cfg = load_desktop_daemon_config(&DaemonConfig::default_path()).ok()?;
         let host = self
             .state
             .lock()
@@ -7846,20 +9586,10 @@ impl RemoteMeshHub {
                 let _ = peer
                     .send_oneway(
                         PeerMessage::PtyInput {
-                            terminal: terminal.clone(),
+                            terminal,
                             data_b64: B64.encode([0x03u8]),
                         },
                         TrafficLane::ControlP0,
-                    )
-                    .await;
-                let _ = peer
-                    .request(
-                        PeerMessage::InterruptTerminal {
-                            req_id: format!("int-{}", Uuid::new_v4().simple()),
-                            terminal,
-                        },
-                        TrafficLane::ControlP0,
-                        Duration::from_secs(4),
                     )
                     .await;
             }
@@ -8097,7 +9827,7 @@ impl RemoteMeshHub {
     pub fn probe_host(self: &Arc<Self>, host: RemoteHostSummary) {
         let hub = Arc::clone(self);
         self.spawn_bg(async move {
-            let Ok(cfg) = DaemonConfig::load(&DaemonConfig::default_path()) else {
+            let Ok(cfg) = load_desktop_daemon_config(&DaemonConfig::default_path()) else {
                 return;
             };
             let exact_prefix = format!("remote:{}", host.id);
@@ -8232,7 +9962,11 @@ fn spawn_device_login(
             return;
         };
         rt.block_on(async move {
-            match start_device_login_flow(&server_url, "hybrid", None, None).await {
+            let cfg_path = DaemonConfig::default_path();
+            let existing_identity = load_desktop_daemon_config(&cfg_path)
+                .ok()
+                .map(|c| c.identity);
+            match start_device_login_flow(&server_url, "hybrid", None, existing_identity).await {
                 Ok(flow) => {
                     let uri = flow.verification_uri_complete.clone();
                     #[cfg(target_os = "macos")]
@@ -8242,16 +9976,20 @@ fn spawn_device_login(
                     if let Ok(mut g) = state_bg.lock() {
                         g.device_login_code = Some(flow.user_code.clone());
                         g.device_login_uri = Some(uri);
+                        g.auth_error = None;
                         g.status_notice = Some("Approve sign-in in your browser...".to_string());
                     }
                     ui_dirty.store(true, Ordering::Release);
 
                     match poll_device_login_until_approved(&flow).await {
                         Ok(cfg) => {
-                            let _ = cfg.save(&DaemonConfig::default_path());
+                            let _ = save_desktop_daemon_config(&cfg, &cfg_path);
                             if let Ok(mut g) = state_bg.lock() {
                                 g.is_logged_in = true;
                                 g.auth_form_expanded = false;
+                                g.auth_loading = false;
+                                g.auth_error = None;
+                                g.local_host_device_id = Some(cfg.device_id);
                                 g.input_target = ActiveInputTarget::TerminalDirect;
                                 g.account_email = cfg
                                     .owner_email
@@ -8265,16 +10003,22 @@ fn spawn_device_login(
                             mesh_hub.start_account_sync();
                         }
                         Err(err) => {
+                            let msg = format!("Login failed: {err}");
                             if let Ok(mut g) = state_bg.lock() {
-                                g.status_notice = Some(format!("Login failed: {err}"));
+                                g.auth_loading = false;
+                                g.auth_error = Some(msg.clone());
+                                g.status_notice = Some(msg);
                             }
                             ui_dirty.store(true, Ordering::Release);
                         }
                     }
                 }
                 Err(err) => {
+                    let msg = format!("Auth init failed: {err}");
                     if let Ok(mut g) = state_bg.lock() {
-                        g.status_notice = Some(format!("Auth init failed: {err}"));
+                        g.auth_loading = false;
+                        g.auth_error = Some(msg.clone());
+                        g.status_notice = Some(msg);
                     }
                     ui_dirty.store(true, Ordering::Release);
                 }
@@ -8299,12 +10043,28 @@ fn spawn_password_login(
             return;
         };
         rt.block_on(async move {
-            match login_with_password_and_enroll(&server_url, &email, &password, "hybrid", None).await {
+            let cfg_path = DaemonConfig::default_path();
+            let existing_identity = load_desktop_daemon_config(&cfg_path)
+                .ok()
+                .map(|c| c.identity);
+            match login_with_password_and_enroll_with_identity(
+                &server_url,
+                &email,
+                &password,
+                "hybrid",
+                None,
+                existing_identity,
+            )
+            .await
+            {
                 Ok(cfg) => {
-                    let _ = cfg.save(&DaemonConfig::default_path());
+                    let _ = save_desktop_daemon_config(&cfg, &cfg_path);
                     if let Ok(mut g) = state_bg.lock() {
                         g.is_logged_in = true;
                         g.auth_form_expanded = false;
+                        g.auth_loading = false;
+                        g.auth_error = None;
+                        g.local_host_device_id = Some(cfg.device_id);
                         g.input_target = ActiveInputTarget::TerminalDirect;
                         g.account_email = cfg.owner_email.clone().unwrap_or(email);
                         g.auth_password_input.clear();
@@ -8315,8 +10075,11 @@ fn spawn_password_login(
                     mesh_hub.start_account_sync();
                 }
                 Err(err) => {
+                    let msg = format!("Login error: {err}");
                     if let Ok(mut g) = state_bg.lock() {
-                        g.status_notice = Some(format!("Login error: {err}"));
+                        g.auth_loading = false;
+                        g.auth_error = Some(msg.clone());
+                        g.status_notice = Some(msg);
                     }
                     ui_dirty.store(true, Ordering::Release);
                 }
@@ -8329,12 +10092,46 @@ fn spawn_password_login(
 // Application Launcher & Direct PTY / Palette Keyboard Loop
 // ============================================================================
 
+fn open_main_workbench_window(cx: &mut App) -> gpui::Entity<CodaGpuWorkspaceView> {
+    let bounds = Bounds::centered(None, size(px(1380.0), px(860.0)), cx);
+    let window = cx
+        .open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                titlebar: Some(TitlebarOptions {
+                    title: None,
+                    appears_transparent: true,
+                    traffic_light_position: Some(point(px(14.0), px(8.0))),
+                }),
+                window_min_size: Some(size(px(960.0), px(600.0))),
+                ..Default::default()
+            },
+            |_, cx| cx.new(CodaGpuWorkspaceView::new),
+        )
+        .expect("failed to open Coda GPUI desktop window");
+
+    window
+        .update(cx, |this, win, cx| {
+            win.focus(&this.focus_handle);
+            cx.entity()
+        })
+        .expect("failed to focus Coda GPUI desktop view")
+}
+
 pub fn launch_gpui_desktop_app() {
     ensure_macos_gui_path();
 
-    Application::new().run(|cx: &mut App| {
+    let app = Application::new();
+    app.on_reopen(|cx| {
+        if cx.windows().is_empty() {
+            let _ = open_main_workbench_window(cx);
+        }
+        cx.activate(true);
+    });
+    app.run(|cx: &mut App| {
         cx.bind_keys([
             KeyBinding::new("cmd-q", QuitApp, None),
+            KeyBinding::new("cmd-shift-n", NewWindow, None),
             KeyBinding::new("cmd-,", ToggleSettings, None),
             KeyBinding::new("cmd-b", ToggleSidebar, None),
             KeyBinding::new("cmd-n", NewTerminal, None),
@@ -8345,6 +10142,13 @@ pub fn launch_gpui_desktop_app() {
             KeyBinding::new("cmd-k", ToggleCommandPalette, None),
             KeyBinding::new("cmd-1", SwitchLayoutWorkbench, None),
             KeyBinding::new("cmd-2", SwitchLayoutTerminals, None),
+            KeyBinding::new("cmd-c", CopyTerminalAction, None),
+            KeyBinding::new("cmd-v", PasteTerminalAction, None),
+            KeyBinding::new("cmd-a", SelectAllAction, None),
+            KeyBinding::new("cmd-=", ZoomInTerminal, None),
+            KeyBinding::new("cmd-+", ZoomInTerminal, None),
+            KeyBinding::new("cmd--", ZoomOutTerminal, None),
+            KeyBinding::new("cmd-0", ZoomResetTerminal, None),
         ]);
         cx.set_menus(vec![
             Menu {
@@ -8358,8 +10162,18 @@ pub fn launch_gpui_desktop_app() {
                 ],
             },
             Menu {
+                name: "Edit".into(),
+                items: vec![
+                    MenuItem::action("Copy", CopyTerminalAction),
+                    MenuItem::action("Paste", PasteTerminalAction),
+                    MenuItem::separator(),
+                    MenuItem::action("Select All", SelectAllAction),
+                ],
+            },
+            Menu {
                 name: "Shell".into(),
                 items: vec![
+                    MenuItem::action("New Window", NewWindow),
                     MenuItem::action("New Terminal", NewTerminal),
                     MenuItem::action("Toggle Split Terminals", ToggleSplit),
                     MenuItem::separator(),
@@ -8372,43 +10186,37 @@ pub fn launch_gpui_desktop_app() {
                     MenuItem::action("Command Palette…", ToggleCommandPalette),
                     MenuItem::action("Toggle Sidebar", ToggleSidebar),
                     MenuItem::separator(),
+                    MenuItem::action("Zoom In", ZoomInTerminal),
+                    MenuItem::action("Zoom Out", ZoomOutTerminal),
+                    MenuItem::action("Actual Size", ZoomResetTerminal),
+                    MenuItem::separator(),
                     MenuItem::action("Main Workbench", SwitchLayoutWorkbench),
                     MenuItem::action("Terminals Grid", SwitchLayoutTerminals),
                 ],
             },
         ]);
         cx.on_action(|_: &QuitApp, cx| cx.quit());
+        cx.on_action(|_: &NewWindow, cx| {
+            let _ = open_main_workbench_window(cx);
+            cx.activate(true);
+        });
 
-        let bounds = Bounds::centered(None, size(px(1380.0), px(860.0)), cx);
-        let window = cx
-            .open_window(
-                WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(bounds)),
-                    titlebar: Some(TitlebarOptions {
-                        title: None,
-                        appears_transparent: true,
-                        traffic_light_position: Some(point(px(14.0), px(8.0))),
-                    }),
-                    window_min_size: Some(size(px(960.0), px(600.0))),
-                    ..Default::default()
-                },
-                |_, cx| cx.new(CodaGpuWorkspaceView::new),
-            )
-            .expect("failed to open Coda GPUI desktop window");
-
-        let view = window
-            .update(cx, |this, win, cx| {
-                win.focus(&this.focus_handle);
-                cx.entity()
-            })
-            .unwrap();
+        let view = open_main_workbench_window(cx);
 
         let view_settings = view.clone();
         cx.on_action(move |_: &ToggleSettings, cx| {
-            view_settings.update(cx, |this, cx| {
-                this.toggle_settings_modal();
-                cx.notify();
-            });
+            if cx.windows().is_empty() {
+                let reopened = open_main_workbench_window(cx);
+                reopened.update(cx, |this, cx| {
+                    this.toggle_settings_modal();
+                    cx.notify();
+                });
+            } else {
+                let _ = view_settings.update(cx, |this, cx| {
+                    this.toggle_settings_modal();
+                    cx.notify();
+                });
+            }
         });
 
         cx.activate(true);

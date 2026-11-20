@@ -87,6 +87,8 @@ fn run_git(repo_path: &Path, args: &[&str]) -> Option<String> {
     let out = Command::new("git")
         .arg("-c")
         .arg("core.quotePath=false")
+        .arg("-c")
+        .arg("core.fsmonitor=false")
         .arg("-C")
         .arg(repo_path)
         .args(args)
@@ -391,16 +393,17 @@ pub fn read_workspace_file_preview(path: &Path, max_lines: usize) -> String {
         return format!("Binary file ({total_len} bytes)");
     }
     let text = String::from_utf8_lossy(&bytes);
-    let mut numbered = Vec::new();
+    let mut lines_out = Vec::new();
     let mut total_truncated = false;
     for (idx, line) in text.lines().enumerate() {
         if idx >= max_lines {
             total_truncated = true;
             break;
         }
-        numbered.push(format!("{:>4} | {}", idx + 1, line));
+        // #41: Return clean raw lines; the UI file preview pane renders the single line-number gutter.
+        lines_out.push(line);
     }
-    let mut out = numbered.join("\n");
+    let mut out = lines_out.join("\n");
     if total_truncated {
         out.push_str(&format!("\n... (truncated at {max_lines} lines)"));
     } else if truncated_bytes {
