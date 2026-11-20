@@ -16,7 +16,7 @@ Coda 每次发布 Tag (`v*`) 时，GitHub Actions 流水线会自动构建并发
 | **`coda-server-linux-{x86_64,aarch64}-<version>.tar.gz`** | `coda-server-linux-*/` | Linux 服务端裸机包（含 `coda-server` + `web-dist` + `migrations` + `deploy`） |
 | **`coda-daemon-linux-{x86_64,aarch64}-<version>.tar.gz`** | `coda-daemon-linux-*/` | Linux 受控开发机守护进程 (`coda-daemon`) |
 | **`coda-macos-aarch64-<version>.tar.gz`** | `coda-macos-aarch64/` | macOS Apple Silicon 全家桶（含 **`coda-desktop` [Rust+GPUI 120Hz 桌面端]**、`CodaMacApp` [SwiftUI]、`libcoda_apple_ffi.dylib`、`coda-daemon`、`coda-server`） |
-| **`Coda-Desktop-macos-aarch64-<version>.dmg`** | macOS App 安装镜像 | 拖入 `Applications` 即可运行的 `Coda.app`（内置 `coda-desktop` + `coda-daemon`） |
+| **`Coda-Desktop-macos-aarch64-<version>.dmg`** | macOS App 安装镜像 | 拖入 `Applications` 即可运行的 `Coda.app`（原生 GPUI 桌面端，支持双向被控显式开关与独立 `coda-daemon` 平滑共存） |
 | **`coda-daemon-macos-aarch64-<version>.tar.gz`** | `coda-daemon-macos-aarch64/` | macOS Apple Silicon 受控开发机守护进程 (`coda-daemon`) |
 
 ---
@@ -31,12 +31,12 @@ Coda 每次发布 Tag (`v*`) 时，GitHub Actions 流水线会自动构建并发
    - **Path**：留空不填（转发所有页面、API 与 `/v1/tunnel/ws` WebSocket 隧道）
    - **Service Type / URL**：`HTTP` → **`http://127.0.0.1:8080`**（勿填 `https://`；建议写 `127.0.0.1` 避免 `localhost` 解析为 IPv6 `[::1]`）
    - 在 Cloudflare 域名 **Network** 设置中确认 **WebSockets** 为开启状态（用于 `/v1/tunnel/ws` 隧道转发）。
-2. 检查服务端 `.env`（默认模板 `.env.example` 已预设好）：
+2. 检查服务端 `.env`（自建默认留空 `CODA_PUBLIC_URL=`，控制面会按请求 `Host` 与反向代理自动推导；生产环境建议显式配置公网域名）：
    ```dotenv
    CODA_PUBLIC_URL=https://codahub.dev
    CODA_OPEN_REGISTRATION=false   # 如需向公网开放免邀请码自助注册可设为 true
    ```
-   > 只要 `CODA_PUBLIC_URL` 是 `https://` 域名且未配置 `CODA_RAW_TCP_PUBLIC_ENDPOINT`，控制面会自动将 `global-cdn-wss`（`wss://codahub.dev/v1/tunnel/ws`）设为首选，并屏蔽不可达的内网 `127.0.0.1:24443` 地址。
+   > 只要 `CODA_PUBLIC_URL` 是 `https://` 域名且未配置 `CODA_RAW_TCP_PUBLIC_ENDPOINT`，控制面会自动将 `global-cdn-wss`（`wss://codahub.dev/v1/tunnel/ws`）设为首选，并屏蔽不可达的内网 `127.0.0.1:24443` 地址；若同时配置了独立国内免备案中继，`coda-daemon` 会并发保活主控面与国内 `:24443` 中继，确保 Web 端和移动端均保持极速连通。
 3. 修改配置后执行 **`./restart.sh`** 让 `.env` 生效。
 4. 访问 **`https://codahub.dev`** 即可打开 **Coda 官网与免登录全端下载中心**，访客无需登录即可注册或下载 Linux Server / macOS 桌面端 / deploy-bundle；后期如加自选 CDN，直接把 CDN 回源指向该域名即可。
 
@@ -127,24 +127,32 @@ curl -fsSL https://codahub.dev/install.sh | sh
 执行后终端会打印激活链接与 8 位设备码（例如 **`https://codahub.dev/activate?code=ABCD-2345`**）。在任意浏览器打开并登录确认批准，服务器即自动绑定到你的账号并后台启动 `coda-daemon`。（同时兼容传统 6 位 `--code 839-204` 配对方式。）
 
 ```bash
-# 查看当前绑定的设备状态与中继链路
+# 查看当前绑定的设备状态、进程/锁健康、hc 可用性与票据有效期
 ~/.local/bin/coda-daemon status
+
+# 常用运维子命令（支持停服、重启、登出解绑与完整卸载）
+~/.local/bin/coda-daemon restart
+~/.local/bin/coda-daemon stop
+~/.local/bin/coda-daemon logout
+~/.local/bin/coda-daemon uninstall
 ```
+
+> 若目标主机未安装或不便安装 `herdr-core` (`hc`)，可在安装时传入 `CODA_SKIP_HC_INSTALL=1`，`coda-daemon` 会自动回落内置原生 Unix PTY Shell 会话管理。
 
 ---
 
 ## 四、使用各端客户端连接开发（Windows/Mac/iOS 互控）
 
 1. **Web 终端 & iOS Safari PWA（零上架零安装）**：
-   用电脑浏览器或 iPhone Safari 访问 `https://codahub.dev`；在 iPhone Safari 点击「分享 → 添加到主屏幕」即可全屏当原生 App 使用；如有苹果开发者账号测试分发的 **TestFlight** 链接，可在 `.env` 中配置 `CODA_IOS_BETA_URL`，官网下载卡片会自动显示按钮。
-2. **macOS 桌面端（`.dmg` 双击安装，`Hybrid` 双重角色）**：
+   用电脑浏览器或 iPhone Safari 访问 `https://codahub.dev`（支持终端直接原始键盘输入、多标签独立会话、Whisper 语音转写输入、账号/会话/设备全生命周期管理）；在 iPhone Safari 点击「分享 → 添加到主屏幕」即可全屏当原生 App 使用；如有 **TestFlight** 链接，可在 `.env` 中配置 `CODA_IOS_BETA_URL`。
+2. **macOS 桌面端（`.dmg` 双击安装，`Hybrid` 双向互控 + 显式被控开关）**：
    在官网下载中心直接点击下载 **`Coda-Desktop-macos-aarch64-<version>.dmg`** 并拖入 `Applications`；首次打开若提示未公证开发者，在终端执行一次：
    ```bash
    xattr -cr /Applications/Coda.app
    ```
-   打开 `Coda.app` 点击左侧「🔑 浏览器登录」即可绑定同一账号——它既可作为控制端遥控你所有远端 Linux Server，也可同时作为被控主机让手机或网页端遥控。
+   打开 `Coda.app` 点击左侧「🔑 浏览器登录」即可绑定同一账号——支持在侧边抽屉与设置页一键开关 **「允许远端控制本机（Allow Remote Control）」**，开启后可被手机/网页/公司电脑远程接管，关闭则仅作为纯控制端，并与独立安装的 `coda-daemon` 自动共存互不冲突。
 3. **iPhone / iPhone Duo / iPad 原生 SwiftUI 客户端 (`apple/`)**：
-   使用 Xcode 打开 `apple/Package.swift` 编译到真机运行测试版，点左上角钥匙图标使用浏览器设备码授权登录。
+   使用 Xcode 打开 `apple/Package.swift`（或 `apple/project.yml`）编译到真机运行测试版，支持浏览器设备码授权、低延迟 PTY 实时输入、Whisper 语音录音转写与完整设备/账号管理。
 
 ---
 

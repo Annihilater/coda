@@ -47,6 +47,8 @@ OVERRIDE_MODE=""
 PASSTHROUGH_ARGS=""
 DOWN_FLAG=0
 DOWN_VOLUMES_FLAG=0
+KEEP_TAG_FLAG=0
+FORCE_LATEST_FLAG=0
 
 for arg in "$@"; do
   case "${arg}" in
@@ -56,6 +58,12 @@ for arg in "$@"; do
       ;;
     --relay-cn)
       OVERRIDE_MODE="relay-cn"
+      ;;
+    --latest)
+      FORCE_LATEST_FLAG=1
+      ;;
+    --keep-tag)
+      KEEP_TAG_FLAG=1
       ;;
     --down)
       DOWN_FLAG=1
@@ -236,7 +244,8 @@ CODA_IMAGE=ghcr.io/annihilater/coda:latest
 CODA_HOST_BIND_IP=127.0.0.1
 CODA_HTTP_PORT=8080
 CODA_RAW_TCP_PORT=24443
-CODA_PUBLIC_URL=https://codahub.dev
+# CODA_PUBLIC_URL=https://coda.example.com
+CODA_PUBLIC_URL=
 CODA_REGION_LABEL=CN-BGP-NoICP
 CODA_OPEN_REGISTRATION=false
 CODA_GITHUB_REPO=Annihilater/coda
@@ -261,7 +270,7 @@ EOF
   HTTP_PORT="${CODA_HTTP_PORT:-8080}"
   RAW_TCP_PORT="${CODA_RAW_TCP_PORT:-24443}"
   IMAGE="${CODA_IMAGE:-ghcr.io/annihilater/coda:latest}"
-  PUBLIC_URL="${CODA_PUBLIC_URL:-https://codahub.dev}"
+  PUBLIC_URL="${CODA_PUBLIC_URL:-}"
 
   if [ "${DEPLOY_MODE}" = "relay-cn" ] && [ -z "${POSTGRES_PASSWORD:-}" ]; then
     export POSTGRES_PASSWORD="unused_relay_cn_placeholder"
@@ -391,8 +400,21 @@ if [ "${RUNTIME}" = "systemd" ] || [ "${SYSTEMD_FLAG}" = "1" ]; then
     stop)
       systemctl stop "${UNIT}"
       ;;
-    restart|update)
+    restart)
       systemctl restart "${UNIT}"
+      systemctl --no-pager -l status "${UNIT}" || true
+      ;;
+    update)
+      if [ "${UNIT}" = "coda-relay-cn" ] && [ -x "${SCRIPT_DIR}/install-relay-cn.sh" ]; then
+        echo "==> 正在使用 install-relay-cn.sh 更新裸机中继至最新版本..."
+        sh "${SCRIPT_DIR}/install-relay-cn.sh" --version latest
+      elif [ "${UNIT}" = "coda-server" ] && [ -x "${SCRIPT_DIR}/install-server.sh" ]; then
+        echo "==> 正在使用 install-server.sh 更新裸机主控至最新版本..."
+        sh "${SCRIPT_DIR}/install-server.sh" --version latest
+      else
+        echo "[WARN] 当前目录未找到安装脚本，仅执行 systemctl restart ${UNIT}。如需升级二进制请重新运行 install-server.sh / install-relay-cn.sh。" >&2
+        systemctl restart "${UNIT}"
+      fi
       systemctl --no-pager -l status "${UNIT}" || true
       ;;
     status)
@@ -435,7 +457,7 @@ case "${CMD}" in
       else
         echo "[WARN] 容器已启动，等待健康检查响应超时，可执行 ./logs.sh 查看详细日志。" >&2
       fi
-      echo "    公网访问入口     : ${PUBLIC_URL}"
+      echo "    公网访问入口     : ${PUBLIC_URL:-<自动按请求 Host / 反向代理推导>}"
       echo "    宿主机本地监听   : ${HOST_BIND_IP}:${HTTP_PORT} (HTTP/WSS) | ${HOST_BIND_IP}:${RAW_TCP_PORT}"
     fi
     echo "    常用命令: ./pull.sh | ./status.sh | ./logs.sh | ./restart.sh | ./stop.sh"
@@ -493,8 +515,42 @@ case "${CMD}" in
     ;;
   update)
     load_env 1
+    if [ "${KEEP_TAG_FLAG}" != "1" ]; then
+      case "${IMAGE}" in
+        ghcr.io/annihilater/coda:v*|ghcr.io/annihilater/coda:latest)
+          if [ "${FORCE_LATEST_FLAG}" = "1" ] || [ "${IMAGE}" != "ghcr.io/annihilater/coda:latest" ]; then
+            if command -v curl >/dev/null 2>&1; then
+              latest_url="$(curl -fsSLI -o /dev/null -w '%{url_effective}' "https://github.com/${REPO}/releases/latest" 2>/dev/null || true)"
+              latest_tag="${latest_url##*/}"
+              case "${latest_tag}" in
+                v*)
+                  next_image="ghcr.io/annihilater/coda:${latest_tag}"
+                  if [ "${next_image}" != "${IMAGE}" ]; then
+                    echo "==> [更新] 检测到最新版本 ${latest_tag}，升级镜像 ${IMAGE} -> ${next_image}"
+                    IMAGE="${next_image}"
+                    export CODA_IMAGE="${next_image}"
+                    if [ -f "${SCRIPT_DIR}/.env" ]; then
+                      tmp_env="$(mktemp)"
+                      chmod 600 "${tmp_env}" 2>/dev/null || true
+                      if grep -q '^CODA_IMAGE=' "${SCRIPT_DIR}/.env"; then
+                        sed "s|^CODA_IMAGE=.*|CODA_IMAGE=${next_image}|" "${SCRIPT_DIR}/.env" > "${tmp_env}"
+                      else
+                        cat "${SCRIPT_DIR}/.env" > "${tmp_env}"
+                        printf '\nCODA_IMAGE=%s\n' "${next_image}" >> "${tmp_env}"
+                      fi
+                      mv -f "${tmp_env}" "${SCRIPT_DIR}/.env"
+                      chmod 600 "${SCRIPT_DIR}/.env" 2>/dev/null || true
+                    fi
+                  fi
+                  ;;
+              esac
+            fi
+          fi
+          ;;
+      esac
+    fi
     ensure_image 1
-    echo "==> 正在使用最新镜像重建服务 (DEPLOY_MODE=${DEPLOY_MODE})..."
+    echo "==> 正在使用最新镜像 (${IMAGE}) 重建服务 (DEPLOY_MODE=${DEPLOY_MODE})..."
     if [ "${DEPLOY_MODE}" = "relay-cn" ]; then
       run_compose --profile relay-cn up -d --force-recreate --no-deps coda-relay-cn
     else

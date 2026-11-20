@@ -9,8 +9,15 @@
 
 set -eu
 
-REPO="Annihilater/coda"
-VERSION="${CODA_VERSION:-latest}"
+REPO="__CODA_GITHUB_REPO__"
+case "${REPO}" in
+  ""|*__*) REPO="Annihilater/coda" ;;
+esac
+DEFAULT_RELEASE_VERSION="__CODA_RELEASE_VERSION__"
+case "${DEFAULT_RELEASE_VERSION}" in
+  ""|*__*) DEFAULT_RELEASE_VERSION="latest" ;;
+esac
+VERSION="${CODA_VERSION:-${DEFAULT_RELEASE_VERSION}}"
 DEFAULT_SERVER_URL="__CODA_DEFAULT_SERVER_URL__"
 case "${DEFAULT_SERVER_URL}" in
   __*__) DEFAULT_SERVER_URL="https://codahub.dev" ;;
@@ -26,8 +33,18 @@ LOGIN_PASSWORD="${CODA_LOGIN_PASSWORD:-}"
 CONFIG_ARG=""
 P2P_BIND="${CODA_P2P_BIND:-}"
 NON_INTERACTIVE=0
+FORCE_REINSTALL="${CODA_FORCE_REINSTALL:-0}"
 INSTALL_DIR="${CODA_INSTALL_DIR:-${HOME}/.local/bin}"
-LAUNCH_PWD="$(pwd)"
+
+# Guard against `sudo sh` polluting a non-root user's $HOME with root-owned files.
+SUDO_FIXUP_USER=""
+if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ] && [ "${SUDO_USER}" != "root" ]; then
+  SUDO_USER_HOME="$(eval printf '%s' "~${SUDO_USER}" 2>/dev/null || true)"
+  if [ -n "${SUDO_USER_HOME}" ] && [ "${HOME}" = "${SUDO_USER_HOME}" ]; then
+    echo "[WARN] Detected sudo preserving ${SUDO_USER}'s HOME (${HOME}); will restore ownership to ${SUDO_USER}." >&2
+    SUDO_FIXUP_USER="${SUDO_USER}"
+  fi
+fi
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -146,18 +163,57 @@ if [ "${OS_NAME}" = "Linux" ]; then
   fi
 fi
 
+atomic_install_bin() {
+  src="$1"
+  dst="$2"
+  mkdir -p "$(dirname "${dst}")"
+  tmp_bin="${dst}.tmp.$$"
+  cp "${src}" "${tmp_bin}"
+  chmod 0755 "${tmp_bin}"
+  mv -f "${tmp_bin}" "${dst}"
+}
+
+is_real_herdr_core() {
+  candidate="$1"
+  [ -x "${candidate}" ] || return 1
+  ver_out="$("${candidate}" --version 2>&1 || true)"
+  case "$(printf '%s' "${ver_out}" | tr '[:upper:]' '[:lower:]')" in
+    *herbstclient*|*herbstluftwm*) return 1 ;;
+  esac
+  return 0
+}
+
 echo "==> [1/4] Checking herdr-core (herdr-core / hc) runtime..."
 if [ -n "${LOCAL_HC_BIN}" ] && [ -x "${LOCAL_HC_BIN}" ]; then
-  cp "${LOCAL_HC_BIN}" "${INSTALL_DIR}/hc"
-  chmod +x "${INSTALL_DIR}/hc"
+  atomic_install_bin "${LOCAL_HC_BIN}" "${INSTALL_DIR}/hc"
   echo "    Installed local herdr-core binary to ${INSTALL_DIR}/hc"
-elif command -v herdr-core >/dev/null 2>&1; then
+elif [ "${CODA_SKIP_HC_INSTALL:-0}" = "1" ]; then
+  echo "    Skipping herdr-core install (CODA_SKIP_HC_INSTALL=1); coda-daemon will use built-in native PTY shell fallback if hc is absent."
+elif command -v herdr-core >/dev/null 2>&1 && is_real_herdr_core "$(command -v herdr-core)"; then
   echo "    Found herdr-core: $(command -v herdr-core)"
-elif command -v hc >/dev/null 2>&1; then
+elif command -v hc >/dev/null 2>&1 && is_real_herdr_core "$(command -v hc)"; then
   echo "    Found hc: $(command -v hc)"
 else
-  echo "    Installing herdr-core (hc)..."
-  curl -fsSL https://releases.herdr.dev/core/install.sh | sh
+  if command -v hc >/dev/null 2>&1 && ! is_real_herdr_core "$(command -v hc)"; then
+    echo "    [WARN] Ignoring unrelated window-manager binary at $(command -v hc) (herbstclient)." >&2
+  fi
+  echo "    Downloading herdr-core installer (set CODA_SKIP_HC_INSTALL=1 to skip)..."
+  HC_SCRIPT="$(mktemp)"
+  if curl -fsSL https://releases.herdr.dev/core/install.sh -o "${HC_SCRIPT}"; then
+    if [ -n "${CODA_HC_INSTALL_SHA256:-}" ]; then
+      HC_ACTUAL="$(sha256sum "${HC_SCRIPT}" 2>/dev/null | awk '{print tolower($1)}' || shasum -a 256 "${HC_SCRIPT}" 2>/dev/null | awk '{print tolower($1)}' || true)"
+      HC_EXPECTED="$(printf '%s' "${CODA_HC_INSTALL_SHA256}" | tr '[:upper:]' '[:lower:]')"
+      if [ "${HC_ACTUAL}" != "${HC_EXPECTED}" ]; then
+        rm -f "${HC_SCRIPT}"
+        echo "error: herdr-core installer SHA256 mismatch (expected=${HC_EXPECTED}, actual=${HC_ACTUAL})" >&2
+        exit 1
+      fi
+    fi
+    sh "${HC_SCRIPT}" || echo "    [WARN] herdr-core installer failed; coda-daemon will fall back to built-in native PTY shell." >&2
+  else
+    echo "    [WARN] Failed to download herdr-core installer; coda-daemon will fall back to built-in native PTY shell." >&2
+  fi
+  rm -f "${HC_SCRIPT}"
 fi
 
 compute_sha256() {
@@ -222,36 +278,44 @@ systemd_quote() {
   printf '"%s"' "${esc}"
 }
 
-echo "==> [2/4] Checking coda-daemon binary..."
+echo "==> [2/4] Installing / upgrading coda-daemon binary..."
 if [ -n "${LOCAL_BIN}" ] && [ -x "${LOCAL_BIN}" ]; then
-  cp "${LOCAL_BIN}" "${INSTALL_DIR}/coda-daemon"
-  chmod +x "${INSTALL_DIR}/coda-daemon"
+  atomic_install_bin "${LOCAL_BIN}" "${INSTALL_DIR}/coda-daemon"
   echo "    Installed local coda-daemon binary to ${INSTALL_DIR}/coda-daemon"
-elif ! command -v coda-daemon >/dev/null 2>&1; then
-  if [ "${CODA_ALLOW_LOCAL_TARGET:-0}" = "1" ] && [ -x "./target/release/coda-daemon" ]; then
-    cp "./target/release/coda-daemon" "${INSTALL_DIR}/coda-daemon"
-  elif [ "${CODA_ALLOW_LOCAL_TARGET:-0}" = "1" ] && [ -x "./target/debug/coda-daemon" ]; then
-    cp "./target/debug/coda-daemon" "${INSTALL_DIR}/coda-daemon"
-  else
-    ARCH_NAME="$(uname -m)"
-    PKG_NAME=""
-    DIR_NAME=""
-    if [ "${OS_NAME}" = "Darwin" ]; then
-      DIR_NAME="coda-daemon-macos-aarch64"
-    elif [ "${OS_NAME}" = "Linux" ]; then
-      case "${ARCH_NAME}" in
-        x86_64|amd64) DIR_NAME="coda-daemon-linux-x86_64" ;;
-        aarch64|arm64) DIR_NAME="coda-daemon-linux-aarch64" ;;
-      esac
+elif [ "${CODA_ALLOW_LOCAL_TARGET:-0}" = "1" ] && [ -x "./target/release/coda-daemon" ]; then
+  atomic_install_bin "./target/release/coda-daemon" "${INSTALL_DIR}/coda-daemon"
+elif [ "${CODA_ALLOW_LOCAL_TARGET:-0}" = "1" ] && [ -x "./target/debug/coda-daemon" ]; then
+  atomic_install_bin "./target/debug/coda-daemon" "${INSTALL_DIR}/coda-daemon"
+else
+  ARCH_NAME="$(uname -m)"
+  PKG_NAME=""
+  DIR_NAME=""
+  if [ "${OS_NAME}" = "Darwin" ]; then
+    DIR_NAME="coda-daemon-macos-aarch64"
+  elif [ "${OS_NAME}" = "Linux" ]; then
+    case "${ARCH_NAME}" in
+      x86_64|amd64) DIR_NAME="coda-daemon-linux-x86_64" ;;
+      aarch64|arm64) DIR_NAME="coda-daemon-linux-aarch64" ;;
+    esac
+  fi
+
+  if [ -n "${DIR_NAME}" ]; then
+    if [ "${VERSION}" = "latest" ]; then
+      EFFECTIVE_URL="$(curl -fsSLI -o /dev/null -w '%{url_effective}' "https://github.com/${REPO}/releases/latest" 2>/dev/null || true)"
+      if [ -n "${EFFECTIVE_URL}" ]; then
+        VERSION="${EFFECTIVE_URL##*/}"
+      fi
     fi
 
-    if [ -n "${DIR_NAME}" ]; then
-      if [ "${VERSION}" = "latest" ]; then
-        EFFECTIVE_URL="$(curl -fsSLI -o /dev/null -w '%{url_effective}' "https://github.com/${REPO}/releases/latest" 2>/dev/null || true)"
-        if [ -n "${EFFECTIVE_URL}" ]; then
-          VERSION="${EFFECTIVE_URL##*/}"
-        fi
-      fi
+    INSTALLED_VER=""
+    if [ -x "${INSTALL_DIR}/coda-daemon" ]; then
+      INSTALLED_VER="$("${INSTALL_DIR}/coda-daemon" --version 2>/dev/null | awk '{print $2}' || true)"
+    fi
+    TARGET_PLAIN_VER="${VERSION#v}"
+
+    if [ "${FORCE_REINSTALL}" != "1" ] && [ -n "${INSTALLED_VER}" ] && [ "${INSTALLED_VER}" = "${TARGET_PLAIN_VER}" ]; then
+      echo "    coda-daemon ${INSTALLED_VER} is already up to date at ${INSTALL_DIR}/coda-daemon"
+    else
       PKG_NAME="${DIR_NAME}-${VERSION}.tar.gz"
       REL_BASE="https://github.com/${REPO}/releases/download/${VERSION}"
       echo "    Downloading & verifying prebuilt ${PKG_NAME} from GitHub Releases..."
@@ -262,28 +326,30 @@ elif ! command -v coda-daemon >/dev/null 2>&1; then
           exit 1
         fi
         tar -C "${TMP_D}" -xzf "${TMP_D}/${PKG_NAME}"
-        cp "${TMP_D}/${DIR_NAME}/coda-daemon" "${INSTALL_DIR}/coda-daemon"
+        atomic_install_bin "${TMP_D}/${DIR_NAME}/coda-daemon" "${INSTALL_DIR}/coda-daemon"
+        echo "    Installed coda-daemon ${VERSION} to ${INSTALL_DIR}/coda-daemon"
       elif [ "${CODA_ALLOW_SOURCE_BUILD:-0}" = "1" ] && [ -f "./Cargo.toml" ]; then
         echo "    Release download unavailable; building coda-daemon from source via cargo..."
         cargo build --release -p coda-daemon
-        cp "./target/release/coda-daemon" "${INSTALL_DIR}/coda-daemon"
+        atomic_install_bin "./target/release/coda-daemon" "${INSTALL_DIR}/coda-daemon"
+      elif [ -x "${INSTALL_DIR}/coda-daemon" ]; then
+        echo "    [WARN] Release download unavailable; keeping existing binary at ${INSTALL_DIR}/coda-daemon" >&2
       else
         rm -rf "${TMP_D}"
         echo "error: failed downloading ${PKG_NAME} from ${REL_BASE}" >&2
         exit 1
       fi
       rm -rf "${TMP_D}"
-    else
-      if [ "${CODA_ALLOW_SOURCE_BUILD:-0}" = "1" ] && [ -f "./Cargo.toml" ]; then
-        cargo build --release -p coda-daemon
-        cp "./target/release/coda-daemon" "${INSTALL_DIR}/coda-daemon"
-      else
-        echo "error: unsupported OS/architecture (${OS_NAME}/${ARCH_NAME})" >&2
-        exit 1
-      fi
+    fi
+  else
+    if [ "${CODA_ALLOW_SOURCE_BUILD:-0}" = "1" ] && [ -f "./Cargo.toml" ]; then
+      cargo build --release -p coda-daemon
+      atomic_install_bin "./target/release/coda-daemon" "${INSTALL_DIR}/coda-daemon"
+    elif [ ! -x "${INSTALL_DIR}/coda-daemon" ]; then
+      echo "error: unsupported OS/architecture (${OS_NAME}/${ARCH_NAME})" >&2
+      exit 1
     fi
   fi
-  chmod +x "${INSTALL_DIR}/coda-daemon"
 fi
 
 if [ -n "${PAIR_CODE}" ]; then
@@ -315,9 +381,28 @@ else
   echo "==> [3/4] Existing daemon config detected at ${CFG_PATH} (re-run \`coda-daemon login --server ${SERVER_URL}\` to re-authorize)."
 fi
 
+prepare_daemon_log() {
+  log_path="$1"
+  mkdir -p "$(dirname "${log_path}")"
+  if [ -f "${log_path}" ]; then
+    log_size="$(wc -c < "${log_path}" 2>/dev/null || echo 0)"
+    if [ "${log_size}" -gt 10485760 ] 2>/dev/null; then
+      tmp_log="${log_path}.trim.$$"
+      (
+        umask 077
+        tail -c 2097152 "${log_path}" > "${tmp_log}" && mv -f "${tmp_log}" "${log_path}"
+      ) || rm -f "${tmp_log}"
+    fi
+  else
+    ( umask 077 && : > "${log_path}" )
+  fi
+  chmod 600 "${log_path}" 2>/dev/null || true
+}
+
 start_nohup_daemon() {
   PID_FILE="${STATE_DIR}/coda-daemon.pid"
   LOG_FILE="${STATE_DIR}/coda-daemon.log"
+  prepare_daemon_log "${LOG_FILE}"
   if [ -f "${PID_FILE}" ]; then
     OLD_PID="$(cat "${PID_FILE}" 2>/dev/null || true)"
     if [ -n "${OLD_PID}" ] && kill -0 "${OLD_PID}" 2>/dev/null; then
@@ -326,12 +411,12 @@ start_nohup_daemon() {
     fi
   fi
   if [ -n "${P2P_BIND}" ]; then
-    nohup "${INSTALL_DIR}/coda-daemon" --config "${CFG_PATH}" run --p2p-bind "${P2P_BIND}" >"${LOG_FILE}" 2>&1 </dev/null &
+    nohup "${INSTALL_DIR}/coda-daemon" --config "${CFG_PATH}" run --p2p-bind "${P2P_BIND}" >>"${LOG_FILE}" 2>&1 </dev/null &
   else
-    nohup "${INSTALL_DIR}/coda-daemon" --config "${CFG_PATH}" run >"${LOG_FILE}" 2>&1 </dev/null &
+    nohup "${INSTALL_DIR}/coda-daemon" --config "${CFG_PATH}" run >>"${LOG_FILE}" 2>&1 </dev/null &
   fi
   DAEMON_PID=$!
-  echo "${DAEMON_PID}" >"${PID_FILE}"
+  ( umask 077 && echo "${DAEMON_PID}" >"${PID_FILE}" )
   sleep 1
   if ! kill -0 "${DAEMON_PID}" 2>/dev/null; then
     echo "error: coda-daemon exited prematurely; tail of ${LOG_FILE}:" >&2
@@ -348,6 +433,8 @@ if [ "${OS_NAME}" = "Darwin" ]; then
   else
     PLIST_DIR="${HOME}/Library/LaunchAgents"
     PLIST_PATH="${PLIST_DIR}/dev.coda.daemon.plist"
+    LOG_FILE="${STATE_DIR}/coda-daemon.log"
+    prepare_daemon_log "${LOG_FILE}"
     mkdir -p "${PLIST_DIR}"
     PLIST_P2P_XML=""
     if [ -n "${P2P_BIND}" ]; then
@@ -361,6 +448,8 @@ if [ "${OS_NAME}" = "Darwin" ]; then
 <dict>
   <key>Label</key>
   <string>dev.coda.daemon</string>
+  <key>WorkingDirectory</key>
+  <string>$(xml_escape "${HOME}")</string>
   <key>ProgramArguments</key>
   <array>
     <string>$(xml_escape "${INSTALL_DIR}/coda-daemon")</string>
@@ -376,8 +465,17 @@ ${PLIST_P2P_XML}
     <key>CODA_DAEMON_CONFIG</key>
     <string>$(xml_escape "${CFG_PATH}")</string>
   </dict>
+  <key>StandardOutPath</key>
+  <string>$(xml_escape "${LOG_FILE}")</string>
+  <key>StandardErrorPath</key>
+  <string>$(xml_escape "${LOG_FILE}")</string>
   <key>KeepAlive</key>
-  <true/>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
   <key>RunAtLoad</key>
   <true/>
 </dict>
@@ -389,13 +487,7 @@ EOF
   fi
 elif [ "${OS_NAME}" = "Linux" ]; then
   SERVICE_STARTED=0
-  SAFE_WORK_DIR="${LAUNCH_PWD}"
-  case "${SAFE_WORK_DIR}" in
-    ""|/tmp|/tmp/*|/var/tmp|/var/tmp/*) SAFE_WORK_DIR="${HOME:-/}" ;;
-  esac
-  if [ ! -d "${SAFE_WORK_DIR}" ]; then
-    SAFE_WORK_DIR="${HOME:-/}"
-  fi
+  SAFE_WORK_DIR="${HOME:-/}"
   if [ ! -d "${SAFE_WORK_DIR}" ]; then
     SAFE_WORK_DIR="/"
   fi
@@ -427,6 +519,7 @@ RestartSec=2
 WantedBy=multi-user.target
 EOF
     if systemctl daemon-reload 2>/dev/null && systemctl enable --now coda-daemon 2>/dev/null; then
+      systemctl restart coda-daemon 2>/dev/null || true
       sleep 1
       if systemctl is-active --quiet coda-daemon; then
         SERVICE_STARTED=1
@@ -455,6 +548,7 @@ RestartSec=2
 WantedBy=default.target
 EOF
     if systemctl --user daemon-reload 2>/dev/null && systemctl --user enable --now coda-daemon 2>/dev/null; then
+      systemctl --user restart coda-daemon 2>/dev/null || true
       sleep 1
       if systemctl --user is-active --quiet coda-daemon; then
         SERVICE_STARTED=1
@@ -467,6 +561,11 @@ EOF
     echo "    systemd unavailable in this environment; starting supervised background coda-daemon..."
     start_nohup_daemon
   fi
+fi
+
+if [ -n "${SUDO_FIXUP_USER}" ]; then
+  SUDO_FIXUP_GROUP="$(id -gn "${SUDO_FIXUP_USER}" 2>/dev/null || printf '%s' "${SUDO_FIXUP_USER}")"
+  chown -R "${SUDO_FIXUP_USER}:${SUDO_FIXUP_GROUP}" "${INSTALL_DIR}" "${STATE_DIR}" 2>/dev/null || true
 fi
 
 echo "==> Coda Host Daemon setup complete!"

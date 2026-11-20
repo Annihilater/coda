@@ -134,7 +134,7 @@ if [ -n "${ENV_SRC}" ] && [ -f "${ENV_SRC}" ]; then
   load_env_file "${ENV_SRC}"
 fi
 
-PUBLIC_URL="${ARG_PUBLIC_URL:-${CODA_PUBLIC_URL:-http://127.0.0.1:8080}}"
+PUBLIC_URL="${ARG_PUBLIC_URL:-${CODA_PUBLIC_URL:-}}"
 RELAY_SECRET="${ARG_RELAY_SECRET:-${CODA_RELAY_SECRET:-}}"
 DB_URL="${ARG_DB_URL:-${DATABASE_URL:-}}"
 HTTP_BIND="${ARG_HTTP_BIND:-${CODA_HTTP_BIND:-0.0.0.0:${CODA_HTTP_PORT:-8080}}}"
@@ -144,6 +144,34 @@ OPEN_REGISTRATION="${ARG_OPEN_REG:-${CODA_OPEN_REGISTRATION:-false}}"
 GITHUB_REPO="${CODA_GITHUB_REPO:-Annihilater/coda}"
 IOS_BETA_URL="${CODA_IOS_BETA_URL:-}"
 RAW_TCP_PUBLIC_ENDPOINT="${CODA_RAW_TCP_PUBLIC_ENDPOINT:-}"
+
+ensure_coda_user() {
+  if ! getent group coda >/dev/null 2>&1; then
+    if command -v groupadd >/dev/null 2>&1; then
+      groupadd --system coda 2>/dev/null || true
+    elif command -v addgroup >/dev/null 2>&1; then
+      addgroup --system coda 2>/dev/null || true
+    fi
+  fi
+  if ! id -u coda >/dev/null 2>&1; then
+    if command -v useradd >/dev/null 2>&1; then
+      useradd --system --gid coda --home-dir /opt/coda --no-create-home --shell /usr/sbin/nologin coda 2>/dev/null || true
+    elif command -v adduser >/dev/null 2>&1; then
+      adduser --system --ingroup coda --home /opt/coda --no-create-home --shell /usr/sbin/nologin coda 2>/dev/null || true
+    fi
+  fi
+}
+
+atomic_install_bin() {
+  src="$1"
+  dst="$2"
+  dst_dir="$(dirname "${dst}")"
+  mkdir -p "${dst_dir}"
+  tmp_bin="${dst}.tmp.$$"
+  cp "${src}" "${tmp_bin}"
+  chmod 0755 "${tmp_bin}"
+  mv -f "${tmp_bin}" "${dst}"
+}
 
 case "${RELAY_SECRET}" in
   ""|*change-me*|*change_me*)
@@ -179,17 +207,18 @@ curl -fsSL "${REL_BASE}/${PKG}" -o "${TMP_DIR}/${PKG}"
 verify_release_sha256 "${REL_BASE}" "${VERSION}" "${PKG}" "${TMP_DIR}/${PKG}"
 tar -C "${TMP_DIR}" -xzf "${TMP_DIR}/${PKG}"
 
-mkdir -p /opt/coda /etc/coda
+ensure_coda_user
+mkdir -p /opt/coda /etc/coda /var/lib/coda
 chmod 700 /etc/coda
-cp "${TMP_DIR}/${DIR}/coda-server" /usr/local/bin/coda-server
-chmod +x /usr/local/bin/coda-server
+atomic_install_bin "${TMP_DIR}/${DIR}/coda-server" /usr/local/bin/coda-server
 rm -rf /opt/coda/web-dist /opt/coda/migrations
 cp -r "${TMP_DIR}/${DIR}/web-dist" /opt/coda/web-dist
 if [ -d "${TMP_DIR}/${DIR}/migrations" ]; then
   cp -r "${TMP_DIR}/${DIR}/migrations" /opt/coda/migrations
 fi
+chown -R coda:coda /opt/coda /var/lib/coda 2>/dev/null || true
 
-echo "==> [2/3] Writing unified /etc/coda/.env (0600) & systemd unit /etc/systemd/system/coda-server.service..."
+echo "==> [2/3] Writing unified /etc/coda/.env (0600) & hardened systemd unit /etc/systemd/system/coda-server.service..."
 (
   umask 077
   cat > /etc/coda/.env <<EOF
@@ -215,12 +244,24 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+User=coda
+Group=coda
 WorkingDirectory=/opt/coda
 EnvironmentFile=/etc/coda/.env
 ExecStart=/usr/local/bin/coda-server --web-dist /opt/coda/web-dist
 Restart=always
 RestartSec=2
 LimitNOFILE=1048576
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+StateDirectory=coda
+ReadWritePaths=/var/lib/coda
 
 [Install]
 WantedBy=multi-user.target
@@ -229,7 +270,8 @@ EOF
 echo "==> [3/3] Starting coda-server service..."
 systemctl daemon-reload
 systemctl enable --now coda-server
+systemctl restart coda-server
 
 echo "==> Coda Coordinator is running!"
-echo "    Web Console & API : ${PUBLIC_URL}"
+echo "    Web Console & API : ${PUBLIC_URL:-<auto-derived from Host / reverse proxy>}"
 echo "    No-ICP Raw TCP    : ${RAW_TCP_BIND}"

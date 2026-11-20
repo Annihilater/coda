@@ -42,6 +42,7 @@ jobs:
       - name: Test core crates & Build coda-server, coda-daemon, coda-apple-ffi (release)
         run: |
           cargo test --release -p coda-protocol -p coda-herdr -p coda-daemon -p coda-apple-ffi
+          cargo test --release -p coda-server --lib
           cargo build --release -p coda-server -p coda-daemon
       - name: Package Linux x86_64 Artifacts
         run: |
@@ -86,6 +87,7 @@ jobs:
       - name: Test core crates & Build coda-server, coda-daemon, coda-apple-ffi (release)
         run: |
           cargo test --release -p coda-protocol -p coda-herdr -p coda-daemon -p coda-apple-ffi
+          cargo test --release -p coda-server --lib
           cargo build --release -p coda-server -p coda-daemon
       - name: Package Linux aarch64
         run: |
@@ -169,8 +171,7 @@ jobs:
           APP_DIR="${DMG_STAGE}/Coda.app"
           mkdir -p "${APP_DIR}/Contents/MacOS" "${APP_DIR}/Contents/Resources"
           cp target/release/coda-desktop "${APP_DIR}/Contents/MacOS/coda-desktop"
-          cp target/release/coda-daemon "${APP_DIR}/Contents/MacOS/coda-daemon"
-          chmod +x "${APP_DIR}/Contents/MacOS/coda-desktop" "${APP_DIR}/Contents/MacOS/coda-daemon"
+          chmod +x "${APP_DIR}/Contents/MacOS/coda-desktop"
           swift assets/render_icon.swift --icns "${APP_DIR}/Contents/Resources/AppIcon.icns"
           SHORT_VER="${RELEASE_TAG#v}"
           cat > "${APP_DIR}/Contents/Info.plist" <<EOF
@@ -190,6 +191,7 @@ jobs:
             <key>CFBundleVersion</key><string>${SHORT_VER}</string>
             <key>LSMinimumSystemVersion</key><string>14.0</string>
             <key>NSHighResolutionCapable</key><true/>
+            <key>NSLocalNetworkUsageDescription</key><string>Coda discovers and connects directly to your paired Macs and Linux workstations on your local network over end-to-end encrypted P2P.</string>
           </dict>
           </plist>
           EOF
@@ -366,13 +368,10 @@ jobs:
           sed "s|ghcr.io/annihilater/coda:latest|ghcr.io/annihilater/coda:${RELEASE_TAG}|g" \
             deploy/docker-compose.yml > "${BUNDLE_DIR}/docker-compose.yml"
 
-          for s in pull.sh start.sh stop.sh restart.sh status.sh logs.sh update.sh install-server.sh install-relay-cn.sh install-daemon.sh; do
+          for s in pull.sh start.sh stop.sh restart.sh status.sh logs.sh update.sh install-server.sh install-relay-cn.sh install-daemon.sh coda.sh; do
             cp "deploy/${s}" "${BUNDLE_DIR}/${s}"
             chmod 0755 "${BUNDLE_DIR}/${s}"
           done
-          sed "s|ghcr.io/annihilater/coda:latest|ghcr.io/annihilater/coda:${RELEASE_TAG}|g" \
-            deploy/coda.sh > "${BUNDLE_DIR}/coda.sh"
-          chmod 0755 "${BUNDLE_DIR}/coda.sh"
           chmod 0644 "${BUNDLE_DIR}"/*.md "${BUNDLE_DIR}/.env.example" "${BUNDLE_DIR}/env.example" "${BUNDLE_DIR}/docker-compose.yml" "${BUNDLE_DIR}/coda-server.service" "${BUNDLE_DIR}/coda-relay-cn.service"
 
           tar --owner=0 --group=0 -C dist-bundle -czf "release-assets/coda-deploy-bundle-${RELEASE_TAG}.tar.gz" coda-deploy-bundle

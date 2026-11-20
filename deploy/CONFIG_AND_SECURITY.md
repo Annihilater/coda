@@ -18,16 +18,20 @@
 | `CODA_RAW_TCP_PORT` | `24443` | 全部 | 裸 TCP 加密隧道中继端口 |
 | `CODA_HTTP_BIND` | `0.0.0.0:8080` | 裸机 / 二进制 | `coda-server` HTTP/WS 监听地址（Docker 内固定监听 `0.0.0.0:8080`） |
 | `CODA_RAW_TCP_BIND` | `0.0.0.0:24443` | 裸机 / 二进制 | `coda-server` 裸 TCP 中继监听地址 |
-| `CODA_PUBLIC_URL` | `https://codahub.dev` | `coordinator` | 对外公开访问地址（决定 WebAuthn/设备流 URL 与默认 WSS 隧道节点） |
+| `CODA_PUBLIC_URL` | 留空（示例 `https://coda.example.com`） | `coordinator` | 对外公开访问地址；默认留空按请求 `Host`/代理自动推导，生产上线建议显式配置 |
+| `CODA_TRUST_PROXY_HEADERS` | `auto`（可选 `true`/`false`） | `coordinator` | 反向代理真实 IP 信任策略（默认仅信任回环/私网代理的 `CF-Connecting-IP`/`X-Real-IP`） |
+| `CODA_ALLOWED_ORIGINS` | 逗号分隔白名单（可选） | `coordinator` | 额外允许访问 CORS 与 WebSocket 的浏览器 `Origin` 白名单（默认严格同源 + `CODA_PUBLIC_URL`） |
 | `CODA_REGION_LABEL` | `CN-BGP-NoICP` | 全部 | 中继节点展示标签 |
 | `CODA_OPEN_REGISTRATION` | `false` | `coordinator` | 是否允许公开自助注册；`false` 时仅首号免邀，后续需管理员签发邀请码 |
 | `CODA_RELAY_SECRET` | **必填**（32B hex） | **全部** | 控制面签发中继令牌与中继节点验签的共享 HMAC 密钥，主控与全部中继必须一致 |
-| `POSTGRES_PASSWORD` | **必填** | `coordinator` | PostgreSQL 18 `coda` 用户密码（`relay-cn` 模式无需配置） |
-| `DATABASE_URL` | 外部连接串（可选） | 裸机 / 外部 DB | 覆盖 Docker Compose 内置 PostgreSQL 连接串；支持 `DOCKER_DATABASE_URL` |
-| `CODA_GITHUB_REPO` | `Annihilater/coda` | `coordinator` | 下载中心链接指向的 GitHub 仓库 |
-| `CODA_RELEASE_VERSION` | `vX.Y.Z`（可选） | `coordinator` | 固定下载中心展示的版本标签；留空则由服务端自动跟随构建版本或 `latest` |
-| `CODA_RAW_TCP_PUBLIC_ENDPOINT` | 例如 `cn-relay.codahub.dev:24443` | `coordinator` | 若海外主控配合独立公网 IP/国内中继暴露裸 TCP 端口，可显式声明公网端点 |
+| `POSTGRES_PASSWORD` | **必填** | `coordinator` | PostgreSQL 18 `coda` 用户密码（经 `PGPASSWORD` 传入，原生支持 `@`/`#`/`/`/`%` 等任意特殊字符） |
+| `DATABASE_URL` | 外部连接串（可选，支持 `sslmode=require` TLS） | 裸机 / 外部 DB | 覆盖 Docker Compose 内置 PostgreSQL 连接串；支持 `DOCKER_DATABASE_URL` 与 `rustls` TLS |
+| `CODA_GITHUB_REPO` | `Annihilater/coda` | `coordinator` | 下载中心与 `/install.sh` 注入指向的 GitHub 仓库 |
+| `CODA_RELEASE_VERSION` | `vX.Y.Z`（可选） | `coordinator` | 固定下载中心与 `/install.sh` 使用的版本标签；留空则自动跟随最新 Release（带 5 分钟失败负缓存） |
+| `CODA_RAW_TCP_PUBLIC_ENDPOINT` | 例如 `cn-relay.codahub.dev:24443` | `coordinator` | 若海外主控配合独立公网 IP/国内中继暴露裸 TCP 端口，可显式声明公网端点（`coda-daemon` 会与主控并发双路保活） |
 | `CODA_IOS_BETA_URL` | 可选 TestFlight URL | `coordinator` | 在 Web 下载中心展示 iOS TestFlight 测试入口 |
+| `CODA_SKIP_HC_INSTALL` | `0`（设为 `1` 跳过） | `install-daemon.sh` | 跳过远端 `herdr-core` 脚本安装，直接回落 `coda-daemon` 内置原生 Unix PTY Shell |
+| `CODA_HC_INSTALL_SHA256` | 可选 64 位 SHA-256 | `install-daemon.sh` | 为 `herdr-core` 安装脚本提供强制摘要校验 |
 | `GITHUB_PROXY` | 可选加速前缀 | 脚本 | 如国内下载离线容器包缓慢，可设加速前缀（如 `https://ghfast.top/`） |
 
 ---
@@ -38,8 +42,10 @@
 - `deploy/docker-compose.yml` 与 `coda.sh` 均已启用 Fail-Closed 校验：**未设置 `CODA_RELAY_SECRET` 或 `POSTGRES_PASSWORD`，或仍为 `change_me` 等示例占位符时将直接拒绝启动**。
 - 首次在 `coda-deploy-bundle/` 下运行 `./pull.sh` 或 `./start.sh` 且当前目录不存在 `.env` 时，脚本会以 `umask 077` 自动使用 CSPRNG（`openssl rand -hex 24` 或 `/dev/urandom`）生成高熵随机密钥，写入权限 `0600` 的 `.env`，并将 `CODA_OPEN_REGISTRATION` 默认设为 `false`。
 
-### 2. 最小权限容器运行时
-- `ghcr.io/annihilater/coda` 运行时以非特权系统用户 `coda`（`UID/GID 10001`）执行，不以 `root` 身份运行服务端或中继进程。
+### 2. 最小权限运行时与权限隔离
+- **容器与裸机均非 root**：`ghcr.io/annihilater/coda` 容器以及裸机 `coda-server.service` / `coda-relay-cn.service` 均以非特权系统用户 `coda` 执行，裸机 Systemd 单元启用 `NoNewPrivileges`、`ProtectSystem=strict`、`ProtectHome=true`、`PrivateTmp=true` 等沙箱限制。
+- **角色最小权限与设备吊销**：`role = "daemon"` 受控机无法反向控制同账号其他设备；删除设备时级联吊销关联会话并立即踢出活跃中继与 Direct P2P 连接；`coda-daemon` 支持 30 天中继票据提前 7 天 Ed25519 签名自动续签。
+- **凭据最小暴露**：macOS `Coda.app` 会话 Token 优先存入 macOS Keychain（CLI/测试回落 `0600` 文件）；`install-daemon.sh` 防止 `sudo` 污染普通用户 `$HOME` 权限，且日志强制 `0600` 与 10 MiB 截断。
 
 ### 3. 全制品 SHA-256 完整性校验
 - 每次发版均会生成 `SHA256SUMS-<version>.txt` 与 `SHA256SUMS.txt`；`coda.sh` 离线镜像包回落、`install-server.sh`、`install-relay-cn.sh` 与 `install-daemon.sh` 均已内置自动 SHA-256 摘要校验，摘要不匹配或缺少校验清单时拒绝导入或安装。
@@ -71,10 +77,11 @@
 # 查看当前状态与健康检查 (/api/v1/health)
 ./status.sh
 
-# 拉取新版本镜像并重建容器（保留 coda_pgdata 数据库卷与 .env 配置）
+# 自动检测并拉取最新 Release 镜像、同步更新 .env 中 CODA_IMAGE 并平滑重建容器（保留 coda_pgdata）
+# 若希望保持当前固定版本不自动升 tag，可加 --keep-tag；裸机模式传 --systemd 自动升级二进制
 ./update.sh
 ```
-> 若已升级到指定固定 Tag（例如 `.env` 中 `CODA_IMAGE=ghcr.io/annihilater/coda:v0.4.0`），请先修改 `.env` 中的 `CODA_IMAGE` 为新版本号后再执行 `./update.sh`（或 `./restart.sh`）。
+> 裸机 Systemd 模式下 `./update.sh --systemd` 会调用同目录 `install-server.sh` / `install-relay-cn.sh --version latest` 通过临时文件原子替换二进制（避免 `ETXTBSY`）并平滑重启服务。
 
 ### 2. 手动离线镜像导入
 若服务器无法直连 `ghcr.io`，可预先从 GitHub Releases 下载对应架构的 `coda-image-linux-{amd64,arm64}-<version>.tar.gz` 与 `SHA256SUMS-<version>.txt`，校验后直接导入：

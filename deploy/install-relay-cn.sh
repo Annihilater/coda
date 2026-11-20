@@ -172,18 +172,47 @@ EOF
   sysctl --system >/dev/null 2>&1 || true
 fi
 
+ensure_coda_user() {
+  if ! getent group coda >/dev/null 2>&1; then
+    if command -v groupadd >/dev/null 2>&1; then
+      groupadd --system coda 2>/dev/null || true
+    elif command -v addgroup >/dev/null 2>&1; then
+      addgroup --system coda 2>/dev/null || true
+    fi
+  fi
+  if ! id -u coda >/dev/null 2>&1; then
+    if command -v useradd >/dev/null 2>&1; then
+      useradd --system --gid coda --home-dir /opt/coda --no-create-home --shell /usr/sbin/nologin coda 2>/dev/null || true
+    elif command -v adduser >/dev/null 2>&1; then
+      adduser --system --ingroup coda --home /opt/coda --no-create-home --shell /usr/sbin/nologin coda 2>/dev/null || true
+    fi
+  fi
+}
+
+atomic_install_bin() {
+  src="$1"
+  dst="$2"
+  dst_dir="$(dirname "${dst}")"
+  mkdir -p "${dst_dir}"
+  tmp_bin="${dst}.tmp.$$"
+  cp "${src}" "${tmp_bin}"
+  chmod 0755 "${tmp_bin}"
+  mv -f "${tmp_bin}" "${dst}"
+}
+
 echo "==> [2/4] Downloading & verifying Coda Relay ${VERSION} (${PKG})..."
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "${TMP_DIR}"' EXIT HUP INT TERM
 curl -fsSL "${REL_BASE}/${PKG}" -o "${TMP_DIR}/${PKG}"
 verify_release_sha256 "${REL_BASE}" "${VERSION}" "${PKG}" "${TMP_DIR}/${PKG}"
 tar -C "${TMP_DIR}" -xzf "${TMP_DIR}/${PKG}"
+ensure_coda_user
 mkdir -p /opt/coda /etc/coda
 chmod 700 /etc/coda
-cp "${TMP_DIR}/${DIR}/coda-server" /usr/local/bin/coda-server
-chmod +x /usr/local/bin/coda-server
+atomic_install_bin "${TMP_DIR}/${DIR}/coda-server" /usr/local/bin/coda-server
+chown -R coda:coda /opt/coda 2>/dev/null || true
 
-echo "==> [3/4] Writing /etc/coda/.env (0600) & systemd unit /etc/systemd/system/coda-relay-cn.service..."
+echo "==> [3/4] Writing /etc/coda/.env (0600) & hardened systemd unit /etc/systemd/system/coda-relay-cn.service..."
 (
   umask 077
   cat > /etc/coda/.env <<EOF
@@ -202,12 +231,22 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+User=coda
+Group=coda
 WorkingDirectory=/opt/coda
 EnvironmentFile=/etc/coda/.env
 ExecStart=/usr/local/bin/coda-server --relay-only
 Restart=always
 RestartSec=2
 LimitNOFILE=1048576
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
 
 [Install]
 WantedBy=multi-user.target
@@ -216,5 +255,6 @@ EOF
 echo "==> [4/4] Starting coda-relay-cn service..."
 systemctl daemon-reload
 systemctl enable --now coda-relay-cn
+systemctl restart coda-relay-cn
 
 echo "==> Domestic No-ICP Raw TCP Relay active on 0.0.0.0:${PORT} (${REGION})!"

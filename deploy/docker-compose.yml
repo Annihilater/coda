@@ -25,14 +25,18 @@ services:
       - path: .env
         required: false
     environment:
-      DATABASE_URL: ${DOCKER_DATABASE_URL:-postgres://coda:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env or environment}@postgres:5432/coda_prod}
+      DATABASE_URL: ${DOCKER_DATABASE_URL:-postgres://coda@postgres:5432/coda_prod}
+      PGPASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env or environment}
       CODA_RELAY_SECRET: ${CODA_RELAY_SECRET:?CODA_RELAY_SECRET must be set in .env or environment}
       CODA_PUBLIC_URL: ${CODA_PUBLIC_URL:-}
       CODA_REGION_LABEL: ${CODA_REGION_LABEL:-CN-BGP-NoICP}
       CODA_OPEN_REGISTRATION: ${CODA_OPEN_REGISTRATION:-false}
       CODA_RAW_TCP_PUBLIC_ENDPOINT: ${CODA_RAW_TCP_PUBLIC_ENDPOINT:-}
       CODA_GITHUB_REPO: ${CODA_GITHUB_REPO:-Annihilater/coda}
+      CODA_RELEASE_VERSION: ${CODA_RELEASE_VERSION:-}
       CODA_IOS_BETA_URL: ${CODA_IOS_BETA_URL:-}
+      CODA_TRUST_PROXY_HEADERS: ${CODA_TRUST_PROXY_HEADERS:-}
+      CODA_ALLOWED_ORIGINS: ${CODA_ALLOWED_ORIGINS:-}
       CODA_HTTP_BIND: 0.0.0.0:8080
       CODA_RAW_TCP_BIND: 0.0.0.0:24443
     ports:

@@ -9,6 +9,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+User=coda
+Group=coda
 WorkingDirectory=/opt/coda
 EnvironmentFile=-/etc/coda/.env
 EnvironmentFile=-/opt/coda/.env
@@ -16,6 +18,16 @@ ExecStart=/usr/local/bin/coda-server --web-dist /opt/coda/web-dist
 Restart=always
 RestartSec=2
 LimitNOFILE=1048576
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+StateDirectory=coda
+ReadWritePaths=/var/lib/coda
 
 [Install]
 WantedBy=multi-user.target
