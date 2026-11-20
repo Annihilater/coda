@@ -10,7 +10,13 @@
 
 pub mod config;
 pub mod git_inspector;
+pub mod helpers;
+pub mod notify;
 pub mod pty;
+pub mod remote_mesh;
+pub mod smart_path;
+
+pub use crate::remote_mesh::RemoteMeshHub;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -18,16 +24,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
-use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-use coda_daemon::{
-    active_daemon_lock_pid, change_account_password, delete_account_device, list_account_hosts,
-    login_with_password_and_enroll_with_identity, mint_peer_relay_config,
-    poll_device_login_until_approved, rename_account_device, start_device_login_flow,
-    start_embedded_host_with_handle, subscribe_account_events_ws, DaemonConfig, EmbeddedHostHandle,
-    LivePeerSession, PeerAsyncEvent, RemoteHostSummary,
-};
+use coda_daemon::{active_daemon_lock_pid, DaemonConfig, RemoteHostSummary};
 use coda_herdr::{discover_hc_binary, ensure_or_install_hc_binary, HerdrClient};
-use coda_protocol::{HerdrTerminalSummary, PeerMessage, RemoteFileItem, TrafficLane};
 use gpui::{
     actions, canvas, div, point, prelude::*, px, rgb, rgba, size, App, Application, Bounds,
     ClickEvent, ClipboardItem, Context, ElementInputHandler, EntityInputHandler, FocusHandle,
@@ -39,18 +37,23 @@ use gpui::{
 use uuid::Uuid;
 
 use crate::config::{
-    config_root_dir, delete_secret_from_keychain, detect_local_machine_name,
-    discover_local_git_repositories, display_compact_path, ensure_agents_md_manual,
-    ensure_macos_gui_path, is_safe_http_url, load_secret_from_keychain,
-    pick_folder_via_native_dialog, reveal_in_finder, save_secret_in_keychain, space_avatar_color,
-    tr, DesktopClientIdentityRecord, DesktopPreferences, LayoutMode, MalleableLayoutConfig,
-    UiLocale,
+    config_root_dir, detect_local_machine_name, discover_local_git_repositories,
+    display_compact_path, ensure_agents_md_manual, ensure_macos_gui_path, is_safe_http_url,
+    pick_folder_via_native_dialog, reveal_in_finder, space_avatar_color, tr, DesktopPreferences,
+    LayoutMode, MalleableLayoutConfig, UiLocale,
 };
 use crate::git_inspector::{
     compute_repo_snapshot, list_workspace_dir, read_workspace_file_preview, resolve_contained_path,
-    ChangedFileEntry, RepoInspectorSnapshot, WorkspaceFileEntry,
+    RepoInspectorSnapshot, WorkspaceFileEntry,
 };
+use crate::helpers::{
+    extract_file_diff_lines, herdr_status_to_osc, load_desktop_daemon_config, utf16_slice,
+};
+#[cfg(test)]
+use crate::helpers::path_within_root;
+use crate::notify::{dispatch_native_notification, DesktopNotificationTracker};
 use crate::pty::{AgentLifecycleState, LocalPtyManager, Osc7501Status, StyledTerminalLine};
+use crate::remote_mesh::{spawn_device_login, spawn_password_login};
 
 actions!(
     coda_desktop,
@@ -105,40 +108,6 @@ pub enum ActiveInputTarget {
     RenameDeviceInput,
     ChangePwCurrent,
     ChangePwNew,
-}
-
-fn load_desktop_daemon_config(path: &Path) -> anyhow::Result<DaemonConfig> {
-    let mut cfg = DaemonConfig::load(path)?;
-    if cfg.session_token.is_none() {
-        cfg.session_token = load_secret_from_keychain("session_token");
-    } else if let Some(ref tok) = cfg.session_token {
-        // Migrate existing plaintext disk token into macOS Keychain when running inside Coda.app
-        // without an external standalone coda-daemon holding the lock.
-        let external_owns = active_daemon_lock_pid(path)
-            .map(|pid| pid != std::process::id())
-            .unwrap_or(false);
-        if !external_owns && save_secret_in_keychain("session_token", tok) {
-            let mut scrubbed = cfg.clone();
-            scrubbed.session_token = None;
-            let _ = scrubbed.save(path);
-        }
-    }
-    Ok(cfg)
-}
-
-fn save_desktop_daemon_config(cfg: &DaemonConfig, path: &Path) -> anyhow::Result<()> {
-    let external_owns = active_daemon_lock_pid(path)
-        .map(|pid| pid != std::process::id())
-        .unwrap_or(false);
-    if let Some(ref tok) = cfg.session_token {
-        let stored_in_keychain = save_secret_in_keychain("session_token", tok);
-        if stored_in_keychain && !external_owns {
-            let mut scrubbed = cfg.clone();
-            scrubbed.session_token = None;
-            return scrubbed.save(path);
-        }
-    }
-    cfg.save(path)
 }
 
 /// Primary or Secondary split terminal pane.
@@ -320,6 +289,8 @@ pub struct CodaDesktopState {
     pub auth_form_expanded: bool,
     pub account_email: String,
     pub allow_remote_control: bool,
+    pub desktop_notifications: bool,
+    pub notify_tracker: DesktopNotificationTracker,
     pub embedded_host_active: bool,
     pub external_daemon_running: bool,
     pub local_host_device_id: Option<Uuid>,
@@ -378,6 +349,8 @@ impl Default for CodaDesktopState {
             auth_form_expanded: false,
             account_email: String::new(),
             allow_remote_control: true,
+            desktop_notifications: true,
+            notify_tracker: DesktopNotificationTracker::default(),
             embedded_host_active: false,
             external_daemon_running: false,
             local_host_device_id: None,
@@ -414,6 +387,29 @@ impl CodaDesktopState {
 
     pub fn session_by_id(&self, id: &str) -> Option<&TerminalSessionEntry> {
         self.sessions.iter().find(|s| s.id == id)
+    }
+
+    pub fn record_session_osc_status(&mut self, session_id: &str, osc: Osc7501Status) {
+        let title = if let Some(sess) = self.sessions.iter_mut().find(|s| s.id == session_id) {
+            sess.osc_status = Some(osc.clone());
+            sess.title.clone()
+        } else {
+            return;
+        };
+        if !self.desktop_notifications {
+            return;
+        }
+        let active_id = self.focused_session_id().map(str::to_string);
+        if let Some(payload) = self.notify_tracker.observe(
+            session_id,
+            &title,
+            &osc,
+            active_id.as_deref(),
+            self.locale,
+            Instant::now(),
+        ) {
+            dispatch_native_notification(payload);
+        }
     }
 
     pub fn palette_items(&self) -> Vec<PaletteItem> {
@@ -586,13 +582,6 @@ impl Focusable for CodaGpuWorkspaceView {
     }
 }
 
-fn utf16_slice(s: &str, range_utf16: std::ops::Range<usize>) -> String {
-    let utf16: Vec<u16> = s.encode_utf16().collect();
-    let start = range_utf16.start.min(utf16.len());
-    let end = range_utf16.end.min(utf16.len()).max(start);
-    String::from_utf16_lossy(&utf16[start..end])
-}
-
 impl EntityInputHandler for CodaGpuWorkspaceView {
     fn text_for_range(
         &mut self,
@@ -702,6 +691,7 @@ impl CodaGpuWorkspaceView {
         init_state.locale = prefs.locale;
         init_state.server_url = prefs.server_url.clone();
         init_state.allow_remote_control = prefs.allow_remote_control;
+        init_state.desktop_notifications = prefs.desktop_notifications;
         init_state.layout = layout_cfg;
         init_state.layout_mtime = layout_mtime;
         init_state.hc_path = discover_hc_binary();
@@ -1857,6 +1847,7 @@ impl CodaGpuWorkspaceView {
         let Ok(mut g) = self.state.lock() else {
             return;
         };
+        let mut osc_updates: Vec<(String, Osc7501Status)> = Vec::new();
         for sess in &mut g.sessions {
             if let Some(snap) = snaps.get(&sess.id) {
                 let prev = synced.get(&sess.id).copied();
@@ -1887,9 +1878,12 @@ impl CodaGpuWorkspaceView {
                 sess.alive = snap.alive;
                 sess.attached_hc = snap.attached_hc;
                 if let Some(ref osc) = snap.osc_status {
-                    sess.osc_status = Some(osc.clone());
+                    osc_updates.push((sess.id.clone(), osc.clone()));
                 }
             }
+        }
+        for (sid, osc) in osc_updates {
+            g.record_session_osc_status(&sid, osc);
         }
     }
 
@@ -4470,6 +4464,27 @@ impl CodaGpuWorkspaceView {
             .unwrap_or("main")
             .to_string();
         let osc_badge = sess.osc_status.as_ref().and_then(|o| o.task.clone());
+        let needs_you_active = sess
+            .osc_status
+            .as_ref()
+            .map(|o| o.state == AgentLifecycleState::NeedsYou)
+            .unwrap_or(false);
+        let needs_you_msg = sess
+            .osc_status
+            .as_ref()
+            .and_then(|o| o.task.clone())
+            .filter(|t| !t.trim().is_empty())
+            .unwrap_or_else(|| {
+                tr(
+                    loc,
+                    "Agent is waiting for your approval",
+                    "AI Agent 正在等待你的交互确认",
+                )
+                .to_string()
+            });
+        let sid_approve_yes = sess.id.clone();
+        let sid_approve_always = sess.id.clone();
+        let sid_approve_deny = sess.id.clone();
 
         let total_lines = sess.styled_lines.len();
         let max_off = total_lines.saturating_sub(measured_rows);
@@ -4740,6 +4755,127 @@ impl CodaGpuWorkspaceView {
                         ),
                     ),
             )
+            .when(needs_you_active, |el| {
+                el.child(
+                    // OSC 7501 Needs-You one-tap approval bar (matches Web / Apple / Prototype)
+                    div()
+                        .flex_shrink_0()
+                        .px(px(12.0))
+                        .py(px(6.0))
+                        .bg(rgba(0xf59e0b1c))
+                        .border_t_1()
+                        .border_color(rgba(0xf59e0b66))
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(10.0))
+                        .child(
+                            div()
+                                .min_w_0()
+                                .flex_1()
+                                .flex()
+                                .items_center()
+                                .gap(px(8.0))
+                                .child(
+                                    div()
+                                        .w(px(7.0))
+                                        .h(px(7.0))
+                                        .rounded(px(99.0))
+                                        .bg(rgb(palette::NEEDS_YOU_AMBER)),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(11.5))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(rgb(palette::TEXT_PRIMARY))
+                                        .truncate()
+                                        .child(needs_you_msg.clone()),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .flex()
+                                .items_center()
+                                .gap(px(6.0))
+                                .child(
+                                    div()
+                                        .id(SharedString::from(format!(
+                                            "approve-yes-{pane_slot:?}"
+                                        )))
+                                        .occlude()
+                                        .px(px(9.0))
+                                        .py(px(3.0))
+                                        .rounded(px(5.0))
+                                        .bg(rgb(palette::NEEDS_YOU_AMBER))
+                                        .text_size(px(11.0))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(rgb(0x09090b))
+                                        .cursor_pointer()
+                                        .child(tr(loc, "1 · Yes", "1 · 允许一次"))
+                                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                            cx.stop_propagation();
+                                        })
+                                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                            cx.stop_propagation();
+                                            this.send_bytes_to_session(&sid_approve_yes, b"1\r");
+                                            cx.notify();
+                                        })),
+                                )
+                                .child(
+                                    div()
+                                        .id(SharedString::from(format!(
+                                            "approve-always-{pane_slot:?}"
+                                        )))
+                                        .occlude()
+                                        .px(px(9.0))
+                                        .py(px(3.0))
+                                        .rounded(px(5.0))
+                                        .bg(rgba(0xf59e0b2e))
+                                        .border_1()
+                                        .border_color(rgba(0xf59e0b66))
+                                        .text_size(px(11.0))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(rgb(palette::TEXT_PRIMARY))
+                                        .cursor_pointer()
+                                        .child(tr(loc, "2 · Always", "2 · 始终允许"))
+                                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                            cx.stop_propagation();
+                                        })
+                                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                            cx.stop_propagation();
+                                            this.send_bytes_to_session(&sid_approve_always, b"2\r");
+                                            cx.notify();
+                                        })),
+                                )
+                                .child(
+                                    div()
+                                        .id(SharedString::from(format!(
+                                            "approve-deny-{pane_slot:?}"
+                                        )))
+                                        .occlude()
+                                        .px(px(8.0))
+                                        .py(px(3.0))
+                                        .rounded(px(5.0))
+                                        .border_1()
+                                        .border_color(rgb(palette::BORDER_STRONG))
+                                        .hover(|h| h.bg(rgb(palette::HOVER_BG)))
+                                        .text_size(px(11.0))
+                                        .text_color(rgb(palette::TEXT_MUTED))
+                                        .cursor_pointer()
+                                        .child(tr(loc, "Esc · Deny", "Esc · 拒绝"))
+                                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                            cx.stop_propagation();
+                                        })
+                                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                            cx.stop_propagation();
+                                            this.send_bytes_to_session(&sid_approve_deny, b"\x1b");
+                                            cx.notify();
+                                        })),
+                                ),
+                        ),
+                )
+            })
             .child(
                 // Minimal terminal status footer strip (26px)
                 div()
@@ -4819,7 +4955,10 @@ impl CodaGpuWorkspaceView {
                                         .cursor_pointer()
                                         .text_size(px(10.5))
                                         .text_color(rgb(accent))
-                                        .child(format!("↑ -{eff_off} lines"))
+                                        .child(format!(
+                                            "↓ {} (-{eff_off})",
+                                            tr(loc, "Latest", "回到最新")
+                                        ))
                                         .on_mouse_down(MouseButton::Left, |_, _, cx| {
                                             cx.stop_propagation();
                                         })
@@ -7490,6 +7629,55 @@ impl CodaGpuWorkspaceView {
                                             this.mesh_hub.set_allow_remote_control(!host_mode_on);
                                             cx.notify();
                                         }),
+                                    ))
+                                    .child({
+                                        let notify_on = st.desktop_notifications;
+                                        self.render_setting_pill(
+                                            "settings-toggle-desktop-notify",
+                                            if notify_on {
+                                                tr(loc, "Alerts: ON", "通知: 开")
+                                            } else {
+                                                tr(loc, "Alerts: OFF", "通知: 关")
+                                            },
+                                            notify_on,
+                                            accent,
+                                            cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                                let next = !notify_on;
+                                                if let Ok(mut g) = this.state.lock() {
+                                                    g.desktop_notifications = next;
+                                                    g.status_notice = Some(
+                                                        if next {
+                                                            tr(
+                                                                g.locale,
+                                                                "Native macOS OSC 7501 alerts enabled",
+                                                                "已开启 macOS 原生 OSC 7501 系统通知",
+                                                            )
+                                                        } else {
+                                                            tr(
+                                                                g.locale,
+                                                                "Native macOS OSC 7501 alerts muted",
+                                                                "已关闭 macOS 原生系统通知",
+                                                            )
+                                                        }
+                                                        .to_string(),
+                                                    );
+                                                }
+                                                CodaGpuWorkspaceView::update_prefs_async(move |p| {
+                                                    p.desktop_notifications = next;
+                                                });
+                                                cx.notify();
+                                            }),
+                                        )
+                                    })
+                                    .child(self.render_setting_pill(
+                                        "settings-probe-lan-now",
+                                        tr(loc, "Probe LAN", "探测直连"),
+                                        false,
+                                        accent,
+                                        cx.listener(|this, _: &ClickEvent, _, cx| {
+                                            this.mesh_hub.probe_all_relay_peers_now();
+                                            cx.notify();
+                                        }),
                                     )),
                             ),
                     )
@@ -7989,18 +8177,6 @@ fn render_styled_terminal_line(
 // Background Workers (`herdr-core` persistent sessions & `coda-daemon` Mesh)
 // ============================================================================
 
-fn herdr_status_to_osc(status: &Option<coda_protocol::HerdrAgentStatus>) -> Option<Osc7501Status> {
-    status.as_ref().map(|s| Osc7501Status {
-        state: AgentLifecycleState::from_str_lossy(&s.state),
-        task: s
-            .title
-            .clone()
-            .or_else(|| s.msg.clone())
-            .or_else(|| s.app.clone()),
-        updated_at: Instant::now(),
-    })
-}
-
 fn spawn_local_fallback_shell(
     state_bg: &Arc<Mutex<CodaDesktopState>>,
     pty_mgr: &Arc<Mutex<LocalPtyManager>>,
@@ -8132,7 +8308,7 @@ async fn reconcile_local_herdr_sessions(
                 if let Some(existing) = g.sessions.iter_mut().find(|s| s.id == id) {
                     existing.alive = term.alive;
                     if let Some(o) = osc {
-                        existing.osc_status = Some(o);
+                        g.record_session_osc_status(&id, o);
                     }
                 } else {
                     let matched_space_id = g
@@ -8293,8 +8469,8 @@ fn spawn_herdr_discovery(
                                     .ok()
                                 }) {
                                     if let Ok(mut g) = state_bg.lock() {
-                                        if let Some(s) = g.sessions.iter_mut().find(|s| s.id == sid) {
-                                            s.osc_status = herdr_status_to_osc(&Some(raw_st));
+                                        if let Some(osc) = herdr_status_to_osc(&Some(raw_st)) {
+                                            g.record_session_osc_status(&sid, osc);
                                         }
                                     }
                                     ui_dirty.store(true, Ordering::Release);
@@ -8307,1782 +8483,6 @@ fn spawn_herdr_discovery(
                     }
                 }
                 tokio::time::sleep(Duration::from_secs(2)).await;
-            }
-        });
-    });
-}
-
-static EMBEDDED_HOST_STARTED: AtomicBool = AtomicBool::new(false);
-
-fn normalize_newlines_for_vt(text: &str) -> Vec<u8> {
-    let mut out = Vec::with_capacity(text.len() + 32);
-    let bytes = text.as_bytes();
-    for (i, &b) in bytes.iter().enumerate() {
-        if b == b'\n' && (i == 0 || bytes[i - 1] != b'\r') {
-            out.push(b'\r');
-        }
-        out.push(b);
-    }
-    out
-}
-
-fn path_within_root(path: &str, root: &str) -> bool {
-    let p = path.trim_end_matches('/');
-    let r = root.trim_end_matches('/');
-    !p.is_empty()
-        && !r.is_empty()
-        && (p == r || (p.len() > r.len() && p.starts_with(r) && p.as_bytes()[r.len()] == b'/'))
-}
-
-fn parse_git_status_short(status_short: &str) -> Vec<ChangedFileEntry> {
-    status_short
-        .lines()
-        .filter_map(|l| {
-            let status = l.get(..2)?.trim().to_string();
-            let path = l.get(3..)?.trim().to_string();
-            (!path.is_empty()).then_some(ChangedFileEntry { status, path })
-        })
-        .collect()
-}
-
-pub struct RemoteMeshHub {
-    rt: Option<tokio::runtime::Runtime>,
-    state: Arc<Mutex<CodaDesktopState>>,
-    pty_mgr: Arc<Mutex<LocalPtyManager>>,
-    ui_dirty: Arc<AtomicBool>,
-    peers: tokio::sync::Mutex<HashMap<Uuid, Arc<LivePeerSession>>>,
-    client_identities: tokio::sync::Mutex<HashMap<Uuid, (Uuid, coda_protocol::StoredDeviceIdentity)>>,
-    attached_terms: tokio::sync::Mutex<HashSet<(Uuid, String)>>,
-    embedded_host_handle: tokio::sync::Mutex<Option<EmbeddedHostHandle>>,
-    peer_connect_locks: tokio::sync::Mutex<HashMap<Uuid, Arc<tokio::sync::Mutex<()>>>>,
-    watcher_gen: AtomicU64,
-}
-
-impl Drop for RemoteMeshHub {
-    fn drop(&mut self) {
-        if let Some(rt) = self.rt.take() {
-            rt.shutdown_background();
-        }
-    }
-}
-
-impl RemoteMeshHub {
-    pub fn new(
-        state: Arc<Mutex<CodaDesktopState>>,
-        pty_mgr: Arc<Mutex<LocalPtyManager>>,
-        ui_dirty: Arc<AtomicBool>,
-    ) -> Arc<Self> {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .worker_threads(2)
-            .build()
-            .expect("failed to start Coda mesh tokio runtime");
-        Arc::new(Self {
-            rt: Some(rt),
-            state,
-            pty_mgr,
-            ui_dirty,
-            peers: tokio::sync::Mutex::new(HashMap::new()),
-            client_identities: tokio::sync::Mutex::new(HashMap::new()),
-            attached_terms: tokio::sync::Mutex::new(HashSet::new()),
-            embedded_host_handle: tokio::sync::Mutex::new(None),
-            peer_connect_locks: tokio::sync::Mutex::new(HashMap::new()),
-            watcher_gen: AtomicU64::new(0),
-        })
-    }
-
-    fn spawn_bg<F>(&self, fut: F)
-    where
-        F: std::future::Future<Output = ()> + Send + 'static,
-    {
-        if let Some(ref rt) = self.rt {
-            rt.spawn(fut);
-        }
-    }
-
-    pub fn ensure_embedded_host(self: &Arc<Self>) {
-        let cfg_path = DaemonConfig::default_path();
-        let Ok(cfg) = load_desktop_daemon_config(&cfg_path) else {
-            return;
-        };
-        let allow_remote = self
-            .state
-            .lock()
-            .map(|mut g| {
-                g.local_host_device_id = Some(cfg.device_id);
-                g.allow_remote_control
-            })
-            .unwrap_or(true);
-        let ext_pid = active_daemon_lock_pid(&cfg_path);
-        let external_running = ext_pid.map(|p| p != std::process::id()).unwrap_or(false);
-        if let Ok(mut g) = self.state.lock() {
-            g.external_daemon_running = external_running;
-        }
-        if !allow_remote || external_running {
-            self.ui_dirty.store(true, Ordering::Release);
-            return;
-        }
-        if EMBEDDED_HOST_STARTED
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return;
-        }
-        let hub = Arc::clone(self);
-        self.spawn_bg(async move {
-            if let Some(handle) = start_embedded_host_with_handle(&cfg_path).await {
-                if !EMBEDDED_HOST_STARTED.load(Ordering::Acquire) {
-                    handle.stop();
-                    return;
-                }
-                *hub.embedded_host_handle.lock().await = Some(handle);
-                if let Ok(mut g) = hub.state.lock() {
-                    g.embedded_host_active = true;
-                    g.external_daemon_running = false;
-                }
-                hub.ui_dirty.store(true, Ordering::Release);
-            } else {
-                EMBEDDED_HOST_STARTED.store(false, Ordering::Release);
-                if let Ok(mut g) = hub.state.lock() {
-                    g.embedded_host_active = false;
-                    g.external_daemon_running = active_daemon_lock_pid(&cfg_path)
-                        .map(|p| p != std::process::id())
-                        .unwrap_or(false);
-                }
-                hub.ui_dirty.store(true, Ordering::Release);
-            }
-        });
-    }
-
-    pub fn set_allow_remote_control(self: &Arc<Self>, enabled: bool) {
-        if let Ok(mut g) = self.state.lock() {
-            g.allow_remote_control = enabled;
-            let notice = if enabled {
-                tr(
-                    g.locale,
-                    "Remote control enabled for this Mac",
-                    "已允许其他设备远端控制本机",
-                )
-            } else if g.external_daemon_running {
-                tr(
-                    g.locale,
-                    "Embedded host off (standalone coda-daemon is still running)",
-                    "已关闭内嵌被控（独立 coda-daemon 仍在后台运行）",
-                )
-            } else {
-                tr(
-                    g.locale,
-                    "Remote control disabled (controller-only mode)",
-                    "已关闭本机远端被控（仅控制端模式）",
-                )
-            };
-            g.status_notice = Some(notice.to_string());
-        }
-        CodaGpuWorkspaceView::update_prefs_async(move |p| {
-            p.allow_remote_control = enabled;
-        });
-        if enabled {
-            self.ensure_embedded_host();
-        } else {
-            EMBEDDED_HOST_STARTED.store(false, Ordering::Release);
-            let hub = Arc::clone(self);
-            self.spawn_bg(async move {
-                if let Some(handle) = hub.embedded_host_handle.lock().await.take() {
-                    handle.stop();
-                }
-                if let Ok(mut g) = hub.state.lock() {
-                    g.embedded_host_active = false;
-                }
-                hub.ui_dirty.store(true, Ordering::Release);
-            });
-        }
-        self.ui_dirty.store(true, Ordering::Release);
-    }
-
-    pub fn rename_remote_device(self: &Arc<Self>, device_id: Uuid, new_name: String) {
-        let hub = Arc::clone(self);
-        self.spawn_bg(async move {
-            let Ok(cfg) = load_desktop_daemon_config(&DaemonConfig::default_path()) else {
-                return;
-            };
-            let Some(ref tok) = cfg.session_token else {
-                return;
-            };
-            match rename_account_device(&cfg.server_url, tok, device_id, &new_name).await {
-                Ok(()) => {
-                    let host_str = device_id.to_string();
-                    if let Ok(mut g) = hub.state.lock() {
-                        for h in &mut g.remote_hosts {
-                            if h.id == device_id {
-                                h.name = new_name.clone();
-                            }
-                        }
-                        for sp in &mut g.spaces {
-                            if sp.machine_id == host_str {
-                                sp.machine_label = new_name.clone();
-                                if sp.id == format!("remote:{device_id}") {
-                                    sp.name = new_name.clone();
-                                }
-                            }
-                        }
-                        g.status_notice = Some(format!(
-                            "{}: {new_name}",
-                            tr(g.locale, "Renamed machine", "主机已重命名")
-                        ));
-                    }
-                }
-                Err(err) => {
-                    if let Ok(mut g) = hub.state.lock() {
-                        g.status_notice = Some(format!("Rename device failed: {err}"));
-                    }
-                }
-            }
-            hub.ui_dirty.store(true, Ordering::Release);
-        });
-    }
-
-    pub fn change_password(self: &Arc<Self>, current_password: String, new_password: String) {
-        let hub = Arc::clone(self);
-        self.spawn_bg(async move {
-            let cfg_path = DaemonConfig::default_path();
-            let Ok(mut cfg) = load_desktop_daemon_config(&cfg_path) else {
-                return;
-            };
-            let Some(ref tok) = cfg.session_token else {
-                return;
-            };
-            match change_account_password(&cfg.server_url, tok, &current_password, &new_password)
-                .await
-            {
-                Ok(rotated_tok) => {
-                    if let Some(new_tok) = rotated_tok {
-                        cfg.session_token = Some(new_tok);
-                        let _ = save_desktop_daemon_config(&cfg, &cfg_path);
-                    }
-                    if let Ok(mut g) = hub.state.lock() {
-                        g.pw_change_expanded = false;
-                        g.auth_error = None;
-                        g.status_notice = Some(
-                            tr(g.locale, "Password updated", "密码已更新").to_string(),
-                        );
-                    }
-                }
-                Err(err) => {
-                    if let Ok(mut g) = hub.state.lock() {
-                        let msg = format!("{err}");
-                        g.auth_error = Some(msg.clone());
-                        g.status_notice = Some(msg);
-                    }
-                }
-            }
-            hub.ui_dirty.store(true, Ordering::Release);
-        });
-    }
-
-    pub fn delete_remote_device(self: &Arc<Self>, device_id: Uuid) {
-        let hub = Arc::clone(self);
-        self.spawn_bg(async move {
-            let Ok(cfg) = load_desktop_daemon_config(&DaemonConfig::default_path()) else {
-                return;
-            };
-            let Some(ref tok) = cfg.session_token else {
-                return;
-            };
-            match delete_account_device(&cfg.server_url, tok, device_id).await {
-                Ok(()) => {
-                    hub.drop_peer(device_id).await;
-                    let host_str = device_id.to_string();
-                    let mut removed_sids = Vec::new();
-                    if let Ok(mut g) = hub.state.lock() {
-                        g.remote_hosts.retain(|h| h.id != device_id);
-                        g.spaces.retain(|sp| sp.machine_id != host_str);
-                        for s in &g.sessions {
-                            if s.remote_host_id.as_deref() == Some(host_str.as_str()) {
-                                removed_sids.push(s.id.clone());
-                            }
-                        }
-                        g.sessions
-                            .retain(|s| s.remote_host_id.as_deref() != Some(host_str.as_str()));
-                        if g.active_space().is_none() {
-                            g.active_space_id = g.spaces.first().map(|sp| sp.id.clone());
-                        }
-                        if let Some(ref aid) = g.active_session_id {
-                            if !g.sessions.iter().any(|s| s.id == *aid) {
-                                g.active_session_id = g.sessions.first().map(|s| s.id.clone());
-                            }
-                        }
-                        g.status_notice = Some(
-                            tr(g.locale, "Removed remote machine", "已移除远端主机").to_string(),
-                        );
-                    }
-                    if let Ok(mut mgr) = hub.pty_mgr.lock() {
-                        for sid in removed_sids {
-                            mgr.remove_remote_buffer(&sid);
-                        }
-                    }
-                }
-                Err(err) => {
-                    if let Ok(mut g) = hub.state.lock() {
-                        g.status_notice = Some(format!("Remove device failed: {err}"));
-                    }
-                }
-            }
-            hub.ui_dirty.store(true, Ordering::Release);
-        });
-    }
-
-    pub fn sign_out(self: &Arc<Self>) {
-        self.watcher_gen.fetch_add(1, Ordering::AcqRel);
-        EMBEDDED_HOST_STARTED.store(false, Ordering::Release);
-
-        let cfg_path = DaemonConfig::default_path();
-        let prev_cfg = load_desktop_daemon_config(&cfg_path).ok();
-        let external_daemon_owns_cfg = active_daemon_lock_pid(&cfg_path)
-            .map(|pid| pid != std::process::id())
-            .unwrap_or(false);
-        if !external_daemon_owns_cfg {
-            let _ = std::fs::remove_file(&cfg_path);
-        }
-        delete_secret_from_keychain("session_token");
-        DesktopClientIdentityRecord::remove_saved();
-
-        let mut removed_remote_sids = Vec::new();
-        if let Ok(mut g) = self.state.lock() {
-            for s in &g.sessions {
-                if s.remote_host_id.is_some() {
-                    removed_remote_sids.push(s.id.clone());
-                }
-            }
-            g.is_logged_in = false;
-            g.auth_form_expanded = false;
-            g.auth_loading = false;
-            g.auth_error = None;
-            g.embedded_host_active = false;
-            g.external_daemon_running = external_daemon_owns_cfg;
-            g.account_email.clear();
-            g.auth_account_input.clear();
-            g.auth_password_input.clear();
-            g.device_login_code = None;
-            g.device_login_uri = None;
-            g.remote_hosts.clear();
-            g.remote_probe_status = None;
-            g.spaces.retain(|sp| !sp.is_remote);
-            g.sessions.retain(|s| s.remote_host_id.is_none());
-            if g.active_space().is_none() {
-                g.active_space_id = g.spaces.first().map(|sp| sp.id.clone());
-            }
-            if let Some(ref aid) = g.active_session_id {
-                if !g.sessions.iter().any(|s| s.id == *aid) {
-                    g.active_session_id = g.sessions.first().map(|s| s.id.clone());
-                }
-            }
-            if let Some(ref sid) = g.split_session_id {
-                if !g.sessions.iter().any(|s| s.id == *sid) {
-                    g.split_session_id = None;
-                }
-            }
-            g.input_target = ActiveInputTarget::TerminalDirect;
-            g.status_notice = Some(
-                if external_daemon_owns_cfg {
-                    tr(
-                        g.locale,
-                        "Signed out (kept standalone coda-daemon config)",
-                        "已退出登录（保留独立 coda-daemon 后台配置）",
-                    )
-                } else {
-                    tr(g.locale, "Signed out", "已退出登录")
-                }
-                .to_string(),
-            );
-        }
-        if let Ok(mut mgr) = self.pty_mgr.lock() {
-            for sid in removed_remote_sids {
-                mgr.remove_remote_buffer(&sid);
-            }
-        }
-        self.ui_dirty.store(true, Ordering::Release);
-
-        let hub = Arc::clone(self);
-        self.spawn_bg(async move {
-            if let Some(handle) = hub.embedded_host_handle.lock().await.take() {
-                handle.stop();
-            }
-            let peers_to_close: Vec<Arc<LivePeerSession>> =
-                hub.peers.lock().await.drain().map(|(_, p)| p).collect();
-            for peer in peers_to_close {
-                peer.close();
-            }
-            hub.attached_terms.lock().await.clear();
-            hub.client_identities.lock().await.clear();
-            hub.peer_connect_locks.lock().await.clear();
-            if !external_daemon_owns_cfg {
-                if let Some(cfg) = prev_cfg {
-                    if let Some(ref tok) = cfg.session_token {
-                        let _ = coda_daemon::logout_account_session(&cfg.server_url, tok).await;
-                    }
-                }
-            }
-        });
-    }
-
-    pub fn start_account_sync(self: &Arc<Self>) {
-        let my_gen = self.watcher_gen.fetch_add(1, Ordering::AcqRel) + 1;
-        let hub = Arc::clone(self);
-        self.spawn_bg(async move {
-            hub.sync_all_hosts_and_sessions().await;
-
-            loop {
-                if hub.watcher_gen.load(Ordering::Acquire) != my_gen {
-                    break;
-                }
-                let Ok(cfg) = load_desktop_daemon_config(&DaemonConfig::default_path()) else {
-                    break;
-                };
-                let Some(ref tok) = cfg.session_token else {
-                    break;
-                };
-
-                match subscribe_account_events_ws(&cfg.server_url, tok).await {
-                    Ok(mut rx) => {
-                        while let Some(ev) = rx.recv().await {
-                            if hub.watcher_gen.load(Ordering::Acquire) != my_gen {
-                                return;
-                            }
-                            if ev.role.as_deref() == Some("client") {
-                                continue;
-                            }
-                            if matches!(
-                                ev.kind.as_str(),
-                                "connected" | "devices_changed" | "peer_presence"
-                            ) {
-                                hub.sync_all_hosts_and_sessions().await;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::debug!("account /api/v1/events/ws reconnect scheduled: {e}");
-                    }
-                }
-                tokio::time::sleep(Duration::from_secs(2)).await;
-            }
-        });
-    }
-
-    async fn sync_all_hosts_and_sessions(self: &Arc<Self>) {
-        let Ok(cfg) = load_desktop_daemon_config(&DaemonConfig::default_path()) else {
-            return;
-        };
-        let Some(ref tok) = cfg.session_token else {
-            return;
-        };
-        let Ok(list) = list_account_hosts(&cfg.server_url, tok).await else {
-            return;
-        };
-        let local_host_id = self
-            .state
-            .lock()
-            .ok()
-            .and_then(|g| g.local_host_device_id);
-        let hosts: Vec<RemoteHostSummary> = list
-            .into_iter()
-            .filter(|h| h.id != cfg.device_id && Some(h.id) != local_host_id)
-            .collect();
-
-        {
-            let Ok(mut g) = self.state.lock() else {
-                return;
-            };
-            let online_map: HashMap<String, bool> =
-                hosts.iter().map(|h| (h.id.to_string(), h.is_online)).collect();
-            for sp in &mut g.spaces {
-                if sp.is_remote {
-                    match online_map.get(&sp.machine_id) {
-                        Some(true) => {
-                            if sp.branch == "offline" {
-                                sp.branch = "online".to_string();
-                            }
-                        }
-                        _ => sp.branch = "offline".to_string(),
-                    }
-                }
-            }
-            for host in &hosts {
-                let sid = format!("remote:{}", host.id);
-                if !g.spaces.iter().any(|s| s.machine_id == host.id.to_string()) {
-                    g.spaces.push(SpaceEntry {
-                        id: sid,
-                        avatar_color: space_avatar_color(&host.name),
-                        name: host.name.clone(),
-                        path: ".".to_string(),
-                        machine_id: host.id.to_string(),
-                        machine_label: host.name.clone(),
-                        is_remote: true,
-                        branch: if host.is_online { "online" } else { "offline" }.to_string(),
-                        dirty_files: 0,
-                        ahead: 0,
-                        behind: 0,
-                    });
-                }
-            }
-            g.remote_hosts = hosts.clone();
-        }
-        self.ui_dirty.store(true, Ordering::Release);
-
-        for host in &hosts {
-            if !host.is_online {
-                self.drop_peer(host.id).await;
-                continue;
-            }
-            self.sync_single_remote_host(&cfg, host).await;
-        }
-    }
-
-    async fn drop_peer(self: &Arc<Self>, host_id: Uuid) {
-        if let Some(peer) = self.peers.lock().await.remove(&host_id) {
-            peer.close();
-        }
-        {
-            let mut att = self.attached_terms.lock().await;
-            att.retain(|(id, _)| *id != host_id);
-        }
-        let host_str = host_id.to_string();
-        let affected: Vec<String> = self
-            .state
-            .lock()
-            .map(|mut g| {
-                let mut ids = Vec::new();
-                for s in &mut g.sessions {
-                    if s.remote_host_id.as_deref() == Some(host_str.as_str()) {
-                        s.alive = false;
-                        ids.push(s.id.clone());
-                    }
-                }
-                ids
-            })
-            .unwrap_or_default();
-        if let Ok(mgr) = self.pty_mgr.lock() {
-            for sid in affected {
-                mgr.set_remote_alive(&sid, false);
-            }
-        }
-        self.ui_dirty.store(true, Ordering::Release);
-    }
-
-    async fn get_or_connect_peer(
-        self: &Arc<Self>,
-        cfg: &DaemonConfig,
-        host: &RemoteHostSummary,
-    ) -> anyhow::Result<Arc<LivePeerSession>> {
-        if let Some(existing) = self.peers.lock().await.get(&host.id).cloned() {
-            return Ok(existing);
-        }
-        let connect_lock = {
-            let mut locks = self.peer_connect_locks.lock().await;
-            Arc::clone(
-                locks
-                    .entry(host.id)
-                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
-            )
-        };
-        let _connect_guard = connect_lock.lock().await;
-        if let Some(existing) = self.peers.lock().await.get(&host.id).cloned() {
-            return Ok(existing);
-        }
-
-        let (mut client_dev_id, mut client_identity, loaded_from_disk) = {
-            if let Some(existing) = self.client_identities.lock().await.get(&Uuid::nil()).cloned() {
-                (existing.0, existing.1, true)
-            } else if let Some(tok) = cfg.session_token.as_deref() {
-                if let Some((saved_id, saved_ident)) =
-                    DesktopClientIdentityRecord::load_matching(&cfg.server_url, tok)
-                {
-                    self.client_identities
-                        .lock()
-                        .await
-                        .insert(Uuid::nil(), (saved_id, saved_ident.clone()));
-                    (saved_id, saved_ident, true)
-                } else if let Ok(created) = coda_daemon::register_client_identity(
-                    &cfg.server_url,
-                    tok,
-                    "desktop-client",
-                    "macos",
-                )
-                .await
-                {
-                    let _ = DesktopClientIdentityRecord::save_for_token(
-                        &cfg.server_url,
-                        tok,
-                        created.0,
-                        &created.1,
-                    );
-                    self.client_identities
-                        .lock()
-                        .await
-                        .insert(Uuid::nil(), created.clone());
-                    (created.0, created.1, false)
-                } else {
-                    (cfg.device_id, cfg.identity.clone(), false)
-                }
-            } else {
-                (cfg.device_id, cfg.identity.clone(), false)
-            }
-        };
-
-        let relay_cfg = match cfg.session_token.as_deref() {
-            Some(tok) => {
-                let first_try = mint_peer_relay_config(
-                    &cfg.server_url,
-                    tok,
-                    client_dev_id,
-                    host.id,
-                    &host.ed25519_pubkey,
-                    &host.x25519_pubkey,
-                )
-                .await;
-                if let Ok(rc) = first_try {
-                    Some(rc)
-                } else if loaded_from_disk {
-                    if let Ok(fresh) = coda_daemon::register_client_identity(
-                        &cfg.server_url,
-                        tok,
-                        "desktop-client",
-                        "macos",
-                    )
-                    .await
-                    {
-                        client_dev_id = fresh.0;
-                        client_identity = fresh.1.clone();
-                        let _ = DesktopClientIdentityRecord::save_for_token(
-                            &cfg.server_url,
-                            tok,
-                            client_dev_id,
-                            &client_identity,
-                        );
-                        self.client_identities
-                            .lock()
-                            .await
-                            .insert(Uuid::nil(), (client_dev_id, client_identity.clone()));
-                        mint_peer_relay_config(
-                            &cfg.server_url,
-                            tok,
-                            client_dev_id,
-                            host.id,
-                            &host.ed25519_pubkey,
-                            &host.x25519_pubkey,
-                        )
-                        .await
-                        .ok()
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            }
-            None => None,
-        };
-        let session = LivePeerSession::connect_auto(
-            client_identity,
-            client_dev_id,
-            host.id,
-            host.identity_pin(),
-            host.endpoints.clone(),
-            Some("255.255.255.255:24444".parse().unwrap()),
-            relay_cfg,
-        )
-        .await?;
-        let arc_sess = Arc::new(session);
-        let mut rx = arc_sess.subscribe_events();
-        {
-            self.peers.lock().await.insert(host.id, Arc::clone(&arc_sess));
-        }
-
-        let hub = Arc::clone(self);
-        let host_id = host.id;
-        let host_clone = host.clone();
-        let peer_for_task = Arc::clone(&arc_sess);
-        let sync_notify = Arc::new(tokio::sync::Notify::new());
-        let sync_stop = Arc::new(AtomicBool::new(false));
-        {
-            // Decouple `HerdrLiveEvent` full-list RPC sync into a coalesced background task so
-            // high-frequency PTY output chunks are never blocked waiting on RPC round-trips.
-            let hub_sync = Arc::clone(self);
-            let peer_sync = Arc::clone(&arc_sess);
-            let host_sync = host.clone();
-            let notify_rx = Arc::clone(&sync_notify);
-            let stop_flag = Arc::clone(&sync_stop);
-            self.spawn_bg(async move {
-                loop {
-                    notify_rx.notified().await;
-                    if stop_flag.load(Ordering::Acquire) {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(250)).await;
-                    if stop_flag.load(Ordering::Acquire) {
-                        break;
-                    }
-                    hub_sync
-                        .sync_with_connected_peer(Arc::clone(&peer_sync), &host_sync)
-                        .await;
-                }
-            });
-        }
-        self.spawn_bg(async move {
-            loop {
-                match rx.recv().await {
-                    Ok(PeerAsyncEvent::PtyOutputChunk {
-                        terminal,
-                        data_b64,
-                        ..
-                    }) => {
-                        if let Ok(bytes) = B64.decode(&data_b64) {
-                            let sid = format!("remote:{host_id}:{terminal}");
-                            let replies = if let Ok(mut mgr) = hub.pty_mgr.lock() {
-                                mgr.ensure_remote_buffer(&sid, 120, 36);
-                                mgr.feed_remote_output(&sid, &bytes);
-                                mgr.drain_remote_replies(&sid)
-                            } else {
-                                Vec::new()
-                            };
-                            for reply in replies {
-                                hub.send_remote_pty_input(host_id, &terminal, reply);
-                            }
-                        }
-                    }
-                    Ok(PeerAsyncEvent::HerdrLiveEvent { terminal, .. }) => {
-                        if let Some(term) = terminal {
-                            let sid = format!("remote:{}:{}", host_id, term.address);
-                            if let Ok(mut g) = hub.state.lock() {
-                                if let Some(sess) = g.sessions.iter_mut().find(|s| s.id == sid) {
-                                    sess.alive = term.alive;
-                                    if let Some(osc) = herdr_status_to_osc(&term.status) {
-                                        sess.osc_status = Some(osc);
-                                    }
-                                }
-                            }
-                            if let Ok(mgr) = hub.pty_mgr.lock() {
-                                mgr.set_remote_alive(&sid, term.alive);
-                            }
-                            hub.ui_dirty.store(true, Ordering::Release);
-                        }
-                        sync_notify.notify_one();
-                    }
-                    Ok(PeerAsyncEvent::Disconnected(_))
-                    | Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        sync_stop.store(true, Ordering::Release);
-                        sync_notify.notify_one();
-                        hub.drop_peer(host_id).await;
-                        break;
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        // Recover from dropped broadcast chunks by fetching a clean screen snapshot.
-                        let hub_resync = Arc::clone(&hub);
-                        let peer_resync = Arc::clone(&peer_for_task);
-                        let host_resync = host_clone.clone();
-                        hub.spawn_bg(async move {
-                            let terms: Vec<String> = hub_resync
-                                .attached_terms
-                                .lock()
-                                .await
-                                .iter()
-                                .filter(|(hid, _)| *hid == host_resync.id)
-                                .map(|(_, t)| t.clone())
-                                .collect();
-                            for term_addr in terms {
-                                let sid = format!("remote:{}:{term_addr}", host_resync.id);
-                                if let Ok(PeerMessage::TerminalScreenSnapshot { text, .. }) =
-                                    peer_resync
-                                        .request(
-                                            PeerMessage::ReadTerminalScreen {
-                                                req_id: format!("lag-{}", Uuid::new_v4().simple()),
-                                                terminal: term_addr.clone(),
-                                                history_lines: 120,
-                                            },
-                                            TrafficLane::BulkP1,
-                                            Duration::from_secs(6),
-                                        )
-                                        .await
-                                {
-                                    if !text.is_empty() {
-                                        let norm = normalize_newlines_for_vt(&text);
-                                        if let Ok(mgr) = hub_resync.pty_mgr.lock() {
-                                            mgr.clear_buffer(&sid);
-                                            mgr.feed_remote_output(&sid, &norm);
-                                        }
-                                    }
-                                }
-                            }
-                        });
-                    }
-                }
-            }
-        });
-
-        Ok(arc_sess)
-    }
-
-    async fn sync_single_remote_host(
-        self: &Arc<Self>,
-        cfg: &DaemonConfig,
-        host: &RemoteHostSummary,
-    ) {
-        let Ok(peer) = self.get_or_connect_peer(cfg, host).await else {
-            return;
-        };
-        self.sync_with_connected_peer(peer, host).await;
-    }
-
-    async fn sync_with_connected_peer(
-        self: &Arc<Self>,
-        peer: Arc<LivePeerSession>,
-        host: &RemoteHostSummary,
-    ) {
-
-        let ws_reply = peer
-            .request(
-                PeerMessage::ListWorkspaces {
-                    req_id: format!("ws-{}", Uuid::new_v4().simple()),
-                    root_dirs: Vec::new(),
-                },
-                TrafficLane::BulkP1,
-                Duration::from_secs(10),
-            )
-            .await;
-        let repos = match ws_reply {
-            Ok(PeerMessage::WorkspacesSnapshot { repos, .. }) => repos,
-            _ => Vec::new(),
-        };
-
-        let terms_reply = peer
-            .request(
-                PeerMessage::ListTerminals {
-                    req_id: format!("lt-{}", Uuid::new_v4().simple()),
-                    include_finished: false,
-                },
-                TrafficLane::ControlP0,
-                Duration::from_secs(10),
-            )
-            .await;
-        let terms = match terms_reply {
-            Ok(PeerMessage::TerminalsSnapshot { terminals, .. }) => terminals,
-            _ => return,
-        };
-
-        let host_id_str = host.id.to_string();
-        let remote_sid_prefix = format!("remote:{}:", host.id);
-        let fallback_space_id = format!("remote:{}", host.id);
-        let fallback_path = terms
-            .iter()
-            .find(|t| !t.cwd.trim().is_empty())
-            .map(|t| t.cwd.clone())
-            .unwrap_or_else(|| ".".to_string());
-
-        let mut closed_snapshot = HashSet::new();
-        let mut active_remote_refresh: Option<(String, String, String)> = None;
-        {
-            if let Ok(mut g) = self.state.lock() {
-                let mut first_repo_id: Option<String> = None;
-                for repo in &repos {
-                    let sp_id = format!("remote:{}:{}", host.id, repo.root_path);
-                    if g.dismissed_spaces.contains(&sp_id) {
-                        continue;
-                    }
-                    if first_repo_id.is_none() {
-                        first_repo_id = Some(sp_id.clone());
-                    }
-                    let primary_branch = repo
-                        .branches
-                        .first()
-                        .map(|b| b.branch.clone())
-                        .filter(|b| !b.is_empty())
-                        .unwrap_or_else(|| "online".to_string());
-                    let dirty_count = repo
-                        .branches
-                        .iter()
-                        .map(|b| (b.diff_added + b.diff_deleted) as usize)
-                        .sum();
-                    if let Some(sp) = g.spaces.iter_mut().find(|s| s.id == sp_id) {
-                        sp.branch = primary_branch;
-                        sp.dirty_files = dirty_count;
-                    } else {
-                        g.spaces.push(SpaceEntry {
-                            id: sp_id,
-                            avatar_color: space_avatar_color(&repo.repo_name),
-                            name: repo.repo_name.clone(),
-                            path: repo.root_path.clone(),
-                            machine_id: host_id_str.clone(),
-                            machine_label: host.name.clone(),
-                            is_remote: true,
-                            branch: primary_branch,
-                            dirty_files: dirty_count,
-                            ahead: 0,
-                            behind: 0,
-                        });
-                    }
-                }
-
-                if let Some(ref primary_repo_id) = first_repo_id {
-                    g.spaces.retain(|s| s.id != fallback_space_id);
-                    if g.active_space_id.as_deref() == Some(fallback_space_id.as_str()) {
-                        g.active_space_id = Some(primary_repo_id.clone());
-                    }
-                    for sess in &mut g.sessions {
-                        if sess.space_id == fallback_space_id {
-                            sess.space_id = primary_repo_id.clone();
-                        }
-                    }
-                } else if repos.is_empty()
-                    && !g.dismissed_spaces.contains(&fallback_space_id)
-                    && !g.spaces.iter().any(|s| s.id == fallback_space_id)
-                {
-                    g.spaces.push(SpaceEntry {
-                        id: fallback_space_id.clone(),
-                        avatar_color: space_avatar_color(&host.name),
-                        name: host.name.clone(),
-                        path: fallback_path.clone(),
-                        machine_id: host_id_str.clone(),
-                        machine_label: host.name.clone(),
-                        is_remote: true,
-                        branch: "online".to_string(),
-                        dirty_files: 0,
-                        ahead: 0,
-                        behind: 0,
-                    });
-                }
-
-                let live_sids: HashSet<String> = terms
-                    .iter()
-                    .map(|t| format!("remote:{}:{}", host.id, t.address))
-                    .collect();
-                g.closed_session_ids
-                    .retain(|cid| !cid.starts_with(&remote_sid_prefix) || live_sids.contains(cid));
-                closed_snapshot = g.closed_session_ids.clone();
-
-                for sess in &mut g.sessions {
-                    if sess.remote_host_id.as_deref() == Some(host_id_str.as_str())
-                        && !live_sids.contains(&sess.id)
-                    {
-                        sess.alive = false;
-                    }
-                }
-
-                for term in &terms {
-                    let sid = format!("remote:{}:{}", host.id, term.address);
-                    if closed_snapshot.contains(&sid) {
-                        continue;
-                    }
-                    let space_id = g
-                        .spaces
-                        .iter()
-                        .filter(|sp| sp.machine_id == host_id_str)
-                        .filter(|sp| path_within_root(&term.cwd, &sp.path))
-                        .max_by_key(|sp| sp.path.len())
-                        .or_else(|| g.spaces.iter().find(|sp| sp.machine_id == host_id_str))
-                        .map(|sp| sp.id.clone())
-                        .unwrap_or_else(|| fallback_space_id.clone());
-
-                    let osc = herdr_status_to_osc(&term.status);
-                    let label = term
-                        .name
-                        .as_deref()
-                        .filter(|n| !n.trim().is_empty())
-                        .unwrap_or(&term.address);
-                    if let Some(existing) = g.sessions.iter_mut().find(|s| s.id == sid) {
-                        existing.alive = term.alive;
-                        existing.space_id = space_id;
-                        if let Some(o) = osc {
-                            existing.osc_status = Some(o);
-                        }
-                    } else {
-                        g.sessions.push(TerminalSessionEntry {
-                            id: sid.clone(),
-                            title: format!("{} · {}", host.name, label),
-                            space_id,
-                            cwd: term.cwd.clone(),
-                            started_at: Instant::now(),
-                            last_output_at: Instant::now(),
-                            last_byte_sig: 0,
-                            lines: Vec::new(),
-                            styled_lines: Vec::new(),
-                            scroll_offset: 0,
-                            alive: term.alive,
-                            attached_hc: true,
-                            hc_addr: Some(term.address.clone()),
-                            remote_host_id: Some(host_id_str.clone()),
-                            osc_status: osc,
-                        });
-                        if g.active_session_id.is_none() {
-                            g.active_session_id = Some(sid);
-                        }
-                    }
-                }
-
-                if let Some(sp) = g.active_space() {
-                    if sp.machine_id == host_id_str && sp.path != "." && g.dir_entries.is_empty() {
-                        active_remote_refresh = Some((
-                            sp.id.clone(),
-                            sp.path.clone(),
-                            g.current_browse_rel.clone(),
-                        ));
-                    }
-                }
-            }
-        }
-
-        if let Some((sp_id, sp_path, browse_rel)) = active_remote_refresh {
-            self.refresh_remote_git_diff(host.id, &sp_id, &sp_path);
-            self.refresh_remote_directory(host.id, &sp_id, &sp_path, &browse_rel);
-        }
-
-        for term in terms {
-            let sid = format!("remote:{}:{}", host.id, term.address);
-            if closed_snapshot.contains(&sid) {
-                continue;
-            }
-            if let Ok(mut mgr) = self.pty_mgr.lock() {
-                mgr.ensure_remote_buffer(&sid, term.cols.max(80), term.rows.max(24));
-                mgr.set_remote_alive(&sid, term.alive);
-            }
-            let need_attach = {
-                let mut att = self.attached_terms.lock().await;
-                att.insert((host.id, term.address.clone()))
-            };
-            if need_attach {
-                self.seed_and_attach_remote_term(Arc::clone(&peer), host.id, &term)
-                    .await;
-            }
-        }
-
-        self.ui_dirty.store(true, Ordering::Release);
-    }
-
-    async fn seed_and_attach_remote_term(
-        self: &Arc<Self>,
-        peer: Arc<LivePeerSession>,
-        host_id: Uuid,
-        term: &HerdrTerminalSummary,
-    ) {
-        let sid = format!("remote:{}:{}", host_id, term.address);
-        if let Ok(PeerMessage::TerminalScreenSnapshot { text, .. }) = peer
-            .request(
-                PeerMessage::ReadTerminalScreen {
-                    req_id: format!("scr-{}", Uuid::new_v4().simple()),
-                    terminal: term.address.clone(),
-                    history_lines: 120,
-                },
-                TrafficLane::BulkP1,
-                Duration::from_secs(6),
-            )
-            .await
-        {
-            if !text.is_empty() {
-                let norm = normalize_newlines_for_vt(&text);
-                if let Ok(mgr) = self.pty_mgr.lock() {
-                    mgr.feed_remote_output(&sid, &norm);
-                }
-            }
-        }
-
-        let attached_ok = matches!(
-            peer.request(
-                PeerMessage::PtyAttach {
-                    req_id: format!("att-{}", Uuid::new_v4().simple()),
-                    terminal: term.address.clone(),
-                    cols: 120,
-                    rows: 36,
-                },
-                TrafficLane::ControlP0,
-                Duration::from_secs(6),
-            )
-            .await,
-            Ok(PeerMessage::PtyAttached { ok: true, .. })
-        );
-
-        if !attached_ok {
-            self.attached_terms
-                .lock()
-                .await
-                .remove(&(host_id, term.address.clone()));
-        }
-    }
-
-    async fn ensure_peer_for_host(self: &Arc<Self>, host_id: Uuid) -> Option<Arc<LivePeerSession>> {
-        if let Some(p) = self.peers.lock().await.get(&host_id).cloned() {
-            return Some(p);
-        }
-        let cfg = load_desktop_daemon_config(&DaemonConfig::default_path()).ok()?;
-        let host = self
-            .state
-            .lock()
-            .ok()
-            .and_then(|g| g.remote_hosts.iter().find(|h| h.id == host_id).cloned())?;
-        self.get_or_connect_peer(&cfg, &host).await.ok()
-    }
-
-    pub fn spawn_remote_terminal_or_agent(
-        self: &Arc<Self>,
-        host_id: Uuid,
-        agent: &str,
-        cwd: &str,
-        space_id: &str,
-    ) {
-        let hub = Arc::clone(self);
-        let agent = agent.to_string();
-        let cwd = cwd.to_string();
-        let space_id = space_id.to_string();
-        if let Ok(mut g) = hub.state.lock() {
-            g.status_notice = Some(format!("Starting {agent} on remote host..."));
-        }
-        hub.ui_dirty.store(true, Ordering::Release);
-        self.spawn_bg(async move {
-            let Some(peer) = hub.ensure_peer_for_host(host_id).await else {
-                if let Ok(mut g) = hub.state.lock() {
-                    g.status_notice = Some("Remote host is not connected".to_string());
-                }
-                hub.ui_dirty.store(true, Ordering::Release);
-                return;
-            };
-            let host_name = hub
-                .state
-                .lock()
-                .ok()
-                .and_then(|g| {
-                    g.remote_hosts
-                        .iter()
-                        .find(|h| h.id == host_id)
-                        .map(|h| h.name.clone())
-                })
-                .unwrap_or_else(|| "remote".to_string());
-
-            let cwd_opt = if cwd.trim().is_empty() || cwd == "." {
-                None
-            } else {
-                Some(cwd.clone())
-            };
-            let hc_name = format!("coda-{}", &Uuid::new_v4().simple().to_string()[..8]);
-            let req = PeerMessage::LaunchAgent {
-                req_id: format!("la-{}", Uuid::new_v4().simple()),
-                agent: agent.clone(),
-                name: Some(hc_name),
-                cwd: cwd_opt,
-                initial_prompt: None,
-                cols: 120,
-                rows: 36,
-            };
-            match peer
-                .request(req, TrafficLane::ControlP0, Duration::from_secs(12))
-                .await
-            {
-                Ok(PeerMessage::LaunchAgentResult {
-                    ok: true,
-                    terminal: Some(term),
-                    ..
-                }) => {
-                    let sid = format!("remote:{}:{}", host_id, term.address);
-                    if let Ok(mut mgr) = hub.pty_mgr.lock() {
-                        mgr.ensure_remote_buffer(&sid, 120, 36);
-                    }
-                    {
-                        if let Ok(mut g) = hub.state.lock() {
-                            g.closed_session_ids.remove(&sid);
-                            g.status_notice = None;
-                            if !g.sessions.iter().any(|s| s.id == sid) {
-                                g.sessions.push(TerminalSessionEntry {
-                                    id: sid.clone(),
-                                    title: format!("{host_name} · {agent}"),
-                                    space_id,
-                                    cwd: term.cwd.clone(),
-                                    started_at: Instant::now(),
-                                    last_output_at: Instant::now(),
-                                    last_byte_sig: 0,
-                                    lines: Vec::new(),
-                                    styled_lines: Vec::new(),
-                                    scroll_offset: 0,
-                                    alive: true,
-                                    attached_hc: true,
-                                    hc_addr: Some(term.address.clone()),
-                                    remote_host_id: Some(host_id.to_string()),
-                                    osc_status: None,
-                                });
-                            }
-                            if g.layout.split_terminals && g.focused_pane == SplitPane::Secondary {
-                                g.split_session_id = Some(sid);
-                            } else {
-                                g.active_session_id = Some(sid);
-                            }
-                            g.input_target = ActiveInputTarget::TerminalDirect;
-                        }
-                    }
-                    {
-                        hub.attached_terms
-                            .lock()
-                            .await
-                            .insert((host_id, term.address.clone()));
-                    }
-                    hub.seed_and_attach_remote_term(Arc::clone(&peer), host_id, &term)
-                        .await;
-                    hub.ui_dirty.store(true, Ordering::Release);
-                }
-                Ok(PeerMessage::LaunchAgentResult { error, .. }) => {
-                    if let Ok(mut g) = hub.state.lock() {
-                        g.status_notice = Some(error.unwrap_or_else(|| "remote launch failed".into()));
-                    }
-                    hub.ui_dirty.store(true, Ordering::Release);
-                }
-                Err(e) => {
-                    if let Ok(mut g) = hub.state.lock() {
-                        g.status_notice = Some(format!("remote launch error: {e}"));
-                    }
-                    hub.ui_dirty.store(true, Ordering::Release);
-                }
-                _ => {}
-            }
-        });
-    }
-
-    pub fn send_remote_pty_input(self: &Arc<Self>, host_id: Uuid, terminal: &str, bytes: Vec<u8>) {
-        let hub = Arc::clone(self);
-        let terminal = terminal.to_string();
-        let data_b64 = B64.encode(bytes);
-        self.spawn_bg(async move {
-            if let Some(peer) = hub.peers.lock().await.get(&host_id).cloned() {
-                let _ = peer
-                    .send_oneway(PeerMessage::PtyInput { terminal, data_b64 }, TrafficLane::ControlP0)
-                    .await;
-            }
-        });
-    }
-
-    pub fn resize_remote_pty(
-        self: &Arc<Self>,
-        host_id: Uuid,
-        terminal: &str,
-        cols: u16,
-        rows: u16,
-    ) {
-        let hub = Arc::clone(self);
-        let terminal = terminal.to_string();
-        self.spawn_bg(async move {
-            if let Some(peer) = hub.peers.lock().await.get(&host_id).cloned() {
-                let _ = peer
-                    .send_oneway(
-                        PeerMessage::PtyResize {
-                            terminal,
-                            cols,
-                            rows,
-                        },
-                        TrafficLane::ControlP0,
-                    )
-                    .await;
-            }
-        });
-    }
-
-    pub fn send_remote_interrupt(self: &Arc<Self>, host_id: Uuid, terminal: &str) {
-        let hub = Arc::clone(self);
-        let terminal = terminal.to_string();
-        self.spawn_bg(async move {
-            if let Some(peer) = hub.peers.lock().await.get(&host_id).cloned() {
-                let _ = peer
-                    .send_oneway(
-                        PeerMessage::PtyInput {
-                            terminal,
-                            data_b64: B64.encode([0x03u8]),
-                        },
-                        TrafficLane::ControlP0,
-                    )
-                    .await;
-            }
-        });
-    }
-
-    pub fn detach_remote_pty(self: &Arc<Self>, host_id: Uuid, terminal: &str) {
-        let hub = Arc::clone(self);
-        let terminal = terminal.to_string();
-        self.spawn_bg(async move {
-            hub.attached_terms
-                .lock()
-                .await
-                .remove(&(host_id, terminal.clone()));
-            if let Some(peer) = hub.peers.lock().await.get(&host_id).cloned() {
-                let _ = peer
-                    .request(
-                        PeerMessage::PtyDetach {
-                            req_id: format!("det-{}", Uuid::new_v4().simple()),
-                            terminal,
-                        },
-                        TrafficLane::ControlP0,
-                        Duration::from_secs(4),
-                    )
-                    .await;
-            }
-        });
-    }
-
-    pub fn kill_remote_terminal(self: &Arc<Self>, host_id: Uuid, terminal: &str) {
-        let hub = Arc::clone(self);
-        let terminal = terminal.to_string();
-        self.spawn_bg(async move {
-            hub.attached_terms
-                .lock()
-                .await
-                .remove(&(host_id, terminal.clone()));
-            let Some(peer) = hub.ensure_peer_for_host(host_id).await else {
-                return;
-            };
-            match peer
-                .request(
-                    PeerMessage::KillTerminal {
-                        req_id: format!("kt-{}", Uuid::new_v4().simple()),
-                        terminal: terminal.clone(),
-                    },
-                    TrafficLane::ControlP0,
-                    Duration::from_secs(6),
-                )
-                .await
-            {
-                Ok(PeerMessage::ActionAck { ok: false, detail, .. }) => {
-                    if let Ok(mut g) = hub.state.lock() {
-                        g.status_notice = Some(format!("Remote kill failed: {detail}"));
-                    }
-                    hub.ui_dirty.store(true, Ordering::Release);
-                }
-                Err(e) => {
-                    if let Ok(mut g) = hub.state.lock() {
-                        g.status_notice = Some(format!("Remote kill error ({terminal}): {e}"));
-                    }
-                    hub.ui_dirty.store(true, Ordering::Release);
-                }
-                _ => {}
-            }
-        });
-    }
-
-    pub fn refresh_remote_directory(
-        self: &Arc<Self>,
-        host_id: Uuid,
-        space_id: &str,
-        root_path: &str,
-        sub_path: &str,
-    ) {
-        let hub = Arc::clone(self);
-        let space_id = space_id.to_string();
-        let root_path = root_path.to_string();
-        let sub_path = sub_path.to_string();
-        self.spawn_bg(async move {
-            let Some(peer) = hub.ensure_peer_for_host(host_id).await else {
-                return;
-            };
-            let req = PeerMessage::ListDirectory {
-                req_id: format!("ls-{}", Uuid::new_v4().simple()),
-                root_path: root_path.clone(),
-                sub_path: sub_path.clone(),
-            };
-            if let Ok(PeerMessage::DirectoryListing { entries, error, .. }) = peer
-                .request(req, TrafficLane::BulkP1, Duration::from_secs(8))
-                .await
-            {
-                if let Some(err) = error {
-                    if let Ok(mut g) = hub.state.lock() {
-                        g.status_notice = Some(format!("Remote ls error: {err}"));
-                    }
-                    hub.ui_dirty.store(true, Ordering::Release);
-                    return;
-                }
-                let root_trim = root_path.trim_end_matches('/');
-                let mapped: Vec<WorkspaceFileEntry> = entries
-                    .into_iter()
-                    .map(|item: RemoteFileItem| WorkspaceFileEntry {
-                        name: item.name,
-                        full_path: format!("{root_trim}/{}", item.rel_path),
-                        rel_path: item.rel_path,
-                        is_dir: item.is_dir,
-                        size_bytes: item.size_bytes,
-                    })
-                    .collect();
-                if let Ok(mut g) = hub.state.lock() {
-                    if g.active_space_id.as_deref() == Some(space_id.as_str()) {
-                        g.dir_entries = mapped;
-                    }
-                }
-                hub.ui_dirty.store(true, Ordering::Release);
-            }
-        });
-    }
-
-    pub fn open_remote_file_preview(
-        self: &Arc<Self>,
-        host_id: Uuid,
-        full_path: &str,
-        rel_path: &str,
-    ) {
-        let hub = Arc::clone(self);
-        let full_path = full_path.to_string();
-        let rel_path = rel_path.to_string();
-        self.spawn_bg(async move {
-            let Some(peer) = hub.ensure_peer_for_host(host_id).await else {
-                if let Ok(mut g) = hub.state.lock() {
-                    g.status_notice = Some("Remote host is not connected".to_string());
-                }
-                hub.ui_dirty.store(true, Ordering::Release);
-                return;
-            };
-            let req = PeerMessage::ReadFilePreview {
-                req_id: format!("rf-{}", Uuid::new_v4().simple()),
-                path: full_path,
-                max_bytes: 120_000,
-            };
-            match peer
-                .request(req, TrafficLane::BulkP1, Duration::from_secs(8))
-                .await
-            {
-                Ok(PeerMessage::FilePreviewResponse { content, error, .. }) => {
-                    if let Ok(mut g) = hub.state.lock() {
-                        g.selected_file_rel = Some(rel_path);
-                        g.selected_file_content = match error {
-                            Some(err) => format!("[Error reading remote file: {err}]"),
-                            None => content,
-                        };
-                    }
-                    hub.ui_dirty.store(true, Ordering::Release);
-                }
-                Err(e) => {
-                    if let Ok(mut g) = hub.state.lock() {
-                        g.status_notice = Some(format!("Remote read error: {e}"));
-                    }
-                    hub.ui_dirty.store(true, Ordering::Release);
-                }
-                _ => {}
-            }
-        });
-    }
-
-    pub fn refresh_remote_git_diff(
-        self: &Arc<Self>,
-        host_id: Uuid,
-        space_id: &str,
-        cwd: &str,
-    ) {
-        let hub = Arc::clone(self);
-        let space_id = space_id.to_string();
-        let cwd = cwd.to_string();
-        self.spawn_bg(async move {
-            let Some(peer) = hub.ensure_peer_for_host(host_id).await else {
-                return;
-            };
-            let req = PeerMessage::GitDiffRequest {
-                req_id: format!("gd-{}", Uuid::new_v4().simple()),
-                cwd: cwd.clone(),
-            };
-            if let Ok(PeerMessage::GitDiffResponse {
-                branch,
-                status_short,
-                diff_unified,
-                ..
-            }) = peer
-                .request(req, TrafficLane::BulkP1, Duration::from_secs(8))
-                .await
-            {
-                let changed_files = parse_git_status_short(&status_short);
-                let clean_branch = if branch.trim().is_empty() {
-                    "online".to_string()
-                } else {
-                    branch.trim().to_string()
-                };
-                if let Ok(mut g) = hub.state.lock() {
-                    if let Some(sp) = g.spaces.iter_mut().find(|s| s.id == space_id) {
-                        sp.branch = clean_branch.clone();
-                        sp.dirty_files = changed_files.len();
-                    }
-                    if g.active_space_id.as_deref() == Some(space_id.as_str()) {
-                        let repo_name = Path::new(&cwd)
-                            .file_name()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or("remote")
-                            .to_string();
-                        g.repo_snapshot = RepoInspectorSnapshot {
-                            repo_path: cwd.clone(),
-                            repo_name,
-                            is_git_repo: !status_short.is_empty() || !diff_unified.is_empty() || clean_branch != "online",
-                            branch: clean_branch,
-                            head_summary: format!("{} changed (remote)", changed_files.len()),
-                            diff_added: diff_unified.lines().filter(|l| l.starts_with('+') && !l.starts_with("+++")).count() as u32,
-                            diff_deleted: diff_unified.lines().filter(|l| l.starts_with('-') && !l.starts_with("---")).count() as u32,
-                            changed_files,
-                            diff_title: format!("{cwd} · remote diff"),
-                            diff_text: if diff_unified.trim().is_empty() {
-                                "Clean working tree on remote host.".to_string()
-                            } else {
-                                diff_unified
-                            },
-                            ..Default::default()
-                        };
-                    }
-                }
-                hub.ui_dirty.store(true, Ordering::Release);
-            }
-        });
-    }
-
-    pub fn probe_host(self: &Arc<Self>, host: RemoteHostSummary) {
-        let hub = Arc::clone(self);
-        self.spawn_bg(async move {
-            let Ok(cfg) = load_desktop_daemon_config(&DaemonConfig::default_path()) else {
-                return;
-            };
-            let exact_prefix = format!("remote:{}", host.id);
-            let repo_prefix = format!("remote:{}:", host.id);
-            if let Ok(mut g) = hub.state.lock() {
-                g.dismissed_spaces
-                    .retain(|id| id != &exact_prefix && !id.starts_with(&repo_prefix));
-            }
-            let mut prefs = DesktopPreferences::load_or_default();
-            let before_len = prefs.dismissed_spaces.len();
-            prefs
-                .dismissed_spaces
-                .retain(|id| id != &exact_prefix && !id.starts_with(&repo_prefix));
-            if prefs.dismissed_spaces.len() != before_len {
-                let _ = prefs.save();
-            }
-
-            match hub.get_or_connect_peer(&cfg, &host).await {
-                Ok(peer) => {
-                    let route = peer.route_label().to_string();
-                    hub.sync_single_remote_host(&cfg, &host).await;
-                    let host_id_str = host.id.to_string();
-                    let (term_count, target_space) = hub
-                        .state
-                        .lock()
-                        .map(|mut g| {
-                            let found_sp = g
-                                .spaces
-                                .iter()
-                                .find(|s| {
-                                    s.machine_id == host_id_str
-                                        && s.id.starts_with(&repo_prefix)
-                                        && s.path != "."
-                                })
-                                .or_else(|| g.spaces.iter().find(|s| s.machine_id == host_id_str))
-                                .map(|s| (s.id.clone(), s.path.clone()));
-                            if let Some((ref sp_id, _)) = found_sp {
-                                g.active_space_id = Some(sp_id.clone());
-                                g.current_browse_rel.clear();
-                                g.selected_file_rel = None;
-                                g.selected_file_content.clear();
-                                g.selected_change_path = None;
-                                g.active_session_id = g
-                                    .sessions
-                                    .iter()
-                                    .find(|s| &s.space_id == sp_id)
-                                    .map(|s| s.id.clone());
-                                if g.layout.split_terminals {
-                                    g.split_session_id = g
-                                        .sessions
-                                        .iter()
-                                        .find(|s| {
-                                            &s.space_id == sp_id
-                                                && Some(&s.id) != g.active_session_id.as_ref()
-                                        })
-                                        .map(|s| s.id.clone());
-                                }
-                                g.input_target = ActiveInputTarget::TerminalDirect;
-                            }
-                            let cnt = g
-                                .sessions
-                                .iter()
-                                .filter(|s| s.remote_host_id.as_deref() == Some(host_id_str.as_str()))
-                                .count();
-                            (cnt, found_sp)
-                        })
-                        .unwrap_or((0, None));
-                    if let Some((sp_id, sp_path)) = target_space {
-                        let sp_id_pref = sp_id.clone();
-                        CodaGpuWorkspaceView::update_prefs_async(move |p| {
-                            p.selected_repo_path = Some(sp_id_pref);
-                        });
-                        hub.refresh_remote_git_diff(host.id, &sp_id, &sp_path);
-                        if sp_path != "." {
-                            hub.refresh_remote_directory(host.id, &sp_id, &sp_path, "");
-                        }
-                    }
-                    if let Ok(mut g) = hub.state.lock() {
-                        g.remote_probe_status =
-                            Some(format!("{} · {route} · {term_count} sessions", host.name));
-                        g.status_notice = g.remote_probe_status.clone();
-                    }
-                }
-                Err(err) => {
-                    if let Ok(mut g) = hub.state.lock() {
-                        g.status_notice = Some(format!("{} unreachable: {err}", host.name));
-                    }
-                }
-            }
-            hub.ui_dirty.store(true, Ordering::Release);
-        });
-    }
-}
-
-fn extract_file_diff_lines<'a>(diff_text: &'a str, selected_path: Option<&str>) -> Vec<&'a str> {
-    if let Some(target) = selected_path {
-        if diff_text.matches("diff --git ").count() > 1 {
-            let b_suffix = format!(" b/{target}");
-            let a_prefix = format!("diff --git a/{target} ");
-            let mut in_block = false;
-            let mut filtered = Vec::new();
-            for line in diff_text.lines() {
-                if line.starts_with("diff --git ") {
-                    in_block = line.ends_with(&b_suffix) || line.starts_with(&a_prefix);
-                }
-                if in_block {
-                    filtered.push(line);
-                    if filtered.len() >= 160 {
-                        break;
-                    }
-                }
-            }
-            if !filtered.is_empty() {
-                return filtered;
-            }
-        }
-    }
-    diff_text.lines().take(160).collect()
-}
-
-fn spawn_device_login(
-    state_bg: Arc<Mutex<CodaDesktopState>>,
-    ui_dirty: Arc<AtomicBool>,
-    mesh_hub: Arc<RemoteMeshHub>,
-    server_url: String,
-) {
-    std::thread::spawn(move || {
-        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        else {
-            return;
-        };
-        rt.block_on(async move {
-            let cfg_path = DaemonConfig::default_path();
-            let existing_identity = load_desktop_daemon_config(&cfg_path)
-                .ok()
-                .map(|c| c.identity);
-            match start_device_login_flow(&server_url, "hybrid", None, existing_identity).await {
-                Ok(flow) => {
-                    let uri = flow.verification_uri_complete.clone();
-                    #[cfg(target_os = "macos")]
-                    if is_safe_http_url(&uri) {
-                        let _ = std::process::Command::new("open").arg(&uri).spawn();
-                    }
-                    if let Ok(mut g) = state_bg.lock() {
-                        g.device_login_code = Some(flow.user_code.clone());
-                        g.device_login_uri = Some(uri);
-                        g.auth_error = None;
-                        g.status_notice = Some("Approve sign-in in your browser...".to_string());
-                    }
-                    ui_dirty.store(true, Ordering::Release);
-
-                    match poll_device_login_until_approved(&flow).await {
-                        Ok(cfg) => {
-                            let _ = save_desktop_daemon_config(&cfg, &cfg_path);
-                            if let Ok(mut g) = state_bg.lock() {
-                                g.is_logged_in = true;
-                                g.auth_form_expanded = false;
-                                g.auth_loading = false;
-                                g.auth_error = None;
-                                g.local_host_device_id = Some(cfg.device_id);
-                                g.input_target = ActiveInputTarget::TerminalDirect;
-                                g.account_email = cfg
-                                    .owner_email
-                                    .clone()
-                                    .unwrap_or_else(|| cfg.owner_handle.clone());
-                                g.device_login_code = None;
-                                g.status_notice = Some("Signed in".to_string());
-                            }
-                            ui_dirty.store(true, Ordering::Release);
-                            mesh_hub.ensure_embedded_host();
-                            mesh_hub.start_account_sync();
-                        }
-                        Err(err) => {
-                            let msg = format!("Login failed: {err}");
-                            if let Ok(mut g) = state_bg.lock() {
-                                g.auth_loading = false;
-                                g.auth_error = Some(msg.clone());
-                                g.status_notice = Some(msg);
-                            }
-                            ui_dirty.store(true, Ordering::Release);
-                        }
-                    }
-                }
-                Err(err) => {
-                    let msg = format!("Auth init failed: {err}");
-                    if let Ok(mut g) = state_bg.lock() {
-                        g.auth_loading = false;
-                        g.auth_error = Some(msg.clone());
-                        g.status_notice = Some(msg);
-                    }
-                    ui_dirty.store(true, Ordering::Release);
-                }
-            }
-        });
-    });
-}
-
-fn spawn_password_login(
-    state_bg: Arc<Mutex<CodaDesktopState>>,
-    ui_dirty: Arc<AtomicBool>,
-    mesh_hub: Arc<RemoteMeshHub>,
-    server_url: String,
-    email: String,
-    password: String,
-) {
-    std::thread::spawn(move || {
-        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        else {
-            return;
-        };
-        rt.block_on(async move {
-            let cfg_path = DaemonConfig::default_path();
-            let existing_identity = load_desktop_daemon_config(&cfg_path)
-                .ok()
-                .map(|c| c.identity);
-            match login_with_password_and_enroll_with_identity(
-                &server_url,
-                &email,
-                &password,
-                "hybrid",
-                None,
-                existing_identity,
-            )
-            .await
-            {
-                Ok(cfg) => {
-                    let _ = save_desktop_daemon_config(&cfg, &cfg_path);
-                    if let Ok(mut g) = state_bg.lock() {
-                        g.is_logged_in = true;
-                        g.auth_form_expanded = false;
-                        g.auth_loading = false;
-                        g.auth_error = None;
-                        g.local_host_device_id = Some(cfg.device_id);
-                        g.input_target = ActiveInputTarget::TerminalDirect;
-                        g.account_email = cfg.owner_email.clone().unwrap_or(email);
-                        g.auth_password_input.clear();
-                        g.status_notice = Some("Signed in".to_string());
-                    }
-                    ui_dirty.store(true, Ordering::Release);
-                    mesh_hub.ensure_embedded_host();
-                    mesh_hub.start_account_sync();
-                }
-                Err(err) => {
-                    let msg = format!("Login error: {err}");
-                    if let Ok(mut g) = state_bg.lock() {
-                        g.auth_loading = false;
-                        g.auth_error = Some(msg.clone());
-                        g.status_notice = Some(msg);
-                    }
-                    ui_dirty.store(true, Ordering::Release);
-                }
             }
         });
     });

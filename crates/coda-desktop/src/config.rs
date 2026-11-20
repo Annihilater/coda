@@ -241,6 +241,10 @@ fn default_allow_remote_control() -> bool {
     true
 }
 
+fn default_desktop_notifications() -> bool {
+    true
+}
+
 /// Persisted user desktop preferences stored at `~/.config/coda/desktop.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DesktopPreferences {
@@ -257,6 +261,9 @@ pub struct DesktopPreferences {
     /// #8 / #31: Explicit user toggle controlling whether this Mac accepts incoming remote control.
     #[serde(default = "default_allow_remote_control")]
     pub allow_remote_control: bool,
+    /// Native macOS OSC 7501 agent notifications (`needs_you`, `error`, background `done`).
+    #[serde(default = "default_desktop_notifications")]
+    pub desktop_notifications: bool,
 }
 
 fn default_server_url() -> String {
@@ -272,6 +279,7 @@ impl Default for DesktopPreferences {
             selected_repo_path: None,
             dismissed_spaces: Vec::new(),
             allow_remote_control: true,
+            desktop_notifications: true,
         }
     }
 }
