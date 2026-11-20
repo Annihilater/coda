@@ -1154,7 +1154,7 @@ dependencies = [
 
 [[package]]
 name = "coda-apple-ffi"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "base64 0.22.1",
  "coda-protocol",
@@ -1164,7 +1164,7 @@ dependencies = [
 
 [[package]]
 name = "coda-daemon"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1186,7 +1186,7 @@ dependencies = [
 
 [[package]]
 name = "coda-desktop"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1209,7 +1209,7 @@ dependencies = [
 
 [[package]]
 name = "coda-herdr"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1225,7 +1225,7 @@ dependencies = [
 
 [[package]]
 name = "coda-protocol"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1247,7 +1247,7 @@ dependencies = [
 
 [[package]]
 name = "coda-server"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "argon2",
