@@ -23,7 +23,11 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 #[derive(Debug, Parser)]
-#[command(name = "coda-daemon", about = "Coda Zero-Knowledge Host Daemon (macOS & Linux)")]
+#[command(
+    name = "coda-daemon",
+    version,
+    about = "Coda Zero-Knowledge Host Daemon (macOS & Linux)"
+)]
 struct Cli {
     #[arg(long, env = "CODA_DAEMON_CONFIG")]
     config: Option<PathBuf>,
@@ -82,6 +86,15 @@ enum Commands {
     Logout,
     /// Stop and remove the background launchd/systemd service definition
     Uninstall,
+    /// Self-upgrade `coda-daemon` in place (SHA-256 verified) and zero-downtime restart active service
+    Upgrade {
+        /// Optional release tag (e.g. `v0.8.0` or `0.8.0`); defaults to latest stable release
+        #[arg(long)]
+        version: Option<String>,
+        /// Coordinator URL used for `/download/...` fallback when `daemon.json` is not present
+        #[arg(long, env = "CODA_SERVER_URL")]
+        server: Option<String>,
+    },
     /// Run persistent encrypted mesh tunnel bridging local `herdr-core` (`hc`)
     Run {
         /// Optional preferred relay mode: `raw_tcp_no_sni` (Domestic Cloud) or `cdn_wss` (Overseas CDN)
@@ -216,6 +229,7 @@ async fn main() -> Result<()> {
         std::env::remove_var(k);
     }
 
+    let startup_exe = coda_daemon::telemetry_ota::resolve_clean_exe_path().ok();
     let orig_args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     let cli = Cli::parse();
     let cfg_path = cli.config.unwrap_or_else(DaemonConfig::default_path);
@@ -626,6 +640,31 @@ async fn main() -> Result<()> {
             }
             println!("Uninstalled coda-daemon background service. Run `coda-daemon logout` to also remove credentials.");
         }
+        Commands::Upgrade { version, server } => {
+            let resolved_server = server
+                .or_else(|| DaemonConfig::load(&cfg_path).ok().map(|c| c.server_url))
+                .unwrap_or_else(|| "https://codahub.dev".to_string());
+            println!(
+                "Checking and downloading coda-daemon {} (server fallback: {})...",
+                version.as_deref().unwrap_or("latest"),
+                resolved_server
+            );
+            let (prev_ver, new_ver) = coda_daemon::telemetry_ota::perform_daemon_ota_upgrade(
+                &resolved_server,
+                version.as_deref(),
+            )
+            .await?;
+            println!("Replaced coda-daemon binary in place: v{prev_ver} -> v{new_ver}");
+            if active_daemon_lock_pid(&cfg_path).is_some() {
+                if signal_running_daemon(&cfg_path, libc::SIGUSR1) {
+                    println!("Signaled running coda-daemon (SIGUSR1) to zero-downtime re-exec v{new_ver} (herdr-core terminals preserved).");
+                } else {
+                    restart_daemon_service_or_process(&cfg_path)?;
+                }
+            } else {
+                println!("No active coda-daemon lock held; next `coda-daemon run` or service start will run v{new_ver}.");
+            }
+        }
         Commands::Run { mode, p2p_bind } => {
             let _daemon_lock = try_acquire_daemon_lock(&cfg_path)?
                 .context("another coda-daemon or embedded Coda host already holds the lock")?;
@@ -682,6 +721,8 @@ async fn main() -> Result<()> {
             let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
             let mut sigterm =
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+            let mut sigusr1 =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())?;
             let mut reexec_rx = runtime.reexec_rx();
             let mut ota_reexec = false;
             let mut backoff_secs = 1u64;
@@ -713,6 +754,12 @@ async fn main() -> Result<()> {
                     }
                     _ = sigterm.recv() => {
                         info!("coda-daemon received SIGTERM; shutting down cleanly");
+                        runtime.trigger_shutdown();
+                        break;
+                    }
+                    _ = sigusr1.recv() => {
+                        info!("coda-daemon received SIGUSR1; shutting down old listeners to zero-downtime exec upgraded binary");
+                        ota_reexec = true;
                         runtime.trigger_shutdown();
                         break;
                     }
@@ -762,7 +809,13 @@ async fn main() -> Result<()> {
                                 runtime.trigger_shutdown();
                                 break;
                             }
-                            _ = sighup.recv() => {
+                            _ = sigusr1.recv() => {
+                        info!("coda-daemon received SIGUSR1; shutting down old listeners to zero-downtime exec upgraded binary");
+                        ota_reexec = true;
+                        runtime.trigger_shutdown();
+                        break;
+                    }
+                    _ = sighup.recv() => {
                                 if let Ok(reloaded) = DaemonConfig::load(&cfg_path) {
                                     cfg = reloaded;
                                     peers_store.update_relay_ticket(cfg.daemon_relay_ticket.clone()).await;
@@ -788,7 +841,9 @@ async fn main() -> Result<()> {
                 #[cfg(unix)]
                 {
                     use std::os::unix::process::CommandExt;
-                    if let Ok(exe) = std::env::current_exe() {
+                    let target_exe = startup_exe
+                        .or_else(|| coda_daemon::telemetry_ota::resolve_clean_exe_path().ok());
+                    if let Some(exe) = target_exe {
                         info!("exec-ing upgraded coda-daemon binary at {}", exe.display());
                         let err = std::process::Command::new(&exe).args(&orig_args).exec();
                         error!("failed to exec upgraded coda-daemon ({err}); exiting for supervisor restart");

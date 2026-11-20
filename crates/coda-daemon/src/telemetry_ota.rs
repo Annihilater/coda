@@ -14,6 +14,18 @@ use sha2::{Digest, Sha256};
 
 const MAX_OTA_ARCHIVE_BYTES: usize = 64 * 1024 * 1024;
 
+/// Resolves the on-disk path of the current executable, stripping any Linux `" (deleted)"` suffix
+/// if a previous in-place `rename()` already replaced the running inode.
+pub fn resolve_clean_exe_path() -> Result<PathBuf> {
+    let raw = std::env::current_exe().context("failed resolving current_exe")?;
+    if let Some(s) = raw.to_str() {
+        if let Some(stripped) = s.strip_suffix(" (deleted)") {
+            return Ok(PathBuf::from(stripped));
+        }
+    }
+    Ok(raw)
+}
+
 /// Returns `true` when the current process is a standalone `coda-daemon` binary (not embedded inside
 /// a macOS `.app` bundle or unit-test runner).
 pub fn is_standalone_daemon_binary(exe_path: &Path) -> bool {
@@ -79,7 +91,7 @@ pub fn collect_host_health_snapshot(
 
     let (mem_used_mb, mem_total_mb) = sample_memory_mb();
     let os_uptime_secs = sample_os_uptime_secs();
-    let ota_supported = std::env::current_exe()
+    let ota_supported = resolve_clean_exe_path()
         .ok()
         .map(|p| is_standalone_daemon_binary(&p))
         .unwrap_or(false);
@@ -344,7 +356,7 @@ pub async fn perform_daemon_ota_upgrade(
     target_version: Option<&str>,
 ) -> Result<(String, String)> {
     let prev_ver = env!("CARGO_PKG_VERSION").to_string();
-    let exe_path = std::env::current_exe().context("failed resolving current_exe")?;
+    let exe_path = resolve_clean_exe_path()?;
     if !is_standalone_daemon_binary(&exe_path) {
         bail!(
             "Host runs embedded inside Coda Desktop (`{}`); update Coda.app via DMG/Release instead",
@@ -474,15 +486,38 @@ pub async fn perform_daemon_ota_upgrade(
         .await
         .context("timed out running `--version` smoke test on new daemon binary")?
         .context("failed executing new daemon binary `--version`")?;
-        if !smoke_out.status.success() {
-            bail!("new daemon binary failed `--version` smoke check ({})", smoke_out.status);
-        }
-        let reported_ver = String::from_utf8_lossy(&smoke_out.stdout)
-            .trim()
-            .split_whitespace()
-            .last()
-            .unwrap_or("updated")
-            .to_string();
+        let reported_ver = if smoke_out.status.success() {
+            String::from_utf8_lossy(&smoke_out.stdout)
+                .trim()
+                .split_whitespace()
+                .last()
+                .unwrap_or("updated")
+                .trim_start_matches('v')
+                .to_string()
+        } else {
+            // Legacy daemon releases prior to v0.8.0 only supported `--help`.
+            let help_out = tokio::time::timeout(
+                Duration::from_secs(5),
+                tokio::process::Command::new(&extracted_bin)
+                    .arg("--help")
+                    .output(),
+            )
+            .await
+            .context("timed out running `--help` smoke test on new daemon binary")?
+            .context("failed executing new daemon binary `--help`")?;
+            if !help_out.status.success() {
+                bail!(
+                    "new daemon binary failed `--version` ({}) and `--help` ({}) smoke checks",
+                    smoke_out.status,
+                    help_out.status
+                );
+            }
+            normalized_tag
+                .as_deref()
+                .unwrap_or("latest")
+                .trim_start_matches('v')
+                .to_string()
+        };
 
         let exe_parent = exe_path
             .parent()

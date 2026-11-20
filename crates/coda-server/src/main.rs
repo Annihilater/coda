@@ -32,7 +32,11 @@ fn parse_trust_proxy_mode(raw: &str) -> std::result::Result<TrustProxyMode, Stri
 }
 
 #[derive(Debug, Parser)]
-#[command(name = "coda-server", about = "Coda Multi-Tenant Coordinator & Anti-UDP-Block Relay Server")]
+#[command(
+    name = "coda-server",
+    version,
+    about = "Coda Multi-Tenant Coordinator & Anti-UDP-Block Relay Server"
+)]
 struct Args {
     /// Optional path to a `.env` file (auto-discovers `./.env` and `/etc/coda/.env` as well)
     #[arg(long, env = "CODA_ENV_FILE")]
