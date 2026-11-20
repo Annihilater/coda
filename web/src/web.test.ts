@@ -48,6 +48,31 @@ import {
   parseWebPreviewPortAndPath,
   renderPortPreviewModal,
 } from "./port_preview";
+import {
+  APPROVAL_CAPSULE_ITEMS,
+  buildClipboardImageFilename,
+  collectNeedsAttentionItems,
+  createDefaultNotificationSettings,
+  createInitialGitDiffState,
+  encodeApprovalActionBytes,
+  encodeComposerBracketedPasteSubmit,
+  filterUnifiedDiffByFile,
+  formatUploadedPathForPty,
+  parentAbsolutePath,
+  parseGitStatusShort,
+  parseUnifiedDiffLines,
+  pickNextNeedsAttentionItem,
+  renderGitDiffModal,
+  renderNeedsAttentionSidebarSection,
+  renderNeedsYouCapsuleBar,
+  renderPromptComposerPanel,
+  resolveVoiceCaptureStrategy,
+  shellEscapePath,
+  suggestFolderNameFromGitUrl,
+  validateGitCloneUrlClient,
+  validateNotificationWebhookSettings,
+  validateSingleFolderName,
+} from "./git_diff_composer";
 
 function makeTestIdentity(name: string): WebDeviceIdentity {
   const edPriv = ed25519.utils.randomPrivateKey();
@@ -769,5 +794,298 @@ describe("Web modular engines: terminal_keys, OSC 7501 notifications & Smart-Pat
     const ppHtml = renderPortPreviewModal(pp, "dev-box", (en) => en);
     expect(ppHtml).toContain('sandbox=""');
     expect(ppHtml).toContain("&lt;script&gt;alert(1)&lt;/script&gt;");
+  });
+});
+
+describe("v0.9.0 Git Diff Review Modal, Clipboard Screenshot Upload, Prompt Composer, Inbox & Webhooks", () => {
+  test("parseGitStatusShort parses M/A/D/??/R badges, quoted paths & trimmed lines", () => {
+    const raw = [
+      " M web/src/app.ts",
+      "A  web/src/git_diff_composer.ts",
+      "D  legacy/old.ts",
+      "?? assets/new screen.png",
+      'R  "src/old name.ts" -> "src/new name.ts"',
+    ].join("\n");
+    const files = parseGitStatusShort(raw);
+    expect(files.length).toBe(5);
+    expect(files[0]).toEqual({ status: "M", rawStatus: "M", path: "web/src/app.ts", origPath: null });
+    expect(files[1]).toEqual({
+      status: "A",
+      rawStatus: "A",
+      path: "web/src/git_diff_composer.ts",
+      origPath: null,
+    });
+    expect(files[2].status).toBe("D");
+    expect(files[3]).toEqual({ status: "??", rawStatus: "??", path: "assets/new screen.png", origPath: null });
+    expect(files[4]).toEqual({
+      status: "R",
+      rawStatus: "R",
+      path: "src/new name.ts",
+      origPath: "src/old name.ts",
+    });
+
+    // Trimmed first-line fallback
+    expect(parseGitStatusShort("M src/trimmed.ts")[0]?.path).toBe("src/trimmed.ts");
+  });
+
+  test("filterUnifiedDiffByFile, parseUnifiedDiffLines & renderGitDiffModal strictly escape HTML/XSS", () => {
+    const sampleDiff = [
+      "diff --git a/web/src/app.ts b/web/src/app.ts",
+      "index 1111111..2222222 100644",
+      "--- a/web/src/app.ts",
+      "+++ b/web/src/app.ts",
+      "@@ -10,3 +10,4 @@ function boot<T>() {",
+      " const safe = true;",
+      '-const oldHtml = "<img src=x onerror=alert(1)>";',
+      '+const newHtml = "<script>alert(document.cookie)</script>";',
+      "+const extra = 42;",
+      "diff --git a/README.md b/README.md",
+      "index 3333333..4444444 100644",
+      "--- a/README.md",
+      "+++ b/README.md",
+      "@@ -1,1 +1,2 @@",
+      " # Coda",
+      "+v0.9.0",
+    ].join("\n");
+
+    const onlyApp = filterUnifiedDiffByFile(sampleDiff, "web/src/app.ts");
+    expect(onlyApp).toContain("diff --git a/web/src/app.ts b/web/src/app.ts");
+    expect(onlyApp).not.toContain("README.md");
+
+    const parsed = parseUnifiedDiffLines(onlyApp);
+    expect(parsed.added).toBe(2);
+    expect(parsed.deleted).toBe(1);
+    expect(parsed.lines.some((l) => l.kind === "hunk" && l.text.startsWith("@@"))).toBe(true);
+    const delLine = parsed.lines.find((l) => l.kind === "del");
+    const addLines = parsed.lines.filter((l) => l.kind === "add");
+    expect(delLine?.oldLine).toBe(11);
+    expect(addLines[0]?.newLine).toBe(11);
+    expect(addLines[1]?.newLine).toBe(12);
+
+    const gdState = createInitialGitDiffState();
+    gdState.open = true;
+    gdState.cwd = '/tmp/"bad"<cwd>';
+    gdState.branch = "feat/<xss>";
+    gdState.statusShort = ' M web/src/app.ts\n?? "<svg onload=alert(1)>.ts"';
+    gdState.files = parseGitStatusShort(gdState.statusShort);
+    gdState.diffUnified = sampleDiff;
+
+    const modalHtml = renderGitDiffModal(gdState, [gdState.cwd], (en) => en);
+    expect(modalHtml).not.toContain("<script>");
+    expect(modalHtml).not.toContain("<img src=x");
+    expect(modalHtml).not.toContain("<svg onload=");
+    expect(modalHtml).toContain("&lt;script&gt;alert(document.cookie)&lt;/script&gt;");
+    expect(modalHtml).toContain("&lt;img src=x onerror=alert(1)&gt;");
+    expect(modalHtml).toContain("feat/&lt;xss&gt;");
+    expect(modalHtml).toContain("gd-add");
+    expect(modalHtml).toContain("gd-del");
+    expect(modalHtml).toContain("gd-hunk");
+  });
+
+  test("clipboard filename generator, shell path escaping & E2EE v0.9.0 wire messages", () => {
+    expect(buildClipboardImageFilename(1700000000123, 0)).toBe("clipboard-1700000000123.png");
+    expect(buildClipboardImageFilename(1700000000123, 1)).toBe("clipboard-1700000000123-1.png");
+
+    expect(shellEscapePath("/tmp/herdr/clipboard-1700000000123.png")).toBe(
+      "/tmp/herdr/clipboard-1700000000123.png"
+    );
+    expect(formatUploadedPathForPty("/tmp/herdr/clipboard-1700000000123.png")).toBe(
+      "/tmp/herdr/clipboard-1700000000123.png "
+    );
+
+    // Spaces, single quotes, subshells & leading hyphens must be strictly quoted
+    expect(formatUploadedPathForPty("/tmp/my folder/it's $(whoami).png")).toBe(
+      `'/tmp/my folder/it'\\''s $(whoami).png' `
+    );
+    expect(shellEscapePath("-rf")).toBe("'-rf'");
+
+    // Verify E2EE session seals/opens git_diff_request and bootstrap_workspace cleanly
+    const client = makeTestIdentity("web");
+    const daemon = makeTestIdentity("host");
+    const auth = createRelaySessionAuth(client, "c-1", "d-1");
+    const sClient = BrowserE2EESession.deriveRelayV2({
+      myStaticSecretB64: client.x25519SecretB64,
+      peerStaticPublicB64: daemon.x25519PublicB64,
+      sessionNonceB64: auth.session_nonce_b64,
+      clientDeviceId: "c-1",
+      daemonDeviceId: "d-1",
+      isInitiator: true,
+    });
+    const sDaemon = BrowserE2EESession.deriveRelayV2({
+      myStaticSecretB64: daemon.x25519SecretB64,
+      peerStaticPublicB64: client.x25519PublicB64,
+      sessionNonceB64: auth.session_nonce_b64,
+      clientDeviceId: "c-1",
+      daemonDeviceId: "d-1",
+      isInitiator: false,
+    });
+
+    const diffReq = sDaemon.openMessage(
+      sClient.sealMessage({ op: "git_diff_request", req_id: "gd-1", cwd: "/opt/coda" })
+    );
+    expect(diffReq).toEqual({ op: "git_diff_request", req_id: "gd-1", cwd: "/opt/coda" });
+
+    const bootReq = sDaemon.openMessage(
+      sClient.sealMessage({
+        op: "bootstrap_workspace",
+        req_id: "boot-1",
+        parent_dir: "~/code",
+        folder_name: "coda",
+        git_clone_url: "https://github.com/Annihilater/coda.git",
+      })
+    );
+    expect(bootReq.op).toBe("bootstrap_workspace");
+    expect(bootReq.folder_name).toBe("coda");
+  });
+
+  test("Needs-You capsule bar, Bracketed Paste composer, Attention Inbox cycling & Speech fallback", () => {
+    expect(APPROVAL_CAPSULE_ITEMS.map((i) => i.labelEn)).toEqual([
+      "Allow (y)",
+      "Reject (Esc)",
+      "1",
+      "2",
+      "3",
+      "Enter",
+    ]);
+    expect(encodeApprovalActionBytes("allow")).toBe("y\r");
+    expect(encodeApprovalActionBytes("reject")).toBe("\x1b");
+    expect(encodeApprovalActionBytes("1")).toBe("1\r");
+    expect(encodeApprovalActionBytes("2")).toBe("2\r");
+    expect(encodeApprovalActionBytes("3")).toBe("3\r");
+    expect(encodeApprovalActionBytes("enter")).toBe("\r");
+
+    const capsuleHtml = renderNeedsYouCapsuleBar(
+      {
+        address: "t-1",
+        argv: ["claude"],
+        cwd: "/repo",
+        alive: true,
+        status: { state: "needs_you", app: "claude", msg: "Allow <rm>?" },
+      },
+      (en) => en
+    );
+    expect(capsuleHtml).toContain("visible");
+    expect(capsuleHtml).toContain("Allow (y)");
+    expect(capsuleHtml).toContain("Reject (Esc)");
+    expect(capsuleHtml).toContain("&lt;rm&gt;");
+    expect(capsuleHtml).not.toContain("<rm>");
+
+    // Multi-line Bracketed Paste strips embedded \x1b[201~ breakout attempts
+    expect(encodeComposerBracketedPasteSubmit("step 1\r\nstep 2")).toBe(
+      "\x1b[200~step 1\nstep 2\x1b[201~\r"
+    );
+    expect(encodeComposerBracketedPasteSubmit("evil\x1b[201~;rm -rf /")).toBe(
+      "\x1b[200~evil;rm -rf /\x1b[201~\r"
+    );
+
+    const compHtml = renderPromptComposerPanel({
+      open: true,
+      draft: "line 1\n<tag>",
+      isRecordingVoice: false,
+      isTranscribingVoice: false,
+      hasSpeechFallback: true,
+      hasWhisperKey: false,
+      tr: (en) => en,
+    });
+    expect(compHtml).toContain("Voice (Live)");
+    expect(compHtml).toContain("line 1\n&lt;tag&gt;");
+
+    // Zero-config speech strategy selection
+    expect(
+      resolveVoiceCaptureStrategy({
+        apiKey: "",
+        isSafeBaseUrl: true,
+        hasMediaRecorder: true,
+        hasSpeechRecognition: true,
+      })
+    ).toBe("browser_speech");
+    expect(
+      resolveVoiceCaptureStrategy({
+        apiKey: "••••••••",
+        isSafeBaseUrl: true,
+        hasMediaRecorder: true,
+        hasSpeechRecognition: true,
+      })
+    ).toBe("browser_speech");
+    expect(
+      resolveVoiceCaptureStrategy({
+        apiKey: "sk-live-123",
+        isSafeBaseUrl: true,
+        hasMediaRecorder: true,
+        hasSpeechRecognition: true,
+      })
+    ).toBe("whisper");
+
+    // Pinned Needs-Attention inbox & ⌘J / Alt+J round-robin jump
+    const devices = [
+      { id: "d-mac", name: "MacBook", role: "daemon", platform: "macos", x25519_pubkey: "k1", is_online: true },
+      { id: "d-lin", name: "Ubuntu", role: "daemon", platform: "linux", x25519_pubkey: "k2", is_online: true },
+    ];
+    const macTerms = [
+      { address: "m-1", name: "claude", argv: [], cwd: "/a", alive: true, status: { state: "needs_you", msg: "Approve edit?" } },
+      { address: "m-2", name: "shell", argv: [], cwd: "/a", alive: true, status: { state: "working" } },
+    ];
+    const byPeer = new Map([
+      ["d-mac", macTerms],
+      [
+        "d-lin",
+        [
+          { address: "l-1", name: "codex", argv: [], cwd: "/b", alive: true, status: { state: "permission", msg: "Run cargo test?" } },
+        ],
+      ],
+    ]);
+    const inbox = collectNeedsAttentionItems(devices, byPeer, "d-mac", macTerms);
+    expect(inbox.length).toBe(2);
+    expect(inbox[0].terminalAddr).toBe("m-1");
+    expect(inbox[1].terminalAddr).toBe("l-1");
+
+    expect(pickNextNeedsAttentionItem(inbox, "d-mac", "m-2")?.terminalAddr).toBe("m-1");
+    expect(pickNextNeedsAttentionItem(inbox, "d-mac", "m-1")?.terminalAddr).toBe("l-1");
+    expect(pickNextNeedsAttentionItem(inbox, "d-lin", "l-1")?.terminalAddr).toBe("m-1");
+
+    const inboxHtml = renderNeedsAttentionSidebarSection(inbox, "d-mac", "m-1", (en) => en);
+    expect(inboxHtml).toContain("Needs Attention");
+    expect(inboxHtml).toContain("⌘J");
+    expect(inboxHtml).toContain("Run cargo test?");
+  });
+
+  test("Workspace bootstrapper RCE guards & offline webhook validation", () => {
+    expect(validateSingleFolderName("coda-service")).toBeNull();
+    expect(validateSingleFolderName("")).not.toBeNull();
+    expect(validateSingleFolderName("../escape")).not.toBeNull();
+    expect(validateSingleFolderName("sub/dir")).not.toBeNull();
+    expect(validateSingleFolderName("-upload-pack")).not.toBeNull();
+
+    expect(validateGitCloneUrlClient("")).toBeNull();
+    expect(validateGitCloneUrlClient("https://github.com/Annihilater/coda.git")).toBeNull();
+    expect(validateGitCloneUrlClient("ssh://git@github.com/Annihilater/coda.git")).toBeNull();
+    expect(validateGitCloneUrlClient("git@github.com:Annihilater/coda.git")).toBeNull();
+    expect(validateGitCloneUrlClient("ext::sh -c touch% /tmp/pwn")).not.toBeNull();
+    expect(validateGitCloneUrlClient("file:///etc/passwd")).not.toBeNull();
+    expect(validateGitCloneUrlClient("--upload-pack=evil")).not.toBeNull();
+
+    expect(suggestFolderNameFromGitUrl("https://github.com/Annihilater/coda.git")).toBe("coda");
+    expect(suggestFolderNameFromGitUrl("git@github.com:Annihilater/coda-web.git")).toBe("coda-web");
+    expect(parentAbsolutePath("/Users/alice/code/coda")).toBe("/Users/alice/code");
+    expect(parentAbsolutePath("/Users")).toBe("/");
+
+    const cfg = createDefaultNotificationSettings();
+    expect(validateNotificationWebhookSettings(cfg)).toBeNull();
+    expect(
+      validateNotificationWebhookSettings({ ...cfg, bark_url: "https://api.day.app/abc123" })
+    ).toBeNull();
+    expect(
+      validateNotificationWebhookSettings({ ...cfg, bark_url: "http://192.168.1.5/hook" })
+    ).not.toBeNull();
+    expect(
+      validateNotificationWebhookSettings({ ...cfg, telegram_bot_token: "123:ABC", telegram_chat_id: "" })
+    ).not.toBeNull();
+    expect(
+      validateNotificationWebhookSettings({
+        ...cfg,
+        telegram_bot_token: "123:ABC",
+        telegram_chat_id: "998877",
+      })
+    ).toBeNull();
   });
 });
