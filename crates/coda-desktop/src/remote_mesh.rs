@@ -42,10 +42,13 @@ pub struct RemoteMeshHub {
     pty_mgr: Arc<Mutex<LocalPtyManager>>,
     ui_dirty: Arc<AtomicBool>,
     peers: tokio::sync::Mutex<HashMap<Uuid, Arc<LivePeerSession>>>,
+    peers_sync: std::sync::RwLock<HashMap<Uuid, Arc<LivePeerSession>>>,
     client_identities:
         tokio::sync::Mutex<HashMap<Uuid, (Uuid, coda_protocol::StoredDeviceIdentity)>>,
     attached_terms: tokio::sync::Mutex<HashSet<(Uuid, String)>>,
     embedded_host_handle: tokio::sync::Mutex<Option<EmbeddedHostHandle>>,
+    embedded_host_lock: tokio::sync::Mutex<()>,
+    embedded_host_gen: AtomicU64,
     peer_connect_locks: tokio::sync::Mutex<HashMap<Uuid, Arc<tokio::sync::Mutex<()>>>>,
     smart_path: tokio::sync::Mutex<DesktopSmartPathPolicy>,
     watcher_gen: AtomicU64,
@@ -53,6 +56,13 @@ pub struct RemoteMeshHub {
 
 impl Drop for RemoteMeshHub {
     fn drop(&mut self) {
+        self.embedded_host_gen.fetch_add(1, Ordering::AcqRel);
+        if let Ok(mut guard) = self.embedded_host_handle.try_lock() {
+            if let Some(handle) = guard.take() {
+                handle.stop();
+                EMBEDDED_HOST_STARTED.store(false, Ordering::Release);
+            }
+        }
         if let Some(rt) = self.rt.take() {
             rt.shutdown_background();
         }
@@ -76,13 +86,58 @@ impl RemoteMeshHub {
             pty_mgr,
             ui_dirty,
             peers: tokio::sync::Mutex::new(HashMap::new()),
+            peers_sync: std::sync::RwLock::new(HashMap::new()),
             client_identities: tokio::sync::Mutex::new(HashMap::new()),
             attached_terms: tokio::sync::Mutex::new(HashSet::new()),
             embedded_host_handle: tokio::sync::Mutex::new(None),
+            embedded_host_lock: tokio::sync::Mutex::new(()),
+            embedded_host_gen: AtomicU64::new(0),
             peer_connect_locks: tokio::sync::Mutex::new(HashMap::new()),
             smart_path: tokio::sync::Mutex::new(DesktopSmartPathPolicy::default()),
             watcher_gen: AtomicU64::new(0),
         })
+    }
+
+    async fn insert_peer(&self, host_id: Uuid, peer: Arc<LivePeerSession>) -> Option<Arc<LivePeerSession>> {
+        let mut map = self.peers.lock().await;
+        let old = map.insert(host_id, Arc::clone(&peer));
+        if let Ok(mut sync_map) = self.peers_sync.write() {
+            sync_map.insert(host_id, peer);
+        }
+        old
+    }
+
+    async fn remove_peer(&self, host_id: Uuid) -> Option<Arc<LivePeerSession>> {
+        let mut map = self.peers.lock().await;
+        let old = map.remove(&host_id);
+        if let Ok(mut sync_map) = self.peers_sync.write() {
+            sync_map.remove(&host_id);
+        }
+        old
+    }
+
+    async fn remove_peer_if_ptr_eq(&self, host_id: Uuid, expected: &Arc<LivePeerSession>) -> bool {
+        let mut map = self.peers.lock().await;
+        if map.get(&host_id).map(|cur| Arc::ptr_eq(cur, expected)).unwrap_or(false) {
+            map.remove(&host_id);
+            if let Ok(mut sync_map) = self.peers_sync.write() {
+                if sync_map.get(&host_id).map(|cur| Arc::ptr_eq(cur, expected)).unwrap_or(false) {
+                    sync_map.remove(&host_id);
+                }
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    async fn drain_peers(&self) -> Vec<Arc<LivePeerSession>> {
+        let mut map = self.peers.lock().await;
+        let drained: Vec<Arc<LivePeerSession>> = map.drain().map(|(_, p)| p).collect();
+        if let Ok(mut sync_map) = self.peers_sync.write() {
+            sync_map.clear();
+        }
+        drained
     }
 
     fn spawn_bg<F>(&self, fut: F)
@@ -116,17 +171,46 @@ impl RemoteMeshHub {
             self.ui_dirty.store(true, Ordering::Release);
             return;
         }
-        if EMBEDDED_HOST_STARTED
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return;
-        }
+        let my_gen = self.embedded_host_gen.fetch_add(1, Ordering::AcqRel) + 1;
         let hub = Arc::clone(self);
         self.spawn_bg(async move {
-            if let Some(handle) = start_embedded_host_with_handle(&cfg_path).await {
-                if !EMBEDDED_HOST_STARTED.load(Ordering::Acquire) {
+            let _op_guard = hub.embedded_host_lock.lock().await;
+            if hub.embedded_host_gen.load(Ordering::Acquire) != my_gen {
+                return;
+            }
+            if hub.embedded_host_handle.lock().await.is_some() {
+                if let Ok(mut g) = hub.state.lock() {
+                    g.embedded_host_active = true;
+                    g.external_daemon_running = false;
+                }
+                hub.ui_dirty.store(true, Ordering::Release);
+                return;
+            }
+            if EMBEDDED_HOST_STARTED
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                return;
+            }
+            let mut started_handle = None;
+            for attempt in 0..3 {
+                if hub.embedded_host_gen.load(Ordering::Acquire) != my_gen {
+                    break;
+                }
+                if let Some(handle) = start_embedded_host_with_handle(&cfg_path).await {
+                    started_handle = Some(handle);
+                    break;
+                }
+                if attempt < 2 {
+                    tokio::time::sleep(Duration::from_millis(120)).await;
+                }
+            }
+            if let Some(handle) = started_handle {
+                if hub.embedded_host_gen.load(Ordering::Acquire) != my_gen
+                    || !EMBEDDED_HOST_STARTED.load(Ordering::Acquire)
+                {
                     handle.stop();
+                    EMBEDDED_HOST_STARTED.store(false, Ordering::Release);
                     return;
                 }
                 *hub.embedded_host_handle.lock().await = Some(handle);
@@ -178,9 +262,14 @@ impl RemoteMeshHub {
         if enabled {
             self.ensure_embedded_host();
         } else {
-            EMBEDDED_HOST_STARTED.store(false, Ordering::Release);
+            let my_gen = self.embedded_host_gen.fetch_add(1, Ordering::AcqRel) + 1;
             let hub = Arc::clone(self);
             self.spawn_bg(async move {
+                let _op_guard = hub.embedded_host_lock.lock().await;
+                if hub.embedded_host_gen.load(Ordering::Acquire) != my_gen {
+                    return;
+                }
+                EMBEDDED_HOST_STARTED.store(false, Ordering::Release);
                 if let Some(handle) = hub.embedded_host_handle.lock().await.take() {
                     handle.stop();
                 }
@@ -189,6 +278,62 @@ impl RemoteMeshHub {
                 }
                 hub.ui_dirty.store(true, Ordering::Release);
             });
+        }
+        self.ui_dirty.store(true, Ordering::Release);
+    }
+
+    /// Cleanly tears down old account peers, remote sessions, and embedded host before switching accounts.
+    pub async fn reset_for_account_switch(self: &Arc<Self>) {
+        self.watcher_gen.fetch_add(1, Ordering::AcqRel);
+        self.embedded_host_gen.fetch_add(1, Ordering::AcqRel);
+        {
+            let _op_guard = self.embedded_host_lock.lock().await;
+            EMBEDDED_HOST_STARTED.store(false, Ordering::Release);
+            if let Some(handle) = self.embedded_host_handle.lock().await.take() {
+                handle.stop();
+            }
+        }
+        for peer in self.drain_peers().await {
+            peer.close();
+        }
+        self.attached_terms.lock().await.clear();
+        self.client_identities.lock().await.clear();
+        self.peer_connect_locks.lock().await.clear();
+        self.smart_path.lock().await.reset_all();
+        DesktopClientIdentityRecord::remove_saved();
+
+        let mut removed_remote_sids = Vec::new();
+        if let Ok(mut g) = self.state.lock() {
+            for s in &g.sessions {
+                if s.remote_host_id.is_some() {
+                    removed_remote_sids.push(s.id.clone());
+                }
+            }
+            g.embedded_host_active = false;
+            g.remote_hosts.clear();
+            g.remote_probe_status = None;
+            g.clear_settings_ephemeral_inputs();
+            g.notify_tracker.reset();
+            g.spaces.retain(|sp| !sp.is_remote);
+            g.sessions.retain(|s| s.remote_host_id.is_none());
+            if g.active_space().is_none() {
+                g.active_space_id = g.spaces.first().map(|sp| sp.id.clone());
+            }
+            if let Some(ref aid) = g.active_session_id {
+                if !g.sessions.iter().any(|s| s.id == *aid) {
+                    g.active_session_id = g.sessions.first().map(|s| s.id.clone());
+                }
+            }
+            if let Some(ref sid) = g.split_session_id {
+                if !g.sessions.iter().any(|s| s.id == *sid) {
+                    g.split_session_id = None;
+                }
+            }
+        }
+        if let Ok(mut mgr) = self.pty_mgr.lock() {
+            for sid in removed_remote_sids {
+                mgr.remove_remote_buffer(&sid);
+            }
         }
         self.ui_dirty.store(true, Ordering::Release);
     }
@@ -342,10 +487,20 @@ impl RemoteMeshHub {
                     if let Ok(mut g) = hub.state.lock() {
                         g.remote_hosts.retain(|h| h.id != device_id);
                         g.spaces.retain(|sp| sp.machine_id != host_str);
+                        if g.renaming_host_id == Some(device_id) {
+                            g.renaming_host_id = None;
+                            g.rename_host_input.clear();
+                            if g.input_target == ActiveInputTarget::RenameDeviceInput {
+                                g.input_target = ActiveInputTarget::TerminalDirect;
+                            }
+                        }
                         for s in &g.sessions {
                             if s.remote_host_id.as_deref() == Some(host_str.as_str()) {
                                 removed_sids.push(s.id.clone());
                             }
+                        }
+                        for sid in &removed_sids {
+                            g.notify_tracker.prune_session(sid);
                         }
                         g.sessions
                             .retain(|s| s.remote_host_id.as_deref() != Some(host_str.as_str()));
@@ -355,6 +510,11 @@ impl RemoteMeshHub {
                         if let Some(ref aid) = g.active_session_id {
                             if !g.sessions.iter().any(|s| s.id == *aid) {
                                 g.active_session_id = g.sessions.first().map(|s| s.id.clone());
+                            }
+                        }
+                        if let Some(ref sid) = g.split_session_id {
+                            if !g.sessions.iter().any(|s| s.id == *sid) {
+                                g.split_session_id = None;
                             }
                         }
                         g.status_notice = Some(
@@ -408,6 +568,8 @@ impl RemoteMeshHub {
             g.account_email.clear();
             g.auth_account_input.clear();
             g.auth_password_input.clear();
+            g.clear_settings_ephemeral_inputs();
+            g.notify_tracker.reset();
             g.device_login_code = None;
             g.device_login_uri = None;
             g.remote_hosts.clear();
@@ -448,14 +610,19 @@ impl RemoteMeshHub {
         }
         self.ui_dirty.store(true, Ordering::Release);
 
+        let my_host_gen = self.embedded_host_gen.fetch_add(1, Ordering::AcqRel) + 1;
         let hub = Arc::clone(self);
         self.spawn_bg(async move {
-            if let Some(handle) = hub.embedded_host_handle.lock().await.take() {
-                handle.stop();
+            {
+                let _op_guard = hub.embedded_host_lock.lock().await;
+                if hub.embedded_host_gen.load(Ordering::Acquire) == my_host_gen {
+                    EMBEDDED_HOST_STARTED.store(false, Ordering::Release);
+                    if let Some(handle) = hub.embedded_host_handle.lock().await.take() {
+                        handle.stop();
+                    }
+                }
             }
-            let peers_to_close: Vec<Arc<LivePeerSession>> =
-                hub.peers.lock().await.drain().map(|(_, p)| p).collect();
-            for peer in peers_to_close {
+            for peer in hub.drain_peers().await {
                 peer.close();
             }
             hub.attached_terms.lock().await.clear();
@@ -536,10 +703,59 @@ impl RemoteMeshHub {
             .filter(|h| h.id != cfg.device_id && Some(h.id) != local_host_id)
             .collect();
 
+        let live_host_ids: HashSet<Uuid> = hosts.iter().map(|h| h.id).collect();
+        let live_host_strs: HashSet<String> = hosts.iter().map(|h| h.id.to_string()).collect();
+        let mut stale_host_ids: Vec<Uuid> = Vec::new();
+        let mut pruned_sids: Vec<String> = Vec::new();
         {
             let Ok(mut g) = self.state.lock() else {
                 return;
             };
+            for prev_h in &g.remote_hosts {
+                if !live_host_ids.contains(&prev_h.id) {
+                    stale_host_ids.push(prev_h.id);
+                }
+            }
+            // V3-31: Prune spaces & sessions belonging to hosts removed from the account.
+            g.spaces
+                .retain(|sp| !sp.is_remote || live_host_strs.contains(&sp.machine_id));
+            for s in &g.sessions {
+                if let Some(ref hid) = s.remote_host_id {
+                    if !live_host_strs.contains(hid) {
+                        pruned_sids.push(s.id.clone());
+                    }
+                }
+            }
+            if !pruned_sids.is_empty() {
+                let pruned_set: HashSet<&str> = pruned_sids.iter().map(String::as_str).collect();
+                for sid in &pruned_sids {
+                    g.notify_tracker.prune_session(sid);
+                }
+                g.sessions.retain(|s| !pruned_set.contains(s.id.as_str()));
+            }
+            if let Some(ren_id) = g.renaming_host_id {
+                if !live_host_ids.contains(&ren_id) {
+                    g.renaming_host_id = None;
+                    g.rename_host_input.clear();
+                    if g.input_target == ActiveInputTarget::RenameDeviceInput {
+                        g.input_target = ActiveInputTarget::TerminalDirect;
+                    }
+                }
+            }
+            if g.active_space().is_none() {
+                g.active_space_id = g.spaces.first().map(|sp| sp.id.clone());
+            }
+            if let Some(ref aid) = g.active_session_id {
+                if !g.sessions.iter().any(|s| s.id == *aid) {
+                    g.active_session_id = g.sessions.first().map(|s| s.id.clone());
+                }
+            }
+            if let Some(ref sid) = g.split_session_id {
+                if !g.sessions.iter().any(|s| s.id == *sid) {
+                    g.split_session_id = None;
+                }
+            }
+
             let online_map: HashMap<String, bool> =
                 hosts.iter().map(|h| (h.id.to_string(), h.is_online)).collect();
             for sp in &mut g.spaces {
@@ -574,6 +790,16 @@ impl RemoteMeshHub {
             }
             g.remote_hosts = hosts.clone();
         }
+        if !pruned_sids.is_empty() {
+            if let Ok(mut mgr) = self.pty_mgr.lock() {
+                for sid in pruned_sids {
+                    mgr.remove_remote_buffer(&sid);
+                }
+            }
+        }
+        for stale_id in stale_host_ids {
+            self.drop_peer(stale_id).await;
+        }
         self.ui_dirty.store(true, Ordering::Release);
 
         for host in &hosts {
@@ -586,8 +812,26 @@ impl RemoteMeshHub {
     }
 
     async fn drop_peer(self: &Arc<Self>, host_id: Uuid) {
-        if let Some(peer) = self.peers.lock().await.remove(&host_id) {
+        if let Some(peer) = self.remove_peer(host_id).await {
             peer.close();
+        }
+        self.mark_host_sessions_disconnected_if_no_peer(host_id).await;
+    }
+
+    async fn drop_peer_if_ptr_eq(
+        self: &Arc<Self>,
+        host_id: Uuid,
+        expected: &Arc<LivePeerSession>,
+    ) {
+        if self.remove_peer_if_ptr_eq(host_id, expected).await {
+            expected.close();
+        }
+        self.mark_host_sessions_disconnected_if_no_peer(host_id).await;
+    }
+
+    async fn mark_host_sessions_disconnected_if_no_peer(&self, host_id: Uuid) {
+        if self.peers.lock().await.contains_key(&host_id) {
+            return;
         }
         {
             let mut att = self.attached_terms.lock().await;
@@ -672,13 +916,20 @@ impl RemoteMeshHub {
             .map(|(_, t)| t.clone())
             .collect();
         for term_addr in terms {
+            let sid = format!("remote:{host_id}:{term_addr}");
+            let (cols, rows) = self
+                .pty_mgr
+                .lock()
+                .ok()
+                .and_then(|mgr| mgr.session_dims(&sid))
+                .unwrap_or((120, 36));
             let _ = peer
                 .request(
                     PeerMessage::PtyAttach {
                         req_id: format!("hot-{}", Uuid::new_v4().simple()),
                         terminal: term_addr,
-                        cols: 120,
-                        rows: 36,
+                        cols,
+                        rows,
                     },
                     TrafficLane::ControlP0,
                     Duration::from_secs(5),
@@ -689,6 +940,16 @@ impl RemoteMeshHub {
 
     /// Background Smart-Path hot-upgrade from Smart Relay to Direct LAN/IPv6 P2P with zero black screen.
     async fn try_hot_upgrade_peer_to_direct(self: &Arc<Self>, host: &RemoteHostSummary) -> bool {
+        let connect_lock = {
+            let mut locks = self.peer_connect_locks.lock().await;
+            Arc::clone(
+                locks
+                    .entry(host.id)
+                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+            )
+        };
+        let _connect_guard = connect_lock.lock().await;
+
         let current_peer = match self.peers.lock().await.get(&host.id).cloned() {
             Some(p) if !p.is_direct_p2p() => p,
             _ => return false,
@@ -718,10 +979,9 @@ impl RemoteMeshHub {
 
         let new_peer = Arc::new(direct_sess);
         let route_label = new_peer.route_label().to_string();
-        self.spawn_peer_event_loop(Arc::clone(&new_peer), host.clone());
-        self.reattach_terms_preserving_screen(&new_peer, host.id)
-            .await;
 
+        // V3-01: Atomically swap active peer BEFORE re-attaching so the old Relay event loop
+        // immediately stops forwarding duplicate PTY chunks, then detach & close old Relay.
         let swapped_old = {
             let mut map = self.peers.lock().await;
             let still_same = map
@@ -729,14 +989,40 @@ impl RemoteMeshHub {
                 .map(|p| Arc::ptr_eq(p, &current_peer))
                 .unwrap_or(false);
             if still_same {
-                map.insert(host.id, Arc::clone(&new_peer))
+                let old = map.insert(host.id, Arc::clone(&new_peer));
+                if let Ok(mut sync_map) = self.peers_sync.write() {
+                    sync_map.insert(host.id, Arc::clone(&new_peer));
+                }
+                old
             } else {
                 None
             }
         };
 
         if let Some(old_relay) = swapped_old {
+            let terms_to_detach: Vec<String> = self
+                .attached_terms
+                .lock()
+                .await
+                .iter()
+                .filter(|(hid, _)| *hid == host.id)
+                .map(|(_, t)| t.clone())
+                .collect();
+            for term_addr in terms_to_detach {
+                let _ = old_relay.try_send_oneway(
+                    PeerMessage::PtyDetach {
+                        req_id: format!("hdet-{}", Uuid::new_v4().simple()),
+                        terminal: term_addr,
+                    },
+                    TrafficLane::ControlP0,
+                );
+            }
             old_relay.close();
+
+            self.spawn_peer_event_loop(Arc::clone(&new_peer), host.clone());
+            self.reattach_terms_preserving_screen(&new_peer, host.id)
+                .await;
+
             self.smart_path
                 .lock()
                 .await
@@ -854,6 +1140,16 @@ impl RemoteMeshHub {
                         data_b64,
                         ..
                     }) => {
+                        // V3-01: Drop any late chunks from a superseded peer (e.g. old Relay after Direct hot-switch).
+                        let is_current = hub
+                            .peers_sync
+                            .read()
+                            .ok()
+                            .and_then(|m| m.get(&host_id).map(|cur| Arc::ptr_eq(cur, &peer_for_task)))
+                            .unwrap_or(false);
+                        if !is_current {
+                            continue;
+                        }
                         if let Ok(bytes) = B64.decode(&data_b64) {
                             let sid = format!("remote:{host_id}:{terminal}");
                             let replies = if let Ok(mut mgr) = hub.pty_mgr.lock() {
@@ -869,6 +1165,15 @@ impl RemoteMeshHub {
                         }
                     }
                     Ok(PeerAsyncEvent::HerdrLiveEvent { terminal, .. }) => {
+                        let is_current = hub
+                            .peers_sync
+                            .read()
+                            .ok()
+                            .and_then(|m| m.get(&host_id).map(|cur| Arc::ptr_eq(cur, &peer_for_task)))
+                            .unwrap_or(false);
+                        if !is_current {
+                            continue;
+                        }
                         if let Some(term) = terminal {
                             let sid = format!("remote:{}:{}", host_id, term.address);
                             if let Ok(mut g) = hub.state.lock() {
@@ -904,7 +1209,7 @@ impl RemoteMeshHub {
                         }
 
                         // Seamless failover: if a Direct P2P session drops while host is still online,
-                        // keep VT buffers intact and immediately fail over to Smart Relay.
+                        // keep VT buffers intact and immediately fail over to Smart Relay (respecting 8s flap guard).
                         let host_still_online = hub
                             .state
                             .lock()
@@ -918,27 +1223,28 @@ impl RemoteMeshHub {
                                 .await
                                 .record_direct_drop(host_id, Instant::now());
                             if let Some(online_host) = host_still_online {
-                                {
-                                    let mut map = hub.peers.lock().await;
-                                    if map
-                                        .get(&host_id)
-                                        .map(|cur| Arc::ptr_eq(cur, &peer_for_task))
-                                        .unwrap_or(false)
-                                    {
-                                        map.remove(&host_id);
-                                    }
+                                if !hub.remove_peer_if_ptr_eq(host_id, &peer_for_task).await {
+                                    break;
                                 }
+                                peer_for_task.close();
                                 if let Ok(cfg) =
                                     load_desktop_daemon_config(&DaemonConfig::default_path())
                                 {
-                                    if let Ok(new_peer) =
-                                        hub.get_or_connect_peer(&cfg, &online_host).await
+                                    // V3-12: Force Relay-only on Direct drop failover so we never re-probe dead LAN during 8s flap-guard!
+                                    if let Ok(new_peer) = hub
+                                        .get_or_connect_peer_with_mode(&cfg, &online_host, false)
+                                        .await
                                     {
                                         hub.reattach_terms_preserving_screen(&new_peer, host_id)
                                             .await;
+                                        let route_lbl = new_peer.route_label().to_string();
                                         if let Ok(mut g) = hub.state.lock() {
+                                            g.remote_probe_status = Some(format!(
+                                                "{} · {route_lbl}",
+                                                online_host.name
+                                            ));
                                             g.status_notice = Some(format!(
-                                                "{} · {}",
+                                                "{} · {} ({route_lbl})",
                                                 tr(
                                                     g.locale,
                                                     "LAN Direct dropped — failed over seamlessly to Smart Relay",
@@ -951,10 +1257,34 @@ impl RemoteMeshHub {
                                         break;
                                     }
                                 }
+                                hub.mark_host_sessions_disconnected_if_no_peer(host_id).await;
+                                break;
                             }
+                        } else if let Some(online_host) = host_still_online {
+                            // Relay leg dropped or received `SessionReset`: remove stale Relay peer,
+                            // wait briefly to avoid tight loops, and seamlessly re-handshake & re-attach.
+                            if !hub.remove_peer_if_ptr_eq(host_id, &peer_for_task).await {
+                                break;
+                            }
+                            peer_for_task.close();
+                            tokio::time::sleep(Duration::from_millis(350)).await;
+                            if let Ok(cfg) =
+                                load_desktop_daemon_config(&DaemonConfig::default_path())
+                            {
+                                if let Ok(new_peer) =
+                                    hub.get_or_connect_peer(&cfg, &online_host).await
+                                {
+                                    hub.reattach_terms_preserving_screen(&new_peer, host_id)
+                                        .await;
+                                    hub.ui_dirty.store(true, Ordering::Release);
+                                    break;
+                                }
+                            }
+                            hub.mark_host_sessions_disconnected_if_no_peer(host_id).await;
+                            break;
                         }
 
-                        hub.drop_peer(host_id).await;
+                        hub.drop_peer_if_ptr_eq(host_id, &peer_for_task).await;
                         break;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
@@ -1006,6 +1336,15 @@ impl RemoteMeshHub {
         self: &Arc<Self>,
         cfg: &DaemonConfig,
         host: &RemoteHostSummary,
+    ) -> anyhow::Result<Arc<LivePeerSession>> {
+        self.get_or_connect_peer_with_mode(cfg, host, true).await
+    }
+
+    async fn get_or_connect_peer_with_mode(
+        self: &Arc<Self>,
+        cfg: &DaemonConfig,
+        host: &RemoteHostSummary,
+        allow_direct: bool,
     ) -> anyhow::Result<Arc<LivePeerSession>> {
         if let Some(existing) = self.peers.lock().await.get(&host.id).cloned() {
             return Ok(existing);
@@ -1079,21 +1418,27 @@ impl RemoteMeshHub {
             }
             None => None,
         };
+        let (endpoints, udp_probe) = if allow_direct {
+            (
+                host.endpoints.clone(),
+                Some("255.255.255.255:24444".parse().unwrap()),
+            )
+        } else {
+            (Vec::new(), None)
+        };
         let session = LivePeerSession::connect_auto(
             client_identity,
             client_dev_id,
             host.id,
             host.identity_pin(),
-            host.endpoints.clone(),
-            Some("255.255.255.255:24444".parse().unwrap()),
+            endpoints,
+            udp_probe,
             relay_cfg,
         )
         .await?;
         let is_direct = session.is_direct_p2p();
         let arc_sess = Arc::new(session);
-        {
-            self.peers.lock().await.insert(host.id, Arc::clone(&arc_sess));
-        }
+        self.insert_peer(host.id, Arc::clone(&arc_sess)).await;
 
         self.spawn_peer_event_loop(Arc::clone(&arc_sess), host.clone());
         if is_direct {
@@ -1300,6 +1645,9 @@ impl RemoteMeshHub {
                         });
                         if let Some(o) = initial_osc {
                             g.record_session_osc_status(&sid, o);
+                        } else {
+                            g.notify_tracker
+                                .seed_baseline(&sid, crate::pty::AgentLifecycleState::Idle);
                         }
                         if g.active_session_id.is_none() {
                             g.active_session_id = Some(sid);
@@ -1353,6 +1701,12 @@ impl RemoteMeshHub {
         term: &HerdrTerminalSummary,
     ) {
         let sid = format!("remote:{}:{}", host_id, term.address);
+        let (cols, rows) = self
+            .pty_mgr
+            .lock()
+            .ok()
+            .and_then(|mgr| mgr.session_dims(&sid))
+            .unwrap_or((term.cols.max(80), term.rows.max(24)));
         if let Ok(PeerMessage::TerminalScreenSnapshot { text, .. }) = peer
             .request(
                 PeerMessage::ReadTerminalScreen {
@@ -1368,6 +1722,7 @@ impl RemoteMeshHub {
             if !text.is_empty() {
                 let norm = normalize_newlines_for_vt(&text);
                 if let Ok(mgr) = self.pty_mgr.lock() {
+                    mgr.clear_buffer(&sid);
                     mgr.feed_remote_output(&sid, &norm);
                 }
             }
@@ -1378,8 +1733,8 @@ impl RemoteMeshHub {
                 PeerMessage::PtyAttach {
                     req_id: format!("att-{}", Uuid::new_v4().simple()),
                     terminal: term.address.clone(),
-                    cols: 120,
-                    rows: 36,
+                    cols,
+                    rows,
                 },
                 TrafficLane::ControlP0,
                 Duration::from_secs(6),
@@ -1494,6 +1849,8 @@ impl RemoteMeshHub {
                                     remote_host_id: Some(host_id.to_string()),
                                     osc_status: None,
                                 });
+                                g.notify_tracker
+                                    .seed_baseline(&sid, crate::pty::AgentLifecycleState::Idle);
                             }
                             if g.layout.split_terminals && g.focused_pane == SplitPane::Secondary {
                                 g.split_session_id = Some(sid);
@@ -1503,14 +1860,15 @@ impl RemoteMeshHub {
                             g.input_target = ActiveInputTarget::TerminalDirect;
                         }
                     }
-                    {
-                        hub.attached_terms
-                            .lock()
-                            .await
-                            .insert((host_id, term.address.clone()));
+                    let need_attach = hub
+                        .attached_terms
+                        .lock()
+                        .await
+                        .insert((host_id, term.address.clone()));
+                    if need_attach {
+                        hub.seed_and_attach_remote_term(Arc::clone(&peer), host_id, &term)
+                            .await;
                     }
-                    hub.seed_and_attach_remote_term(Arc::clone(&peer), host_id, &term)
-                        .await;
                     hub.ui_dirty.store(true, Ordering::Release);
                 }
                 Ok(PeerMessage::LaunchAgentResult { error, .. }) => {
@@ -1532,9 +1890,27 @@ impl RemoteMeshHub {
     }
 
     pub fn send_remote_pty_input(self: &Arc<Self>, host_id: Uuid, terminal: &str, bytes: Vec<u8>) {
+        let data_b64 = B64.encode(bytes);
+        // V3-13: Synchronous FIFO enqueue on caller thread prevents out-of-order keystrokes across
+        // Tokio worker threads; only fall back to async send if channel backpressure is hit.
+        if let Ok(sync_map) = self.peers_sync.read() {
+            if let Some(peer) = sync_map.get(&host_id) {
+                if peer
+                    .try_send_oneway(
+                        PeerMessage::PtyInput {
+                            terminal: terminal.to_string(),
+                            data_b64: data_b64.clone(),
+                        },
+                        TrafficLane::ControlP0,
+                    )
+                    .is_ok()
+                {
+                    return;
+                }
+            }
+        }
         let hub = Arc::clone(self);
         let terminal = terminal.to_string();
-        let data_b64 = B64.encode(bytes);
         self.spawn_bg(async move {
             if let Some(peer) = hub.peers.lock().await.get(&host_id).cloned() {
                 let _ = peer
@@ -1573,6 +1949,22 @@ impl RemoteMeshHub {
     }
 
     pub fn send_remote_interrupt(self: &Arc<Self>, host_id: Uuid, terminal: &str) {
+        if let Ok(sync_map) = self.peers_sync.read() {
+            if let Some(peer) = sync_map.get(&host_id) {
+                if peer
+                    .try_send_oneway(
+                        PeerMessage::PtyInput {
+                            terminal: terminal.to_string(),
+                            data_b64: B64.encode([0x03u8]),
+                        },
+                        TrafficLane::ControlP0,
+                    )
+                    .is_ok()
+                {
+                    return;
+                }
+            }
+        }
         let hub = Arc::clone(self);
         let terminal = terminal.to_string();
         self.spawn_bg(async move {
@@ -1965,6 +2357,7 @@ pub(crate) fn spawn_device_login(
 
                     match poll_device_login_until_approved(&flow).await {
                         Ok(cfg) => {
+                            mesh_hub.reset_for_account_switch().await;
                             let _ = save_desktop_daemon_config(&cfg, &cfg_path);
                             if let Ok(mut g) = state_bg.lock() {
                                 g.is_logged_in = true;
@@ -2040,6 +2433,7 @@ pub(crate) fn spawn_password_login(
             .await
             {
                 Ok(cfg) => {
+                    mesh_hub.reset_for_account_switch().await;
                     let _ = save_desktop_daemon_config(&cfg, &cfg_path);
                     if let Ok(mut g) = state_bg.lock() {
                         g.is_logged_in = true;

@@ -174,11 +174,11 @@ pub struct TerminalSessionEntry {
 
 impl TerminalSessionEntry {
     pub fn effective_state(&self) -> AgentLifecycleState {
-        if let Some(ref osc) = self.osc_status {
-            return osc.state;
-        }
         if !self.alive {
             return AgentLifecycleState::Done;
+        }
+        if let Some(ref osc) = self.osc_status {
+            return osc.state;
         }
         if self.started_at.elapsed() > Duration::from_secs(1)
             && self.last_output_at.elapsed() < Duration::from_secs(3)
@@ -290,6 +290,7 @@ pub struct CodaDesktopState {
     pub account_email: String,
     pub allow_remote_control: bool,
     pub desktop_notifications: bool,
+    pub app_is_active: bool,
     pub notify_tracker: DesktopNotificationTracker,
     pub embedded_host_active: bool,
     pub external_daemon_running: bool,
@@ -350,6 +351,7 @@ impl Default for CodaDesktopState {
             account_email: String::new(),
             allow_remote_control: true,
             desktop_notifications: true,
+            app_is_active: true,
             notify_tracker: DesktopNotificationTracker::default(),
             embedded_host_active: false,
             external_daemon_running: false,
@@ -389,6 +391,28 @@ impl CodaDesktopState {
         self.sessions.iter().find(|s| s.id == id)
     }
 
+    /// Clears transient Settings inputs (inline rename + plaintext password buffers) so they never
+    /// leak across tab switches, modal closes, Escape, or sign-out.
+    pub fn clear_settings_ephemeral_inputs(&mut self) {
+        self.renaming_host_id = None;
+        self.rename_host_input.clear();
+        self.pw_change_expanded = false;
+        self.pw_current_input.clear();
+        self.pw_new_input.clear();
+        self.input_selected_all = false;
+        if matches!(
+            self.input_target,
+            ActiveInputTarget::RenameDeviceInput
+                | ActiveInputTarget::ChangePwCurrent
+                | ActiveInputTarget::ChangePwNew
+                | ActiveInputTarget::AuthServerUrl
+                | ActiveInputTarget::AuthAccount
+                | ActiveInputTarget::AuthPassword
+        ) {
+            self.input_target = ActiveInputTarget::TerminalDirect;
+        }
+    }
+
     pub fn record_session_osc_status(&mut self, session_id: &str, osc: Osc7501Status) {
         let title = if let Some(sess) = self.sessions.iter_mut().find(|s| s.id == session_id) {
             sess.osc_status = Some(osc.clone());
@@ -396,19 +420,19 @@ impl CodaDesktopState {
         } else {
             return;
         };
-        if !self.desktop_notifications {
-            return;
-        }
         let active_id = self.focused_session_id().map(str::to_string);
         if let Some(payload) = self.notify_tracker.observe(
             session_id,
             &title,
             &osc,
             active_id.as_deref(),
+            self.app_is_active,
             self.locale,
             Instant::now(),
         ) {
-            dispatch_native_notification(payload);
+            if self.desktop_notifications {
+                dispatch_native_notification(payload);
+            }
         }
     }
 
@@ -572,7 +596,7 @@ pub struct CodaGpuWorkspaceView {
     pane_geometry: Arc<Mutex<HashMap<SplitPane, PaneGeometry>>>,
     terminal_selection: Arc<Mutex<Option<TerminalSelection>>>,
     scroll_pixel_acc: Mutex<HashMap<String, f32>>,
-    pty_synced_gen: Mutex<HashMap<String, (u64, bool)>>,
+    pty_synced_gen: Mutex<HashMap<String, (u64, bool, u64)>>,
     inspector_seq: Arc<AtomicU64>,
 }
 
@@ -1486,6 +1510,7 @@ impl CodaGpuWorkspaceView {
             if key == "escape" {
                 if let Ok(mut g) = self.state.lock() {
                     g.settings_open = false;
+                    g.clear_settings_ephemeral_inputs();
                 }
                 cx.notify();
                 cx.stop_propagation();
@@ -1688,6 +1713,9 @@ impl CodaGpuWorkspaceView {
                 }
                 "escape" => {
                     if let Ok(mut g) = self.state.lock() {
+                        g.pw_change_expanded = false;
+                        g.pw_current_input.clear();
+                        g.pw_new_input.clear();
                         g.input_selected_all = false;
                         g.input_target = ActiveInputTarget::TerminalDirect;
                     }
@@ -1716,6 +1744,9 @@ impl CodaGpuWorkspaceView {
                 }
                 "escape" => {
                     if let Ok(mut g) = self.state.lock() {
+                        g.pw_change_expanded = false;
+                        g.pw_current_input.clear();
+                        g.pw_new_input.clear();
                         g.input_selected_all = false;
                         g.input_target = ActiveInputTarget::TerminalDirect;
                     }
@@ -1847,21 +1878,26 @@ impl CodaGpuWorkspaceView {
         let Ok(mut g) = self.state.lock() else {
             return;
         };
-        let mut osc_updates: Vec<(String, Osc7501Status)> = Vec::new();
+        let mut osc_updates: Vec<(String, Option<Osc7501Status>)> = Vec::new();
         for sess in &mut g.sessions {
             if let Some(snap) = snaps.get(&sess.id) {
                 let prev = synced.get(&sess.id).copied();
-                if prev == Some((snap.generation, snap.alive)) {
+                if prev == Some((snap.generation, snap.alive, snap.osc_seq)) {
                     continue;
                 }
-                synced.insert(sess.id.clone(), (snap.generation, snap.alive));
+                let prev_osc_seq = prev.map(|p| p.2).unwrap_or(0);
+                synced.insert(sess.id.clone(), (snap.generation, snap.alive, snap.osc_seq));
                 let old_total = sess.styled_lines.len();
                 let new_total = snap.styled_lines.len();
-                // #41: Keep scrollback viewport pinned while user is reading history instead of jumping.
-                if sess.scroll_offset > 0 && !snap.in_alt_screen && new_total > old_total {
-                    sess.scroll_offset = (sess.scroll_offset + (new_total - old_total)).min(1200);
-                } else if snap.in_alt_screen {
+                // #41 + V3-31: Keep scrollback viewport pinned while reading history, and clamp if output shrinks.
+                if snap.in_alt_screen {
                     sess.scroll_offset = 0;
+                } else if sess.scroll_offset > 0 && new_total > old_total {
+                    sess.scroll_offset = (sess.scroll_offset + (new_total - old_total))
+                        .min(new_total.saturating_sub(1))
+                        .min(1200);
+                } else if sess.scroll_offset > 0 {
+                    sess.scroll_offset = sess.scroll_offset.min(new_total.saturating_sub(1));
                 }
                 let sig = snap
                     .lines
@@ -1877,17 +1913,60 @@ impl CodaGpuWorkspaceView {
                 sess.styled_lines = snap.styled_lines.clone();
                 sess.alive = snap.alive;
                 sess.attached_hc = snap.attached_hc;
-                if let Some(ref osc) = snap.osc_status {
-                    osc_updates.push((sess.id.clone(), osc.clone()));
+                // V3-10: Only propagate OSC 7501 when a genuinely new OSC sequence arrived (osc_seq changed),
+                // preventing sticky NeedsYou state from resurrecting after approval or herdr_live_event.
+                if snap.osc_seq != prev_osc_seq {
+                    osc_updates.push((sess.id.clone(), snap.osc_status.clone()));
                 }
             }
         }
-        for (sid, osc) in osc_updates {
-            g.record_session_osc_status(&sid, osc);
+        for (sid, osc_opt) in osc_updates {
+            if let Some(osc) = osc_opt {
+                g.record_session_osc_status(&sid, osc);
+            } else if let Some(sess) = g.sessions.iter_mut().find(|s| s.id == sid) {
+                sess.osc_status = None;
+            }
         }
     }
 
+    fn optimistically_clear_needs_you(&self, session_id: &str) {
+        let should_clear = self
+            .state
+            .lock()
+            .ok()
+            .and_then(|g| {
+                g.sessions
+                    .iter()
+                    .find(|s| s.id == session_id)
+                    .and_then(|s| s.osc_status.as_ref())
+                    .map(|o| o.state == AgentLifecycleState::NeedsYou)
+            })
+            .unwrap_or(false);
+        if !should_clear {
+            return;
+        }
+        let next = Osc7501Status {
+            state: AgentLifecycleState::Working,
+            task: None,
+            updated_at: Instant::now(),
+        };
+        if let Ok(mgr) = self.pty_mgr.lock() {
+            mgr.set_session_osc_status(session_id, Some(next.clone()));
+        }
+        if let Ok(mut g) = self.state.lock() {
+            g.record_session_osc_status(session_id, next);
+        }
+        self.ui_dirty.store(true, Ordering::Release);
+    }
+
     fn send_bytes_to_session(&self, session_id: &str, bytes: &[u8]) {
+        if !bytes.is_empty() {
+            self.optimistically_clear_needs_you(session_id);
+        }
+        self.send_bytes_to_session_raw(session_id, bytes);
+    }
+
+    fn send_bytes_to_session_raw(&self, session_id: &str, bytes: &[u8]) {
         let remote_target = self.state.lock().ok().and_then(|g| {
             g.sessions
                 .iter()
@@ -1908,6 +1987,7 @@ impl CodaGpuWorkspaceView {
     }
 
     fn interrupt_session(&self, session_id: &str) {
+        self.optimistically_clear_needs_you(session_id);
         let remote_target = self.state.lock().ok().and_then(|g| {
             g.sessions
                 .iter()
@@ -2207,6 +2287,10 @@ impl CodaGpuWorkspaceView {
                                                         remote_host_id: None,
                                                         osc_status: None,
                                                     });
+                                                    g.notify_tracker.seed_baseline(
+                                                        &id,
+                                                        AgentLifecycleState::Idle,
+                                                    );
                                                 }
                                                 if g.layout.split_terminals
                                                     && g.focused_pane == SplitPane::Secondary
@@ -2296,6 +2380,8 @@ impl CodaGpuWorkspaceView {
                 remote_host_id: None,
                 osc_status: None,
             });
+            g.notify_tracker
+                .seed_baseline(&id, AgentLifecycleState::Idle);
             if g.layout.split_terminals && g.focused_pane == SplitPane::Secondary {
                 g.split_session_id = Some(id);
             } else {
@@ -2674,6 +2760,7 @@ impl CodaGpuWorkspaceView {
         }
         if let Ok(mut g) = self.state.lock() {
             g.sessions.retain(|s| s.id != session_id);
+            g.notify_tracker.prune_session(session_id);
             let active_space = g.active_space_id.clone();
             if g.active_session_id.as_deref() == Some(session_id) {
                 g.active_session_id = active_space.as_ref().and_then(|sp_id| {
@@ -2993,6 +3080,8 @@ impl CodaGpuWorkspaceView {
             g.settings_open = !g.settings_open;
             if g.settings_open {
                 g.palette_open = false;
+            } else {
+                g.clear_settings_ephemeral_inputs();
             }
             g.input_target = ActiveInputTarget::TerminalDirect;
         }
@@ -3103,9 +3192,13 @@ impl CodaGpuWorkspaceView {
 // ============================================================================
 
 impl Render for CodaGpuWorkspaceView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let win_active = window.is_window_active();
         let st = match self.state.lock() {
-            Ok(g) => g.clone(),
+            Ok(mut g) => {
+                g.app_is_active = win_active;
+                g.clone()
+            }
             Err(_) => CodaDesktopState::default(),
         };
 
@@ -3140,6 +3233,10 @@ impl Render for CodaGpuWorkspaceView {
             .key_context("CodaWorkbench")
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(Self::handle_key_down))
+            .on_action(cx.listener(|this, _: &ToggleSettings, _, cx| {
+                this.toggle_settings_modal();
+                cx.notify();
+            }))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {
                 if let Ok(mut g) = this.state.lock() {
                     g.layout.sidebar_visible = !g.layout.sidebar_visible;
@@ -3171,6 +3268,7 @@ impl Render for CodaGpuWorkspaceView {
                     g.palette_open = !g.palette_open;
                     if g.palette_open {
                         g.settings_open = false;
+                        g.clear_settings_ephemeral_inputs();
                         g.palette_query.clear();
                         g.palette_selected = 0;
                         g.input_target = ActiveInputTarget::CommandPalette;
@@ -3220,10 +3318,15 @@ impl Render for CodaGpuWorkspaceView {
                     } else if let Some(sid) = g.focused_session_id().map(str::to_string) {
                         if let Some(sess) = g.session_by_id(&sid) {
                             let last_line = sess.styled_lines.len().saturating_sub(1);
-                            let last_col = sess
+                            let last_col: usize = sess
                                 .styled_lines
                                 .get(last_line)
-                                .map(|l| l.text.chars().count())
+                                .map(|l| {
+                                    l.text
+                                        .chars()
+                                        .map(|ch| crate::pty::char_display_width(ch).max(1))
+                                        .sum()
+                                })
                                 .unwrap_or(0);
                             if let Ok(mut sel) = this.terminal_selection.lock() {
                                 *sel = Some(TerminalSelection {
@@ -4464,11 +4567,12 @@ impl CodaGpuWorkspaceView {
             .unwrap_or("main")
             .to_string();
         let osc_badge = sess.osc_status.as_ref().and_then(|o| o.task.clone());
-        let needs_you_active = sess
-            .osc_status
-            .as_ref()
-            .map(|o| o.state == AgentLifecycleState::NeedsYou)
-            .unwrap_or(false);
+        let needs_you_active = sess.alive
+            && sess
+                .osc_status
+                .as_ref()
+                .map(|o| o.state == AgentLifecycleState::NeedsYou)
+                .unwrap_or(false);
         let needs_you_msg = sess
             .osc_status
             .as_ref()
@@ -4507,7 +4611,8 @@ impl CodaGpuWorkspaceView {
             .flex_col()
             .overflow_hidden()
             .on_scroll_wheel(cx.listener(move |this, ev: &ScrollWheelEvent, _, cx| {
-                let (in_alt, app_cursor, _) = this
+                // V3-11: terminal_modes returns (in_alt_screen, bracketed_paste, app_cursor_keys).
+                let (in_alt, _, app_cursor) = this
                     .pty_mgr
                     .lock()
                     .map(|mgr| mgr.terminal_modes(&sid_scroll))
@@ -4554,7 +4659,7 @@ impl CodaGpuWorkspaceView {
                     for _ in 0..repeats {
                         payload.extend_from_slice(key_seq);
                     }
-                    this.send_bytes_to_session(&sid_scroll, &payload);
+                    this.send_bytes_to_session_raw(&sid_scroll, &payload);
                     return;
                 }
                 if let Ok(mut g) = this.state.lock() {
@@ -4671,9 +4776,13 @@ impl CodaGpuWorkspaceView {
                             if abs_idx < r0 || abs_idx > r1 {
                                 return None;
                             }
-                            let line_len = line.text.chars().count();
+                            let line_cols: usize = line
+                                .text
+                                .chars()
+                                .map(|ch| crate::pty::char_display_width(ch).max(1))
+                                .sum();
                             let s_col = if abs_idx == r0 { c0 } else { 0 };
-                            let e_col = if abs_idx == r1 { c1 } else { line_len };
+                            let e_col = if abs_idx == r1 { c1 } else { line_cols };
                             (s_col < e_col).then_some((s_col, e_col))
                         });
                         render_styled_terminal_line(line, line_h, sel_cols)
@@ -6413,6 +6522,7 @@ impl CodaGpuWorkspaceView {
             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                 if let Ok(mut g) = this.state.lock() {
                     g.settings_open = false;
+                    g.clear_settings_ephemeral_inputs();
                     g.input_target = ActiveInputTarget::TerminalDirect;
                 }
                 cx.notify();
@@ -6505,6 +6615,9 @@ impl CodaGpuWorkspaceView {
                                             .child(tr(loc, en, zh))
                                             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                                                 if let Ok(mut g) = this.state.lock() {
+                                                    if g.settings_section != sec {
+                                                        g.clear_settings_ephemeral_inputs();
+                                                    }
                                                     g.settings_section = sec;
                                                     g.input_target =
                                                         ActiveInputTarget::TerminalDirect;
@@ -6600,6 +6713,7 @@ impl CodaGpuWorkspaceView {
                                             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                                                 if let Ok(mut g) = this.state.lock() {
                                                     g.settings_open = false;
+                                                    g.clear_settings_ephemeral_inputs();
                                                     g.input_target =
                                                         ActiveInputTarget::TerminalDirect;
                                                 }
@@ -7841,6 +7955,7 @@ impl CodaGpuWorkspaceView {
                                         this.mesh_hub.probe_host(host_clone.clone());
                                         if let Ok(mut g) = this.state.lock() {
                                             g.settings_open = false;
+                                            g.clear_settings_ephemeral_inputs();
                                             g.input_target = ActiveInputTarget::TerminalDirect;
                                         }
                                         cx.notify();
@@ -8143,23 +8258,31 @@ fn render_styled_terminal_line(
 
     if let Some((col_start, col_end)) = selection_cols {
         if col_start < col_end {
-            let char_offsets: Vec<usize> = line
-                .text
-                .char_indices()
-                .map(|(i, _)| i)
-                .chain(std::iter::once(line.text.len()))
-                .collect();
-            let last_idx = char_offsets.len().saturating_sub(1);
-            let b_start = char_offsets[col_start.min(last_idx)];
-            let b_end = char_offsets[col_end.min(last_idx)];
-            if b_start < b_end {
-                highlights.push((
-                    b_start..b_end,
-                    HighlightStyle {
-                        background_color: Some(Hsla::from(rgba(0x38bdf855))),
-                        ..Default::default()
-                    },
-                ));
+            // V3-30: Map display columns (width 2 for CJK/Emoji, 1 for narrow) to UTF-8 byte bounds
+            // so highlight aligns identically with `extract_selected_terminal_text`.
+            let mut col = 0usize;
+            let mut b_start: Option<usize> = None;
+            let mut b_end: usize = 0;
+            for (byte_idx, ch) in line.text.char_indices() {
+                let w = crate::pty::char_display_width(ch).max(1);
+                if col + w > col_start && col < col_end {
+                    if b_start.is_none() {
+                        b_start = Some(byte_idx);
+                    }
+                    b_end = byte_idx + ch.len_utf8();
+                }
+                col += w;
+            }
+            if let Some(bs) = b_start {
+                if bs < b_end {
+                    highlights.push((
+                        bs..b_end,
+                        HighlightStyle {
+                            background_color: Some(Hsla::from(rgba(0x38bdf855))),
+                            ..Default::default()
+                        },
+                    ));
+                }
             }
         }
     }
@@ -8218,6 +8341,8 @@ fn spawn_local_fallback_shell(
                 remote_host_id: None,
                 osc_status: None,
             });
+            g.notify_tracker
+                .seed_baseline(&id, AgentLifecycleState::Idle);
             if g.active_session_id.is_none() {
                 g.active_session_id = Some(id);
             }
@@ -8363,6 +8488,10 @@ async fn reconcile_local_herdr_sessions(
                             .map(|sp| sp.id.clone())
                             .unwrap_or_else(|| "local".to_string())
                     };
+                    let initial_state = osc
+                        .as_ref()
+                        .map(|o| o.state)
+                        .unwrap_or(AgentLifecycleState::Idle);
                     g.sessions.push(TerminalSessionEntry {
                         id: id.clone(),
                         title: format!(
@@ -8383,6 +8512,7 @@ async fn reconcile_local_herdr_sessions(
                         remote_host_id: None,
                         osc_status: osc,
                     });
+                    g.notify_tracker.seed_baseline(&id, initial_state);
                     if g.active_session_id.is_none() {
                         g.active_session_id = Some(id);
                     }
@@ -8512,6 +8642,15 @@ fn open_main_workbench_window(cx: &mut App) -> gpui::Entity<CodaGpuWorkspaceView
 
     window
         .update(cx, |this, win, cx| {
+            if let Ok(mut g) = this.state.lock() {
+                g.app_is_active = win.is_window_active();
+            }
+            cx.observe_window_activation(win, |this, win, _cx| {
+                if let Ok(mut g) = this.state.lock() {
+                    g.app_is_active = win.is_window_active();
+                }
+            })
+            .detach();
             win.focus(&this.focus_handle);
             cx.entity()
         })
@@ -8601,18 +8740,14 @@ pub fn launch_gpui_desktop_app() {
             cx.activate(true);
         });
 
-        let view = open_main_workbench_window(cx);
+        let _initial_view = open_main_workbench_window(cx);
 
-        let view_settings = view.clone();
+        // V3-15: Active windows handle `ToggleSettings` directly in `CodaGpuWorkspaceView::render`.
+        // This app-level fallback only triggers when all windows are closed (Dock / menu bar reopen).
         cx.on_action(move |_: &ToggleSettings, cx| {
             if cx.windows().is_empty() {
                 let reopened = open_main_workbench_window(cx);
                 reopened.update(cx, |this, cx| {
-                    this.toggle_settings_modal();
-                    cx.notify();
-                });
-            } else {
-                let _ = view_settings.update(cx, |this, cx| {
                     this.toggle_settings_modal();
                     cx.notify();
                 });

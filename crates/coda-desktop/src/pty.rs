@@ -137,6 +137,7 @@ pub struct PtySnapshot {
     pub styled_lines: Vec<StyledTerminalLine>,
     pub alive: bool,
     pub osc_status: Option<Osc7501Status>,
+    pub osc_seq: u64,
     pub started_at: Instant,
     pub attached_hc: bool,
     pub generation: u64,
@@ -231,6 +232,7 @@ pub struct VtScreenBuffer {
     osc_overflow: bool,
     utf8_pending: Vec<u8>,
     osc_status: Option<Osc7501Status>,
+    osc_seq: u64,
     generation: u64,
 }
 
@@ -261,6 +263,7 @@ impl VtScreenBuffer {
             osc_overflow: false,
             utf8_pending: Vec::with_capacity(4),
             osc_status: None,
+            osc_seq: 0,
             generation: 1,
         }
     }
@@ -331,6 +334,16 @@ impl VtScreenBuffer {
 
     pub fn osc_status(&self) -> Option<Osc7501Status> {
         self.osc_status.clone()
+    }
+
+    pub fn osc_seq(&self) -> u64 {
+        self.osc_seq
+    }
+
+    pub fn set_osc_status(&mut self, next: Option<Osc7501Status>) {
+        self.osc_status = next;
+        self.osc_seq = self.osc_seq.wrapping_add(1);
+        self.generation = self.generation.wrapping_add(1);
     }
 
     pub fn feed_bytes(&mut self, data: &[u8]) {
@@ -411,6 +424,8 @@ impl VtScreenBuffer {
                     self.cursor_visible = true;
                     self.bracketed_paste = false;
                     self.app_cursor_keys = false;
+                    self.osc_status = None;
+                    self.osc_seq = self.osc_seq.wrapping_add(1);
                     self.parse_state = ParseState::Ground;
                 }
                 b'P' | b'_' | b'^' | b'X' => {
@@ -569,7 +584,8 @@ impl VtScreenBuffer {
         if top > bottom {
             return;
         }
-        for _ in 0..count {
+        let clamped = count.min(bottom - top + 1);
+        for _ in 0..clamped {
             let removed = self.grid.remove(top);
             if top == 0 && self.alt_saved.is_none() {
                 if self.scrollback.len() >= self.max_scrollback {
@@ -587,7 +603,8 @@ impl VtScreenBuffer {
         if top > bottom {
             return;
         }
-        for _ in 0..count {
+        let clamped = count.min(bottom - top + 1);
+        for _ in 0..clamped {
             self.grid.remove(bottom);
             self.grid.insert(top, vec![VtCell::default(); self.cols]);
         }
@@ -615,6 +632,7 @@ impl VtScreenBuffer {
                         task,
                         updated_at: Instant::now(),
                     });
+                    self.osc_seq = self.osc_seq.wrapping_add(1);
                 }
             }
             return;
@@ -641,6 +659,7 @@ impl VtScreenBuffer {
                 task,
                 updated_at: Instant::now(),
             });
+            self.osc_seq = self.osc_seq.wrapping_add(1);
         }
     }
 
@@ -755,11 +774,11 @@ impl VtScreenBuffer {
 
         match cmd {
             'A' => self.cursor_row = self.cursor_row.saturating_sub(p0_one),
-            'B' => self.cursor_row = (self.cursor_row + p0_one).min(self.rows - 1),
-            'C' => self.cursor_col = (self.cursor_col + p0_one).min(self.cols - 1),
+            'B' => self.cursor_row = self.cursor_row.saturating_add(p0_one).min(self.rows - 1),
+            'C' => self.cursor_col = self.cursor_col.saturating_add(p0_one).min(self.cols - 1),
             'D' => self.cursor_col = self.cursor_col.saturating_sub(p0_one),
             'E' => {
-                self.cursor_row = (self.cursor_row + p0_one).min(self.rows - 1);
+                self.cursor_row = self.cursor_row.saturating_add(p0_one).min(self.rows - 1);
                 self.cursor_col = 0;
             }
             'F' => {
@@ -870,7 +889,7 @@ impl VtScreenBuffer {
             'X' => {
                 let row = self.cursor_row;
                 let col = self.cursor_col;
-                for c in col..(col + p0_one).min(self.cols) {
+                for c in col..col.saturating_add(p0_one).min(self.cols) {
                     self.clear_cell_preserving_wide(row, c);
                 }
             }
@@ -1741,6 +1760,27 @@ impl LocalPtyManager {
         (false, false, false)
     }
 
+    pub fn set_session_osc_status(&self, id: &str, next: Option<Osc7501Status>) {
+        let screen = self
+            .sessions
+            .get(id)
+            .map(|s| &s.screen)
+            .or_else(|| self.remote_buffers.get(id).map(|r| &r.screen));
+        if let Some(s) = screen {
+            if let Ok(mut guard) = s.lock() {
+                guard.set_osc_status(next);
+            }
+            self.ui_dirty.store(true, Ordering::SeqCst);
+        }
+    }
+
+    pub fn session_dims(&self, id: &str) -> Option<(u16, u16)> {
+        if let Some(s) = self.sessions.get(id) {
+            return Some((s.cols, s.rows));
+        }
+        self.remote_buffers.get(id).map(|r| (r.cols, r.rows))
+    }
+
     /// Drains any pending DSR responses (`\x1b[row;colR`) queued by a remote VT buffer (`#38`).
     pub fn drain_remote_replies(&self, id: &str) -> Vec<Vec<u8>> {
         if let Some(remote) = self.remote_buffers.get(id) {
@@ -1844,6 +1884,7 @@ fn build_pty_snapshot_cached(
             styled_lines: Vec::new(),
             alive,
             osc_status: None,
+            osc_seq: 0,
             started_at,
             attached_hc,
             generation: 0,
@@ -1862,6 +1903,7 @@ fn build_pty_snapshot_cached(
     }
     let styled_lines = guard.render_styled_lines(max_lines, alive);
     let osc_status = guard.osc_status();
+    let osc_seq = guard.osc_seq();
     let in_alt_screen = guard.in_alt_screen();
     let bracketed_paste = guard.bracketed_paste_enabled();
     let app_cursor_keys = guard.app_cursor_keys_enabled();
@@ -1872,6 +1914,7 @@ fn build_pty_snapshot_cached(
         styled_lines,
         alive,
         osc_status,
+        osc_seq,
         started_at,
         attached_hc,
         generation,
@@ -1952,5 +1995,30 @@ mod tests {
         let styled = vt.render_styled_lines(60, false);
         assert!(styled.iter().any(|l| l.text.contains("COLOR")
             && l.spans.iter().any(|s| s.fg == Some(0xff8040))));
+    }
+
+    #[test]
+    fn test_vt_huge_csi_scroll_clamped_and_osc_seq_monotonic() {
+        let mut vt = VtScreenBuffer::new(80, 24);
+        assert_eq!(vt.osc_seq(), 0);
+        // Huge CSI S / T / B / C / E / X must never DoS or overflow
+        vt.feed_bytes(b"\x1b[999999999S\x1b[999999999T\x1b[9999999999999999999B\x1b[9999999999999999999C\x1b[9999999999999999999E\x1b[9999999999999999999Xok");
+        assert!(vt.render_lines(40).iter().any(|l| l.contains("ok")));
+        assert_eq!(vt.osc_seq(), 0);
+        // OSC 7501 bumps osc_seq only on new OSC, not on plain stdout
+        vt.feed_bytes(b"\x1b]7501;state=needs_you;task=Approve\x07");
+        let seq1 = vt.osc_seq();
+        assert_eq!(seq1, 1);
+        vt.feed_bytes(b"regular stdout\r\n");
+        assert_eq!(vt.osc_seq(), seq1);
+        vt.set_osc_status(Some(Osc7501Status {
+            state: AgentLifecycleState::Working,
+            task: None,
+            updated_at: Instant::now(),
+        }));
+        assert_eq!(vt.osc_seq(), 2);
+        vt.feed_bytes(b"\x1bc");
+        assert!(vt.osc_status().is_none());
+        assert_eq!(vt.osc_seq(), 3);
     }
 }

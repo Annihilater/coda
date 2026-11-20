@@ -2,6 +2,8 @@
 //! for `OSC 7501` agent lifecycle transitions (`needs_you`, `error`, `working -> done`).
 
 use std::collections::HashMap;
+#[cfg(all(target_os = "macos", not(test)))]
+use std::sync::{mpsc, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::config::{tr, UiLocale};
@@ -45,12 +47,32 @@ impl DesktopNotificationTracker {
         }
     }
 
+    /// Seeds initial baseline state for newly created sessions so their very first `NeedsYou`
+    /// alert triggers instead of being swallowed as an initial snapshot.
+    pub fn seed_baseline(&mut self, session_id: &str, state: AgentLifecycleState) {
+        self.last_state
+            .entry(session_id.to_string())
+            .or_insert(state);
+    }
+
+    pub fn prune_session(&mut self, session_id: &str) {
+        self.last_state.remove(session_id);
+        self.last_notified_at.remove(session_id);
+    }
+
+    pub fn reset(&mut self) {
+        self.last_state.clear();
+        self.last_notified_at.clear();
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn observe(
         &mut self,
         session_id: &str,
         session_title: &str,
         osc: &Osc7501Status,
         active_session_id: Option<&str>,
+        app_is_active: bool,
         locale: UiLocale,
         now: Instant,
     ) -> Option<DesktopNotificationPayload> {
@@ -71,8 +93,9 @@ impl DesktopNotificationTracker {
             _ => return None,
         };
 
-        // Suppress alerts for the currently focused session unless it explicitly requires user approval.
-        if active_session_id == Some(session_id) && kind == NotificationKind::Done {
+        // Suppress native banners ONLY when Coda is foreground-active AND the user is viewing
+        // this exact session pane (its inline amber approval bar is already visible).
+        if app_is_active && active_session_id == Some(session_id) {
             return None;
         }
 
@@ -132,29 +155,45 @@ pub fn escape_applescript_string(input: &str) -> String {
     out
 }
 
-/// Dispatches a native macOS Notification Center banner asynchronously off the UI thread.
+#[cfg(all(target_os = "macos", not(test)))]
+static NOTIFY_WORKER_TX: OnceLock<mpsc::SyncSender<DesktopNotificationPayload>> = OnceLock::new();
+
+#[cfg(all(target_os = "macos", not(test)))]
+fn notify_worker_tx() -> &'static mpsc::SyncSender<DesktopNotificationPayload> {
+    NOTIFY_WORKER_TX.get_or_init(|| {
+        let (tx, rx) = mpsc::sync_channel::<DesktopNotificationPayload>(16);
+        let _ = std::thread::Builder::new()
+            .name("coda-macos-notifier".into())
+            .spawn(move || {
+                while let Ok(payload) = rx.recv() {
+                    let title = escape_applescript_string(&payload.title);
+                    let subtitle = escape_applescript_string(&payload.subtitle);
+                    let body = escape_applescript_string(&payload.body);
+                    let sound = match payload.kind {
+                        NotificationKind::NeedsYou => " sound name \"Glass\"",
+                        NotificationKind::Done => "",
+                    };
+                    let script = format!(
+                        "display notification \"{body}\" with title \"{title}\" subtitle \"{subtitle}\"{sound}"
+                    );
+                    let _ = std::process::Command::new("/usr/bin/osascript")
+                        .args(["-e", &script])
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status();
+                }
+            });
+        tx
+    })
+}
+
+/// Dispatches a native macOS Notification Center banner asynchronously via a single bounded worker.
 /// No-op under unit tests (`cfg(test)`) and non-macOS targets.
 pub fn dispatch_native_notification(payload: DesktopNotificationPayload) {
     #[cfg(all(target_os = "macos", not(test)))]
     {
-        std::thread::spawn(move || {
-            let title = escape_applescript_string(&payload.title);
-            let subtitle = escape_applescript_string(&payload.subtitle);
-            let body = escape_applescript_string(&payload.body);
-            let sound = match payload.kind {
-                NotificationKind::NeedsYou => " sound name \"Glass\"",
-                NotificationKind::Done => "",
-            };
-            let script = format!(
-                "display notification \"{body}\" with title \"{title}\" subtitle \"{subtitle}\"{sound}"
-            );
-            let _ = std::process::Command::new("/usr/bin/osascript")
-                .args(["-e", &script])
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
-        });
+        let _ = notify_worker_tx().try_send(payload);
     }
     #[cfg(not(all(target_os = "macos", not(test))))]
     {
@@ -186,18 +225,20 @@ mod tests {
                 "Mac · claude",
                 &mk_osc(AgentLifecycleState::Working, None),
                 Some("s2"),
+                true,
                 UiLocale::Zh,
                 t0,
             )
             .is_none());
 
-        // Transition Working -> NeedsYou fires immediately
+        // Transition Working -> NeedsYou on background tab fires immediately
         let alert = tracker
             .observe(
                 "s1",
                 "Mac · claude",
                 &mk_osc(AgentLifecycleState::NeedsYou, Some("Approve git push?")),
                 Some("s2"),
+                true,
                 UiLocale::Zh,
                 t0 + Duration::from_secs(2),
             )
@@ -213,6 +254,7 @@ mod tests {
                 "Mac · claude",
                 &mk_osc(AgentLifecycleState::NeedsYou, Some("Approve git push?")),
                 Some("s2"),
+                true,
                 UiLocale::Zh,
                 t0 + Duration::from_secs(3),
             )
@@ -224,6 +266,7 @@ mod tests {
             "Mac · claude",
             &mk_osc(AgentLifecycleState::Working, None),
             Some("s2"),
+            true,
             UiLocale::En,
             t0 + Duration::from_secs(4),
         );
@@ -233,17 +276,19 @@ mod tests {
                 "Mac · claude",
                 &mk_osc(AgentLifecycleState::Done, Some("All green")),
                 Some("s2"),
+                true,
                 UiLocale::En,
                 t0 + Duration::from_secs(10),
             )
             .is_none());
 
-        // Active session suppresses Done, but background session after cooldown fires Done
+        // Foreground-active focused session suppresses Done AND NeedsYou
         tracker.observe(
             "s1",
             "Mac · claude",
             &mk_osc(AgentLifecycleState::Working, None),
             Some("s1"),
+            true,
             UiLocale::En,
             t0 + Duration::from_secs(25),
         );
@@ -253,16 +298,19 @@ mod tests {
                 "Mac · claude",
                 &mk_osc(AgentLifecycleState::Done, Some("Build ok")),
                 Some("s1"),
+                true,
                 UiLocale::En,
                 t0 + Duration::from_secs(26),
             )
             .is_none());
 
+        // Background tab fires Done after cooldown
         tracker.observe(
             "s1",
             "Mac · claude",
             &mk_osc(AgentLifecycleState::Working, None),
             Some("s2"),
+            true,
             UiLocale::En,
             t0 + Duration::from_secs(27),
         );
@@ -272,12 +320,55 @@ mod tests {
                 "Mac · claude",
                 &mk_osc(AgentLifecycleState::Done, Some("Build ok")),
                 Some("s2"),
+                true,
                 UiLocale::En,
                 t0 + Duration::from_secs(28),
             )
             .expect("expected background done notification");
         assert_eq!(done.kind, NotificationKind::Done);
         assert_eq!(done.body, "Build ok");
+
+        // Inactive app (!app_is_active) fires Done even for the focused session
+        tracker.observe(
+            "s1",
+            "Mac · claude",
+            &mk_osc(AgentLifecycleState::Working, None),
+            Some("s1"),
+            false,
+            UiLocale::En,
+            t0 + Duration::from_secs(52),
+        );
+        let bg_app_done = tracker
+            .observe(
+                "s1",
+                "Mac · claude",
+                &mk_osc(AgentLifecycleState::Done, Some("Done while unfocused")),
+                Some("s1"),
+                false,
+                UiLocale::En,
+                t0 + Duration::from_secs(54),
+            )
+            .expect("expected inactive-app done notification");
+        assert_eq!(bg_app_done.kind, NotificationKind::Done);
+
+        // Seeded new session fires its first NeedsYou alert instead of swallowing it
+        tracker.seed_baseline("s_new", AgentLifecycleState::Idle);
+        let first_ny = tracker
+            .observe(
+                "s_new",
+                "Mac · codex",
+                &mk_osc(AgentLifecycleState::NeedsYou, Some("Approve command")),
+                Some("s_new"),
+                false,
+                UiLocale::En,
+                t0 + Duration::from_secs(60),
+            )
+            .expect("expected first NeedsYou on seeded session");
+        assert_eq!(first_ny.kind, NotificationKind::NeedsYou);
+
+        tracker.prune_session("s_new");
+        assert!(!tracker.last_state.contains_key("s_new"));
+        assert!(!tracker.last_notified_at.contains_key("s_new"));
     }
 
     #[test]
