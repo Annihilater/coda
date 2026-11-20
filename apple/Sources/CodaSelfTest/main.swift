@@ -990,6 +990,42 @@ struct CodaSelfTest {
         _ = nt.observe(sessionId: "s1", machineName: "Mac-mini", workspaceName: "coda", taskTitle: "claude", statusMessage: nil, state: .working, activeSessionId: "s2", locale: .en, now: nt0.addingTimeInterval(24))
         let ntDone = nt.observe(sessionId: "s1", machineName: "Mac-mini", workspaceName: "coda", taskTitle: "claude", statusMessage: "Done", state: .done, activeSessionId: "s2", locale: .en, now: nt0.addingTimeInterval(25))
         precondition(ntDone?.kind == .done && ntDone?.body == "Done")
+
+        // 8i. V3 Regression Guards: scrollUp full-region CSI M / CSI 99 S no-crash, oscStatusGeneration,
+        // treatLFAsCRLF snapshot->live transition, and alt-screen resizeReflow primaryScrollback preservation
+        var vtCrash = GhosttyReflowEngine(columns: 30, rows: 6)
+        vtCrash.feed(Data("L1\r\nL2\r\nL3\r\nL4\r\nL5\r\nL6".utf8))
+        // Cursor is on bottom row (row 6); CSI M deletes 1 line from scrollTop==scrollBottom (n == bottom-top+1)
+        vtCrash.feed(Data("\u{1B}[6;1H\u{1B}[M".utf8))
+        // Full-screen scrollUp CSI 99 S and huge CSI parameter must not trap
+        vtCrash.feed(Data("\u{1B}[99S\u{1B}[999999999999BOK".utf8))
+        precondition(vtCrash.plainVisibleText.contains("OK"))
+
+        var vtOsc = GhosttyReflowEngine(columns: 40, rows: 6)
+        let gen0 = vtOsc.oscStatusGeneration
+        vtOsc.feed(Data("\u{1B}]7501;state=blocked;msg=Approve?\u{07}".utf8))
+        let gen1 = vtOsc.oscStatusGeneration
+        precondition(gen1 == gen0 + 1 && vtOsc.latestHerdrStatus?.state == .needsYou)
+        vtOsc.feed(Data("plain stdout after approval\r\n".utf8))
+        precondition(vtOsc.oscStatusGeneration == gen1, "Plain stdout must not bump oscStatusGeneration")
+        vtOsc.feed(Data("\u{1B}]7501;state=working;msg=Running\u{07}".utf8))
+        precondition(vtOsc.oscStatusGeneration == gen1 + 1 && vtOsc.latestHerdrStatus?.state == .working)
+
+        var vtLf = GhosttyReflowEngine(columns: 40, rows: 6, treatLFAsCRLF: true)
+        vtLf.feed(Data("snap1\nsnap2\n".utf8))
+        vtLf.treatLFAsCRLF = false
+        vtLf.feed(Data("AB\nC".utf8))
+        precondition(vtLf.visibleLines.last == "  C", "Live bare LF with treatLFAsCRLF=false must preserve cursor col, got: \(vtLf.visibleLines)")
+
+        var vtAlt = GhosttyReflowEngine(columns: 24, rows: 6, maxScrollback: 100)
+        for i in 1...10 {
+            vtAlt.feed(Data("hist-\(i)\r\n".utf8))
+        }
+        vtAlt.feed(Data("\u{1B}[?1049hFULLSCREEN TUI".utf8))
+        vtAlt.resizeReflow(columns: 40, rows: 6)
+        vtAlt.feed(Data("\u{1B}[?1049l".utf8))
+        precondition(vtAlt.plainVisibleText.contains("hist-1") && vtAlt.plainVisibleText.contains("hist-10"),
+                     "Alt-screen resizeReflow must preserve primaryScrollback")
     }
 
     private static func readFramed(conn: NWConnection, completion: @escaping @Sendable ([String: Any]?) -> Void) {

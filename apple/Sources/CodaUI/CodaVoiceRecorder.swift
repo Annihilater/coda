@@ -68,6 +68,7 @@ public final class CodaVoiceRecorder {
         cancelRecording()
 
         let granted = await requestMicrophonePermission()
+        try Task.checkCancellation()
         guard granted else {
             throw CodaVoiceRecorderError.permissionDenied
         }

@@ -431,4 +431,41 @@ final class CodaSecurityAndVTTests: XCTestCase {
         XCTAssertEqual(done?.kind, .done)
         XCTAssertEqual(done?.body, "Finished")
     }
+
+    func testGhosttyV3ScrollUpBoundsOscGenerationLfModeAndAltScreenReflow() {
+        // V3-04: CSI M on bottom line & CSI 99 S must never trap ClosedRange
+        var vtCrash = GhosttyReflowEngine(columns: 30, rows: 6)
+        vtCrash.feed(Data("L1\r\nL2\r\nL3\r\nL4\r\nL5\r\nL6".utf8))
+        vtCrash.feed(Data("\u{1B}[6;1H\u{1B}[M\u{1B}[99S\u{1B}[999999999999BOK".utf8))
+        XCTAssertTrue(vtCrash.plainVisibleText.contains("OK"))
+
+        // V3-10: oscStatusGeneration only advances on fresh OSC 7501 frames
+        var vtOsc = GhosttyReflowEngine(columns: 40, rows: 6)
+        let gen0 = vtOsc.oscStatusGeneration
+        vtOsc.feed(Data("\u{1B}]7501;state=blocked;msg=Approve?\u{07}".utf8))
+        let gen1 = vtOsc.oscStatusGeneration
+        XCTAssertEqual(gen1, gen0 + 1)
+        vtOsc.feed(Data("stdout line\r\n".utf8))
+        XCTAssertEqual(vtOsc.oscStatusGeneration, gen1)
+        vtOsc.feed(Data("\u{1B}]7501;state=working\u{07}".utf8))
+        XCTAssertEqual(vtOsc.oscStatusGeneration, gen1 + 1)
+
+        // V3-19: Switching treatLFAsCRLF from true -> false preserves column on live LF
+        var vtLf = GhosttyReflowEngine(columns: 40, rows: 6, treatLFAsCRLF: true)
+        vtLf.feed(Data("snap1\nsnap2\n".utf8))
+        vtLf.treatLFAsCRLF = false
+        vtLf.feed(Data("AB\nC".utf8))
+        XCTAssertEqual(vtLf.visibleLines.last, "  C")
+
+        // V3-35: Alt-screen resizeReflow preserves primaryScrollback & saved cursor
+        var vtAlt = GhosttyReflowEngine(columns: 24, rows: 6, maxScrollback: 100)
+        for i in 1...10 {
+            vtAlt.feed(Data("hist-\(i)\r\n".utf8))
+        }
+        vtAlt.feed(Data("\u{1B}[?1049hALT".utf8))
+        vtAlt.resizeReflow(columns: 40, rows: 6)
+        vtAlt.feed(Data("\u{1B}[?1049l".utf8))
+        XCTAssertTrue(vtAlt.plainVisibleText.contains("hist-1"))
+        XCTAssertTrue(vtAlt.plainVisibleText.contains("hist-10"))
+    }
 }

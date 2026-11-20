@@ -76,6 +76,10 @@ public final class CodaWorkspaceStore: ObservableObject {
     @Published public var machineRouteModes: [UUID: SmartPathRouteMode] = [:]
     @Published public var terminalLinesBySession: [String: [GhosttyStyledLine]] = [:]
     @Published public var rawScreenTextBySession: [String: String] = [:]
+    @Published public var terminalRenderRevisionBySession: [String: UInt64] = [:]
+    @Published public var activeSheetSessionID: String? = nil
+    @Published public var activeSheetIsSecondary: Bool = false
+    @Published public var pendingOpenSettingsAfterCompose: Bool = false
     @Published public var gitDiffResult: CodaGitDiffResult? = nil
     @Published public var gitDiffLoading: Bool = false
 
@@ -117,6 +121,12 @@ public final class CodaWorkspaceStore: ObservableObject {
     private var accountEventsTask: Task<Void, Never>?
     private var deviceAuthTask: Task<Void, Never>?
     private var screenRefreshTask: Task<Void, Never>?
+    private var voiceTask: Task<Void, Never>?
+    private var isStartingVoice: Bool = false
+    private var workspaceEpoch: UInt64 = 0
+    private var voiceGeneration: UInt64 = 0
+    private var gitDiffGeneration: UInt64 = 0
+    private var pendingSelectSessionID: String? = nil
     private var readCompletedIDs: Set<String> = []
     private var attachedSessionIDs: Set<String> = []
     private var surfaceEngines: [String: GhosttyReflowEngine] = [:]
@@ -215,17 +225,77 @@ public final class CodaWorkspaceStore: ObservableObject {
             : tr("LAN Direct unreachable — staying on Smart Relay", "当前网络暂无法直连，继续通过智能中继稳定传输", locale: locale)
     }
 
+    private static func validatedServerURL(from raw: String) -> URL? {
+        var trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            trimmed = "https://codahub.dev"
+        }
+        while trimmed.hasSuffix("/") && trimmed.count > "https://".count {
+            trimmed.removeLast()
+        }
+        guard let url = URL(string: trimmed),
+              let scheme = url.scheme?.lowercased(),
+              let host = url.host?.lowercased(),
+              !host.isEmpty else {
+            return nil
+        }
+        if scheme == "https" {
+            return url
+        }
+        if scheme == "http" && (host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "[::1]") {
+            return url
+        }
+        return nil
+    }
+
     public func updateServerURL(_ raw: String) {
+        guard let validURL = Self.validatedServerURL(from: raw) else {
+            authError = tr(
+                "Server URL must use https:// (or http://localhost).",
+                "服务器地址必须使用 https://（或本机 http://localhost）。",
+                locale: locale
+            )
+            return
+        }
+        let prevNormalized = normalizedServerURLString()
+        let nextNormalized = validURL.absoluteString.hasSuffix("/")
+            ? String(validURL.absoluteString.dropLast())
+            : validURL.absoluteString
+        let originChanged = prevNormalized.lowercased() != nextNormalized.lowercased()
+
+        authError = nil
+        accountStatusMessage = nil
+        workspaceEpoch &+= 1
+        gitDiffGeneration &+= 1
         let oldClient = self.networkClient
-        settings.serverBaseURLString = raw
+        let wasSignedIn = isSignedIn
+        if originChanged && wasSignedIn {
+            settings.sessionToken = ""
+            settings.ownerHandle = ""
+        }
+        settings.serverBaseURLString = nextNormalized
         settings.save()
         stopLiveSync()
+        deviceAuthTask?.cancel()
+        deviceAuthTask = nil
+        pendingDeviceAuth = nil
+        isPollingDeviceAuth = false
+        pairingCode = nil
+        pairingCommand = nil
         if let oldClient {
-            Task { await oldClient.disconnectTransport() }
+            Task {
+                await oldClient.setAsyncEventHandler(nil)
+                if originChanged && wasSignedIn {
+                    await oldClient.logout()
+                }
+                await oldClient.disconnectTransport()
+            }
         }
         self.networkClient = nil
         self.networkClientURL = nil
         self.accountEventsConnectedToken = nil
+        self.pendingRefresh = false
+        self.pendingForceWorkspaces = false
         self.attachedSessionIDs.removeAll()
         self.surfaceEngines.removeAll()
         self.lastWorkspaceScanAt.removeAll()
@@ -235,7 +305,22 @@ public final class CodaWorkspaceStore: ObservableObject {
         self.machineRouteModes.removeAll()
         self.rawScreenTextBySession.removeAll()
         self.terminalLinesBySession.removeAll()
+        self.terminalRenderRevisionBySession.removeAll()
+        self.previousStates.removeAll()
+        self.readCompletedIDs.removeAll()
+        self.notificationTracker.reset()
+        self.pendingSelectSessionID = nil
+        self.activeSheetSessionID = nil
+        self.activeSheetIsSecondary = false
+        self.secondarySessionID = nil
         self.selectedSessionID = nil
+        self.gitDiffResult = nil
+        self.gitDiffLoading = false
+        self.composeText = ""
+        self.activeToast = nil
+        self.uploadStatusBanner = nil
+        self.voiceConfigSyncMessage = nil
+        cancelVoiceDictation()
         syncIdentityDeviceIdForCurrentRegistration()
         _ = ensureClient()
         if isSignedIn {
@@ -250,12 +335,22 @@ public final class CodaWorkspaceStore: ObservableObject {
     }
 
     private func ensureClient() -> CodaNetworkClient? {
-        guard let url = URL(string: normalizedServerURLString()) else {
-            authError = tr("Invalid server URL.", "服务器地址格式无效。", locale: locale)
+        guard let url = Self.validatedServerURL(from: settings.serverBaseURLString) else {
+            authError = tr(
+                "Server URL must use https:// (or http://localhost).",
+                "服务器地址必须使用 https://（或本机 http://localhost）。",
+                locale: locale
+            )
             return nil
         }
         if let existing = networkClient, networkClientURL == url {
             return existing
+        }
+        if let stale = networkClient {
+            Task {
+                await stale.setAsyncEventHandler(nil)
+                await stale.disconnectTransport()
+            }
         }
         let client = CodaNetworkClient(serverBaseURL: url)
         self.networkClient = client
@@ -273,9 +368,11 @@ public final class CodaWorkspaceStore: ObservableObject {
         if !tok.isEmpty {
             await client.setToken(tok)
         }
+        let epoch = self.workspaceEpoch
         await client.setAsyncEventHandler { [weak self] event in
             Task { @MainActor in
-                self?.handleAsyncPeerEvent(event)
+                guard let self, self.workspaceEpoch == epoch else { return }
+                self.handleAsyncPeerEvent(event)
             }
         }
         return client
@@ -362,9 +459,32 @@ public final class CodaWorkspaceStore: ObservableObject {
         return sections
     }
 
+    public var activeSheetSession: CodaAgentSession? {
+        if let sid = activeSheetSessionID, let match = sessions.first(where: { $0.id == sid }) {
+            return match
+        }
+        return selectedSession
+    }
+
+    public func siblingSessions(for session: CodaAgentSession) -> [CodaAgentSession] {
+        sessions.filter { $0.deviceId == session.deviceId && $0.workspaceName == session.workspaceName }
+    }
+
     public var siblingSessionsForSelected: [CodaAgentSession] {
         guard let current = selectedSession else { return [] }
-        return sessions.filter { $0.deviceId == current.deviceId && $0.workspaceName == current.workspaceName }
+        return siblingSessions(for: current)
+    }
+
+    public func openComposeSheet(for session: CodaAgentSession, isSecondary: Bool = false) {
+        activeSheetSessionID = session.id
+        activeSheetIsSecondary = isSecondary
+        showComposeSheet = true
+    }
+
+    public func openMinimapSheet(for session: CodaAgentSession, isSecondary: Bool = false) {
+        activeSheetSessionID = session.id
+        activeSheetIsSecondary = isSecondary
+        showPaneMinimapSheet = true
     }
 
     public var activeRouteModeForSelected: SmartPathRouteMode? {
@@ -407,6 +527,12 @@ public final class CodaWorkspaceStore: ObservableObject {
 
     public func startLiveSync() {
         pollLoopTask?.cancel()
+        if settings.notificationsEnabled {
+            Task {
+                await CodaLocalNotifier.shared.requestAuthorizationIfNotDetermined()
+            }
+        }
+        let epoch = self.workspaceEpoch
         if isSignedIn {
             let token = settings.sessionToken
             if !token.isEmpty && accountEventsConnectedToken != token, let client = ensureClient() {
@@ -415,14 +541,16 @@ public final class CodaWorkspaceStore: ObservableObject {
                 accountEventsTask = Task { [weak self] in
                     await client.setAsyncEventHandler { [weak self] event in
                         Task { @MainActor in
-                            self?.handleAsyncPeerEvent(event)
+                            guard let self, self.workspaceEpoch == epoch else { return }
+                            self.handleAsyncPeerEvent(event)
                         }
                     }
                     await client.connectAccountEventsWebSocket(sessionToken: token) { [weak self] ev in
                         guard ev.role != "client" else { return }
                         if ev.kind == "connected" || ev.kind == "devices_changed" || ev.kind == "peer_presence" {
                             Task { @MainActor in
-                                await self?.refreshMachinesAndSessions()
+                                guard let self, self.workspaceEpoch == epoch else { return }
+                                await self.refreshMachinesAndSessions()
                             }
                         }
                     }
@@ -431,7 +559,7 @@ public final class CodaWorkspaceStore: ObservableObject {
         }
         pollLoopTask = Task { [weak self] in
             while !Task.isCancelled {
-                guard let self else { return }
+                guard let self, self.workspaceEpoch == epoch else { return }
                 if self.isSignedIn {
                     await self.refreshMachinesAndSessions()
                 }
@@ -479,25 +607,114 @@ public final class CodaWorkspaceStore: ObservableObject {
                     }
                 }
                 // Seamlessly re-attach active PTY(s) over the promoted/failover transport without clearing VT buffers.
+                // On Relay -> Direct P2P upgrade, explicitly detach the superseded Relay PTY subscription first
+                // so the daemon never dual-streams output across both transports.
                 if let client = networkClient,
                    let dev = remoteMachines.first(where: { $0.id == event.sourceDeviceId }),
                    let clientDevId = localIdentity.deviceId {
-                    let activeForHost = [selectedSession, secondarySession]
+                    let epoch = self.workspaceEpoch
+                    let prefixWithSlash = "\(hostPrefix)/"
+                    attachedSessionIDs = attachedSessionIDs.filter { !$0.hasPrefix(prefixWithSlash) }
+                    var seenIDs = Set<String>()
+                    let candidates: [CodaAgentSession?] = duoSplitMode == .dualTerminalSplit
+                        ? [selectedSession, secondarySession]
+                        : [selectedSession]
+                    let activeForHost = candidates
                         .compactMap { $0 }
-                        .filter { $0.deviceId == event.sourceDeviceId }
+                        .filter { $0.deviceId == event.sourceDeviceId && seenIDs.insert($0.id).inserted }
                     for sess in activeForHost {
                         let cols = terminalColumns
                         let rows = terminalRows
                         let ident = localIdentity
-                        Task {
-                            _ = try? await client.attachTerminalPty(
+                        Task { [weak self] in
+                            if isDirect {
+                                await client.detachTerminalPtyOverRelay(
+                                    on: dev,
+                                    clientIdentity: ident,
+                                    clientDeviceId: clientDevId,
+                                    terminal: sess.terminalAddress
+                                )
+                            }
+                            let ok = (try? await client.attachTerminalPty(
                                 on: dev,
                                 clientIdentity: ident,
                                 clientDeviceId: clientDevId,
                                 terminal: sess.terminalAddress,
                                 cols: cols,
                                 rows: rows
-                            )
+                            )) ?? false
+                            if ok, let self, self.workspaceEpoch == epoch {
+                                self.attachedSessionIDs.insert(sess.id)
+                            }
+                        }
+                    }
+                }
+            }
+            return
+        }
+
+        if event.op == "direct_disconnected_need_relay" {
+            let prefixWithSlash = "\(hostPrefix)/"
+            attachedSessionIDs = attachedSessionIDs.filter { !$0.hasPrefix(prefixWithSlash) }
+            if let client = networkClient,
+               let dev = remoteMachines.first(where: { $0.id == event.sourceDeviceId }),
+               let clientDevId = localIdentity.deviceId {
+                let epoch = self.workspaceEpoch
+                var seenIDs = Set<String>()
+                let candidates: [CodaAgentSession?] = duoSplitMode == .dualTerminalSplit
+                    ? [selectedSession, secondarySession]
+                    : [selectedSession]
+                let activeForHost = candidates
+                    .compactMap { $0 }
+                    .filter { $0.deviceId == event.sourceDeviceId && seenIDs.insert($0.id).inserted }
+                let token = settings.sessionToken
+                let ident = localIdentity
+                let cols = terminalColumns
+                let rows = terminalRows
+                Task { [weak self] in
+                    guard let self, self.workspaceEpoch == epoch, !token.isEmpty else { return }
+                    do {
+                        let nextRoute = try await client.connectBestAvailable(
+                            sessionToken: token,
+                            targetDevice: dev,
+                            clientIdentity: ident
+                        )
+                        guard self.workspaceEpoch == epoch else { return }
+                        self.machineRouteModes[dev.id] = nextRoute
+                        for sess in activeForHost {
+                            let ok = (try? await client.attachTerminalPty(
+                                on: dev,
+                                clientIdentity: ident,
+                                clientDeviceId: clientDevId,
+                                terminal: sess.terminalAddress,
+                                cols: cols,
+                                rows: rows
+                            )) ?? false
+                            if ok && self.workspaceEpoch == epoch {
+                                self.attachedSessionIDs.insert(sess.id)
+                            }
+                        }
+                        let bannerMsg = tr(
+                            "Switched seamlessly to Smart Relay · \(dev.name)",
+                            "已无缝切回智能中继 · \(dev.name)",
+                            locale: self.locale
+                        )
+                        self.uploadStatusBanner = bannerMsg
+                        try? await Task.sleep(nanoseconds: 4_000_000_000)
+                        if self.uploadStatusBanner == bannerMsg {
+                            self.uploadStatusBanner = nil
+                        }
+                    } catch {
+                        guard self.workspaceEpoch == epoch else { return }
+                        let errMsg = tr(
+                            "Direct link dropped · Reconnecting \(dev.name)...",
+                            "直连已断开 · 正在重连 \(dev.name)...",
+                            locale: self.locale
+                        )
+                        self.uploadStatusBanner = errMsg
+                        try? await Task.sleep(nanoseconds: 4_000_000_000)
+                        if self.uploadStatusBanner == errMsg {
+                            self.uploadStatusBanner = nil
                         }
                     }
                 }
@@ -506,16 +723,24 @@ public final class CodaWorkspaceStore: ObservableObject {
         }
 
         if event.op == "peer_session_reset" {
+            let epoch = self.workspaceEpoch
             let prefixWithSlash = "\(hostPrefix)/"
             attachedSessionIDs = attachedSessionIDs.filter { !$0.hasPrefix(prefixWithSlash) }
             for key in Array(surfaceEngines.keys) where key.hasPrefix(prefixWithSlash) {
                 surfaceEngines.removeValue(forKey: key)
             }
             Task { [weak self] in
-                guard let self else { return }
+                guard let self, self.workspaceEpoch == epoch else { return }
                 await self.refreshMachinesAndSessions()
+                guard self.workspaceEpoch == epoch else { return }
                 if let sel = self.selectedSession, sel.deviceId == event.sourceDeviceId {
                     await self.refreshTerminalScreen(for: sel, forceSnapshot: true)
+                }
+                if self.duoSplitMode == .dualTerminalSplit,
+                   let sec = self.secondarySession,
+                   sec.id != self.selectedSessionID,
+                   sec.deviceId == event.sourceDeviceId {
+                    await self.refreshTerminalScreen(for: sec, forceSnapshot: true)
                 }
             }
             return
@@ -538,20 +763,27 @@ public final class CodaWorkspaceStore: ObservableObject {
             if engine.columns != terminalColumns || engine.rows != terminalRows {
                 engine.resizeReflow(columns: terminalColumns, rows: terminalRows)
             }
+            let prevOscGen = engine.oscStatusGeneration
             engine.feed(rawBytes)
             surfaceEngines[sid] = engine
             let visiblePlain = engine.plainVisibleText
             rawScreenTextBySession[sid] = visiblePlain
             terminalLinesBySession[sid] = engine.styledLines
+            terminalRenderRevisionBySession[sid, default: 0] &+= 1
             if let idx = sessions.firstIndex(where: { $0.id == sid }) {
                 let prevState = sessions[idx].state
                 sessions[idx].screenPreview = String(visiblePlain.suffix(420))
-                if let st = engine.latestHerdrStatus {
+                // Only apply OSC 7501 status when THIS chunk actually emitted a fresh OSC 7501 frame;
+                // never re-apply sticky `latestHerdrStatus` on plain stdout chunks after approval/live-events.
+                if engine.oscStatusGeneration != prevOscGen, let st = engine.latestHerdrStatus {
                     sessions[idx].state = st.state
                     if let msg = st.message { sessions[idx].statusMessage = msg }
                     if let title = st.title { sessions[idx].taskTitle = title }
                     if st.state == .done && prevState != .done && selectedSessionID != sid {
                         sessions[idx].unreadCompletion = true
+                        readCompletedIDs.remove(sid)
+                    } else if st.state != .done {
+                        sessions[idx].unreadCompletion = false
                         readCompletedIDs.remove(sid)
                     }
                     emitTransitionToastsIfNeeded(newSessions: [sessions[idx]])
@@ -572,6 +804,9 @@ public final class CodaWorkspaceStore: ObservableObject {
                     if let title = term.status?.title ?? term.name { sessions[idx].taskTitle = title }
                     if nextState == .done && prevState != .done && selectedSessionID != sid {
                         sessions[idx].unreadCompletion = true
+                        readCompletedIDs.remove(sid)
+                    } else if nextState != .done {
+                        sessions[idx].unreadCompletion = false
                         readCompletedIDs.remove(sid)
                     }
                     emitTransitionToastsIfNeeded(newSessions: [sessions[idx]])
@@ -607,15 +842,17 @@ public final class CodaWorkspaceStore: ObservableObject {
             pendingDeviceAuth = started
             isPollingDeviceAuth = true
 
+            let epoch = self.workspaceEpoch
             deviceAuthTask = Task { [weak self] in
                 guard let self else { return }
                 let maxAttempts = max(30, started.expiresInSecs / max(1, started.intervalSecs))
                 for _ in 0..<maxAttempts {
-                    if Task.isCancelled { return }
+                    if Task.isCancelled || self.workspaceEpoch != epoch { return }
                     try? await Task.sleep(nanoseconds: UInt64(max(1, started.intervalSecs)) * 1_000_000_000)
-                    guard !Task.isCancelled else { return }
+                    guard !Task.isCancelled, self.workspaceEpoch == epoch else { return }
                     do {
                         let res = try await client.pollDeviceAuth(deviceCode: started.deviceCode)
+                        guard !Task.isCancelled, self.workspaceEpoch == epoch else { return }
                         if res.state == "approved", let tok = res.sessionToken {
                             self.settings.sessionToken = tok
                             self.settings.ownerHandle = res.ownerHandle ?? ""
@@ -637,15 +874,22 @@ public final class CodaWorkspaceStore: ObservableObject {
                             self.startLiveSync()
                             await self.refreshMachinesAndSessions(forceWorkspaces: true)
                             return
-                        } else if res.state == "expired" {
+                        } else if res.state == "expired" || res.state == "denied" {
                             self.isPollingDeviceAuth = false
                             self.pendingDeviceAuth = nil
-                            self.authError = tr("Authorization code expired. Start again.", "授权码已过期，请重试。", locale: self.locale)
+                            self.authError = res.state == "denied"
+                                ? tr("Authorization denied.", "授权请求已被拒绝。", locale: self.locale)
+                                : tr("Authorization code expired. Start again.", "授权码已过期，请重试。", locale: self.locale)
                             return
                         }
                     } catch {
                         // Transient network error while waiting for browser approval; keep polling until expiry
                     }
+                }
+                if !Task.isCancelled && self.workspaceEpoch == epoch {
+                    self.isPollingDeviceAuth = false
+                    self.pendingDeviceAuth = nil
+                    self.authError = tr("Authorization code expired. Start again.", "授权码已过期，请重试。", locale: self.locale)
                 }
             }
         } catch {
@@ -889,10 +1133,10 @@ public final class CodaWorkspaceStore: ObservableObject {
     }
 
     public func signOut() {
+        workspaceEpoch &+= 1
+        gitDiffGeneration &+= 1
         let oldClient = networkClient
-        voiceRecorder.cancelRecording()
-        isRecordingVoice = false
-        isTranscribingVoice = false
+        cancelVoiceDictation()
         voiceError = nil
         stopLiveSync()
         deviceAuthTask?.cancel()
@@ -903,6 +1147,8 @@ public final class CodaWorkspaceStore: ObservableObject {
         pairingCommand = nil
         authError = nil
         accountStatusMessage = nil
+        pendingRefresh = false
+        pendingForceWorkspaces = false
         settings.sessionToken = ""
         settings.ownerHandle = ""
         settings.save()
@@ -914,8 +1160,18 @@ public final class CodaWorkspaceStore: ObservableObject {
         machineRouteModes = [:]
         rawScreenTextBySession = [:]
         terminalLinesBySession = [:]
+        terminalRenderRevisionBySession = [:]
         readCompletedIDs.removeAll()
         previousStates.removeAll()
+        notificationTracker.reset()
+        pendingSelectSessionID = nil
+        activeSheetSessionID = nil
+        activeSheetIsSecondary = false
+        secondarySessionID = nil
+        gitDiffResult = nil
+        gitDiffLoading = false
+        composeText = ""
+        activeToast = nil
         voiceConfigSyncMessage = nil
         uploadStatusBanner = nil
         selectedSessionID = nil
@@ -923,6 +1179,7 @@ public final class CodaWorkspaceStore: ObservableObject {
         networkClientURL = nil
         if let oldClient {
             Task {
+                await oldClient.setAsyncEventHandler(nil)
                 await oldClient.logout()
                 await oldClient.disconnectTransport()
             }
@@ -932,7 +1189,9 @@ public final class CodaWorkspaceStore: ObservableObject {
     // MARK: - Real Remote Synchronization
 
     public func refreshMachinesAndSessions(forceWorkspaces: Bool = false) async {
+        let epoch = self.workspaceEpoch
         guard isSignedIn, let client = await preparedClient() else { return }
+        guard self.workspaceEpoch == epoch, isSignedIn else { return }
         if isRefreshing {
             pendingRefresh = true
             if forceWorkspaces { pendingForceWorkspaces = true }
@@ -941,19 +1200,24 @@ public final class CodaWorkspaceStore: ObservableObject {
         isRefreshing = true
         defer {
             isRefreshing = false
-            if pendingRefresh {
+            if pendingRefresh && self.workspaceEpoch == epoch && self.isSignedIn {
                 let nextForce = pendingForceWorkspaces
                 pendingRefresh = false
                 pendingForceWorkspaces = false
                 Task { [weak self] in
                     await self?.refreshMachinesAndSessions(forceWorkspaces: nextForce)
                 }
+            } else if self.workspaceEpoch != epoch || !self.isSignedIn {
+                pendingRefresh = false
+                pendingForceWorkspaces = false
             }
         }
 
         do {
             await ensureClientDeviceRegistered(using: client)
+            guard self.workspaceEpoch == epoch, isSignedIn else { return }
             let allDevices = try await client.listDevices()
+            guard self.workspaceEpoch == epoch, isSignedIn else { return }
             let matchingLocal = localIdentity.deviceId.flatMap { myId in
                 allDevices.first(where: { $0.id == myId })
             }
@@ -963,6 +1227,7 @@ public final class CodaWorkspaceStore: ObservableObject {
             } ?? true
             if identityKeyMismatch {
                 await ensureClientDeviceRegistered(using: client, force: true)
+                guard self.workspaceEpoch == epoch, isSignedIn else { return }
             }
             let hosts = allDevices.filter { $0.role == "daemon" || $0.role == "hybrid" }
             self.remoteMachines = hosts
@@ -970,14 +1235,17 @@ public final class CodaWorkspaceStore: ObservableObject {
             let pinnedSet = Set(settings.pinnedSessionIDs)
             var discoveredSessions: [CodaAgentSession] = []
             var nextWorkspaces: [UUID: [CodaRepoWorkspaceSummary]] = [:]
+            var succeededHostIDs = Set<UUID>()
 
             for host in hosts where host.isOnline {
+                guard self.workspaceEpoch == epoch, isSignedIn else { return }
                 do {
                     let route = try await client.connectBestAvailable(
                         sessionToken: settings.sessionToken,
                         targetDevice: host,
                         clientIdentity: localIdentity
                     )
+                    guard self.workspaceEpoch == epoch, isSignedIn else { return }
                     machineRouteModes[host.id] = route
 
                     let shouldScanWorkspaces = forceWorkspaces
@@ -989,6 +1257,7 @@ public final class CodaWorkspaceStore: ObservableObject {
                             clientIdentity: localIdentity,
                             clientDeviceId: localIdentity.deviceId ?? host.id
                         )
+                        guard self.workspaceEpoch == epoch, isSignedIn else { return }
                         repos = wsRes?.repos ?? (workspacesByDevice[host.id] ?? [])
                         if wsRes != nil {
                             lastWorkspaceScanAt[host.id] = Date()
@@ -1002,12 +1271,13 @@ public final class CodaWorkspaceStore: ObservableObject {
                     }
                     nextWorkspaces[host.id] = repos
 
-                    let terminals = (try? await client.listTerminals(
+                    let terminals = try await client.listTerminals(
                         on: host,
                         clientIdentity: localIdentity,
                         clientDeviceId: localIdentity.deviceId ?? host.id,
                         includeFinished: true
-                    )) ?? []
+                    )
+                    guard self.workspaceEpoch == epoch, isSignedIn else { return }
 
                     let built = correlateSessions(
                         host: host,
@@ -1015,27 +1285,59 @@ public final class CodaWorkspaceStore: ObservableObject {
                         terminals: terminals,
                         pinnedSet: pinnedSet
                     )
+                    succeededHostIDs.insert(host.id)
                     discoveredSessions.append(contentsOf: built)
                 } catch {
-                    // Keep iterating other paired hosts if one host tunnel is temporarily resetting
+                    // Keep iterating other paired hosts if one host tunnel is temporarily resetting;
+                    // previously cached sessions for this still-online host will be preserved below.
                 }
             }
 
-            if !discoveredSessions.isEmpty || !hosts.isEmpty {
-                emitTransitionToastsIfNeeded(newSessions: discoveredSessions)
-                self.sessions = discoveredSessions.sorted(by: CodaAgentSession.inboxOrder)
-                for (k, v) in nextWorkspaces {
-                    self.workspacesByDevice[k] = v
+            guard self.workspaceEpoch == epoch, isSignedIn else { return }
+
+            // Preserve cached sessions for online hosts whose RPC transiently failed so multi-host
+            // glitches never wipe terminals or eject the user from an active session.
+            let onlineFailedHostIDs = Set(hosts.filter { $0.isOnline && !succeededHostIDs.contains($0.id) }.map(\.id))
+            if !onlineFailedHostIDs.isEmpty {
+                let preserved = self.sessions.filter { s in
+                    guard let devId = s.deviceId else { return false }
+                    return onlineFailedHostIDs.contains(devId)
                 }
-                for repo in nextWorkspaces.values.flatMap({ $0 }) {
-                    if expandedWorkspaces.isEmpty {
-                        expandedWorkspaces.insert(repo.id)
-                    }
+                discoveredSessions.append(contentsOf: preserved)
+            }
+
+            emitTransitionToastsIfNeeded(newSessions: discoveredSessions)
+            self.sessions = discoveredSessions.sorted(by: CodaAgentSession.inboxOrder)
+            let validHostIDs = Set(hosts.map(\.id))
+            self.workspacesByDevice = self.workspacesByDevice.filter { validHostIDs.contains($0.key) }
+            for (k, v) in nextWorkspaces {
+                self.workspacesByDevice[k] = v
+            }
+            for repo in nextWorkspaces.values.flatMap({ $0 }) {
+                if expandedWorkspaces.isEmpty {
+                    expandedWorkspaces.insert(repo.id)
                 }
+            }
+            if let selId = self.selectedSessionID, !self.sessions.contains(where: { $0.id == selId }) {
+                self.selectedSessionID = nil
+            }
+            if let secId = self.secondarySessionID, !self.sessions.contains(where: { $0.id == secId }) {
+                self.secondarySessionID = nil
+            }
+
+            if let pendingSid = pendingSelectSessionID,
+               let match = sessions.first(where: { $0.id == pendingSid }) {
+                pendingSelectSessionID = nil
+                selectSession(match)
             }
 
             if let selected = selectedSession {
                 await refreshTerminalScreen(for: selected)
+            }
+            if duoSplitMode == .dualTerminalSplit,
+               let secondary = secondarySession,
+               secondary.id != selectedSessionID {
+                await refreshTerminalScreen(for: secondary)
             }
         } catch {
             // Do not wipe existing cached sessions on transient offline blips
@@ -1131,9 +1433,9 @@ public final class CodaWorkspaceStore: ObservableObject {
 
     private func emitTransitionToastsIfNeeded(newSessions: [CodaAgentSession]) {
         for s in newSessions {
-            // 1. Native iOS / iPadOS / macOS UNUserNotificationCenter alerts (edge-triggered + 20s cooldown)
-            if settings.notificationsEnabled,
-               let alert = notificationTracker.observe(
+            // 1. Always advance the edge-triggered notification tracker baseline so toggling
+            // notifications off/on never fires phantom alerts; gate only delivery on user preference.
+            let alert = notificationTracker.observe(
                 sessionId: s.id,
                 machineName: s.hostName,
                 workspaceName: s.workspaceName,
@@ -1142,7 +1444,8 @@ public final class CodaWorkspaceStore: ObservableObject {
                 state: s.state,
                 activeSessionId: selectedSessionID,
                 locale: locale
-               ) {
+            )
+            if settings.notificationsEnabled, let alert {
                 CodaLocalNotifier.shared.deliver(alert)
             }
 
@@ -1172,76 +1475,98 @@ public final class CodaWorkspaceStore: ObservableObject {
     }
 
     public func refreshTerminalScreen(for session: CodaAgentSession, forceSnapshot: Bool = false) async {
+        let epoch = self.workspaceEpoch
         guard let client = networkClient,
               let devId = session.deviceId,
               let dev = remoteMachines.first(where: { $0.id == devId }),
               let clientDevId = localIdentity.deviceId else { return }
 
-        do {
-            if !attachedSessionIDs.contains(session.id) {
-                let attached = (try? await client.attachTerminalPty(
+        let needSnapshot = forceSnapshot
+            || surfaceEngines[session.id] == nil
+            || (terminalLinesBySession[session.id]?.isEmpty ?? true)
+
+        if needSnapshot && !Task.isCancelled {
+            do {
+                let revBefore = terminalRenderRevisionBySession[session.id] ?? 0
+                let res = try await client.readTerminalScreen(
                     on: dev,
                     clientIdentity: localIdentity,
                     clientDeviceId: clientDevId,
                     terminal: session.terminalAddress,
-                    cols: terminalColumns,
-                    rows: terminalRows
-                )) ?? false
-                if attached {
-                    attachedSessionIDs.insert(session.id)
+                    historyLines: 180
+                )
+                guard !Task.isCancelled, self.workspaceEpoch == epoch else { return }
+                // If live PTY chunks already arrived while a non-forced snapshot RPC was in flight,
+                // keep the fresher live stream instead of clobbering it with an older snapshot.
+                let revAfter = terminalRenderRevisionBySession[session.id] ?? 0
+                if forceSnapshot || !attachedSessionIDs.contains(session.id) || revAfter == revBefore {
+                    var engine = GhosttyReflowEngine(
+                        columns: terminalColumns,
+                        rows: terminalRows,
+                        maxScrollback: 1500,
+                        treatLFAsCRLF: true
+                    )
+                    engine.feed(Data(res.text.utf8))
+                    // Immediately disable LF->CRLF translation after feeding static snapshot text
+                    // so subsequent live PTY streams preserve cursor column on bare LF (`\n`).
+                    engine.treatLFAsCRLF = false
+                    surfaceEngines[session.id] = engine
+                    let visiblePlain = engine.plainVisibleText
+                    rawScreenTextBySession[session.id] = visiblePlain
+                    terminalLinesBySession[session.id] = engine.styledLines
+                    terminalRenderRevisionBySession[session.id, default: 0] &+= 1
+
+                    if let idx = sessions.firstIndex(where: { $0.id == session.id }) {
+                        sessions[idx].screenPreview = String(visiblePlain.suffix(420))
+                        if let st = engine.latestHerdrStatus {
+                            sessions[idx].state = st.state
+                            if let msg = st.message { sessions[idx].statusMessage = msg }
+                            if let title = st.title { sessions[idx].taskTitle = title }
+                        } else if let wireStatus = res.status {
+                            sessions[idx].state = HerdrLifecycleState.from(rawState: wireStatus.state, kind: wireStatus.kind)
+                            if let msg = wireStatus.msg { sessions[idx].statusMessage = msg }
+                        }
+                    }
                 }
+            } catch {
+                // Keep previously cached screen lines if snapshot RPC hit temporary timeout;
+                // still proceed below to attach live PTY stream!
             }
+        }
 
-            if !forceSnapshot && attachedSessionIDs.contains(session.id),
-               surfaceEngines[session.id] != nil,
-               !(terminalLinesBySession[session.id]?.isEmpty ?? true) {
-                return
-            }
-
-            let res = try await client.readTerminalScreen(
+        let isActivelyDisplayed = (session.id == self.selectedSessionID)
+            || (self.duoSplitMode == .dualTerminalSplit && session.id == self.secondarySession?.id)
+        if !Task.isCancelled, self.workspaceEpoch == epoch, isActivelyDisplayed, !attachedSessionIDs.contains(session.id) {
+            let attached = (try? await client.attachTerminalPty(
                 on: dev,
                 clientIdentity: localIdentity,
                 clientDeviceId: clientDevId,
                 terminal: session.terminalAddress,
-                historyLines: 180
-            )
-            var engine = GhosttyReflowEngine(
-                columns: terminalColumns,
-                rows: terminalRows,
-                maxScrollback: 1500,
-                treatLFAsCRLF: true
-            )
-            engine.feed(Data(res.text.utf8))
-            surfaceEngines[session.id] = engine
-            let visiblePlain = engine.plainVisibleText
-            rawScreenTextBySession[session.id] = visiblePlain
-            terminalLinesBySession[session.id] = engine.styledLines
-
-            if let idx = sessions.firstIndex(where: { $0.id == session.id }) {
-                sessions[idx].screenPreview = String(visiblePlain.suffix(420))
-                if let st = engine.latestHerdrStatus {
-                    sessions[idx].state = st.state
-                    if let msg = st.message { sessions[idx].statusMessage = msg }
-                    if let title = st.title { sessions[idx].taskTitle = title }
-                } else if let wireStatus = res.status {
-                    sessions[idx].state = HerdrLifecycleState.from(rawState: wireStatus.state, kind: wireStatus.kind)
-                    if let msg = wireStatus.msg { sessions[idx].statusMessage = msg }
-                }
+                cols: terminalColumns,
+                rows: terminalRows
+            )) ?? false
+            let stillDisplayed = (session.id == self.selectedSessionID)
+                || (self.duoSplitMode == .dualTerminalSplit && session.id == self.secondarySession?.id)
+            if attached, !Task.isCancelled, self.workspaceEpoch == epoch, stillDisplayed {
+                attachedSessionIDs.insert(session.id)
             }
-        } catch {
-            // Keep previously cached screen lines if poll hit temporary timeout
         }
     }
 
     // MARK: - Interactive Controls (Selection, Swipe, Quick Bar, Compose, Launch, Diff)
 
     public func selectSession(_ session: CodaAgentSession) {
+        let changedSession = (selectedSessionID != session.id)
+        pendingSelectSessionID = nil
         selectedSessionID = session.id
         if let idx = sessions.firstIndex(where: { $0.id == session.id }) {
             if sessions[idx].unreadCompletion {
                 sessions[idx].unreadCompletion = false
                 readCompletedIDs.insert(session.id)
             }
+        }
+        if changedSession && formFactor == .iphoneDuoInnerLandscape && duoSplitMode == .studioDiffSplit {
+            loadGitDiff(for: session, presentModal: false)
         }
         screenRefreshTask?.cancel()
         let needSnapshot = !attachedSessionIDs.contains(session.id) || surfaceEngines[session.id] == nil
@@ -1251,17 +1576,16 @@ public final class CodaWorkspaceStore: ObservableObject {
     }
 
     /// Jumps straight to `sessionId` (used when tapping a native OSC 7501 notification banner).
+    /// Persists `pendingSelectSessionID` across cold-launch or mid-refresh calls so the tap is never dropped.
     public func selectSessionByID(_ sessionId: String) {
         if let match = sessions.first(where: { $0.id == sessionId }) {
+            pendingSelectSessionID = nil
             selectSession(match)
             return
         }
+        pendingSelectSessionID = sessionId
         Task { [weak self] in
-            guard let self else { return }
-            await self.refreshMachinesAndSessions()
-            if let match = self.sessions.first(where: { $0.id == sessionId }) {
-                self.selectSession(match)
-            }
+            await self?.refreshMachinesAndSessions()
         }
     }
 
@@ -1398,6 +1722,7 @@ public final class CodaWorkspaceStore: ObservableObject {
                     surfaceEngines[sid] = engine
                     terminalLinesBySession[sid] = engine.styledLines
                     rawScreenTextBySession[sid] = engine.plainVisibleText
+                    terminalRenderRevisionBySession[sid, default: 0] &+= 1
                 } else if let raw = rawScreenTextBySession[sid] {
                     var fresh = GhosttyReflowEngine(
                         columns: nextCols,
@@ -1406,24 +1731,38 @@ public final class CodaWorkspaceStore: ObservableObject {
                         treatLFAsCRLF: true
                     )
                     fresh.feed(Data(raw.utf8))
+                    fresh.treatLFAsCRLF = false
                     surfaceEngines[sid] = fresh
                     terminalLinesBySession[sid] = fresh.styledLines
+                    terminalRenderRevisionBySession[sid, default: 0] &+= 1
                 }
             }
-            if let session = selectedSession,
-               let client = networkClient,
-               let devId = session.deviceId,
-               let dev = remoteMachines.first(where: { $0.id == devId }),
+            if let client = networkClient,
                let clientDevId = localIdentity.deviceId {
-                Task {
-                    try? await client.resizeTerminalPty(
-                        on: dev,
-                        clientIdentity: localIdentity,
-                        clientDeviceId: clientDevId,
-                        terminal: session.terminalAddress,
-                        cols: nextCols,
-                        rows: nextRows
-                    )
+                var seenIDs = Set<String>()
+                var targets: [CodaAgentSession] = []
+                if let primary = selectedSession, seenIDs.insert(primary.id).inserted {
+                    targets.append(primary)
+                }
+                if duoSplitMode == .dualTerminalSplit,
+                   let secondary = secondarySession,
+                   seenIDs.insert(secondary.id).inserted {
+                    targets.append(secondary)
+                }
+                for session in targets {
+                    guard let devId = session.deviceId,
+                          let dev = remoteMachines.first(where: { $0.id == devId }) else { continue }
+                    let ident = localIdentity
+                    Task {
+                        try? await client.resizeTerminalPty(
+                            on: dev,
+                            clientIdentity: ident,
+                            clientDeviceId: clientDevId,
+                            terminal: session.terminalAddress,
+                            cols: nextCols,
+                            rows: nextRows
+                        )
+                    }
                 }
             }
         }
@@ -1441,6 +1780,8 @@ public final class CodaWorkspaceStore: ObservableObject {
 
     public func closeTerminalToInbox() {
         let closing = selectedSession
+        screenRefreshTask?.cancel()
+        screenRefreshTask = nil
         selectedSessionID = nil
         dpadVisible = false
         ctrlActive = false
@@ -1463,13 +1804,24 @@ public final class CodaWorkspaceStore: ObservableObject {
         }
     }
 
-    public func switchSibling(delta: Int) {
-        let siblings = siblingSessionsForSelected
+    public func switchSibling(delta: Int, for targetSession: CodaAgentSession? = nil, isSecondary: Bool = false) {
+        guard let current = targetSession ?? (isSecondary ? secondarySession : selectedSession) else { return }
+        let siblings = siblingSessions(for: current)
         guard siblings.count > 1,
-              let cur = selectedSessionID,
-              let idx = siblings.firstIndex(where: { $0.id == cur }) else { return }
+              let idx = siblings.firstIndex(where: { $0.id == current.id }) else { return }
         let nextIdx = (idx + delta + siblings.count) % siblings.count
-        selectSession(siblings[nextIdx])
+        if isSecondary {
+            selectSecondarySession(siblings[nextIdx])
+        } else {
+            selectSession(siblings[nextIdx])
+        }
+    }
+
+    private func optimisticallyClearNeedsYou(for session: CodaAgentSession) {
+        guard let idx = sessions.firstIndex(where: { $0.id == session.id }),
+              sessions[idx].state == .needsYou else { return }
+        sessions[idx].state = .working
+        sessions[idx].statusMessage = nil
     }
 
     public func togglePin(_ session: CodaAgentSession) {
@@ -1501,6 +1853,7 @@ public final class CodaWorkspaceStore: ObservableObject {
               let devId = session.deviceId,
               let dev = remoteMachines.first(where: { $0.id == devId }),
               let clientDevId = localIdentity.deviceId else { return }
+        optimisticallyClearNeedsYou(for: session)
         let isAttached = attachedSessionIDs.contains(session.id)
         Task {
             try? await client.interruptTerminal(
@@ -1554,6 +1907,10 @@ public final class CodaWorkspaceStore: ObservableObject {
         switch key {
         case .ctrlC, .enter:
             CodaHaptics.mediumTap()
+            optimisticallyClearNeedsYou(for: session)
+        case .esc:
+            CodaHaptics.lightTap()
+            optimisticallyClearNeedsYou(for: session)
         default:
             CodaHaptics.lightTap()
         }
@@ -1595,8 +1952,10 @@ public final class CodaWorkspaceStore: ObservableObject {
 
         if submit && session.state == .needsYou && (text == "1" || text == "2") {
             CodaHaptics.success()
+            optimisticallyClearNeedsYou(for: session)
         } else if submit {
             CodaHaptics.mediumTap()
+            optimisticallyClearNeedsYou(for: session)
         } else {
             CodaHaptics.lightTap()
         }
@@ -1633,14 +1992,15 @@ public final class CodaWorkspaceStore: ObservableObject {
         }
     }
 
-    public func submitComposePrompt() {
+    public func submitComposePrompt(for targetSession: CodaAgentSession? = nil) {
         let trimmed = composeText.trimmingCharacters(in: .newlines)
-        guard !trimmed.isEmpty, let session = selectedSession,
+        guard !trimmed.isEmpty, let session = targetSession ?? activeSheetSession ?? selectedSession,
               let client = networkClient,
               let devId = session.deviceId,
               let dev = remoteMachines.first(where: { $0.id == devId }),
               let clientDevId = localIdentity.deviceId else { return }
 
+        optimisticallyClearNeedsYou(for: session)
         isSendingAction = true
         let toSend = trimmed
         let isAttached = attachedSessionIDs.contains(session.id)
@@ -1683,14 +2043,15 @@ public final class CodaWorkspaceStore: ObservableObject {
         }
     }
 
-    public func uploadAttachment(fileURL: URL) {
-        guard let session = selectedSession,
+    public func uploadAttachment(fileURL: URL, for targetSession: CodaAgentSession? = nil) {
+        guard let session = targetSession ?? activeSheetSession ?? selectedSession,
               let client = networkClient,
               let devId = session.deviceId,
               let dev = remoteMachines.first(where: { $0.id == devId }),
               let clientDevId = localIdentity.deviceId else { return }
 
-        let maxUploadBytes = 8 * 1024 * 1024
+        // Keep raw upload under 4 MiB so double-Base64 inside encrypted RelayWireFrame stays below 8 MiB.
+        let maxUploadBytes = 4 * 1024 * 1024
         Task {
             let granted = fileURL.startAccessingSecurityScopedResource()
             defer {
@@ -1699,8 +2060,8 @@ public final class CodaWorkspaceStore: ObservableObject {
             if let fileSize = (try? fileURL.resourceValues(forKeys: [.fileSizeKey]).fileSize),
                fileSize > maxUploadBytes {
                 uploadStatusBanner = tr(
-                    "File exceeds 8 MiB upload limit.",
-                    "文件超过 8 MiB 上传限制。",
+                    "File exceeds 4 MiB upload limit.",
+                    "文件超过 4 MiB 上传限制。",
                     locale: locale
                 )
                 return
@@ -1711,8 +2072,8 @@ public final class CodaWorkspaceStore: ObservableObject {
             }
             guard data.count <= maxUploadBytes else {
                 uploadStatusBanner = tr(
-                    "File exceeds 8 MiB upload limit.",
-                    "文件超过 8 MiB 上传限制。",
+                    "File exceeds 4 MiB upload limit.",
+                    "文件超过 4 MiB 上传限制。",
                     locale: locale
                 )
                 return
@@ -1742,39 +2103,83 @@ public final class CodaWorkspaceStore: ObservableObject {
 
     public func toggleVoiceDictation() async {
         voiceError = nil
-        if isTranscribingVoice { return }
+        if isTranscribingVoice || isStartingVoice { return }
 
         if isRecordingVoice {
+            voiceGeneration &+= 1
+            let gen = voiceGeneration
+            let epoch = workspaceEpoch
             isRecordingVoice = false
             isTranscribingVoice = true
-            defer { isTranscribingVoice = false }
-            do {
-                let transcript = try await voiceRecorder.stopAndTranscribe(config: settings.voiceConfig)
-                if !transcript.isEmpty {
-                    if composeText.isEmpty || composeText.hasSuffix(" ") || composeText.hasSuffix("\n") {
-                        composeText += transcript
-                    } else {
-                        composeText += " \(transcript)"
+            let task = Task { @MainActor [weak self] in
+                guard let self else { return }
+                defer {
+                    if self.voiceGeneration == gen {
+                        self.isTranscribingVoice = false
+                        self.voiceTask = nil
                     }
                 }
-            } catch {
-                voiceError = error.localizedDescription
+                do {
+                    let transcript = try await self.voiceRecorder.stopAndTranscribe(config: self.settings.voiceConfig)
+                    guard !Task.isCancelled, self.voiceGeneration == gen, self.workspaceEpoch == epoch else { return }
+                    if !transcript.isEmpty {
+                        if self.composeText.isEmpty || self.composeText.hasSuffix(" ") || self.composeText.hasSuffix("\n") {
+                            self.composeText += transcript
+                        } else {
+                            self.composeText += " \(transcript)"
+                        }
+                    }
+                } catch {
+                    guard !Task.isCancelled, self.voiceGeneration == gen, self.workspaceEpoch == epoch else { return }
+                    self.voiceError = error.localizedDescription
+                }
             }
+            voiceTask = task
+            await task.value
             return
         }
 
-        do {
-            _ = try CodaVoiceRecorder.validatedTranscriptionURL(from: settings.voiceConfig.baseURL)
-            try await voiceRecorder.startRecording()
-            isRecordingVoice = true
-        } catch {
-            isRecordingVoice = false
-            voiceError = error.localizedDescription
+        voiceGeneration &+= 1
+        let gen = voiceGeneration
+        let epoch = workspaceEpoch
+        isStartingVoice = true
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer {
+                if self.voiceGeneration == gen {
+                    self.isStartingVoice = false
+                    self.voiceTask = nil
+                }
+            }
+            do {
+                _ = try CodaVoiceRecorder.validatedTranscriptionURL(from: self.settings.voiceConfig.baseURL)
+                try await self.voiceRecorder.startRecording()
+                if Task.isCancelled || self.voiceGeneration != gen || self.workspaceEpoch != epoch {
+                    if self.voiceGeneration == gen {
+                        self.voiceRecorder.cancelRecording()
+                        self.isRecordingVoice = false
+                    }
+                    return
+                }
+                self.isRecordingVoice = true
+            } catch {
+                guard self.voiceGeneration == gen else { return }
+                self.voiceRecorder.cancelRecording()
+                self.isRecordingVoice = false
+                guard !Task.isCancelled, self.workspaceEpoch == epoch else { return }
+                self.voiceError = error.localizedDescription
+            }
         }
+        voiceTask = task
+        await task.value
     }
 
     public func cancelVoiceDictation() {
+        voiceGeneration &+= 1
+        voiceTask?.cancel()
+        voiceTask = nil
         voiceRecorder.cancelRecording()
+        isStartingVoice = false
         isRecordingVoice = false
         isTranscribingVoice = false
     }
@@ -1844,25 +2249,42 @@ public final class CodaWorkspaceStore: ObservableObject {
         }
     }
 
-    public func loadGitDiffForSelected(presentModal: Bool = true) {
-        guard let session = selectedSession,
+    public func loadGitDiff(for targetSession: CodaAgentSession?, presentModal: Bool = true) {
+        guard let session = targetSession ?? selectedSession,
               let client = networkClient,
               let devId = session.deviceId,
               let dev = remoteMachines.first(where: { $0.id == devId }),
               let clientDevId = localIdentity.deviceId else { return }
+        gitDiffGeneration &+= 1
+        let diffGen = gitDiffGeneration
+        let epoch = workspaceEpoch
+        gitDiffResult = nil
         gitDiffLoading = true
         if presentModal {
+            activeSheetSessionID = session.id
             showGitDiffSheet = true
         }
-        Task {
-            defer { self.gitDiffLoading = false }
-            self.gitDiffResult = try? await client.fetchGitDiff(
+        Task { [weak self] in
+            guard let self else { return }
+            defer {
+                if self.gitDiffGeneration == diffGen && self.workspaceEpoch == epoch {
+                    self.gitDiffLoading = false
+                }
+            }
+            let fetched = try? await client.fetchGitDiff(
                 on: dev,
-                clientIdentity: localIdentity,
+                clientIdentity: self.localIdentity,
                 clientDeviceId: clientDevId,
                 cwd: session.cwd
             )
+            if self.gitDiffGeneration == diffGen && self.workspaceEpoch == epoch {
+                self.gitDiffResult = fetched
+            }
         }
+    }
+
+    public func loadGitDiffForSelected(presentModal: Bool = true) {
+        loadGitDiff(for: selectedSession, presentModal: presentModal)
     }
 }
 

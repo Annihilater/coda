@@ -11,6 +11,8 @@ private final class TerminalViewportLocalState: ObservableObject {
     @Published var showDirectInputBar: Bool = false
     @Published var baseFontScale: CGFloat = 1.0
     @Published var atBottom: Bool = true
+    var lastHandledRevision: UInt64 = 0
+    var suppressDisappearUntil: Date = .distantPast
 }
 
 public struct CodaTerminalSessionView: View {
@@ -51,7 +53,11 @@ public struct CodaTerminalSessionView: View {
                     DragGesture(minimumDistance: 28)
                         .onEnded { value in
                             if abs(value.translation.width) > abs(value.translation.height) * 1.3 {
-                                store.switchSibling(delta: value.translation.width < 0 ? 1 : -1)
+                                store.switchSibling(
+                                    delta: value.translation.width < 0 ? 1 : -1,
+                                    for: session,
+                                    isSecondary: isSecondaryLeaf
+                                )
                             }
                         }
                 )
@@ -106,23 +112,32 @@ public struct CodaTerminalSessionView: View {
             }
         }
         .background(CodaHerdrTheme.canvasBG)
-        .sheet(isPresented: Binding(
-            get: { !isSecondaryLeaf && store.showComposeSheet },
-            set: { if !isSecondaryLeaf { store.showComposeSheet = $0 } }
-        )) {
-            CodaComposePromptSheet(store: store, session: store.selectedSession ?? session)
+        .sheet(
+            isPresented: Binding(
+                get: { !isSecondaryLeaf && store.showComposeSheet },
+                set: { if !isSecondaryLeaf { store.showComposeSheet = $0 } }
+            ),
+            onDismiss: {
+                if store.pendingOpenSettingsAfterCompose {
+                    store.pendingOpenSettingsAfterCompose = false
+                    store.settingsInitialFocusPairing = false
+                    store.showSettingsSheet = true
+                }
+            }
+        ) {
+            CodaComposePromptSheet(store: store, session: store.activeSheetSession ?? session)
         }
         .sheet(isPresented: Binding(
             get: { !isSecondaryLeaf && store.showPaneMinimapSheet },
             set: { if !isSecondaryLeaf { store.showPaneMinimapSheet = $0 } }
         )) {
-            CodaPaneMinimapSheet(store: store, session: store.selectedSession ?? session)
+            CodaPaneMinimapSheet(store: store, session: store.activeSheetSession ?? session)
         }
         .sheet(isPresented: Binding(
             get: { !isSecondaryLeaf && store.showGitDiffSheet },
             set: { if !isSecondaryLeaf { store.showGitDiffSheet = $0 } }
         )) {
-            CodaGitDiffSheet(store: store, session: store.selectedSession ?? session)
+            CodaGitDiffSheet(store: store, session: store.activeSheetSession ?? session)
         }
     }
 
@@ -208,14 +223,15 @@ public struct CodaTerminalSessionView: View {
                 }
 
                 HStack(spacing: 6) {
+                    let siblings = store.siblingSessions(for: session)
                     Text("\(session.workspaceName) · \(session.branch) · \(session.hostName)")
                         .font(.system(size: 11))
                         .foregroundStyle(CodaHerdrTheme.textSecondary)
                         .lineLimit(1)
 
-                    if store.siblingSessionsForSelected.count > 1 {
+                    if siblings.count > 1 {
                         HStack(spacing: 4) {
-                            ForEach(store.siblingSessionsForSelected) { sib in
+                            ForEach(siblings) { sib in
                                 Circle()
                                     .fill(sib.id == session.id ? CodaHerdrTheme.textPrimary : CodaHerdrTheme.textDim)
                                     .frame(width: 5, height: 5)
@@ -228,19 +244,20 @@ public struct CodaTerminalSessionView: View {
             Spacer(minLength: 4)
 
             HStack(spacing: 8) {
-                let duoDiffActive = store.formFactor == .iphoneDuoInnerLandscape && store.duoSplitMode == .studioDiffSplit
+                let siblings = store.siblingSessions(for: session)
+                let duoDiffActive = !isSecondaryLeaf && store.formFactor == .iphoneDuoInnerLandscape && store.duoSplitMode == .studioDiffSplit
                 Button {
-                    if store.formFactor == .iphoneDuoInnerLandscape {
+                    if !isSecondaryLeaf && store.formFactor == .iphoneDuoInnerLandscape {
                         withAnimation(.snappy(duration: 0.18)) {
                             if store.duoSplitMode == .studioDiffSplit {
                                 store.setDuoSplitMode(.inboxAndTerminal)
                             } else {
                                 store.setDuoSplitMode(.studioDiffSplit)
-                                store.loadGitDiffForSelected(presentModal: false)
+                                store.loadGitDiff(for: session, presentModal: false)
                             }
                         }
                     } else {
-                        store.loadGitDiffForSelected()
+                        store.loadGitDiff(for: session, presentModal: true)
                     }
                 } label: {
                     Image(systemName: "plus.forwardslash.minus")
@@ -266,10 +283,10 @@ public struct CodaTerminalSessionView: View {
                 .buttonStyle(.plain)
 
                 Button {
-                    store.showPaneMinimapSheet = true
+                    store.openMinimapSheet(for: session, isSecondary: isSecondaryLeaf)
                 } label: {
                     CodaMiniPaneMapGlyph(
-                        siblings: store.siblingSessionsForSelected,
+                        siblings: siblings,
                         selectedId: session.id
                     )
                 }
@@ -378,6 +395,7 @@ public struct CodaTerminalSessionView: View {
 
     private var terminalScrollViewport: some View {
         let lines = store.terminalLinesBySession[session.id] ?? []
+        let renderRevision = store.terminalRenderRevisionBySession[session.id] ?? 0
 
         return ScrollViewReader { proxy in
             ScrollView(.vertical, showsIndicators: true) {
@@ -409,6 +427,14 @@ public struct CodaTerminalSessionView: View {
                     Color.clear
                         .frame(height: hideBottomControls ? 18 : ((local.showDirectInputBar ? 148 : 88) + (store.showTactileTwoRowKeypad ? 86 : 0)))
                         .id("terminal_bottom_anchor")
+                        .onAppear {
+                            local.atBottom = true
+                        }
+                        .onDisappear {
+                            if local.lastHandledRevision == renderRevision && Date() >= local.suppressDisappearUntil {
+                                local.atBottom = false
+                            }
+                        }
                 }
                 .padding(.horizontal, 12)
                 .padding(.top, 10)
@@ -422,25 +448,32 @@ public struct CodaTerminalSessionView: View {
                     }
             )
             .codaDismissKeyboardInteractively()
-            .onChange(of: lines.count) { _, _ in
-                if local.atBottom {
-                    withAnimation(.easeOut(duration: 0.12)) {
-                        proxy.scrollTo("terminal_bottom_anchor", anchor: .bottom)
-                    }
-                }
+            .onChange(of: session.id) { _, _ in
+                local.atBottom = true
+                local.lastHandledRevision = renderRevision
+                local.suppressDisappearUntil = Date().addingTimeInterval(0.25)
+                local.directInputBuffer = ""
+                proxy.scrollTo("terminal_bottom_anchor", anchor: .bottom)
             }
-            .onChange(of: lines.last?.plainText ?? "") { _, _ in
-                if local.atBottom {
+            .onChange(of: renderRevision) { _, _ in
+                let wasAtBottom = local.atBottom
+                local.lastHandledRevision = renderRevision
+                if wasAtBottom {
+                    local.suppressDisappearUntil = Date().addingTimeInterval(0.25)
                     proxy.scrollTo("terminal_bottom_anchor", anchor: .bottom)
                 }
             }
             .onAppear {
                 local.atBottom = true
+                local.lastHandledRevision = renderRevision
+                local.suppressDisappearUntil = Date().addingTimeInterval(0.25)
                 proxy.scrollTo("terminal_bottom_anchor", anchor: .bottom)
             }
             .overlay(alignment: .bottomTrailing) {
                 Button {
                     local.atBottom = true
+                    local.lastHandledRevision = renderRevision
+                    local.suppressDisappearUntil = Date().addingTimeInterval(0.25)
                     withAnimation(.easeOut(duration: 0.15)) {
                         proxy.scrollTo("terminal_bottom_anchor", anchor: .bottom)
                     }
@@ -762,7 +795,7 @@ public struct CodaTerminalSessionView: View {
         .buttonStyle(.plain)
 
         Button {
-            store.showComposeSheet = true
+            store.openComposeSheet(for: session, isSecondary: isSecondaryLeaf)
         } label: {
             Image(systemName: "square.and.pencil")
                 .font(.system(size: 15, weight: .semibold))
@@ -1011,9 +1044,8 @@ public struct CodaComposePromptSheet: View {
 
                 Button {
                     store.cancelVoiceDictation()
+                    store.pendingOpenSettingsAfterCompose = true
                     dismiss()
-                    store.settingsInitialFocusPairing = false
-                    store.showSettingsSheet = true
                 } label: {
                     Image(systemName: "slider.horizontal.3")
                         .font(.system(size: 12, weight: .medium))
@@ -1030,7 +1062,7 @@ public struct CodaComposePromptSheet: View {
                 Spacer()
 
                 Button {
-                    store.submitComposePrompt()
+                    store.submitComposePrompt(for: session)
                     dismiss()
                 } label: {
                     HStack(spacing: 6) {
@@ -1051,16 +1083,14 @@ public struct CodaComposePromptSheet: View {
         .background(CodaHerdrTheme.cardBG)
         .presentationDetents([.medium, .large])
         .onDisappear {
-            if store.isRecordingVoice {
-                store.cancelVoiceDictation()
-            }
+            store.cancelVoiceDictation()
         }
         .fileImporter(
             isPresented: $local.showFileImporter,
             allowedContentTypes: [.item]
         ) { result in
             if case .success(let url) = result {
-                store.uploadAttachment(fileURL: url)
+                store.uploadAttachment(fileURL: url, for: session)
             }
         }
     }
@@ -1105,7 +1135,7 @@ public struct CodaPaneMinimapSheet: View {
 
             ScrollView {
                 LazyVGrid(columns: [GridItem(.flexible(), spacing: 10), GridItem(.flexible(), spacing: 10)], spacing: 10) {
-                    ForEach(store.siblingSessionsForSelected) { sib in
+                    ForEach(store.siblingSessions(for: session)) { sib in
                         VStack(alignment: .leading, spacing: 6) {
                             HStack(spacing: 6) {
                                 Text(sib.agentName)
@@ -1127,7 +1157,11 @@ public struct CodaPaneMinimapSheet: View {
                                 .buttonStyle(.plain)
                             }
                             Button {
-                                store.selectSession(sib)
+                                if store.duoSplitMode == .dualTerminalSplit && store.activeSheetIsSecondary {
+                                    store.selectSecondarySession(sib)
+                                } else {
+                                    store.selectSession(sib)
+                                }
                                 dismiss()
                             } label: {
                                 VStack(alignment: .leading, spacing: 4) {

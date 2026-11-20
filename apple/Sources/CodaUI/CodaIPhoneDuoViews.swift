@@ -1299,7 +1299,7 @@ public struct CodaDuoTabletopControlDeck: View {
 
                 if let active = session {
                     Button {
-                        store.loadGitDiffForSelected()
+                        store.loadGitDiff(for: active)
                     } label: {
                         Image(systemName: "plus.forwardslash.minus")
                             .font(.system(size: 12, weight: .semibold))
@@ -1357,7 +1357,11 @@ public struct CodaDuoTabletopControlDeck: View {
                 .buttonStyle(.plain)
 
                 Button {
-                    store.showComposeSheet = true
+                    if let active = session {
+                        store.openComposeSheet(for: active)
+                    } else {
+                        store.showComposeSheet = true
+                    }
                 } label: {
                     Image(systemName: "square.and.pencil")
                         .font(.system(size: 14, weight: .semibold))
@@ -1384,6 +1388,9 @@ public struct CodaDuoTabletopControlDeck: View {
         .padding(.bottom, max(12, store.edgeSafeAreas.bottom + 4))
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(CodaHerdrTheme.canvasBG)
+        .onChange(of: session?.id) { _, _ in
+            local.commandDraft = ""
+        }
     }
 
     private func submitCommand() {
@@ -1446,7 +1453,7 @@ public struct CodaDuoInlineGitDiffLeaf: View {
                 Spacer()
 
                 Button {
-                    store.loadGitDiffForSelected(presentModal: false)
+                    store.loadGitDiff(for: session, presentModal: false)
                 } label: {
                     Image(systemName: "arrow.clockwise")
                         .font(.system(size: 12, weight: .medium))

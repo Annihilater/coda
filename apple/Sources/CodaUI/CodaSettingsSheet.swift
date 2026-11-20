@@ -5,6 +5,7 @@ import SwiftUI
 // MARK: - Settings, Account Auth & Machine Pairing Sheet
 
 private final class SettingsFormModel: ObservableObject {
+    @Published var serverURLInput: String = ""
     @Published var authMode: Int = 0 // 0: Browser Device Auth, 1: Password, 2: Register
     @Published var emailInput: String = ""
     @Published var handleInput: String = ""
@@ -34,16 +35,36 @@ public struct CodaSettingsAndPairingSheet: View {
 
     public var body: some View {
         NavigationStack {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 18) {
-                    languageAndServerSection
-                    accountAuthSection
-                    if store.isSignedIn {
-                        machinePairingSection
+            ScrollViewReader { proxy in
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 18) {
+                        languageAndServerSection
+                        accountAuthSection
+                        if store.isSignedIn {
+                            machinePairingSection
+                                .id("machine_pairing_section")
+                        }
+                        voiceModelSection
                     }
-                    voiceModelSection
+                    .padding(18)
                 }
-                .padding(18)
+                .onAppear {
+                    form.serverURLInput = store.settings.serverBaseURLString
+                    if store.settingsInitialFocusPairing && store.isSignedIn {
+                        store.settingsInitialFocusPairing = false
+                        Task { @MainActor in
+                            withAnimation(.easeOut(duration: 0.2)) {
+                                proxy.scrollTo("machine_pairing_section", anchor: .top)
+                            }
+                        }
+                    }
+                }
+                .onChange(of: store.isSignedIn) { _, signedIn in
+                    if signedIn {
+                        form.passwordInput = ""
+                        form.inviteCodeInput = ""
+                    }
+                }
             }
             .background(CodaHerdrTheme.canvasBG)
             .navigationTitle(tr("Mesh Settings", "工作网设置", locale: store.locale))
@@ -53,7 +74,6 @@ public struct CodaSettingsAndPairingSheet: View {
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
                     Button(tr("Done", "完成", locale: store.locale)) {
-                        store.settings.save()
                         dismiss()
                     }
                     .foregroundStyle(CodaHerdrTheme.textPrimary)
@@ -89,7 +109,7 @@ public struct CodaSettingsAndPairingSheet: View {
                         .font(.system(size: 12, weight: .medium))
                         .foregroundStyle(CodaHerdrTheme.textSecondary)
                     HStack(spacing: 8) {
-                        TextField("https://codahub.dev", text: $store.settings.serverBaseURLString)
+                        TextField("https://codahub.dev", text: $form.serverURLInput)
                             .font(.system(size: 13, design: .monospaced))
                             .foregroundStyle(CodaHerdrTheme.textPrimary)
                             .padding(.horizontal, 10)
@@ -98,7 +118,8 @@ public struct CodaSettingsAndPairingSheet: View {
                             .codaNoAutocapAndSpelling()
 
                         Button(tr("Apply", "应用", locale: store.locale)) {
-                            store.updateServerURL(store.settings.serverBaseURLString)
+                            store.updateServerURL(form.serverURLInput)
+                            form.serverURLInput = store.settings.serverBaseURLString
                         }
                         .font(.system(size: 12, weight: .semibold))
                         .foregroundStyle(CodaHerdrTheme.textPrimary)
@@ -470,6 +491,7 @@ public struct CodaSettingsAndPairingSheet: View {
                         .background(RoundedRectangle(cornerRadius: 8).fill(CodaHerdrTheme.canvasBG))
 
                     Button {
+                        form.copiedFlag = false
                         Task { await store.generateMachinePairingCommand(suggestedName: form.suggestedHostName) }
                     } label: {
                         Text(tr("Generate Code", "生成配对码", locale: store.locale))

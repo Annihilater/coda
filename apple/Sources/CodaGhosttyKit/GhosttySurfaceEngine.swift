@@ -270,6 +270,9 @@ public struct GhosttyReflowEngine: GhosttyVTSurface {
     public private(set) var title: String = ""
     public private(set) var inAltScreen: Bool = false
     public private(set) var latestHerdrStatus: HerdrOSC7501Status?
+    /// Monotonically incremented only when a fresh OSC 7501 payload is parsed (or engine resets),
+    /// preventing callers from re-applying sticky `latestHerdrStatus` on plain stdout chunks.
+    public private(set) var oscStatusGeneration: UInt64 = 0
 
     private let maxScrollback: Int
     private var primaryGrid: [ScreenRow]
@@ -290,7 +293,7 @@ public struct GhosttyReflowEngine: GhosttyVTSurface {
     private var curBold: Bool = false
     private var curDim: Bool = false
     private var curInverse: Bool = false
-    private var treatLFAsCRLF: Bool
+    public var treatLFAsCRLF: Bool
 
     private var parseState: VTParseState = .ground
     private var csiBuffer: [UInt8] = []
@@ -336,6 +339,7 @@ public struct GhosttyReflowEngine: GhosttyVTSurface {
         pendingUTF8.removeAll(keepingCapacity: true)
         title = ""
         latestHerdrStatus = nil
+        oscStatusGeneration &+= 1
         rebuildDerivedOutputs()
     }
 
@@ -403,7 +407,17 @@ public struct GhosttyReflowEngine: GhosttyVTSurface {
 
         if inAltScreen {
             altGrid = resizeGridWithoutReflow(altGrid, newCols: newCols, newRows: newRows)
-            primaryGrid = reflowPrimaryHistoryAndGrid(newCols: newCols, newRows: newRows).grid
+            let savedAltRow = cursorRow
+            let savedAltCol = cursorCol
+            cursorRow = min(max(0, savedPrimaryCursor.row), max(0, rows - 1))
+            cursorCol = min(max(0, savedPrimaryCursor.col), max(0, columns - 1))
+            let reflowed = reflowPrimaryHistoryAndGrid(newCols: newCols, newRows: newRows)
+            primaryScrollback = reflowed.scrollback
+            primaryGrid = reflowed.grid
+            savedPrimaryCursor.row = min(max(0, reflowed.cursorRow), newRows - 1)
+            savedPrimaryCursor.col = min(max(0, reflowed.cursorCol), newCols - 1)
+            cursorRow = savedAltRow
+            cursorCol = savedAltCol
         } else {
             let reflowed = reflowPrimaryHistoryAndGrid(newCols: newCols, newRows: newRows)
             primaryScrollback = reflowed.scrollback
@@ -704,7 +718,7 @@ public struct GhosttyReflowEngine: GhosttyVTSurface {
         }
 
         withActiveGrid { grid in
-            for r in top...(bottom - n) {
+            for r in top..<(bottom - n + 1) {
                 grid[r] = grid[r + n]
             }
             for r in (bottom - n + 1)...bottom {
@@ -918,7 +932,7 @@ public struct GhosttyReflowEngine: GhosttyVTSurface {
             ? []
             : cleanParams.split(separator: ";", omittingEmptySubsequences: false).map { Int($0) ?? 0 }
         let p1 = ints.first ?? 0
-        let count1 = max(1, p1)
+        let count1 = max(1, min(p1, 65_535))
 
         if isPrivate {
             switch finalByte {
@@ -966,8 +980,8 @@ public struct GhosttyReflowEngine: GhosttyVTSurface {
             cursorCol = min(columns - 1, max(0, count1 - 1))
         case 0x48, 0x66: // 'H' CUP / 'f' HVP
             pendingWrap = false
-            let r = max(1, ints.count >= 1 ? ints[0] : 1)
-            let c = max(1, ints.count >= 2 ? ints[1] : 1)
+            let r = max(1, min(ints.count >= 1 ? ints[0] : 1, 65_535))
+            let c = max(1, min(ints.count >= 2 ? ints[1] : 1, 65_535))
             cursorRow = min(rows - 1, r - 1)
             cursorCol = min(columns - 1, c - 1)
         case 0x64: // 'd' VPA
@@ -1127,11 +1141,13 @@ public struct GhosttyReflowEngine: GhosttyVTSurface {
             let payload = String(raw.dropFirst(5))
             if let status = Self.parseOSC7501Payload(payload, separator: ";") {
                 latestHerdrStatus = status
+                oscStatusGeneration &+= 1
             }
         } else if raw.hasPrefix("7501:") {
             let payload = String(raw.dropFirst(5))
             if let status = Self.parseOSC7501Payload(payload, separator: ":") {
                 latestHerdrStatus = status
+                oscStatusGeneration &+= 1
             }
         } else if raw.hasPrefix("0;") || raw.hasPrefix("2;") {
             title = String(raw.dropFirst(2))

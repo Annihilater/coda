@@ -5,22 +5,14 @@ import SwiftUI
 
 public struct CodaAdaptiveRootView: View {
     @ObservedObject private var store: CodaWorkspaceStore
-    @StateObject private var ownedStore: CodaWorkspaceStore
     @FocusState private var sidebarSearchFocused: Bool
 #if os(iOS)
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @Environment(\.verticalSizeClass) private var verticalSizeClass
 #endif
 
-    public init() {
-        let created = CodaWorkspaceStore()
-        _store = ObservedObject(wrappedValue: created)
-        _ownedStore = StateObject(wrappedValue: created)
-    }
-
     public init(store: CodaWorkspaceStore) {
-        _store = ObservedObject(wrappedValue: store)
-        _ownedStore = StateObject(wrappedValue: store)
+        self.store = store
     }
 
     private var isHorizontalRegular: Bool? {

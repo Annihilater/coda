@@ -43,10 +43,17 @@ public final class CodaLocalNotifier: NSObject {
     public static let shared = CodaLocalNotifier()
 
     private var onSelectSession: (@MainActor (String) -> Void)?
+    private var pendingTappedSessionId: String?
     private var delegateInstalled = false
 
     private override init() {
         super.init()
+        #if canImport(UserNotifications)
+        if isAvailableInCurrentProcess {
+            UNUserNotificationCenter.current().delegate = self
+            delegateInstalled = true
+        }
+        #endif
     }
 
     public var isAvailableInCurrentProcess: Bool {
@@ -58,13 +65,36 @@ public final class CodaLocalNotifier: NSObject {
     }
 
     /// Registers a handler invoked when the user taps an OSC 7501 notification banner,
-    /// jumping straight to the alerting terminal session.
+    /// jumping straight to the alerting terminal session. Also flushes any cold-launch tap
+    /// received before the view layer attached its handler.
     public func registerSessionTapHandler(_ handler: @escaping @MainActor (String) -> Void) {
         self.onSelectSession = handler
         #if canImport(UserNotifications)
-        guard isAvailableInCurrentProcess, !delegateInstalled else { return }
-        UNUserNotificationCenter.current().delegate = self
-        delegateInstalled = true
+        if isAvailableInCurrentProcess, !delegateInstalled {
+            UNUserNotificationCenter.current().delegate = self
+            delegateInstalled = true
+        }
+        #endif
+        if let pending = pendingTappedSessionId {
+            pendingTappedSessionId = nil
+            handler(pending)
+        }
+    }
+
+    /// Prompts for notification permission only when status is `.notDetermined`, so fresh
+    /// installs with `notificationsEnabled = true` receive the OS authorization prompt.
+    public func requestAuthorizationIfNotDetermined() async {
+        #if canImport(UserNotifications)
+        guard isAvailableInCurrentProcess else { return }
+        let center = UNUserNotificationCenter.current()
+        if !delegateInstalled {
+            center.delegate = self
+            delegateInstalled = true
+        }
+        let settings = await center.notificationSettings()
+        if settings.authorizationStatus == .notDetermined {
+            _ = try? await center.requestAuthorization(options: [.alert, .sound, .badge])
+        }
         #endif
     }
 
@@ -107,7 +137,11 @@ public final class CodaLocalNotifier: NSObject {
     }
 
     fileprivate func dispatchTappedSession(_ sessionId: String) {
-        onSelectSession?(sessionId)
+        if let onSelectSession {
+            onSelectSession(sessionId)
+        } else {
+            pendingTappedSessionId = sessionId
+        }
     }
 }
 
