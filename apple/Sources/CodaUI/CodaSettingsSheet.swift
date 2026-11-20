@@ -108,6 +108,48 @@ public struct CodaSettingsAndPairingSheet: View {
                         .buttonStyle(.plain)
                     }
                 }
+
+                Divider().overlay(CodaHerdrTheme.borderHairline)
+
+                Toggle(isOn: Binding(
+                    get: { store.settings.notificationsEnabled },
+                    set: { store.setNotificationsEnabled($0) }
+                )) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(tr("System Alerts (OSC 7501)", "系统通知 (OSC 7501)", locale: store.locale))
+                            .font(.system(size: 13))
+                            .foregroundStyle(CodaHerdrTheme.textPrimary)
+                        Text(tr("Notify when an AI agent needs approval or finishes", "后台 Agent 需要审批或任务完成时发送系统通知", locale: store.locale))
+                            .font(.system(size: 11))
+                            .foregroundStyle(CodaHerdrTheme.textSecondary)
+                    }
+                }
+                .tint(CodaHerdrTheme.amberNeedsYou)
+
+                if store.isSignedIn {
+                    HStack {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(tr("Smart-Path Auto Hot-Switch", "智能路径热切直连", locale: store.locale))
+                                .font(.system(size: 13))
+                                .foregroundStyle(CodaHerdrTheme.textPrimary)
+                            Text(tr("Auto-upgrades Relay to LAN Direct on Wi-Fi/Ethernet", "进入局域网时自动从智能中继无感热切至直连", locale: store.locale))
+                                .font(.system(size: 11))
+                                .foregroundStyle(CodaHerdrTheme.textSecondary)
+                        }
+                        Spacer()
+                        Button {
+                            Task { await store.probeDirectLanNow() }
+                        } label: {
+                            Label(tr("Probe LAN", "探测直连", locale: store.locale), systemImage: "bolt.horizontal.fill")
+                                .font(.system(size: 11.5, weight: .semibold))
+                                .foregroundStyle(CodaHerdrTheme.textPrimary)
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 6)
+                                .background(RoundedRectangle(cornerRadius: 8).fill(CodaHerdrTheme.pillActiveBG))
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
             }
         }
     }

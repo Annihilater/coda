@@ -123,6 +123,7 @@ public final class CodaWorkspaceStore: ObservableObject {
     private var lastWorkspaceScanAt: [UUID: Date] = [:]
     private var accountEventsConnectedToken: String? = nil
     private var previousStates: [String: HerdrLifecycleState] = [:]
+    private var notificationTracker = CodaNotificationTracker(cooldown: 20.0)
     private var lastToastAt: Date = .distantPast
     private var lastViewportSize: CGSize = .zero
     private var lastIsHorizontalRegular: Bool? = nil
@@ -152,6 +153,10 @@ public final class CodaWorkspaceStore: ObservableObject {
         }
         self.localIdentity = loadedIdentity
 
+        CodaLocalNotifier.shared.registerSessionTapHandler { [weak self] sid in
+            self?.selectSessionByID(sid)
+        }
+
         if !loadedSettings.sessionToken.isEmpty {
             Task { [weak self] in
                 await self?.refreshMachinesAndSessions()
@@ -170,6 +175,44 @@ public final class CodaWorkspaceStore: ObservableObject {
     public func setLocale(_ next: CodaUILocale) {
         settings.locale = next
         settings.save()
+    }
+
+    public func setNotificationsEnabled(_ enabled: Bool) {
+        settings.notificationsEnabled = enabled
+        settings.save()
+        if enabled {
+            Task { [weak self] in
+                let granted = await CodaLocalNotifier.shared.requestAuthorization()
+                guard let self else { return }
+                if !granted && CodaLocalNotifier.shared.isAvailableInCurrentProcess {
+                    self.accountStatusMessage = tr(
+                        "Notifications blocked in system settings",
+                        "系统设置已拒绝通知权限，请在系统设置中开启",
+                        locale: self.locale
+                    )
+                }
+            }
+        }
+    }
+
+    public func probeDirectLanNow() async {
+        guard let client = await preparedClient(),
+              let clientDevId = localIdentity.deviceId else { return }
+        let online = remoteMachines.filter(\.isOnline)
+        var upgradedAny = false
+        for dev in online {
+            if let route = await client.probeDirectLanNow(
+                for: dev,
+                clientIdentity: localIdentity,
+                clientDeviceId: clientDevId
+            ) {
+                machineRouteModes[dev.id] = route
+                upgradedAny = true
+            }
+        }
+        accountStatusMessage = upgradedAny
+            ? tr("Hot-switched seamlessly to LAN Direct", "已无感热切至局域网直连", locale: locale)
+            : tr("LAN Direct unreachable — staying on Smart Relay", "当前网络暂无法直连，继续通过智能中继稳定传输", locale: locale)
     }
 
     public func updateServerURL(_ raw: String) {
@@ -415,6 +458,53 @@ public final class CodaWorkspaceStore: ObservableObject {
 
     private func handleAsyncPeerEvent(_ event: CodaAsyncEvent) {
         let hostPrefix = event.sourceDeviceId.uuidString.lowercased()
+        if event.op == "route_changed" {
+            if let obj = try? JSONSerialization.jsonObject(with: event.payloadData) as? [String: Any],
+               let rawRoute = obj["route_mode"] as? String,
+               let nextRoute = SmartPathRouteMode(rawValue: rawRoute) {
+                let isDirect = (obj["is_direct"] as? Bool) ?? (nextRoute == .lanDirect || nextRoute == .cnIPv6P2P)
+                machineRouteModes[event.sourceDeviceId] = nextRoute
+                let hostName = remoteMachines.first(where: { $0.id == event.sourceDeviceId })?.name ?? "Host"
+                let bannerMsg = isDirect
+                    ? tr("Hot-switched to LAN Direct · \(hostName)", "已无感热切至局域网直连 · \(hostName)", locale: locale)
+                    : tr("Switched seamlessly to Smart Relay · \(hostName)", "已无缝切回智能中继 · \(hostName)", locale: locale)
+                if isDirect {
+                    CodaHaptics.success()
+                }
+                uploadStatusBanner = bannerMsg
+                Task { [weak self] in
+                    try? await Task.sleep(nanoseconds: 4_000_000_000)
+                    if self?.uploadStatusBanner == bannerMsg {
+                        self?.uploadStatusBanner = nil
+                    }
+                }
+                // Seamlessly re-attach active PTY(s) over the promoted/failover transport without clearing VT buffers.
+                if let client = networkClient,
+                   let dev = remoteMachines.first(where: { $0.id == event.sourceDeviceId }),
+                   let clientDevId = localIdentity.deviceId {
+                    let activeForHost = [selectedSession, secondarySession]
+                        .compactMap { $0 }
+                        .filter { $0.deviceId == event.sourceDeviceId }
+                    for sess in activeForHost {
+                        let cols = terminalColumns
+                        let rows = terminalRows
+                        let ident = localIdentity
+                        Task {
+                            _ = try? await client.attachTerminalPty(
+                                on: dev,
+                                clientIdentity: ident,
+                                clientDeviceId: clientDevId,
+                                terminal: sess.terminalAddress,
+                                cols: cols,
+                                rows: rows
+                            )
+                        }
+                    }
+                }
+            }
+            return
+        }
+
         if event.op == "peer_session_reset" {
             let prefixWithSlash = "\(hostPrefix)/"
             attachedSessionIDs = attachedSessionIDs.filter { !$0.hasPrefix(prefixWithSlash) }
@@ -1041,6 +1131,22 @@ public final class CodaWorkspaceStore: ObservableObject {
 
     private func emitTransitionToastsIfNeeded(newSessions: [CodaAgentSession]) {
         for s in newSessions {
+            // 1. Native iOS / iPadOS / macOS UNUserNotificationCenter alerts (edge-triggered + 20s cooldown)
+            if settings.notificationsEnabled,
+               let alert = notificationTracker.observe(
+                sessionId: s.id,
+                machineName: s.hostName,
+                workspaceName: s.workspaceName,
+                taskTitle: s.taskTitle,
+                statusMessage: s.statusMessage,
+                state: s.state,
+                activeSessionId: selectedSessionID,
+                locale: locale
+               ) {
+                CodaLocalNotifier.shared.deliver(alert)
+            }
+
+            // 2. Lightweight in-app toast banner for background sessions
             let prev = previousStates[s.id]
             previousStates[s.id] = s.state
 
@@ -1141,6 +1247,21 @@ public final class CodaWorkspaceStore: ObservableObject {
         let needSnapshot = !attachedSessionIDs.contains(session.id) || surfaceEngines[session.id] == nil
         screenRefreshTask = Task { [weak self] in
             await self?.refreshTerminalScreen(for: session, forceSnapshot: needSnapshot)
+        }
+    }
+
+    /// Jumps straight to `sessionId` (used when tapping a native OSC 7501 notification banner).
+    public func selectSessionByID(_ sessionId: String) {
+        if let match = sessions.first(where: { $0.id == sessionId }) {
+            selectSession(match)
+            return
+        }
+        Task { [weak self] in
+            guard let self else { return }
+            await self.refreshMachinesAndSessions()
+            if let match = self.sessions.first(where: { $0.id == sessionId }) {
+                self.selectSession(match)
+            }
         }
     }
 
@@ -1430,6 +1551,13 @@ public final class CodaWorkspaceStore: ObservableObject {
               let dev = remoteMachines.first(where: { $0.id == devId }),
               let clientDevId = localIdentity.deviceId else { return }
 
+        switch key {
+        case .ctrlC, .enter:
+            CodaHaptics.mediumTap()
+        default:
+            CodaHaptics.lightTap()
+        }
+
         let useAlt = altActive
         ctrlActive = false
         altActive = false
@@ -1464,6 +1592,14 @@ public final class CodaWorkspaceStore: ObservableObject {
               let devId = session.deviceId,
               let dev = remoteMachines.first(where: { $0.id == devId }),
               let clientDevId = localIdentity.deviceId else { return }
+
+        if submit && session.state == .needsYou && (text == "1" || text == "2") {
+            CodaHaptics.success()
+        } else if submit {
+            CodaHaptics.mediumTap()
+        } else {
+            CodaHaptics.lightTap()
+        }
 
         let useCtrl = ctrlActive
         let useAlt = altActive

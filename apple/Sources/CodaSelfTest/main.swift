@@ -956,6 +956,40 @@ struct CodaSelfTest {
         precondition(richLines[1].kind == .normal, "Markdown bullet should stay .normal")
         precondition(richLines[2].kind == .diffRemoved, "Unified diff deletion should be .diffRemoved")
         precondition(vtRich.latestHerdrStatus?.state == .needsYou && vtRich.latestHerdrStatus?.message == "Ship?")
+
+        // 8h. Smart-Path hot-switch policy & edge-triggered OSC 7501 notification tracker
+        let spPeer = UUID()
+        var spPolicy = CodaSmartPathPolicy(baseInterval: 10.0, maxInterval: 60.0, dropCooldown: 5.0)
+        let spNow = Date(timeIntervalSince1970: 10_000)
+        precondition(spPolicy.canProbeNow(peerId: spPeer, isDirect: false, now: spNow))
+        precondition(!spPolicy.canProbeNow(peerId: spPeer, isDirect: true, now: spNow))
+        precondition(spPolicy.recordProbeFailure(peerId: spPeer) == 10.0)
+        precondition(spPolicy.recordProbeFailure(peerId: spPeer) == 20.0)
+        precondition(spPolicy.recordProbeFailure(peerId: spPeer) == 40.0)
+        precondition(spPolicy.recordProbeFailure(peerId: spPeer) == 60.0)
+        spPolicy.recordDirectDrop(peerId: spPeer, now: spNow)
+        precondition(!spPolicy.canProbeNow(peerId: spPeer, isDirect: false, now: spNow.addingTimeInterval(2.0)))
+        precondition(spPolicy.canProbeNow(peerId: spPeer, isDirect: false, now: spNow.addingTimeInterval(5.0)))
+        let rankedCands = CodaSmartPathPolicy.buildDirectCandidates(
+            udpFound: (host: "192.168.1.10", port: 24444),
+            endpoints: [
+                CodaEndpointCandidate(kind: "cn_public_ipv6", addr: "[2409::1]:24444"),
+                CodaEndpointCandidate(kind: "lan_ipv4", addr: "192.168.1.10:24444"),
+                CodaEndpointCandidate(kind: "lan_ipv4", addr: "192.168.1.20:24444"),
+            ]
+        )
+        precondition(rankedCands.count == 3 && rankedCands[0].host == "192.168.1.10" && rankedCands[2].host == "2409::1")
+
+        var nt = CodaNotificationTracker(cooldown: 20.0)
+        let nt0 = Date(timeIntervalSince1970: 50_000)
+        precondition(nt.observe(sessionId: "s1", machineName: "Mac-mini", workspaceName: "coda", taskTitle: "claude", statusMessage: nil, state: .working, activeSessionId: "s2", locale: .zh, now: nt0) == nil)
+        let ntAlert = nt.observe(sessionId: "s1", machineName: "Mac-mini", workspaceName: "coda", taskTitle: "claude", statusMessage: "Approve?", state: .needsYou, activeSessionId: "s2", locale: .zh, now: nt0.addingTimeInterval(2))
+        precondition(ntAlert?.kind == .needsYou && ntAlert?.body == "Approve?")
+        _ = nt.observe(sessionId: "s1", machineName: "Mac-mini", workspaceName: "coda", taskTitle: "claude", statusMessage: nil, state: .working, activeSessionId: "s2", locale: .en, now: nt0.addingTimeInterval(4))
+        precondition(nt.observe(sessionId: "s1", machineName: "Mac-mini", workspaceName: "coda", taskTitle: "claude", statusMessage: "Done", state: .done, activeSessionId: "s2", locale: .en, now: nt0.addingTimeInterval(8)) == nil)
+        _ = nt.observe(sessionId: "s1", machineName: "Mac-mini", workspaceName: "coda", taskTitle: "claude", statusMessage: nil, state: .working, activeSessionId: "s2", locale: .en, now: nt0.addingTimeInterval(24))
+        let ntDone = nt.observe(sessionId: "s1", machineName: "Mac-mini", workspaceName: "coda", taskTitle: "claude", statusMessage: "Done", state: .done, activeSessionId: "s2", locale: .en, now: nt0.addingTimeInterval(25))
+        precondition(ntDone?.kind == .done && ntDone?.body == "Done")
     }
 
     private static func readFramed(conn: NWConnection, completion: @escaping @Sendable ([String: Any]?) -> Void) {

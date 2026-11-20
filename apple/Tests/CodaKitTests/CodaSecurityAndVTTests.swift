@@ -284,4 +284,151 @@ final class CodaSecurityAndVTTests: XCTestCase {
         XCTAssertEqual(HerdrQuickKey.ctrlC.encodedBytes, Data([0x03]))
         XCTAssertEqual(HerdrQuickKey.shiftTab.encodedBytes, Data("\u{1B}[Z".utf8))
     }
+
+    func testSmartPathPolicyBackoffCandidatesAndFlapGuard() {
+        let peerId = UUID()
+        var policy = CodaSmartPathPolicy(baseInterval: 10.0, maxInterval: 60.0, dropCooldown: 5.0)
+        let t0 = Date(timeIntervalSince1970: 10_000)
+
+        XCTAssertTrue(policy.canProbeNow(peerId: peerId, isDirect: false, now: t0))
+        XCTAssertFalse(policy.canProbeNow(peerId: peerId, isDirect: true, now: t0))
+
+        XCTAssertEqual(policy.recordProbeFailure(peerId: peerId), 10.0)
+        XCTAssertEqual(policy.recordProbeFailure(peerId: peerId), 20.0)
+        XCTAssertEqual(policy.recordProbeFailure(peerId: peerId), 40.0)
+        XCTAssertEqual(policy.recordProbeFailure(peerId: peerId), 60.0)
+        XCTAssertEqual(policy.recordProbeFailure(peerId: peerId), 60.0)
+
+        policy.reset(peerId: peerId)
+        XCTAssertEqual(policy.nextDelay(for: peerId), 10.0)
+
+        policy.recordDirectDrop(peerId: peerId, now: t0)
+        XCTAssertFalse(policy.canProbeNow(peerId: peerId, isDirect: false, now: t0.addingTimeInterval(2.0)))
+        XCTAssertTrue(policy.canProbeNow(peerId: peerId, isDirect: false, now: t0.addingTimeInterval(5.0)))
+
+        policy.recordUpgradeSuccess(peerId: peerId)
+        XCTAssertEqual(policy.nextDelay(for: peerId), 10.0)
+
+        let endpoints = [
+            CodaEndpointCandidate(kind: "cn_public_ipv6", addr: "[2409::1]:24444"),
+            CodaEndpointCandidate(kind: "lan_ipv4", addr: "192.168.1.20:24444"),
+            CodaEndpointCandidate(kind: "lan_ipv4", addr: "192.168.1.10:24444"),
+        ]
+        let cands = CodaSmartPathPolicy.buildDirectCandidates(
+            udpFound: (host: "192.168.1.10", port: 24444),
+            endpoints: endpoints
+        )
+        XCTAssertEqual(cands, [
+            CodaDirectCandidate(host: "192.168.1.10", port: 24444),
+            CodaDirectCandidate(host: "192.168.1.20", port: 24444),
+            CodaDirectCandidate(host: "2409::1", port: 24444),
+        ])
+    }
+
+    func testNotificationTrackerEdgeTriggerSuppressionAndCooldown() {
+        var tracker = CodaNotificationTracker(cooldown: 20.0)
+        let t0 = Date(timeIntervalSince1970: 50_000)
+
+        // Baseline snapshot establishes state without firing
+        XCTAssertNil(tracker.observe(
+            sessionId: "s1",
+            machineName: "Mac-mini",
+            workspaceName: "coda",
+            taskTitle: "claude",
+            statusMessage: nil,
+            state: .working,
+            activeSessionId: "s2",
+            locale: .zh,
+            now: t0
+        ))
+
+        // Working -> NeedsYou fires immediately
+        let alert = tracker.observe(
+            sessionId: "s1",
+            machineName: "Mac-mini",
+            workspaceName: "coda",
+            taskTitle: "claude",
+            statusMessage: "Allow shell command?",
+            state: .needsYou,
+            activeSessionId: "s2",
+            locale: .zh,
+            now: t0.addingTimeInterval(2)
+        )
+        XCTAssertEqual(alert?.kind, .needsYou)
+        XCTAssertEqual(alert?.body, "Allow shell command?")
+        XCTAssertTrue(alert?.title.contains("需要交互审批") == true)
+
+        // Within 20s cooldown, rapid Working -> Done is suppressed
+        _ = tracker.observe(
+            sessionId: "s1",
+            machineName: "Mac-mini",
+            workspaceName: "coda",
+            taskTitle: "claude",
+            statusMessage: nil,
+            state: .working,
+            activeSessionId: "s2",
+            locale: .en,
+            now: t0.addingTimeInterval(5)
+        )
+        XCTAssertNil(tracker.observe(
+            sessionId: "s1",
+            machineName: "Mac-mini",
+            workspaceName: "coda",
+            taskTitle: "claude",
+            statusMessage: "All tests pass",
+            state: .done,
+            activeSessionId: "s2",
+            locale: .en,
+            now: t0.addingTimeInterval(10)
+        ))
+
+        // Active session suppresses Done, while background session fires after cooldown
+        _ = tracker.observe(
+            sessionId: "s1",
+            machineName: "Mac-mini",
+            workspaceName: "coda",
+            taskTitle: "claude",
+            statusMessage: nil,
+            state: .working,
+            activeSessionId: "s1",
+            locale: .en,
+            now: t0.addingTimeInterval(24)
+        )
+        XCTAssertNil(tracker.observe(
+            sessionId: "s1",
+            machineName: "Mac-mini",
+            workspaceName: "coda",
+            taskTitle: "claude",
+            statusMessage: "Finished",
+            state: .done,
+            activeSessionId: "s1",
+            locale: .en,
+            now: t0.addingTimeInterval(25)
+        ))
+
+        _ = tracker.observe(
+            sessionId: "s1",
+            machineName: "Mac-mini",
+            workspaceName: "coda",
+            taskTitle: "claude",
+            statusMessage: nil,
+            state: .working,
+            activeSessionId: "s2",
+            locale: .en,
+            now: t0.addingTimeInterval(26)
+        )
+        let done = tracker.observe(
+            sessionId: "s1",
+            machineName: "Mac-mini",
+            workspaceName: "coda",
+            taskTitle: "claude",
+            statusMessage: "Finished",
+            state: .done,
+            activeSessionId: "s2",
+            locale: .en,
+            now: t0.addingTimeInterval(27)
+        )
+        XCTAssertEqual(done?.kind, .done)
+        XCTAssertEqual(done?.body, "Finished")
+    }
 }

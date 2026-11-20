@@ -989,6 +989,7 @@ public struct CodaPersistedSettings: Codable, Sendable, Equatable {
     public var pinnedSessionIDs: [String]
     public var voiceConfig: CodaVoiceModelConfig
     public var registeredDeviceIDs: [String: String]
+    public var notificationsEnabled: Bool
 
     private static let defaultsKey = "dev.codahub.client.settings.v2"
     private static let sessionTokenSecretAccount = "coda.session_token.v1"
@@ -1002,6 +1003,7 @@ public struct CodaPersistedSettings: Codable, Sendable, Equatable {
         case pinnedSessionIDs
         case voiceConfig
         case registeredDeviceIDs
+        case notificationsEnabled
     }
 
     public init(
@@ -1011,7 +1013,8 @@ public struct CodaPersistedSettings: Codable, Sendable, Equatable {
         locale: CodaUILocale = .en,
         pinnedSessionIDs: [String] = [],
         voiceConfig: CodaVoiceModelConfig = CodaVoiceModelConfig(),
-        registeredDeviceIDs: [String: String] = [:]
+        registeredDeviceIDs: [String: String] = [:],
+        notificationsEnabled: Bool = true
     ) {
         self.serverBaseURLString = serverBaseURLString
         self.sessionToken = sessionToken
@@ -1020,6 +1023,7 @@ public struct CodaPersistedSettings: Codable, Sendable, Equatable {
         self.pinnedSessionIDs = pinnedSessionIDs
         self.voiceConfig = voiceConfig
         self.registeredDeviceIDs = registeredDeviceIDs
+        self.notificationsEnabled = notificationsEnabled
     }
 
     public init(from decoder: Decoder) throws {
@@ -1031,6 +1035,7 @@ public struct CodaPersistedSettings: Codable, Sendable, Equatable {
         self.pinnedSessionIDs = (try? c.decodeIfPresent([String].self, forKey: .pinnedSessionIDs)) ?? []
         self.voiceConfig = (try? c.decodeIfPresent(CodaVoiceModelConfig.self, forKey: .voiceConfig)) ?? CodaVoiceModelConfig()
         self.registeredDeviceIDs = (try? c.decodeIfPresent([String: String].self, forKey: .registeredDeviceIDs)) ?? [:]
+        self.notificationsEnabled = (try? c.decodeIfPresent(Bool.self, forKey: .notificationsEnabled)) ?? true
     }
 
     public static func load() -> CodaPersistedSettings {

@@ -145,6 +145,8 @@ public actor CodaNetworkClient {
     private var accountEventsGeneration: UInt64 = 0
     public private(set) var activeRouteMode: SmartPathRouteMode = .globalCDNWSS
     private var pathMonitor: NWPathMonitor?
+    private var lanReprobeTask: Task<Void, Never>?
+    private var smartPathPolicy = CodaSmartPathPolicy()
     private var currentGeneration: UInt64 = max(1, UInt64(Date().timeIntervalSince1970 * 1000))
 
     public init(serverBaseURL: URL) {
@@ -279,6 +281,9 @@ public actor CodaNetworkClient {
         disconnectAccountEventsWebSocket()
         pathMonitor?.cancel()
         pathMonitor = nil
+        lanReprobeTask?.cancel()
+        lanReprobeTask = nil
+        smartPathPolicy.reset()
         for (_, peer) in directP2PPeers {
             peer.readerTask?.cancel()
             peer.connection.cancel()
@@ -1457,6 +1462,34 @@ public actor CodaNetworkClient {
         )
     }
 
+    private func emitRouteChangedEvent(peerDeviceId: UUID, routeMode: SmartPathRouteMode, isDirect: Bool) {
+        let dict: [String: Any] = [
+            "route_mode": routeMode.rawValue,
+            "is_direct": isDirect,
+        ]
+        let payload = (try? JSONSerialization.data(withJSONObject: dict)) ?? Data()
+        enqueueAsyncEvent(CodaAsyncEvent(op: "route_changed", sourceDeviceId: peerDeviceId, payloadData: payload))
+    }
+
+    /// Manually resets Smart-Path backoff and probes Direct LAN/IPv6 P2P for `targetDevice` without dropping Relay.
+    public func probeDirectLanNow(
+        for targetDevice: CodaRemoteDevice,
+        clientIdentity: CodaDeviceIdentity,
+        clientDeviceId: UUID,
+        udpProbeHost: String = "255.255.255.255",
+        udpProbePort: UInt16 = 24444
+    ) async -> SmartPathRouteMode? {
+        smartPathPolicy.reset(peerId: targetDevice.id)
+        return await reprobeDirectIfNeeded(
+            targetDevice: targetDevice,
+            clientIdentity: clientIdentity,
+            clientDeviceId: clientDeviceId,
+            udpProbeHost: udpProbeHost,
+            udpProbePort: udpProbePort,
+            force: true
+        )
+    }
+
     private func startWiFiPathMonitor(
         targetDevice: CodaRemoteDevice,
         clientIdentity: CodaDeviceIdentity,
@@ -1465,48 +1498,128 @@ public actor CodaNetworkClient {
         udpProbePort: UInt16
     ) {
         pathMonitor?.cancel()
+        lanReprobeTask?.cancel()
+
         let monitor = NWPathMonitor()
         self.pathMonitor = monitor
         monitor.pathUpdateHandler = { [weak self] path in
-            guard path.usesInterfaceType(.wifi) || path.usesInterfaceType(.wiredEthernet) else {
-                return
-            }
+            let onLanInterface = path.usesInterfaceType(.wifi) || path.usesInterfaceType(.wiredEthernet)
             Task { [weak self] in
-                await self?.reprobeDirectIfNeeded(
+                guard let self else { return }
+                if onLanInterface {
+                    await self.handleNetworkBecameLanCapable(
+                        targetDevice: targetDevice,
+                        clientIdentity: clientIdentity,
+                        clientDeviceId: clientDeviceId,
+                        udpProbeHost: udpProbeHost,
+                        udpProbePort: udpProbePort
+                    )
+                } else {
+                    await self.handleNetworkLeftLan(targetDeviceId: targetDevice.id)
+                }
+            }
+        }
+        monitor.start(queue: .global(qos: .utility))
+
+        // Background periodic LAN hot-upgrade loop while on Smart Relay (exponential backoff 15s -> 120s).
+        lanReprobeTask = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let self else { return }
+                let delaySec = await self.nextSmartPathProbeDelay(for: targetDevice.id)
+                let delayNs = UInt64(max(1.0, delaySec) * 1_000_000_000)
+                try? await Task.sleep(nanoseconds: delayNs)
+                if Task.isCancelled { return }
+                let alreadyDirect = await self.isDirectPeerActive(targetDevice.id)
+                if alreadyDirect {
+                    continue
+                }
+                _ = await self.reprobeDirectIfNeeded(
                     targetDevice: targetDevice,
                     clientIdentity: clientIdentity,
                     clientDeviceId: clientDeviceId,
                     udpProbeHost: udpProbeHost,
-                    udpProbePort: udpProbePort
+                    udpProbePort: udpProbePort,
+                    force: false
                 )
             }
         }
-        monitor.start(queue: .global(qos: .utility))
     }
 
-    private func reprobeDirectIfNeeded(
+    private func nextSmartPathProbeDelay(for peerId: UUID) -> TimeInterval {
+        smartPathPolicy.nextDelay(for: peerId)
+    }
+
+    private func isDirectPeerActive(_ peerId: UUID) -> Bool {
+        directP2PPeers[peerId] != nil
+    }
+
+    private func handleNetworkBecameLanCapable(
         targetDevice: CodaRemoteDevice,
         clientIdentity: CodaDeviceIdentity,
         clientDeviceId: UUID,
         udpProbeHost: String,
         udpProbePort: UInt16
     ) async {
-        guard directP2PPeers[targetDevice.id] == nil else { return }
+        smartPathPolicy.reset(peerId: targetDevice.id)
+        _ = await reprobeDirectIfNeeded(
+            targetDevice: targetDevice,
+            clientIdentity: clientIdentity,
+            clientDeviceId: clientDeviceId,
+            udpProbeHost: udpProbeHost,
+            udpProbePort: udpProbePort,
+            force: false
+        )
+    }
+
+    private func handleNetworkLeftLan(targetDeviceId: UUID) {
+        // When switching off Wi-Fi/Ethernet (e.g. to 5G), proactively drop stale LAN socket
+        // so active Relay leg takes over immediately without waiting for TCP keepalive timeout.
+        if let peer = directP2PPeers[targetDeviceId], peer.routeMode == .lanDirect {
+            handleDirectP2PDisconnect(targetDeviceId: targetDeviceId, gen: peer.generation)
+        }
+    }
+
+    @discardableResult
+    private func reprobeDirectIfNeeded(
+        targetDevice: CodaRemoteDevice,
+        clientIdentity: CodaDeviceIdentity,
+        clientDeviceId: UUID,
+        udpProbeHost: String,
+        udpProbePort: UInt16,
+        force: Bool = false
+    ) async -> SmartPathRouteMode? {
         let targetId = targetDevice.id
+        if let existing = directP2PPeers[targetId] {
+            return existing.routeMode
+        }
+        if !force && !smartPathPolicy.canProbeNow(peerId: targetId, isDirect: false) {
+            return nil
+        }
+
         let udpFound = await Task.detached {
             Self.probeLanUDP(targetDeviceId: targetId, host: udpProbeHost, port: udpProbePort)
         }.value
-        if let found = udpFound {
-            _ = try? await performDirectP2PHandshake(
-                host: found.host,
-                port: found.port,
+        let candidates = CodaSmartPathPolicy.buildDirectCandidates(
+            udpFound: udpFound,
+            endpoints: targetDevice.endpoints
+        )
+        for cand in candidates {
+            if let route = try? await performDirectP2PHandshake(
+                host: cand.host,
+                port: cand.port,
                 clientIdentity: clientIdentity,
                 clientDeviceId: clientDeviceId,
                 targetDeviceId: targetId,
                 expectedDaemonEd25519Pubkey: targetDevice.ed25519Pubkey,
                 expectedDaemonX25519Pubkey: targetDevice.x25519Pubkey
-            )
+            ) {
+                smartPathPolicy.recordUpgradeSuccess(peerId: targetId)
+                emitRouteChangedEvent(peerDeviceId: targetId, routeMode: route, isDirect: true)
+                return route
+            }
         }
+        smartPathPolicy.recordProbeFailure(peerId: targetId)
+        return nil
     }
 
     // MARK: - Unified E2EE PeerMessage RPC (Direct P2P, WSS Relay, Domestic Raw TCP)
@@ -1618,14 +1731,25 @@ public actor CodaNetworkClient {
     }
 
     private func handleDirectP2PDisconnect(targetDeviceId: UUID, gen: UInt64) {
+        var didDrop = false
         if let existing = directP2PPeers[targetDeviceId], existing.generation == gen {
             directP2PPeers.removeValue(forKey: targetDeviceId)
+            existing.readerTask?.cancel()
             existing.connection.cancel()
             if p2pPeerDeviceId == targetDeviceId {
                 p2pPeerDeviceId = nil
             }
+            didDrop = true
         }
         failPendingRequests(forTransportGen: gen, error: URLError(.networkConnectionLost))
+        if didDrop {
+            smartPathPolicy.recordDirectDrop(peerId: targetDeviceId)
+            let fallbackRoute = activeRelayRouteMode ?? .globalCDNWSS
+            if connectedPeerDeviceId == targetDeviceId {
+                activeRouteMode = fallbackRoute
+            }
+            emitRouteChangedEvent(peerDeviceId: targetDeviceId, routeMode: fallbackRoute, isDirect: false)
+        }
     }
 
     private func handleInboundRelayData(_ frameData: Data, gen: UInt64) {
