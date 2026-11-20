@@ -147,15 +147,17 @@ curl -fsSL https://codahub.dev/install.sh | sh
 ## 四、使用各端客户端连接开发（Windows/Mac/iOS 互控）
 
 1. **Web 终端 & iOS Safari PWA（零上架零安装）**：
-   用电脑浏览器或 iPhone Safari 访问 `https://codahub.dev`（支持终端原始键盘输入、多标签与双栏分屏会话、`⌘F` 搜索与 `.md` 导出、E2EE 远端文件树浏览与沙箱化 `localhost` 端口预览、Whisper 语音转写输入、主机健康遥测与一键 OTA 升级）；在 iPhone Safari 点击「分享 → 添加到主屏幕」即可全屏当原生 App 使用；如有 **TestFlight** 链接，可在 `.env` 中配置 `CODA_IOS_BETA_URL`。
+   用电脑浏览器或 iPhone Safari 访问 `https://codahub.dev`（支持终端原始键盘输入、多标签与双栏分屏会话、`Needs-You` 置顶提醒与一键审批胶囊栏、多行 `Prompt Composer`、剪贴板截图粘贴自动上传、E2EE 远端文件树 / `Git Diff` 代码审查 / 沙箱化 `localhost` 端口预览、远端目录选择与 `git clone` 工作区引导、浏览器原生语音识别免 Key 回落 + Whisper 转写、离线告警 Webhook 推送配置及陈旧离线浏览器设备一键清理）；在 iPhone Safari 点击「分享 → 添加到主屏幕」即可全屏当原生 App 使用；如有 **TestFlight** 链接，可在 `.env` 中配置 `CODA_IOS_BETA_URL`。
 2. **macOS 桌面端（`.dmg` 双击安装，`Hybrid` 双向互控 + 显式被控开关）**：
    在官网下载中心直接点击下载 **`Coda-Desktop-macos-aarch64-<version>.dmg`** 并拖入 `Applications`；首次打开若提示未公证开发者，在终端执行一次：
    ```bash
    xattr -cr /Applications/Coda.app
    ```
-   打开 `Coda.app` 点击左侧「🔑 浏览器登录」即可绑定同一账号——支持在侧边抽屉与设置页一键开关 **「允许远端控制本机（Allow Remote Control）」**，配备 Dock `Needs-You` 待审批角标、原生麦克风 Whisper 听写、`⌘F` 搜索 / `⌘+Click` 链接跳转 / `.md` 导出、E2EE 远端文件树与 `localhost` 端口预览，并与独立安装的 `coda-daemon` 自动共存互不冲突。
+   打开 `Coda.app` 点击左侧「🔑 浏览器登录」即可绑定同一账号——支持在侧边抽屉与设置页一键开关 **「允许远端控制本机（Allow Remote Control）」**，配备置顶 `NEEDS ATTENTION` 收件箱（`⌘J` 速跳）与 Dock 待审批角标、剪贴板截图粘贴 (`⌘V`) 自动加密上传、E2EE 远端文件树 / `Git Diff` 审查 / `127.0.0.1` 本地回环 HTTP 代理隧道、macOS 原生听写回落 + Whisper 语音输入、离线 Webhook 配置及一键清理离线 Web 设备，并与独立安装的 `coda-daemon` 自动共存互不冲突。
 3. **iPhone / iPhone Duo / iPad 原生 SwiftUI 客户端 (`apple/`)**：
-   使用 Xcode 打开 `apple/Package.swift`（或 `apple/project.yml`）编译到真机运行测试版，支持浏览器设备码授权、低延迟 PTY 实时输入、终端内联搜索与 `.md` 一键分享导出、E2EE 远端文件树与 `localhost` 端口预览、Whisper 语音录音转写与远程主机健康/OTA 管理。
+   使用 Xcode 打开 `apple/Package.swift`（或 `apple/project.yml`）编译到真机运行测试版，支持浏览器设备码授权、低延迟 PTY 实时输入、`Needs-You` 悬浮审批栏与多行 `Prompt Composer`、E2EE `Files | Changes (Git Diff) | Port Preview` 检视器、远端工作区 `git clone` 引导、Apple 原生 `SFSpeechRecognizer` 免配置语音听写回落 + Whisper 转写、离线 Webhook 配置与远程主机健康/OTA 管理。
+4. **零知识离线告警推送（Bark / Telegram / 飞书 / Discord / 自定义 Webhook）**：
+   在任一客户端「设置」中填入 HTTPS Webhook（如 Bark URL、Telegram Bot Token + Chat ID、飞书机器人或 Discord Webhook）并点击「测试推送」即可生效。当远端 `coda-daemon` 检测到终端进入 `Needs-You` 待审批或完成运行状态时，仅上报设备名、会话名与目录末级名（**绝不包含任何终端屏幕明文或命令内容**），由服务端遵循 SSRF 防护与 60 秒冷却策略异步投递离线通知。
 
 ---
 
