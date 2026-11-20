@@ -73,6 +73,7 @@ public final class CodaWorkspaceStore: ObservableObject {
     @Published public var sessions: [CodaAgentSession] = []
     @Published public var remoteMachines: [CodaRemoteDevice] = []
     @Published public var workspacesByDevice: [UUID: [CodaRepoWorkspaceSummary]] = [:]
+    @Published public var hostHealthByDevice: [UUID: CodaHostHealthSnapshot] = [:]
     @Published public var machineRouteModes: [UUID: SmartPathRouteMode] = [:]
     @Published public var terminalLinesBySession: [String: [GhosttyStyledLine]] = [:]
     @Published public var rawScreenTextBySession: [String: String] = [:]
@@ -1132,6 +1133,40 @@ public final class CodaWorkspaceStore: ObservableObject {
         )
     }
 
+    public func upgradeRemoteMachine(_ device: CodaRemoteDevice) async {
+        guard isSignedIn, device.isOnline, let client = await preparedClient() else { return }
+        let epoch = self.workspaceEpoch
+        accountStatusMessage = tr(
+            "Upgrading coda-daemon on \(device.name) (zero-downtime OTA)…",
+            "正在为 \(device.name) 无感升级 coda-daemon…",
+            locale: locale
+        )
+        authError = nil
+        do {
+            let res = try await client.upgradeRemoteDaemon(
+                on: device,
+                clientIdentity: localIdentity,
+                clientDeviceId: localIdentity.deviceId ?? device.id
+            )
+            guard self.workspaceEpoch == epoch else { return }
+            if res.ok {
+                let targetVer = res.targetVersion ?? "latest"
+                accountStatusMessage = "\(device.name): v\(res.previousVersion) -> v\(targetVer) (\(res.message))"
+                CodaHaptics.success()
+                try? await Task.sleep(nanoseconds: 1_500_000_000)
+                if self.workspaceEpoch == epoch {
+                    await refreshMachinesAndSessions(forceWorkspaces: true)
+                }
+            } else {
+                authError = "\(device.name) OTA failed: \(res.message)"
+            }
+        } catch {
+            if self.workspaceEpoch == epoch {
+                authError = "\(device.name) OTA error: \(error.localizedDescription)"
+            }
+        }
+    }
+
     public func signOut() {
         workspaceEpoch &+= 1
         gitDiffGeneration &+= 1
@@ -1157,6 +1192,7 @@ public final class CodaWorkspaceStore: ObservableObject {
         sessions = []
         remoteMachines = []
         workspacesByDevice = [:]
+        hostHealthByDevice = [:]
         machineRouteModes = [:]
         rawScreenTextBySession = [:]
         terminalLinesBySession = [:]
@@ -1261,6 +1297,9 @@ public final class CodaWorkspaceStore: ObservableObject {
                         repos = wsRes?.repos ?? (workspacesByDevice[host.id] ?? [])
                         if wsRes != nil {
                             lastWorkspaceScanAt[host.id] = Date()
+                        }
+                        if let hh = wsRes?.hostHealth {
+                            hostHealthByDevice[host.id] = hh
                         }
                         if let vc = wsRes?.voiceConfig, settings.voiceConfig.apiKey.isEmpty, !vc.apiKey.isEmpty {
                             settings.voiceConfig = vc

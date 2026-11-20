@@ -302,6 +302,54 @@ public enum CodaCryptoError: Error, LocalizedError {
     }
 }
 
+public struct CodaHostHealthSnapshot: Codable, Sendable, Equatable {
+    public let daemonVersion: String
+    public let os: String
+    public let arch: String
+    public let cpuCores: Int
+    public let loadAvg1m: Double?
+    public let memUsedMb: UInt64?
+    public let memTotalMb: UInt64?
+    public let osUptimeSecs: UInt64?
+    public let daemonUptimeSecs: UInt64
+    public let herdrVersion: String?
+    public let otaSupported: Bool
+
+    public static let quickTerminalCommands: [String] = [
+        "/compact",
+        "/clear",
+        "git status",
+        "git diff",
+        "cargo test",
+    ]
+
+    enum CodingKeys: String, CodingKey {
+        case daemonVersion = "daemon_version"
+        case os
+        case arch
+        case cpuCores = "cpu_cores"
+        case loadAvg1m = "load_avg_1m"
+        case memUsedMb = "mem_used_mb"
+        case memTotalMb = "mem_total_mb"
+        case osUptimeSecs = "os_uptime_secs"
+        case daemonUptimeSecs = "daemon_uptime_secs"
+        case herdrVersion = "herdr_version"
+        case otaSupported = "ota_supported"
+    }
+
+    public var compactSummary: String {
+        let ver = daemonVersion.hasPrefix("v") ? daemonVersion : "v\(daemonVersion)"
+        var parts = [ver, "\(cpuCores)c"]
+        if let load = loadAvg1m {
+            parts.append(String(format: "load %.2f", load))
+        }
+        if let used = memUsedMb, let tot = memTotalMb, tot > 0 {
+            parts.append(String(format: "%.1f/%.1fG", Double(used) / 1024.0, Double(tot) / 1024.0))
+        }
+        return parts.joined(separator: " · ")
+    }
+}
+
 public struct CodaEncryptedPayload: Codable, Sendable {
     public let seq: UInt64
     public let compressed: Bool

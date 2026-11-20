@@ -568,17 +568,28 @@ public struct CodaSettingsAndPairingSheet: View {
                 if !store.remoteMachines.isEmpty {
                     Divider().background(CodaHerdrTheme.borderHairline)
                     ForEach(store.remoteMachines) { dev in
+                        let hh = store.hostHealthByDevice[dev.id]
+                        let canOTA = dev.isOnline && (hh?.otaSupported ?? true)
                         VStack(alignment: .leading, spacing: 6) {
                             HStack(spacing: 8) {
                                 Circle()
                                     .fill(dev.isOnline ? CodaHerdrTheme.greenDiff : CodaHerdrTheme.textDim)
                                     .frame(width: 8, height: 8)
-                                Text(dev.name)
-                                    .font(.system(size: 13, weight: .medium))
-                                    .foregroundStyle(CodaHerdrTheme.textPrimary)
-                                Text(dev.platform)
-                                    .font(.system(size: 11, design: .monospaced))
-                                    .foregroundStyle(CodaHerdrTheme.textSecondary)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    HStack(spacing: 6) {
+                                        Text(dev.name)
+                                            .font(.system(size: 13, weight: .medium))
+                                            .foregroundStyle(CodaHerdrTheme.textPrimary)
+                                        Text(dev.platform)
+                                            .font(.system(size: 11, design: .monospaced))
+                                            .foregroundStyle(CodaHerdrTheme.textSecondary)
+                                    }
+                                    if let hh {
+                                        Text(hh.compactSummary)
+                                            .font(.system(size: 10.5, design: .monospaced))
+                                            .foregroundStyle(CodaHerdrTheme.textSecondary)
+                                    }
+                                }
                                 Spacer()
                                 if let route = store.machineRouteModes[dev.id] {
                                     Text(route.rawValue)
@@ -588,6 +599,20 @@ public struct CodaSettingsAndPairingSheet: View {
                                     Text(dev.isOnline ? tr("Online", "在线", locale: store.locale) : tr("Offline", "离线", locale: store.locale))
                                         .font(.system(size: 11))
                                         .foregroundStyle(dev.isOnline ? CodaHerdrTheme.greenDiff : CodaHerdrTheme.textDim)
+                                }
+
+                                if canOTA {
+                                    Button {
+                                        Task { await store.upgradeRemoteMachine(dev) }
+                                    } label: {
+                                        Text(tr("Upgrade", "升级", locale: store.locale))
+                                            .font(.system(size: 10.5, weight: .semibold))
+                                            .foregroundStyle(CodaHerdrTheme.cyanWorking)
+                                            .padding(.horizontal, 7)
+                                            .padding(.vertical, 4)
+                                            .background(RoundedRectangle(cornerRadius: 6).fill(CodaHerdrTheme.cyanWorking.opacity(0.14)))
+                                    }
+                                    .buttonStyle(.plain)
                                 }
 
                                 Button {

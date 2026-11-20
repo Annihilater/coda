@@ -1026,6 +1026,16 @@ struct CodaSelfTest {
         vtAlt.feed(Data("\u{1B}[?1049l".utf8))
         precondition(vtAlt.plainVisibleText.contains("hist-1") && vtAlt.plainVisibleText.contains("hist-10"),
                      "Alt-screen resizeReflow must preserve primaryScrollback")
+
+        // 8j. v0.7.0 HostHealthSnapshot wire decoding & quick terminal commands
+        let healthRaw = Data("""
+        {"daemon_version":"0.7.0","os":"linux","arch":"x86_64","cpu_cores":8,"load_avg_1m":0.42,"mem_used_mb":6144,"mem_total_mb":16384,"daemon_uptime_secs":120,"ota_supported":true}
+        """.utf8)
+        let healthSnap = try JSONDecoder().decode(CodaHostHealthSnapshot.self, from: healthRaw)
+        precondition(healthSnap.compactSummary == "v0.7.0 · 8c · load 0.42 · 6.0/16.0G",
+                     "Unexpected compactSummary: \(healthSnap.compactSummary)")
+        precondition(CodaHostHealthSnapshot.quickTerminalCommands.contains("/compact"))
+        precondition(CodaHostHealthSnapshot.quickTerminalCommands.contains("git status"))
     }
 
     private static func readFramed(conn: NWConnection, completion: @escaping @Sendable ([String: Any]?) -> Void) {

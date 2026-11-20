@@ -90,11 +90,18 @@ public struct CodaWorkspacesFetchResult: Sendable {
     public let machineName: String
     public let repos: [CodaRepoWorkspaceSummary]
     public let voiceConfig: CodaVoiceModelConfig?
+    public let hostHealth: CodaHostHealthSnapshot?
 
-    public init(machineName: String, repos: [CodaRepoWorkspaceSummary], voiceConfig: CodaVoiceModelConfig?) {
+    public init(
+        machineName: String,
+        repos: [CodaRepoWorkspaceSummary],
+        voiceConfig: CodaVoiceModelConfig?,
+        hostHealth: CodaHostHealthSnapshot? = nil
+    ) {
         self.machineName = machineName
         self.repos = repos
         self.voiceConfig = voiceConfig
+        self.hostHealth = hostHealth
     }
 }
 
@@ -2278,18 +2285,65 @@ public actor CodaNetworkClient {
             let machineName: String
             let repos: [CodaRepoWorkspaceSummary]
             let voiceConfig: CodaVoiceModelConfig?
+            let hostHealth: CodaHostHealthSnapshot?
             enum CodingKeys: String, CodingKey {
                 case machineName = "machine_name"
                 case repos
                 case voiceConfig = "voice_config"
+                case hostHealth = "host_health"
             }
         }
         let decoded = try JSONDecoder().decode(Resp.self, from: respData)
         return CodaWorkspacesFetchResult(
             machineName: decoded.machineName,
             repos: decoded.repos,
-            voiceConfig: decoded.voiceConfig
+            voiceConfig: decoded.voiceConfig,
+            hostHealth: decoded.hostHealth
         )
+    }
+
+    public func upgradeRemoteDaemon(
+        on device: CodaRemoteDevice,
+        clientIdentity: CodaDeviceIdentity,
+        clientDeviceId: UUID,
+        targetVersion: String? = nil
+    ) async throws -> (ok: Bool, previousVersion: String, targetVersion: String?, message: String) {
+        var reqObj: [String: Any] = [
+            "op": "upgrade_daemon",
+            "req_id": nextRequestID(),
+        ]
+        if let targetVersion, !targetVersion.isEmpty {
+            reqObj["target_version"] = targetVersion
+        }
+        let reqData = try JSONSerialization.data(withJSONObject: reqObj)
+        let respData = try await sendPeerMessageData(
+            reqData,
+            to: device,
+            clientIdentity: clientIdentity,
+            clientDeviceId: clientDeviceId,
+            lane: "control_p0"
+        )
+        struct Resp: Decodable {
+            let ok: Bool
+            let previousVersion: String
+            let targetVersion: String?
+            let message: String
+            enum CodingKeys: String, CodingKey {
+                case ok
+                case previousVersion = "previous_version"
+                case targetVersion = "target_version"
+                case message
+            }
+        }
+        let decoded = try JSONDecoder().decode(Resp.self, from: respData)
+        if decoded.ok {
+            relayPeerSessions.removeValue(forKey: device.id)
+            if let existing = directP2PPeers.removeValue(forKey: device.id) {
+                existing.readerTask?.cancel()
+                existing.connection.cancel()
+            }
+        }
+        return (decoded.ok, decoded.previousVersion, decoded.targetVersion, decoded.message)
     }
 
     public func readTerminalScreen(

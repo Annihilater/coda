@@ -88,6 +88,11 @@ public struct CodaTerminalSessionView: View {
 
                 if !hideBottomControls {
                     VStack(spacing: 8) {
+                        if local.showDirectInputBar || store.showTactileTwoRowKeypad {
+                            quickCommandsStrip
+                                .transition(.move(edge: .bottom).combined(with: .opacity))
+                        }
+
                         if local.showDirectInputBar {
                             directKeystrokeStrip
                                 .padding(.horizontal, 12)
@@ -570,6 +575,31 @@ public struct CodaTerminalSessionView: View {
     }
 
     // MARK: - Direct Software/Hardware Keyboard Capture Strip
+
+    private var quickCommandsStrip: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 6) {
+                ForEach(CodaHostHealthSnapshot.quickTerminalCommands, id: \.self) { cmd in
+                    Button {
+                        store.sendDirectText(cmd, submit: true, to: session)
+                    } label: {
+                        Text(cmd)
+                            .font(.system(size: 11, weight: .medium, design: .monospaced))
+                            .foregroundStyle(CodaHerdrTheme.textSecondary)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 5)
+                            .background(
+                                Capsule()
+                                    .fill(CodaHerdrTheme.elevatedBG.opacity(0.95))
+                                    .overlay(Capsule().strokeBorder(CodaHerdrTheme.borderHairline, lineWidth: 1))
+                            )
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.horizontal, 4)
+        }
+    }
 
     private var directKeystrokeStrip: some View {
         HStack(spacing: 8) {
