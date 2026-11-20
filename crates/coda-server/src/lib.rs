@@ -85,6 +85,17 @@ use crate::{
     relay::RelayHub,
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TrustProxyMode {
+    /// Trust proxy headers only when the TCP peer is loopback or RFC1918/ULA private IP.
+    #[default]
+    Auto,
+    /// Always trust proxy headers (`true` / `1` / `always`).
+    Always,
+    /// Never trust proxy headers even from private peer IPs (`false` / `0` / `never`).
+    Never,
+}
+
 #[derive(Debug, Clone)]
 pub struct ServerOptions {
     pub open_registration: bool,
@@ -94,6 +105,7 @@ pub struct ServerOptions {
     pub github_repo: String,
     pub ios_beta_url: Option<String>,
     pub trust_proxy_headers: bool,
+    pub trust_proxy_mode: TrustProxyMode,
     pub allowed_origins: Vec<String>,
 }
 
@@ -107,6 +119,7 @@ impl Default for ServerOptions {
             github_repo: "Annihilater/coda".to_string(),
             ios_beta_url: None,
             trust_proxy_headers: false,
+            trust_proxy_mode: TrustProxyMode::Auto,
             allowed_origins: Vec::new(),
         }
     }
@@ -127,7 +140,7 @@ pub struct AppState {
     pub has_explicit_release_version: bool,
     pub github_repo: String,
     pub ios_beta_url: Option<String>,
-    pub trust_proxy_headers: bool,
+    pub trust_proxy_mode: TrustProxyMode,
     pub allowed_origins: Vec<String>,
     pub http_no_redirect: reqwest::Client,
     pub latest_release_cache: Arc<RwLock<Option<(Option<String>, Instant)>>>,
@@ -599,7 +612,11 @@ pub async fn start_full_server_with_options(
         has_explicit_release_version: options.has_explicit_release_version,
         github_repo: options.github_repo,
         ios_beta_url: options.ios_beta_url.filter(|s| !s.trim().is_empty()),
-        trust_proxy_headers: options.trust_proxy_headers,
+        trust_proxy_mode: if options.trust_proxy_headers {
+            TrustProxyMode::Always
+        } else {
+            options.trust_proxy_mode
+        },
         allowed_origins: options.allowed_origins,
         http_no_redirect,
         latest_release_cache: Arc::new(RwLock::new(None)),
@@ -740,14 +757,15 @@ fn is_private_or_loopback_ip(ip: IpAddr) -> bool {
 
 fn should_trust_proxy_headers(
     conn: Option<&Extension<ConnectInfo<SocketAddr>>>,
-    explicit_trust: bool,
+    mode: TrustProxyMode,
 ) -> bool {
-    if explicit_trust {
-        return true;
-    }
-    match conn {
-        Some(Extension(ConnectInfo(addr))) => is_private_or_loopback_ip(addr.ip()),
-        None => false,
+    match mode {
+        TrustProxyMode::Always => true,
+        TrustProxyMode::Never => false,
+        TrustProxyMode::Auto => match conn {
+            Some(Extension(ConnectInfo(addr))) => is_private_or_loopback_ip(addr.ip()),
+            None => false,
+        },
     }
 }
 
@@ -770,7 +788,7 @@ fn effective_public_base_url(
     if st.has_explicit_public_url {
         return st.public_base_url.clone();
     }
-    let trust_proxy = should_trust_proxy_headers(conn, st.trust_proxy_headers);
+    let trust_proxy = should_trust_proxy_headers(conn, st.trust_proxy_mode);
     let host_raw = if trust_proxy {
         headers
             .get("x-forwarded-host")
@@ -827,7 +845,7 @@ fn client_rate_key(
     conn: Option<&Extension<ConnectInfo<SocketAddr>>>,
     headers: &HeaderMap,
 ) -> String {
-    if should_trust_proxy_headers(conn, st.trust_proxy_headers) {
+    if should_trust_proxy_headers(conn, st.trust_proxy_mode) {
         if let Some(ip) = headers
             .get("cf-connecting-ip")
             .or_else(|| headers.get("x-real-ip"))
@@ -1149,7 +1167,8 @@ async fn change_password_handler(
         .check(&format!("password:{ip}"), 15, Duration::from_secs(60))
         .await?;
     let session = require_auth_session(&st, &headers).await?;
-    st.db
+    let revoked_hashes = st
+        .db
         .change_password(
             session.user.id,
             &req.current_password,
@@ -1158,7 +1177,10 @@ async fn change_password_handler(
         )
         .await
         .map_err(ApiError::bad_request)?;
-    st.relay_hub.notify_session_revoked(session.user.id, None);
+    if !revoked_hashes.is_empty() {
+        st.relay_hub
+            .notify_sessions_revoked_except(session.user.id, session.token_sha256);
+    }
     Ok(Json(json!({ "ok": true })))
 }
 

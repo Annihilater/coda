@@ -5,8 +5,31 @@ use std::{
 
 use anyhow::Result;
 use clap::Parser;
-use coda_server::{relay::RelayHub, start_full_server_with_options, ServerOptions};
+use coda_server::{
+    relay::RelayHub, start_full_server_with_options, ServerOptions, TrustProxyMode,
+};
 use tracing::info;
+
+fn parse_flexible_bool(raw: &str) -> std::result::Result<bool, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "false" | "0" | "no" | "off" => Ok(false),
+        "true" | "1" | "yes" | "on" => Ok(true),
+        other => Err(format!(
+            "invalid boolean value '{other}' (expected true/false/1/0)"
+        )),
+    }
+}
+
+fn parse_trust_proxy_mode(raw: &str) -> std::result::Result<TrustProxyMode, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "auto" => Ok(TrustProxyMode::Auto),
+        "true" | "1" | "yes" | "on" | "always" => Ok(TrustProxyMode::Always),
+        "false" | "0" | "no" | "off" | "never" => Ok(TrustProxyMode::Never),
+        other => Err(format!(
+            "invalid --trust-proxy-headers mode '{other}' (expected auto, true, or false)"
+        )),
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "coda-server", about = "Coda Multi-Tenant Coordinator & Anti-UDP-Block Relay Server")]
@@ -32,7 +55,14 @@ struct Args {
     relay_secret: Option<String>,
 
     /// Development-only escape hatch: allow ephemeral loopback relay secret if CODA_RELAY_SECRET is omitted
-    #[arg(long, env = "CODA_ALLOW_INSECURE_DEV_SECRET", default_value_t = false)]
+    #[arg(
+        long,
+        env = "CODA_ALLOW_INSECURE_DEV_SECRET",
+        default_value = "false",
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = parse_flexible_bool
+    )]
     allow_insecure_dev_secret: bool,
 
     /// Public region label advertised by stateless `--relay-only` node
@@ -48,7 +78,14 @@ struct Args {
     web_dist: PathBuf,
 
     /// Allow anyone to register without an invite code (recommended for public portal)
-    #[arg(long, env = "CODA_OPEN_REGISTRATION", default_value_t = false)]
+    #[arg(
+        long,
+        env = "CODA_OPEN_REGISTRATION",
+        default_value = "false",
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = parse_flexible_bool
+    )]
     open_registration: bool,
 
     /// Optional public Raw TCP relay endpoint (`host:port`); omit when behind Cloudflare Tunnel HTTPS
@@ -67,9 +104,16 @@ struct Args {
     #[arg(long, env = "CODA_IOS_BETA_URL")]
     ios_beta_url: Option<String>,
 
-    /// Trust proxy forwarding headers (`CF-Connecting-IP`, `X-Real-IP`, `X-Forwarded-Host/Proto`) even from non-private peer IPs
-    #[arg(long, env = "CODA_TRUST_PROXY_HEADERS", default_value_t = false)]
-    trust_proxy_headers: bool,
+    /// Proxy header trust mode (`auto` = loopback/private peer IPs only, `true` = always trust, `false` = never trust)
+    #[arg(
+        long,
+        env = "CODA_TRUST_PROXY_HEADERS",
+        default_value = "auto",
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = parse_trust_proxy_mode
+    )]
+    trust_proxy_headers: TrustProxyMode,
 
     /// Comma-separated additional allowed browser CORS/WebSocket origins (e.g. `https://app.example.com`)
     #[arg(long, env = "CODA_ALLOWED_ORIGINS")]
@@ -131,10 +175,33 @@ fn load_dotenv_file(path: &Path) {
     };
     for line in contents.lines() {
         if let Some((key, val)) = parse_dotenv_line(line) {
+            if val.trim().is_empty() {
+                continue;
+            }
             if std::env::var_os(&key).is_none() {
                 std::env::set_var(key, val);
             }
         }
+    }
+}
+
+/// Strips blank (`""` or whitespace-only) `CODA_*` and `DATABASE_URL` environment variables
+/// (such as Docker Compose `${CODA_TRUST_PROXY_HEADERS:-}`) so `clap` falls back cleanly to defaults.
+fn sanitize_empty_coda_env_vars() {
+    let blank_keys: Vec<std::ffi::OsString> = std::env::vars_os()
+        .filter_map(|(k, v)| {
+            let ks = k.to_string_lossy();
+            if (ks.starts_with("CODA_") || ks == "DATABASE_URL")
+                && v.to_string_lossy().trim().is_empty()
+            {
+                Some(k)
+            } else {
+                None
+            }
+        })
+        .collect();
+    for k in blank_keys {
+        std::env::remove_var(k);
     }
 }
 
@@ -156,11 +223,13 @@ fn extract_cli_env_file() -> Option<PathBuf> {
 /// Loads `.env` on the main thread before Tokio spawns worker threads so
 /// `coda-server` binary, Docker Compose, and systemd services share one `.env`.
 fn preload_dotenv() {
+    sanitize_empty_coda_env_vars();
     if let Some(explicit) = extract_cli_env_file() {
         load_dotenv_file(&explicit);
     }
     load_dotenv_file(Path::new(".env"));
     load_dotenv_file(Path::new("/etc/coda/.env"));
+    sanitize_empty_coda_env_vars();
 }
 
 fn main() -> Result<()> {
@@ -312,7 +381,8 @@ async fn async_main(args: Args) -> Result<()> {
             has_explicit_release_version,
             github_repo: args.github_repo,
             ios_beta_url: args.ios_beta_url,
-            trust_proxy_headers: args.trust_proxy_headers,
+            trust_proxy_headers: args.trust_proxy_headers == TrustProxyMode::Always,
+            trust_proxy_mode: args.trust_proxy_headers,
             allowed_origins,
         },
     )
@@ -400,5 +470,39 @@ mod tests {
             parse_dotenv_line(r#"CODA_RELAY_SECRET="abc\"def\\ghi""#),
             Some(("CODA_RELAY_SECRET".into(), "abc\"def\\ghi".into()))
         );
+    }
+
+    #[test]
+    fn test_cli_args_empty_docker_env_and_trust_proxy_modes() {
+        use clap::Parser;
+        use coda_server::TrustProxyMode;
+
+        // Exact reproduction of Docker Compose `${CODA_TRUST_PROXY_HEADERS:-}` passing `""`
+        std::env::set_var("CODA_TRUST_PROXY_HEADERS", "");
+        std::env::set_var("CODA_PUBLIC_URL", "");
+        std::env::set_var("CODA_OPEN_REGISTRATION", "");
+        super::sanitize_empty_coda_env_vars();
+
+        let parsed = super::Args::try_parse_from(["coda-server", "--web-dist", "/opt/coda/web/dist"])
+            .expect("empty Docker Compose env vars must not crash clap");
+        assert_eq!(parsed.trust_proxy_headers, TrustProxyMode::Auto);
+        assert!(!parsed.open_registration);
+        assert!(parsed.public_url.is_none());
+
+        // Even without sanitize_empty_coda_env_vars, custom value_parser accepts `""` and `"auto"`
+        assert_eq!(super::parse_trust_proxy_mode("").unwrap(), TrustProxyMode::Auto);
+        assert_eq!(super::parse_trust_proxy_mode("auto").unwrap(), TrustProxyMode::Auto);
+        assert_eq!(super::parse_trust_proxy_mode("true").unwrap(), TrustProxyMode::Always);
+        assert_eq!(super::parse_trust_proxy_mode("false").unwrap(), TrustProxyMode::Never);
+
+        // Bare `--trust-proxy-headers` flag and explicit `--trust-proxy-headers false`
+        let bare = super::Args::try_parse_from(["coda-server", "--trust-proxy-headers"]).unwrap();
+        assert_eq!(bare.trust_proxy_headers, TrustProxyMode::Always);
+        let never =
+            super::Args::try_parse_from(["coda-server", "--trust-proxy-headers", "false"]).unwrap();
+        assert_eq!(never.trust_proxy_headers, TrustProxyMode::Never);
+        let auto =
+            super::Args::try_parse_from(["coda-server", "--trust-proxy-headers=auto"]).unwrap();
+        assert_eq!(auto.trust_proxy_headers, TrustProxyMode::Auto);
     }
 }

@@ -14,9 +14,9 @@ use coda_daemon::{
     logout_account_session, maybe_renew_daemon_config, mint_peer_relay_config,
     pair_daemon_with_code_and_identity, parse_relay_ticket_exp_unix,
     poll_device_login_until_approved, register_client_identity,
-    run_daemon_once_with_p2p_and_peers, spawn_direct_p2p_listener_with_peers,
+    run_daemon_once_with_runtime, spawn_direct_p2p_listener_with_runtime,
     start_device_login_flow, subscribe_account_events_ws, try_acquire_daemon_lock, DaemonConfig,
-    LivePeerSession, PeerAsyncEvent, TrustedPeersStore,
+    LivePeerSession, PeerAsyncEvent, SharedHostRuntime, TrustedPeersStore,
 };
 use coda_protocol::{current_unix_ms, PeerMessage, TrafficLane};
 use tracing::{error, info, warn};
@@ -200,6 +200,21 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|_| "info,coda_daemon=debug".into()),
         )
         .init();
+
+    let blank_keys: Vec<std::ffi::OsString> = std::env::vars_os()
+        .filter_map(|(k, v)| {
+            if k.to_string_lossy().starts_with("CODA_")
+                && v.to_string_lossy().trim().is_empty()
+            {
+                Some(k)
+            } else {
+                None
+            }
+        })
+        .collect();
+    for k in blank_keys {
+        std::env::remove_var(k);
+    }
 
     let cli = Cli::parse();
     let cfg_path = cli.config.unwrap_or_else(DaemonConfig::default_path);
@@ -621,24 +636,27 @@ async fn main() -> Result<()> {
             let _ = maybe_renew_daemon_config(&mut cfg, Some(&cfg_path), &peers_store, false).await;
             let _ = peers_store.refresh_from_server(true).await;
 
-            let bound_p2p = match spawn_direct_p2p_listener_with_peers(
+            let runtime = SharedHostRuntime::new().await;
+            let bound_p2p = match spawn_direct_p2p_listener_with_runtime(
                 cfg.clone(),
                 p2p_bind,
                 Arc::clone(&peers_store),
+                runtime.clone(),
             )
             .await
             {
-                Ok(addr) => Some(addr),
+                Ok((addr, _)) => Some(addr),
                 Err(e) => {
                     let fallback = SocketAddr::new(p2p_bind.ip(), 0);
-                    match spawn_direct_p2p_listener_with_peers(
+                    match spawn_direct_p2p_listener_with_runtime(
                         cfg.clone(),
                         fallback,
                         Arc::clone(&peers_store),
+                        runtime.clone(),
                     )
                     .await
                     {
-                        Ok(addr) => Some(addr),
+                        Ok((addr, _)) => Some(addr),
                         Err(_) => {
                             warn!("Direct P2P listener on {p2p_bind} not bound ({e}); continuing with Relay tunnel");
                             None
@@ -663,19 +681,22 @@ async fn main() -> Result<()> {
                 let _ = maybe_renew_daemon_config(&mut cfg, Some(&cfg_path), &peers_store, false)
                     .await;
                 let started = tokio::time::Instant::now();
-                let run_fut = run_daemon_once_with_p2p_and_peers(
+                let run_fut = run_daemon_once_with_runtime(
                     &cfg,
                     mode.as_deref(),
                     bound_port,
                     Arc::clone(&peers_store),
+                    runtime.clone(),
                 );
                 tokio::select! {
                     _ = tokio::signal::ctrl_c() => {
                         info!("coda-daemon received SIGINT; shutting down cleanly");
+                        runtime.trigger_shutdown();
                         break;
                     }
                     _ = sigterm.recv() => {
                         info!("coda-daemon received SIGTERM; shutting down cleanly");
+                        runtime.trigger_shutdown();
                         break;
                     }
                     _ = sighup.recv() => {
@@ -709,8 +730,14 @@ async fn main() -> Result<()> {
                         }
                         tokio::select! {
                             _ = tokio::time::sleep(Duration::from_secs(backoff_secs)) => {}
-                            _ = tokio::signal::ctrl_c() => break,
-                            _ = sigterm.recv() => break,
+                            _ = tokio::signal::ctrl_c() => {
+                                runtime.trigger_shutdown();
+                                break;
+                            }
+                            _ = sigterm.recv() => {
+                                runtime.trigger_shutdown();
+                                break;
+                            }
                             _ = sighup.recv() => {
                                 if let Ok(reloaded) = DaemonConfig::load(&cfg_path) {
                                     cfg = reloaded;

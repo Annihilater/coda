@@ -44,7 +44,7 @@ use tokio::{
         TcpListener, TcpStream, UdpSocket as TokioUdpSocket,
     },
     process::Command,
-    sync::{broadcast, mpsc, oneshot, Mutex, RwLock, Semaphore},
+    sync::{broadcast, mpsc, oneshot, watch, Mutex, RwLock, Semaphore},
 };
 use tokio_tungstenite::{
     accept_hdr_async_with_config, connect_async_with_config,
@@ -452,9 +452,26 @@ impl TrustedPeersStore {
         }
         let map: HashMap<Uuid, TrustedPeerEntry> =
             valid.into_iter().map(|e| (e.device_id, e)).collect();
-        *self.peers.write().await = map;
+        let changed = {
+            let mut guard = self.peers.write().await;
+            let is_diff = guard.len() != map.len()
+                || map.iter().any(|(k, v)| {
+                    guard
+                        .get(k)
+                        .map(|o| {
+                            o.ed25519_pub_b64 == v.ed25519_pub_b64
+                                && o.x25519_pub_b64 == v.x25519_pub_b64
+                                && o.role == v.role
+                        })
+                        != Some(true)
+                });
+            *guard = map;
+            is_diff
+        };
         self.miss_cache.lock().await.clear();
-        let _ = self.updates_tx.send(());
+        if changed {
+            let _ = self.updates_tx.send(());
+        }
     }
 
     pub async fn get(&self, device_id: &Uuid) -> Option<TrustedPeerEntry> {
@@ -576,10 +593,13 @@ impl TrustedPeersStore {
     }
 }
 
-/// Decodes the unverified `exp_unix` claim from a Coda relay ticket (`<b64url_json>.<hmac>`).
+/// Decodes the unverified `exp_unix` claim from a Coda relay ticket (`<b64_json>.<hmac>`).
 pub fn parse_relay_ticket_exp_unix(ticket: &str) -> Option<i64> {
     let payload_b64 = ticket.trim().split('.').next()?;
-    let bytes = B64_URL.decode(payload_b64).ok()?;
+    let bytes = B64
+        .decode(payload_b64)
+        .or_else(|_| B64_URL.decode(payload_b64))
+        .ok()?;
     let val: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
     val.get("exp_unix").and_then(|v| v.as_i64())
 }
@@ -1955,6 +1975,12 @@ async fn open_and_verify_relay_route_packet(
             reason: "session_reset_required".into(),
         });
     };
+    if e2ee.seq > 64 {
+        return Err(RelayOpenError::SessionResetRequired {
+            nonce: e2ee.session_nonce_b64.clone(),
+            reason: "session_reset_required".into(),
+        });
+    }
     if e2ee.session_nonce_b64.as_deref() != Some(auth.session_nonce_b64.as_str()) {
         return Err(RelayOpenError::Rejected(anyhow!(
             "encrypted payload session_nonce_b64 mismatch"
@@ -2085,11 +2111,44 @@ fn is_loopback_host(host: &str) -> bool {
     matches!(host, "127.0.0.1" | "localhost" | "::1" | "0.0.0.0")
 }
 
+/// Shared host execution state across Relay and Direct P2P listeners so fallback shells,
+/// `herdr-core` handles, active PTY subscriptions (for cross-transport single-owner eviction),
+/// and immediate shutdown signals stay consistent across reconnects and transport hot-switches.
+#[derive(Clone)]
+pub struct SharedHostRuntime {
+    herdr: SharedHerdr,
+    fallback_shells: Arc<Mutex<NativeFallbackShells>>,
+    active_ptys: Arc<Mutex<HashMap<(PeerSessionKey, String), ActivePtySubscription>>>,
+    shutdown_tx: watch::Sender<bool>,
+}
+
+impl SharedHostRuntime {
+    pub async fn new() -> Self {
+        let herdr: SharedHerdr = Arc::new(RwLock::new(connect_herdr_with_install().await));
+        let (shutdown_tx, _) = watch::channel(false);
+        Self {
+            herdr,
+            fallback_shells: Arc::new(Mutex::new(NativeFallbackShells::default())),
+            active_ptys: Arc::new(Mutex::new(HashMap::new())),
+            shutdown_tx,
+        }
+    }
+
+    pub fn shutdown_rx(&self) -> watch::Receiver<bool> {
+        self.shutdown_tx.subscribe()
+    }
+
+    pub fn trigger_shutdown(&self) {
+        let _ = self.shutdown_tx.send(true);
+    }
+}
+
 /// Connects a single relay leg (`raw_tcp_no_sni` or `cdn_wss`) and spawns its reader/writer tasks.
 async fn connect_single_relay_leg(
     chosen: &DaemonRelayEntry,
     ticket: &str,
     in_tx: mpsc::Sender<(mpsc::Sender<RelayWireFrame>, RelayWireFrame)>,
+    leg_dead_tx: mpsc::Sender<String>,
     task_guard: &mut TaskAbortGuard,
 ) -> Result<mpsc::Sender<RelayWireFrame>> {
     let bind_frame = RelayWireFrame::AuthBind {
@@ -2098,6 +2157,8 @@ async fn connect_single_relay_leg(
         generation: next_monotonic_generation(),
     };
     let (out_tx, mut out_rx) = mpsc::channel::<RelayWireFrame>(256);
+    let leg_label = format!("{} [{}]", chosen.endpoint, chosen.mode);
+    let read_idle_timeout = std::time::Duration::from_secs(WS_KEEPALIVE_SECS * 3);
 
     if chosen.mode == "raw_tcp_no_sni" {
         let stream = tokio::time::timeout(
@@ -2125,6 +2186,8 @@ async fn connect_single_relay_leg(
         }
 
         let out_tx_for_in = out_tx.clone();
+        let dead_w = leg_dead_tx.clone();
+        let label_w = leg_label.clone();
         let tcp_writer = tokio::spawn(async move {
             let mut keepalive =
                 tokio::time::interval(std::time::Duration::from_secs(WS_KEEPALIVE_SECS));
@@ -2149,15 +2212,24 @@ async fn connect_single_relay_leg(
                     }
                 }
             }
+            let _ = dead_w.try_send(format!("{label_w} writer closed"));
         });
         task_guard.0.push(tcp_writer.abort_handle());
 
+        let dead_r = leg_dead_tx;
+        let label_r = leg_label;
         let tcp_reader = tokio::spawn(async move {
-            while let Ok(f) = read_raw_frame(&mut reader).await {
-                if in_tx.send((out_tx_for_in.clone(), f)).await.is_err() {
-                    break;
+            loop {
+                match tokio::time::timeout(read_idle_timeout, read_raw_frame(&mut reader)).await {
+                    Ok(Ok(f)) => {
+                        if in_tx.send((out_tx_for_in.clone(), f)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(Err(_)) | Err(_) => break,
                 }
             }
+            let _ = dead_r.try_send(format!("{label_r} reader closed"));
         });
         task_guard.0.push(tcp_reader.abort_handle());
         Ok(out_tx)
@@ -2187,6 +2259,8 @@ async fn connect_single_relay_leg(
 
         let out_tx_for_in = out_tx.clone();
         let (pong_tx, mut pong_rx) = mpsc::channel::<Vec<u8>>(16);
+        let dead_w = leg_dead_tx.clone();
+        let label_w = leg_label.clone();
         let wss_writer = tokio::spawn(async move {
             let mut keepalive =
                 tokio::time::interval(std::time::Duration::from_secs(WS_KEEPALIVE_SECS));
@@ -2219,34 +2293,41 @@ async fn connect_single_relay_leg(
                     }
                 }
             }
+            let _ = dead_w.try_send(format!("{label_w} writer closed"));
         });
         task_guard.0.push(wss_writer.abort_handle());
 
+        let dead_r = leg_dead_tx;
+        let label_r = leg_label;
         let wss_reader = tokio::spawn(async move {
-            while let Some(Ok(msg)) = stream.next().await {
-                match msg {
-                    WsMsg::Text(t) => {
-                        if let Ok(f) = serde_json::from_str::<RelayWireFrame>(&t) {
-                            if in_tx.send((out_tx_for_in.clone(), f)).await.is_err() {
-                                break;
+            loop {
+                match tokio::time::timeout(read_idle_timeout, stream.next()).await {
+                    Ok(Some(Ok(msg))) => match msg {
+                        WsMsg::Text(t) => {
+                            if let Ok(f) = serde_json::from_str::<RelayWireFrame>(&t) {
+                                if in_tx.send((out_tx_for_in.clone(), f)).await.is_err() {
+                                    break;
+                                }
                             }
                         }
-                    }
-                    WsMsg::Binary(b) => {
-                        if let Ok(f) = serde_json::from_slice::<RelayWireFrame>(&b) {
-                            if in_tx.send((out_tx_for_in.clone(), f)).await.is_err() {
-                                break;
+                        WsMsg::Binary(b) => {
+                            if let Ok(f) = serde_json::from_slice::<RelayWireFrame>(&b) {
+                                if in_tx.send((out_tx_for_in.clone(), f)).await.is_err() {
+                                    break;
+                                }
                             }
                         }
-                    }
-                    WsMsg::Ping(p) => {
-                        let _ = pong_tx.try_send(p.to_vec());
-                    }
-                    WsMsg::Pong(_) => {}
-                    WsMsg::Close(_) => break,
-                    _ => {}
+                        WsMsg::Ping(p) => {
+                            let _ = pong_tx.try_send(p.to_vec());
+                        }
+                        WsMsg::Pong(_) => {}
+                        WsMsg::Close(_) => break,
+                        _ => {}
+                    },
+                    _ => break,
                 }
             }
+            let _ = dead_r.try_send(format!("{label_r} reader closed"));
         });
         task_guard.0.push(wss_reader.abort_handle());
         Ok(out_tx)
@@ -2281,6 +2362,25 @@ pub async fn run_daemon_once_with_p2p_and_peers(
     p2p_port: Option<u16>,
     peers_store: Arc<TrustedPeersStore>,
 ) -> Result<()> {
+    let runtime = SharedHostRuntime::new().await;
+    run_daemon_once_with_runtime(cfg, prefer_mode, p2p_port, peers_store, runtime).await
+}
+
+/// Runs a connected Daemon Relay session using a caller-owned `SharedHostRuntime`,
+/// preserving fallback shells and cross-transport PTY ownership across reconnects and P2P hot-switches.
+pub async fn run_daemon_once_with_runtime(
+    cfg: &DaemonConfig,
+    prefer_mode: Option<&str>,
+    p2p_port: Option<u16>,
+    peers_store: Arc<TrustedPeersStore>,
+    runtime: SharedHostRuntime,
+) -> Result<()> {
+    // Reap any leftover non-P2P PTY subscriptions if a prior relay session was cancelled (e.g. SIGHUP).
+    runtime
+        .active_ptys
+        .lock()
+        .await
+        .retain(|((_, nonce), _), _| nonce.starts_with("p2p-"));
     let remote_server = cfg.server_url.starts_with("https://")
         || !is_loopback_endpoint(cfg.server_url.trim_start_matches("http://"));
     let mut candidates: Vec<&DaemonRelayEntry> = cfg
@@ -2303,6 +2403,7 @@ pub async fn run_daemon_once_with_p2p_and_peers(
     let _ = peers_store.refresh_from_server(true).await;
 
     let (in_tx, mut in_rx) = mpsc::channel::<(mpsc::Sender<RelayWireFrame>, RelayWireFrame)>(256);
+    let (leg_dead_tx, mut leg_dead_rx) = mpsc::channel::<String>(8);
     let mut _task_guard = TaskAbortGuard(Vec::new());
     let mut active_out_txs: Vec<mpsc::Sender<RelayWireFrame>> = Vec::new();
     let mut connected_hosts: Vec<String> = Vec::new();
@@ -2326,6 +2427,7 @@ pub async fn run_daemon_once_with_p2p_and_peers(
             chosen,
             &cfg.daemon_relay_ticket,
             in_tx.clone(),
+            leg_dead_tx.clone(),
             &mut _task_guard,
         )
         .await
@@ -2346,6 +2448,7 @@ pub async fn run_daemon_once_with_p2p_and_peers(
     }
 
     drop(in_tx);
+    drop(leg_dead_tx);
     if active_out_txs.is_empty() {
         return Err(last_err.unwrap_or_else(|| anyhow!("all relay endpoints failed")));
     }
@@ -2393,7 +2496,7 @@ pub async fn run_daemon_once_with_p2p_and_peers(
         None
     };
 
-    let herdr: SharedHerdr = Arc::new(RwLock::new(connect_herdr_with_install().await));
+    let herdr: SharedHerdr = Arc::clone(&runtime.herdr);
     if let Some(ref hc) = *herdr.read().await {
         info!(
             "Bridged local herdr-core `{}` (v{})",
@@ -2404,11 +2507,10 @@ pub async fn run_daemon_once_with_p2p_and_peers(
         info!("herdr-core not active yet; native Unix openpty fallback shell manager ready");
     }
 
-    let fallback_shells = Arc::new(Mutex::new(NativeFallbackShells::default()));
+    let fallback_shells = Arc::clone(&runtime.fallback_shells);
     let sessions: Arc<Mutex<HashMap<PeerSessionKey, PeerCryptoSession>>> =
         Arc::new(Mutex::new(HashMap::new()));
-    let active_ptys: Arc<Mutex<HashMap<(PeerSessionKey, String), ActivePtySubscription>>> =
-        Arc::new(Mutex::new(HashMap::new()));
+    let active_ptys = Arc::clone(&runtime.active_ptys);
     let used_relay_nonces: Arc<Mutex<TimedReplayCache>> =
         Arc::new(Mutex::new(TimedReplayCache::default()));
     let rpc_semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_PEER_RPCS));
@@ -2432,72 +2534,106 @@ pub async fn run_daemon_once_with_p2p_and_peers(
         Arc::clone(&stop_events),
     );
     _task_guard.0.push(event_forwarder.abort_handle());
+    let mut shutdown_rx = runtime.shutdown_rx();
 
-    while let Some((reply_tx, frame)) = in_rx.recv().await {
-        match frame {
-            RelayWireFrame::KeepAlive { .. } => {}
-            RelayWireFrame::RoutePacket {
-                src_device_id,
-                dst_device_id,
-                e2ee,
-                session_auth,
-                ..
-            } => {
-                let (session_key, req_msg) = match open_and_verify_relay_route_packet(
-                    src_device_id,
-                    dst_device_id,
-                    my_device_id,
-                    &cfg.identity,
-                    &e2ee,
-                    &session_auth,
-                    &reply_tx,
-                    &peers_store,
-                    &sessions,
-                    &used_relay_nonces,
-                    &active_ptys,
-                )
-                .await
-                {
-                    Ok(m) => m,
-                    Err(RelayOpenError::SessionResetRequired { nonce, reason }) => {
-                        warn!(
-                            "unknown/expired relay session from {src_device_id}; requesting SessionReset"
-                        );
-                        let _ = reply_tx
-                            .try_send(RelayWireFrame::SessionReset {
-                                src_device_id: my_device_id,
-                                dst_device_id: src_device_id,
-                                session_nonce_b64: nonce,
-                                reason,
-                            });
-                        continue;
-                    }
-                    Err(RelayOpenError::Rejected(e)) => {
-                        warn!("rejected relay packet from {src_device_id}: {e}");
-                        continue;
-                    }
-                };
-
-                dispatch_decrypted_peer_message(
-                    session_key,
-                    req_msg,
-                    &herdr,
-                    &fallback_shells,
-                    &hostname,
-                    &active_ptys,
-                    &sessions,
-                    my_device_id,
-                    &rpc_semaphore,
-                )
-                .await;
+    loop {
+        if *shutdown_rx.borrow() {
+            break;
+        }
+        tokio::select! {
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() {
+                    info!("Daemon relay loop stopping on host shutdown signal");
+                    break;
+                }
             }
-            _ => {}
+            dead = leg_dead_rx.recv() => {
+                if let Some(reason) = dead {
+                    warn!("relay leg disconnected ({reason}); recycling session to restore all legs");
+                }
+                break;
+            }
+            maybe_in = in_rx.recv() => {
+                let Some((reply_tx, frame)) = maybe_in else {
+                    break;
+                };
+                match frame {
+                    RelayWireFrame::KeepAlive { .. } => {}
+                    RelayWireFrame::PeerPresence { device_id, is_online: false, .. } => {
+                        sessions.lock().await.retain(|(dev, _), _| *dev != device_id);
+                        active_ptys
+                            .lock()
+                            .await
+                            .retain(|((dev, nonce), _), _| !(*dev == device_id && !nonce.starts_with("p2p-")));
+                    }
+                    RelayWireFrame::RoutePacket {
+                        src_device_id,
+                        dst_device_id,
+                        e2ee,
+                        session_auth,
+                        ..
+                    } => {
+                        let (session_key, req_msg) = match open_and_verify_relay_route_packet(
+                            src_device_id,
+                            dst_device_id,
+                            my_device_id,
+                            &cfg.identity,
+                            &e2ee,
+                            &session_auth,
+                            &reply_tx,
+                            &peers_store,
+                            &sessions,
+                            &used_relay_nonces,
+                            &active_ptys,
+                        )
+                        .await
+                        {
+                            Ok(m) => m,
+                            Err(RelayOpenError::SessionResetRequired { nonce, reason }) => {
+                                warn!(
+                                    "unknown/expired relay session from {src_device_id}; requesting SessionReset"
+                                );
+                                let _ = reply_tx
+                                    .try_send(RelayWireFrame::SessionReset {
+                                        src_device_id: my_device_id,
+                                        dst_device_id: src_device_id,
+                                        session_nonce_b64: nonce,
+                                        reason,
+                                    });
+                                continue;
+                            }
+                            Err(RelayOpenError::Rejected(e)) => {
+                                warn!("rejected relay packet from {src_device_id}: {e}");
+                                continue;
+                            }
+                        };
+
+                        dispatch_decrypted_peer_message(
+                            session_key,
+                            req_msg,
+                            &herdr,
+                            &fallback_shells,
+                            &hostname,
+                            &active_ptys,
+                            &sessions,
+                            my_device_id,
+                            &rpc_semaphore,
+                        )
+                        .await;
+                    }
+                    _ => {}
+                }
+            }
         }
     }
 
     stop_events.store(true, Ordering::Relaxed);
     event_forwarder.abort();
-    active_ptys.lock().await.clear();
+    // Prune ONLY Relay PTY subscriptions; preserve live Direct P2P subscriptions across Relay reconnects.
+    active_ptys
+        .lock()
+        .await
+        .retain(|((_, nonce), _), _| nonce.starts_with("p2p-"));
     if let Some(w) = endpoint_watcher {
         w.abort();
     }
@@ -2524,15 +2660,18 @@ pub async fn spawn_direct_p2p_listener_with_peers(
     bind_addr: SocketAddr,
     peers_store: Arc<TrustedPeersStore>,
 ) -> Result<SocketAddr> {
-    spawn_direct_p2p_listener_with_abort(cfg, bind_addr, peers_store)
+    let runtime = SharedHostRuntime::new().await;
+    spawn_direct_p2p_listener_with_runtime(cfg, bind_addr, peers_store, runtime)
         .await
         .map(|(addr, _)| addr)
 }
 
-async fn spawn_direct_p2p_listener_with_abort(
+/// Spawns Direct P2P TCP/WS listener sharing a caller-provided `SharedHostRuntime`.
+pub async fn spawn_direct_p2p_listener_with_runtime(
     cfg: DaemonConfig,
     bind_addr: SocketAddr,
     peers_store: Arc<TrustedPeersStore>,
+    runtime: SharedHostRuntime,
 ) -> Result<(SocketAddr, tokio::task::AbortHandle)> {
     // #20: Dual-stack `[::]:24444` (`IPV6_V6ONLY = false`) with automatic `0.0.0.0:24444` fallback.
     let listener = bind_dual_stack_tcp_listener(bind_addr).await?;
@@ -2542,13 +2681,30 @@ async fn spawn_direct_p2p_listener_with_abort(
         local_addr, cfg.device_id
     );
 
-    let herdr: SharedHerdr = Arc::new(RwLock::new(connect_herdr_with_install().await));
-    let fallback_shells = Arc::new(Mutex::new(NativeFallbackShells::default()));
+    let herdr = Arc::clone(&runtime.herdr);
+    let fallback_shells = Arc::clone(&runtime.fallback_shells);
+    let active_ptys = Arc::clone(&runtime.active_ptys);
     let p2p_replay = Arc::new(Mutex::new(TimedReplayCache::default()));
     let conn_sem = Arc::new(Semaphore::new(MAX_DIRECT_P2P_CONNS));
+    let mut accept_shutdown_rx = runtime.shutdown_rx();
 
     let handle = tokio::spawn(async move {
-        while let Ok((stream, peer_addr)) = listener.accept().await {
+        loop {
+            if *accept_shutdown_rx.borrow() {
+                break;
+            }
+            let accept_res = tokio::select! {
+                _ = accept_shutdown_rx.changed() => {
+                    if *accept_shutdown_rx.borrow() {
+                        break;
+                    }
+                    continue;
+                }
+                res = listener.accept() => res,
+            };
+            let Ok((stream, peer_addr)) = accept_res else {
+                break;
+            };
             let Ok(permit) = Arc::clone(&conn_sem).try_acquire_owned() else {
                 warn!("direct P2P concurrency cap reached; dropping {peer_addr}");
                 continue;
@@ -2556,8 +2712,10 @@ async fn spawn_direct_p2p_listener_with_abort(
             let cfg_clone = cfg.clone();
             let herdr_clone = Arc::clone(&herdr);
             let fallback_clone = Arc::clone(&fallback_shells);
+            let active_ptys_clone = Arc::clone(&active_ptys);
             let peers_clone = Arc::clone(&peers_store);
             let replay_clone = Arc::clone(&p2p_replay);
+            let conn_shutdown_rx = runtime.shutdown_rx();
             tokio::spawn(async move {
                 let _conn_permit = permit;
                 let _ = stream.set_nodelay(true);
@@ -2577,8 +2735,10 @@ async fn spawn_direct_p2p_listener_with_abort(
                         cfg_clone,
                         herdr_clone,
                         fallback_clone,
+                        active_ptys_clone,
                         peers_clone,
                         replay_clone,
+                        conn_shutdown_rx,
                     )
                     .await
                 } else {
@@ -2588,8 +2748,10 @@ async fn spawn_direct_p2p_listener_with_abort(
                         cfg_clone,
                         herdr_clone,
                         fallback_clone,
+                        active_ptys_clone,
                         peers_clone,
                         replay_clone,
+                        conn_shutdown_rx,
                     )
                     .await
                 };
@@ -2713,6 +2875,7 @@ async fn dispatch_direct_p2p_frame(
     active_ptys: &Arc<Mutex<HashMap<(PeerSessionKey, String), ActivePtySubscription>>>,
     out_tx: &mpsc::Sender<RelayWireFrame>,
     rpc_semaphore: &Arc<Semaphore>,
+    p2p_conn_nonce: &str,
 ) {
     match frame {
         RelayWireFrame::KeepAlive { ts_ms } => {
@@ -2727,7 +2890,7 @@ async fn dispatch_direct_p2p_frame(
             if dst_device_id != cfg.device_id {
                 return;
             }
-            let session_key = (src_device_id, String::new());
+            let session_key = (src_device_id, p2p_conn_nonce.to_string());
             let req_msg = {
                 let mut map = sessions.lock().await;
                 let Some(s) = map.get_mut(&session_key) else {
@@ -2865,9 +3028,14 @@ async fn handle_direct_p2p_socket(
     cfg: DaemonConfig,
     herdr: SharedHerdr,
     fallback_shells: Arc<Mutex<NativeFallbackShells>>,
+    active_ptys: Arc<Mutex<HashMap<(PeerSessionKey, String), ActivePtySubscription>>>,
     peers_store: Arc<TrustedPeersStore>,
     replay_cache: Arc<Mutex<TimedReplayCache>>,
+    mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
+    if *shutdown_rx.borrow() {
+        return Ok(());
+    }
     let (mut reader, mut writer) = stream.into_split();
 
     // #5: Pre-auth frame read strictly bounded to MAX_AUTH_FRAME_BYTES (16 KiB).
@@ -2894,12 +3062,16 @@ async fn handle_direct_p2p_socket(
             return Err(e);
         }
     };
+    if *shutdown_rx.borrow() {
+        return Ok(());
+    }
 
     let (out_tx, mut out_rx) = mpsc::channel::<RelayWireFrame>(256);
     let (ack, p2p_sess) =
         build_signed_p2p_ack_and_session(&cfg, &verified, path_kind, out_tx.clone())?;
     writer.write_all(&ack.encode_length_delimited()?).await?;
 
+    let (writer_dead_tx, mut writer_dead_rx) = watch::channel(false);
     let write_task = tokio::spawn(async move {
         let mut keepalive = tokio::time::interval(std::time::Duration::from_secs(WS_KEEPALIVE_SECS));
         keepalive.tick().await;
@@ -2923,14 +3095,16 @@ async fn handle_direct_p2p_socket(
                 }
             }
         }
+        let _ = writer_dead_tx.send(true);
     });
 
+    let p2p_conn_nonce = format!("p2p-{}", Uuid::new_v4().simple());
+    let my_session_key = (verified.client_device_id, p2p_conn_nonce.clone());
     let sessions = Arc::new(Mutex::new(HashMap::new()));
     sessions
         .lock()
         .await
-        .insert((verified.client_device_id, String::new()), p2p_sess);
-    let active_ptys = Arc::new(Mutex::new(HashMap::new()));
+        .insert(my_session_key.clone(), p2p_sess);
     let rpc_semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_PEER_RPCS));
     let stop_events = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let event_forwarder = spawn_herdr_event_forwarder(
@@ -2941,17 +3115,43 @@ async fn handle_direct_p2p_socket(
     );
     // #3: Subscribe to live TrustedPeersStore updates so revoked devices disconnect immediately.
     let mut peer_updates = peers_store.subscribe_updates();
+    let read_idle_timeout = std::time::Duration::from_secs(WS_KEEPALIVE_SECS * 3);
+    // Dedicated cancel-safe reader task so `tokio::select!` branches never drop half-read TCP frames.
+    let (frame_tx, mut frame_rx) = mpsc::channel::<RelayWireFrame>(64);
+    let read_task = tokio::spawn(async move {
+        while let Ok(Ok(frame)) = tokio::time::timeout(read_idle_timeout, read_raw_frame(&mut reader)).await {
+            if frame_tx.send(frame).await.is_err() {
+                break;
+            }
+        }
+    });
 
     loop {
+        if *shutdown_rx.borrow() || *writer_dead_rx.borrow() {
+            break;
+        }
         tokio::select! {
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() {
+                    info!("Direct P2P socket to {} terminated by host shutdown", verified.client_device_id);
+                    break;
+                }
+            }
+            _ = writer_dead_rx.changed() => {
+                if *writer_dead_rx.borrow() {
+                    break;
+                }
+            }
             upd = peer_updates.recv() => {
-                if upd.is_ok() && !peers_store.contains(&verified.client_device_id).await {
+                if matches!(upd, Ok(()) | Err(broadcast::error::RecvError::Lagged(_)))
+                    && !peers_store.contains(&verified.client_device_id).await
+                {
                     warn!("Direct P2P peer {} revoked; terminating socket", verified.client_device_id);
                     break;
                 }
             }
-            res = read_raw_frame(&mut reader) => {
-                let Ok(frame) = res else { break; };
+            maybe_frame = frame_rx.recv() => {
+                let Some(frame) = maybe_frame else { break; };
                 dispatch_direct_p2p_frame(
                     frame,
                     &cfg,
@@ -2961,15 +3161,20 @@ async fn handle_direct_p2p_socket(
                     &active_ptys,
                     &out_tx,
                     &rpc_semaphore,
+                    &p2p_conn_nonce,
                 )
                 .await;
             }
         }
     }
 
+    read_task.abort();
     stop_events.store(true, Ordering::Relaxed);
     event_forwarder.abort();
-    active_ptys.lock().await.clear();
+    active_ptys
+        .lock()
+        .await
+        .retain(|(sk, _), _| sk != &my_session_key);
     write_task.abort();
     Ok(())
 }
@@ -2981,9 +3186,14 @@ async fn handle_direct_p2p_ws_socket(
     cfg: DaemonConfig,
     herdr: SharedHerdr,
     fallback_shells: Arc<Mutex<NativeFallbackShells>>,
+    active_ptys: Arc<Mutex<HashMap<(PeerSessionKey, String), ActivePtySubscription>>>,
     peers_store: Arc<TrustedPeersStore>,
     replay_cache: Arc<Mutex<TimedReplayCache>>,
+    mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
+    if *shutdown_rx.borrow() {
+        return Ok(());
+    }
     let allowed_server_url = cfg.server_url.clone();
     // #6: Reject cross-site WebSocket upgrades from untrusted external browser Origins.
     let ws_stream = accept_hdr_async_with_config(
@@ -3034,6 +3244,9 @@ async fn handle_direct_p2p_ws_socket(
             return Err(e);
         }
     };
+    if *shutdown_rx.borrow() {
+        return Ok(());
+    }
 
     let (out_tx, mut out_rx) = mpsc::channel::<RelayWireFrame>(256);
     let (ack, p2p_sess) =
@@ -3043,6 +3256,7 @@ async fn handle_direct_p2p_ws_socket(
     sink.flush().await?;
 
     let (pong_tx, mut pong_rx) = mpsc::channel::<Vec<u8>>(16);
+    let (writer_dead_tx, mut writer_dead_rx) = watch::channel(false);
     let write_task = tokio::spawn(async move {
         let mut keepalive = tokio::time::interval(std::time::Duration::from_secs(WS_KEEPALIVE_SECS));
         keepalive.tick().await;
@@ -3074,14 +3288,16 @@ async fn handle_direct_p2p_ws_socket(
                 }
             }
         }
+        let _ = writer_dead_tx.send(true);
     });
 
+    let p2p_conn_nonce = format!("p2p-{}", Uuid::new_v4().simple());
+    let my_session_key = (verified.client_device_id, p2p_conn_nonce.clone());
     let sessions = Arc::new(Mutex::new(HashMap::new()));
     sessions
         .lock()
         .await
-        .insert((verified.client_device_id, String::new()), p2p_sess);
-    let active_ptys = Arc::new(Mutex::new(HashMap::new()));
+        .insert(my_session_key.clone(), p2p_sess);
     let rpc_semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_PEER_RPCS));
     let stop_events = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let event_forwarder = spawn_herdr_event_forwarder(
@@ -3091,17 +3307,34 @@ async fn handle_direct_p2p_ws_socket(
         Arc::clone(&stop_events),
     );
     let mut peer_updates = peers_store.subscribe_updates();
+    let read_idle_timeout = std::time::Duration::from_secs(WS_KEEPALIVE_SECS * 3);
 
     loop {
+        if *shutdown_rx.borrow() || *writer_dead_rx.borrow() {
+            break;
+        }
         tokio::select! {
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() {
+                    info!("Direct P2P WS socket to {} terminated by host shutdown", verified.client_device_id);
+                    break;
+                }
+            }
+            _ = writer_dead_rx.changed() => {
+                if *writer_dead_rx.borrow() {
+                    break;
+                }
+            }
             upd = peer_updates.recv() => {
-                if upd.is_ok() && !peers_store.contains(&verified.client_device_id).await {
+                if matches!(upd, Ok(()) | Err(broadcast::error::RecvError::Lagged(_)))
+                    && !peers_store.contains(&verified.client_device_id).await
+                {
                     warn!("Direct P2P WS peer {} revoked; terminating socket", verified.client_device_id);
                     break;
                 }
             }
-            maybe_msg = rx.next() => {
-                let Some(Ok(msg)) = maybe_msg else { break; };
+            maybe_msg = tokio::time::timeout(read_idle_timeout, rx.next()) => {
+                let Ok(Some(Ok(msg))) = maybe_msg else { break; };
                 match msg {
                     WsMsg::Text(t) => {
                         if let Ok(frame) = serde_json::from_str::<RelayWireFrame>(&t) {
@@ -3114,6 +3347,7 @@ async fn handle_direct_p2p_ws_socket(
                                 &active_ptys,
                                 &out_tx,
                                 &rpc_semaphore,
+                                &p2p_conn_nonce,
                             )
                             .await;
                         }
@@ -3129,6 +3363,7 @@ async fn handle_direct_p2p_ws_socket(
                                 &active_ptys,
                                 &out_tx,
                                 &rpc_semaphore,
+                                &p2p_conn_nonce,
                             )
                             .await;
                         }
@@ -3145,7 +3380,10 @@ async fn handle_direct_p2p_ws_socket(
 
     stop_events.store(true, Ordering::Relaxed);
     event_forwarder.abort();
-    active_ptys.lock().await.clear();
+    active_ptys
+        .lock()
+        .await
+        .retain(|(sk, _), _| sk != &my_session_key);
     write_task.abort();
     Ok(())
 }
@@ -3265,11 +3503,14 @@ pub async fn probe_lan_udp_peer(
 pub struct EmbeddedHostHandle {
     pub local_addr: SocketAddr,
     abort_handles: Arc<Vec<tokio::task::AbortHandle>>,
+    shutdown_tx: watch::Sender<bool>,
 }
 
 impl EmbeddedHostHandle {
-    /// Terminates the embedded relay loop, P2P listener, and UDP beacon and releases the daemon lock.
+    /// Terminates the embedded relay loop, P2P listener, active P2P sockets, and UDP beacon
+    /// and releases the daemon lock immediately.
     pub fn stop(&self) {
+        let _ = self.shutdown_tx.send(true);
         for handle in self.abort_handles.iter() {
             handle.abort();
         }
@@ -3295,21 +3536,29 @@ pub async fn start_embedded_host_with_handle(cfg_path: &Path) -> Option<Embedded
     let _ = maybe_renew_daemon_config(&mut cfg, Some(cfg_path), &peers_store, false).await;
     let _ = peers_store.refresh_from_server(true).await;
 
+    let runtime = SharedHostRuntime::new().await;
+    let shutdown_tx = runtime.shutdown_tx.clone();
     let mut abort_handles = Vec::new();
     let p2p_bind = SocketAddr::from(([0, 0, 0, 0], DEFAULT_DIRECT_P2P_PORT));
-    let (p2p_addr, p2p_abort) = match spawn_direct_p2p_listener_with_abort(
+    let (p2p_addr, p2p_abort) = match spawn_direct_p2p_listener_with_runtime(
         cfg.clone(),
         p2p_bind,
         Arc::clone(&peers_store),
+        runtime.clone(),
     )
     .await
     {
         Ok(res) => res,
         Err(_) => {
             let fallback = SocketAddr::from(([0, 0, 0, 0], 0));
-            spawn_direct_p2p_listener_with_abort(cfg.clone(), fallback, Arc::clone(&peers_store))
-                .await
-                .ok()?
+            spawn_direct_p2p_listener_with_runtime(
+                cfg.clone(),
+                fallback,
+                Arc::clone(&peers_store),
+                runtime.clone(),
+            )
+            .await
+            .ok()?
         }
     };
     abort_handles.push(p2p_abort);
@@ -3321,22 +3570,31 @@ pub async fn start_embedded_host_with_handle(cfg_path: &Path) -> Option<Embedded
 
     let port = p2p_addr.port();
     let cfg_path_buf = cfg_path.to_path_buf();
+    let relay_runtime = runtime.clone();
     let relay_task = tokio::spawn(async move {
         let _held_lock = lock;
         let mut backoff_secs = 1u64;
+        let shutdown_rx = relay_runtime.shutdown_rx();
         loop {
+            if *shutdown_rx.borrow() {
+                break;
+            }
             let _ = maybe_renew_daemon_config(&mut cfg, Some(&cfg_path_buf), &peers_store, false)
                 .await;
             let started = tokio::time::Instant::now();
-            match run_daemon_once_with_p2p_and_peers(
+            match run_daemon_once_with_runtime(
                 &cfg,
                 None,
                 Some(port),
                 Arc::clone(&peers_store),
+                relay_runtime.clone(),
             )
             .await
             {
                 Ok(()) => {
+                    if *shutdown_rx.borrow() {
+                        break;
+                    }
                     if started.elapsed() >= std::time::Duration::from_secs(10) {
                         backoff_secs = 1;
                     }
@@ -3344,6 +3602,9 @@ pub async fn start_embedded_host_with_handle(cfg_path: &Path) -> Option<Embedded
                     backoff_secs = (backoff_secs * 2).min(30);
                 }
                 Err(e) => {
+                    if *shutdown_rx.borrow() {
+                        break;
+                    }
                     let msg = e.to_string().to_ascii_lowercase();
                     if msg.contains("expired") || msg.contains("ticket") || msg.contains("unauthorized") {
                         let _ = maybe_renew_daemon_config(
@@ -3371,6 +3632,7 @@ pub async fn start_embedded_host_with_handle(cfg_path: &Path) -> Option<Embedded
     Some(EmbeddedHostHandle {
         local_addr: p2p_addr,
         abort_handles: Arc::new(abort_handles),
+        shutdown_tx,
     })
 }
 
@@ -3537,10 +3799,13 @@ async fn handle_peer_request_full(
                         let forward = tokio::spawn(async move {
                             let mut seq = 1u64;
                             if !initial_snap.is_empty() {
+                                let mut snap_payload = Vec::with_capacity(initial_snap.len() + 7);
+                                snap_payload.extend_from_slice(b"\x1b[2J\x1b[H");
+                                snap_payload.extend_from_slice(&initial_snap);
                                 let snap_msg = PeerMessage::PtyOutputChunk {
                                     terminal: term_clone.clone(),
                                     seq,
-                                    data_b64: B64.encode(&initial_snap),
+                                    data_b64: B64.encode(&snap_payload),
                                 };
                                 seq += 1;
                                 if !send_e2ee_peer_message(
@@ -3581,10 +3846,17 @@ async fn handle_peer_request_full(
                                 }
                             }
                         });
-                        active_ptys.lock().await.insert(
-                            (session_key, terminal.clone()),
-                            ActivePtySubscription::Fallback(forward.abort_handle()),
-                        );
+                        {
+                            let mut ptys = active_ptys.lock().await;
+                            // V3-01: Single-owner cross-transport eviction per (client_device_id, terminal)
+                            ptys.retain(|((dev_id, _), term), _| {
+                                !(*dev_id == session_key.0 && term == &terminal)
+                            });
+                            ptys.insert(
+                                (session_key, terminal.clone()),
+                                ActivePtySubscription::Fallback(forward.abort_handle()),
+                            );
+                        }
                         return Some((
                             PeerMessage::PtyAttached {
                                 req_id,
@@ -3624,10 +3896,17 @@ async fn handle_peer_request_full(
             let (pty_tx, mut pty_rx) = mpsc::channel::<PtyOutputEvent>(256);
             match spawn_pty_attach(hc.hc_path(), &terminal, cols, rows, pty_tx) {
                 Ok(handle) => {
-                    active_ptys.lock().await.insert(
-                        (session_key.clone(), terminal.clone()),
-                        ActivePtySubscription::Herdr(handle),
-                    );
+                    {
+                        let mut ptys = active_ptys.lock().await;
+                        // V3-01: Single-owner cross-transport eviction per (client_device_id, terminal)
+                        ptys.retain(|((dev_id, _), term), _| {
+                            !(*dev_id == session_key.0 && term == &terminal)
+                        });
+                        ptys.insert(
+                            (session_key.clone(), terminal.clone()),
+                            ActivePtySubscription::Herdr(handle),
+                        );
+                    }
 
                     let sessions_clone = Arc::clone(sessions);
                     let sk_clone = session_key;
@@ -5056,6 +5335,7 @@ struct RelayClientConn {
     transport: RelaySocketTransport,
     e2ee: E2eeSession,
     session_auth: RelaySessionAuth,
+    auth_confirmed: bool,
     client_device_id: Uuid,
     target_device_id: Uuid,
 }
@@ -5092,12 +5372,13 @@ impl RelayClientConn {
         };
 
         if let Some(ref raw_addr) = cfg.raw_tcp_addr {
-            if let Ok(Ok(stream)) = tokio::time::timeout(
-                std::time::Duration::from_secs(3),
-                TcpStream::connect(raw_addr),
-            )
-            .await
-            {
+            let raw_attempt: Result<RelaySocketTransport> = async {
+                let stream = tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    TcpStream::connect(raw_addr),
+                )
+                .await
+                .map_err(|_| anyhow!("raw TCP connect timed out"))??;
                 let _ = stream.set_nodelay(true);
                 let (mut reader, mut writer) = stream.into_split();
                 writer.write_all(&bind.encode_length_delimited()?).await?;
@@ -5108,14 +5389,27 @@ impl RelayClientConn {
                 .await
                 .map_err(|_| anyhow!("raw TCP relay timed out waiting for AuthAck"))??;
                 if matches!(ack, RelayWireFrame::AuthAck { ok: true, .. }) {
+                    Ok(RelaySocketTransport::RawTcp { reader, writer })
+                } else {
+                    anyhow::bail!("raw TCP relay rejected AuthBind")
+                }
+            }
+            .await;
+
+            match raw_attempt {
+                Ok(transport) => {
                     return Ok(Self {
                         route_label: "relay_raw_tcp".into(),
-                        transport: RelaySocketTransport::RawTcp { reader, writer },
+                        transport,
                         e2ee,
                         session_auth,
+                        auth_confirmed: false,
                         client_device_id,
                         target_device_id,
                     });
+                }
+                Err(e) => {
+                    warn!("raw TCP relay {raw_addr} failed ({e}); falling back to WSS if configured");
                 }
             }
         }
@@ -5137,6 +5431,7 @@ impl RelayClientConn {
                         transport: RelaySocketTransport::Wss { sink, stream },
                         e2ee,
                         session_auth,
+                        auth_confirmed: false,
                         client_device_id,
                         target_device_id,
                     });
@@ -5156,7 +5451,11 @@ impl RelayClientConn {
             lane,
             e2ee: sealed,
             sender_x25519_pub_b64: None,
-            session_auth: Some(self.session_auth.clone()),
+            session_auth: if self.auth_confirmed {
+                None
+            } else {
+                Some(self.session_auth.clone())
+            },
         };
 
         match &mut self.transport {
@@ -5177,6 +5476,7 @@ impl RelayClientConn {
                                 continue;
                             }
                             let opened = self.e2ee.open_message(&e2ee)?;
+                            self.auth_confirmed = true;
                             if matches!(
                                 opened,
                                 PeerMessage::HerdrLiveEvent { .. }
@@ -5224,6 +5524,7 @@ impl RelayClientConn {
                                             continue;
                                         }
                                         let opened = self.e2ee.open_message(&e2ee)?;
+                                        self.auth_confirmed = true;
                                         if matches!(
                                             opened,
                                             PeerMessage::HerdrLiveEvent { .. }
@@ -5569,7 +5870,10 @@ impl LivePeerSession {
         let (events_tx, _) = broadcast::channel::<PeerAsyncEvent>(1024);
 
         let e2ee_w = Arc::clone(&e2ee_state);
+        let relay_auth_confirmed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let relay_auth_confirmed_w = Arc::clone(&relay_auth_confirmed);
         let mut writer = writer_half;
+        let (writer_dead_tx, mut writer_dead_rx) = watch::channel(false);
         let writer_handle = tokio::spawn(async move {
             let mut keepalive =
                 tokio::time::interval(std::time::Duration::from_secs(WS_KEEPALIVE_SECS));
@@ -5600,7 +5904,11 @@ impl LivePeerSession {
                             lane,
                             e2ee,
                             sender_x25519_pub_b64: None,
-                            session_auth: relay_session_auth.clone(),
+                            session_auth: if relay_auth_confirmed_w.load(Ordering::Acquire) {
+                                None
+                            } else {
+                                relay_session_auth.clone()
+                            },
                         };
                         let send_ok = match &mut writer {
                             PeerWriterHalf::RawTcp(w) => match frame.encode_length_delimited() {
@@ -5637,6 +5945,7 @@ impl LivePeerSession {
                     }
                 }
             }
+            let _ = writer_dead_tx.send(true);
         });
         let writer_abort = writer_handle.abort_handle();
 
@@ -5645,32 +5954,58 @@ impl LivePeerSession {
         let events_tx_r = events_tx.clone();
         let writer_abort_for_reader = writer_abort.clone();
         let mut reader = reader_half;
+        let read_idle_timeout = std::time::Duration::from_secs(WS_KEEPALIVE_SECS * 3);
         let reader_handle = tokio::spawn(async move {
             let mut disconnect_reason = "peer stream closed".to_string();
             loop {
-                let next_frame: Option<RelayWireFrame> = match &mut reader {
-                    PeerReaderHalf::RawTcp(r) => read_raw_frame(r).await.ok(),
-                    PeerReaderHalf::Wss(stream) => loop {
-                        match stream.next().await {
-                            Some(Ok(WsMsg::Text(t))) => {
-                                if let Ok(f) = serde_json::from_str::<RelayWireFrame>(&t) {
-                                    break Some(f);
-                                }
-                            }
-                            Some(Ok(WsMsg::Binary(b))) => {
-                                if let Ok(f) = serde_json::from_slice::<RelayWireFrame>(&b) {
-                                    break Some(f);
-                                }
-                            }
-                            Some(Ok(WsMsg::Ping(p))) => {
-                                let _ = pong_tx.try_send(p.to_vec());
-                                continue;
-                            }
-                            Some(Ok(WsMsg::Pong(_))) => continue,
-                            Some(Ok(WsMsg::Close(_))) | Some(Err(_)) | None => break None,
-                            _ => continue,
+                if *writer_dead_rx.borrow() {
+                    disconnect_reason = "peer writer closed".to_string();
+                    break;
+                }
+                let next_frame: Option<RelayWireFrame> = tokio::select! {
+                    _ = writer_dead_rx.changed() => {
+                        if *writer_dead_rx.borrow() {
+                            disconnect_reason = "peer writer closed".to_string();
+                            break;
                         }
-                    },
+                        continue;
+                    }
+                    res = tokio::time::timeout(read_idle_timeout, async {
+                        match &mut reader {
+                            PeerReaderHalf::RawTcp(r) => read_raw_frame(r).await.ok(),
+                            PeerReaderHalf::Wss(stream) => loop {
+                                match stream.next().await {
+                                    Some(Ok(WsMsg::Text(t))) => {
+                                        if let Ok(f) = serde_json::from_str::<RelayWireFrame>(&t) {
+                                            break Some(f);
+                                        }
+                                    }
+                                    Some(Ok(WsMsg::Binary(b))) => {
+                                        if let Ok(f) = serde_json::from_slice::<RelayWireFrame>(&b) {
+                                            break Some(f);
+                                        }
+                                    }
+                                    Some(Ok(WsMsg::Ping(p))) => {
+                                        let _ = pong_tx.try_send(p.to_vec());
+                                        break Some(RelayWireFrame::KeepAlive { ts_ms: 0 });
+                                    }
+                                    Some(Ok(WsMsg::Pong(_))) => {
+                                        break Some(RelayWireFrame::KeepAlive { ts_ms: 0 });
+                                    }
+                                    Some(Ok(WsMsg::Close(_))) | Some(Err(_)) | None => break None,
+                                    _ => continue,
+                                }
+                            },
+                        }
+                    }) => {
+                        match res {
+                            Ok(f) => f,
+                            Err(_) => {
+                                disconnect_reason = "peer read idle timeout".to_string();
+                                None
+                            }
+                        }
+                    }
                 };
 
                 let Some(frame) = next_frame else {
@@ -5696,6 +6031,7 @@ impl LivePeerSession {
                         let Ok(msg) = opened else {
                             continue;
                         };
+                        relay_auth_confirmed.store(true, Ordering::Release);
                         if let Some(req_id) = msg.response_req_id() {
                             let waiter = {
                                 let mut map = pending_r.lock().expect("pending mutex poisoned");
@@ -5793,6 +6129,14 @@ impl LivePeerSession {
             .send((msg, lane))
             .await
             .map_err(|_| anyhow!("live peer session closed"))
+    }
+
+    /// Non-blocking FIFO enqueue onto the outbound writer channel (preserving exact keystroke order
+    /// from UI threads without per-keystroke async task scheduling).
+    pub fn try_send_oneway(&self, msg: PeerMessage, lane: TrafficLane) -> Result<()> {
+        self.outbound_tx
+            .try_send((msg, lane))
+            .map_err(|e| anyhow!("live peer session try_send failed: {e}"))
     }
 
     pub async fn request(
@@ -5918,5 +6262,24 @@ mod tests {
         assert!(lock3.is_some());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_parse_relay_ticket_exp_unix_standard_base64_and_renewal() {
+        let claims = coda_protocol::RelayTicketClaims {
+            user_id: Uuid::new_v4(),
+            device_id: Uuid::new_v4(),
+            peer_device_id: None,
+            role: "daemon".into(),
+            quota_mbps: 100,
+            exp_unix: ((current_unix_ms() / 1000) as i64) + 3 * 86_400,
+        };
+        let signed = claims
+            .sign(b"0123456789abcdef0123456789abcdef")
+            .expect("sign ticket");
+        // Verify STANDARD base64 (`+`, `/`, `=`) decodes cleanly and triggers 7-day lead renewal
+        assert_eq!(parse_relay_ticket_exp_unix(&signed), Some(claims.exp_unix));
+        assert!(ticket_needs_renewal(&signed, 7 * 86_400));
+        assert!(!ticket_needs_renewal(&signed, 24 * 3600));
     }
 }

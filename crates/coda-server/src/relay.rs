@@ -97,13 +97,20 @@ impl TenantBucket {
     }
 }
 
+#[derive(Debug, Clone)]
+pub enum SessionRevocation {
+    All(Uuid),
+    Single(Uuid, String),
+    AllExcept(Uuid, String),
+}
+
 pub struct RelayHub {
     relay_secret: Vec<u8>,
     region_label: String,
     devices: RwLock<HashMap<Uuid, DeviceSlots>>,
     tenant_buckets: RwLock<HashMap<Uuid, TenantBucket>>,
     account_watchers: RwLock<HashMap<Uuid, broadcast::Sender<AccountLiveEvent>>>,
-    session_revocations: broadcast::Sender<(Uuid, Option<String>)>,
+    session_revocations: broadcast::Sender<SessionRevocation>,
     next_conn_id: AtomicU64,
     online_sync_lock: Mutex<()>,
     /// Optional DB handle when running co-located with `coda-coord` to sync `is_online`.
@@ -113,7 +120,7 @@ pub struct RelayHub {
 
 impl RelayHub {
     pub fn new(relay_secret: Vec<u8>, region_label: impl Into<String>, db: Option<Db>) -> Arc<Self> {
-        let (rev_tx, _) = broadcast::channel(128);
+        let (rev_tx, _) = broadcast::channel(256);
         Arc::new(Self {
             relay_secret,
             region_label: region_label.into(),
@@ -129,7 +136,19 @@ impl RelayHub {
 
     /// Notifies live `/api/v1/events/ws` sockets to terminate when a token or all user sessions are revoked.
     pub fn notify_session_revoked(&self, user_id: Uuid, token_sha256: Option<String>) {
-        let _ = self.session_revocations.send((user_id, token_sha256));
+        let ev = match token_sha256 {
+            Some(sha) => SessionRevocation::Single(user_id, sha),
+            None => SessionRevocation::All(user_id),
+        };
+        let _ = self.session_revocations.send(ev);
+    }
+
+    /// Single-frame revocation broadcast for password changes: revokes every session of `user_id`
+    /// EXCEPT `keep_token_sha256`, avoiding O(N) broadcast channel overflow.
+    pub fn notify_sessions_revoked_except(&self, user_id: Uuid, keep_token_sha256: String) {
+        let _ = self
+            .session_revocations
+            .send(SessionRevocation::AllExcept(user_id, keep_token_sha256));
     }
 
     pub async fn subscribe_account_events(
@@ -244,18 +263,30 @@ impl RelayHub {
                     }
                 }
                 rev = rev_rx.recv() => {
-                    if let Ok((rev_uid, rev_sha)) = rev {
-                        if rev_uid == user_id {
-                            let matches_token = match (&rev_sha, &token_sha256) {
-                                (None, _) => true,
-                                (Some(target), Some(ours)) => target == ours,
-                                _ => false,
-                            };
-                            if matches_token {
-                                let _ = socket.send(WsMessage::Close(None)).await;
-                                break;
-                            }
+                    match rev {
+                        Ok(SessionRevocation::All(rev_uid)) if rev_uid == user_id => {
+                            let _ = socket.send(WsMessage::Close(None)).await;
+                            break;
                         }
+                        Ok(SessionRevocation::Single(rev_uid, target))
+                            if rev_uid == user_id && token_sha256.as_deref() == Some(target.as_str()) =>
+                        {
+                            let _ = socket.send(WsMessage::Close(None)).await;
+                            break;
+                        }
+                        Ok(SessionRevocation::AllExcept(rev_uid, keep))
+                            if rev_uid == user_id && token_sha256.as_deref() != Some(keep.as_str()) =>
+                        {
+                            let _ = socket.send(WsMessage::Close(None)).await;
+                            break;
+                        }
+                        Ok(_) => {}
+                        Err(broadcast::error::RecvError::Lagged(_)) => {
+                            // Fail closed on revocation channel lag so a missed revocation never leaves a dead session open.
+                            let _ = socket.send(WsMessage::Close(None)).await;
+                            break;
+                        }
+                        Err(broadcast::error::RecvError::Closed) => break,
                     }
                 }
                 recv = rx.recv() => {
@@ -361,6 +392,7 @@ impl RelayHub {
 
         let (tx, mut rx) = mpsc::channel::<Arc<RelayWireFrame>>(512);
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let shutdown_tx_w = shutdown_tx.clone();
         let write_task = tokio::spawn(async move {
             while let Some(frame) = rx.recv().await {
                 if let Ok(encoded) = frame.encode_length_delimited() {
@@ -369,6 +401,7 @@ impl RelayHub {
                     }
                 }
             }
+            let _ = shutdown_tx_w.send(true);
         });
         let write_abort = write_task.abort_handle();
         let conn_id = match self
@@ -449,6 +482,7 @@ impl RelayHub {
 
         let (tx, mut rx) = mpsc::channel::<Arc<RelayWireFrame>>(512);
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let shutdown_tx_w = shutdown_tx.clone();
         let write_task = tokio::spawn(async move {
             while let Some(frame) = rx.recv().await {
                 if let Ok(txt) = serde_json::to_string(&*frame) {
@@ -457,6 +491,7 @@ impl RelayHub {
                     }
                 }
             }
+            let _ = shutdown_tx_w.send(true);
             let _ = ws_sink.send(WsMessage::Close(None)).await;
         });
         let write_abort = write_task.abort_handle();
@@ -869,22 +904,28 @@ impl RelayHub {
                         session_auth,
                     });
                     if let Err(err) = target_tx.try_send(forwarded) {
-                        if matches!(err, mpsc::error::TrySendError::Full(_)) {
-                            if let Some((back_tx, _)) = self
-                                .pick_target_sender(
-                                    sender.user_id,
-                                    sender.device_id,
-                                    TrafficLane::ControlP0,
-                                )
-                                .await
-                            {
-                                let _ = back_tx.try_send(Arc::new(RelayWireFrame::Error {
-                                    code: "peer_backpressure".into(),
-                                    message: format!(
-                                        "target device {dst_device_id} outbound queue full"
-                                    ),
-                                }));
-                            }
+                        let (code, msg) = match err {
+                            mpsc::error::TrySendError::Full(_) => (
+                                "peer_backpressure",
+                                format!("target device {dst_device_id} outbound queue full"),
+                            ),
+                            mpsc::error::TrySendError::Closed(_) => (
+                                "peer_offline",
+                                format!("target device {dst_device_id} connection closed"),
+                            ),
+                        };
+                        if let Some((back_tx, _)) = self
+                            .pick_target_sender(
+                                sender.user_id,
+                                sender.device_id,
+                                TrafficLane::ControlP0,
+                            )
+                            .await
+                        {
+                            let _ = back_tx.try_send(Arc::new(RelayWireFrame::Error {
+                                code: code.into(),
+                                message: msg,
+                            }));
                         }
                     }
                 } else if let Some((back_tx, _)) = self

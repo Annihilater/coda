@@ -914,7 +914,7 @@ impl Db {
         current_password: &str,
         new_password: &str,
         keep_token_sha256: Option<&str>,
-    ) -> Result<()> {
+    ) -> Result<Vec<String>> {
         if new_password.len() < 6 || new_password.len() > MAX_PASSWORD_BYTES {
             bail!("new password must be 6..={MAX_PASSWORD_BYTES} bytes");
         }
@@ -950,18 +950,22 @@ impl Db {
             &[&user_id, &new_hash],
         )
         .await?;
-        if let Some(keep) = keep_token_sha256 {
-            tx.execute(
-                "DELETE FROM auth_sessions WHERE user_id = $1 AND token_sha256 <> $2",
+        let revoked_rows = if let Some(keep) = keep_token_sha256 {
+            tx.query(
+                "DELETE FROM auth_sessions WHERE user_id = $1 AND token_sha256 <> $2 RETURNING token_sha256",
                 &[&user_id, &keep],
             )
-            .await?;
+            .await?
         } else {
-            tx.execute("DELETE FROM auth_sessions WHERE user_id = $1", &[&user_id])
-                .await?;
-        }
+            tx.query(
+                "DELETE FROM auth_sessions WHERE user_id = $1 RETURNING token_sha256",
+                &[&user_id],
+            )
+            .await?
+        };
+        let revoked_hashes: Vec<String> = revoked_rows.into_iter().map(|r| r.get(0)).collect();
         tx.commit().await?;
-        Ok(())
+        Ok(revoked_hashes)
     }
 
     pub async fn delete_user_account(&self, user_id: Uuid, password: &str) -> Result<Vec<Uuid>> {
