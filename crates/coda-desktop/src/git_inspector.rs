@@ -191,8 +191,8 @@ pub fn compute_repo_snapshot(
     }
 
     let selected_item = requested_item.map(String::from).or_else(|| {
-        if let Some(first_file) = changed_files.first() {
-            Some(format!("file:{}", first_file.path))
+        if !changed_files.is_empty() {
+            Some("all".to_string())
         } else {
             recent_commits
                 .first()
@@ -201,6 +201,31 @@ pub fn compute_repo_snapshot(
     });
 
     let (diff_title, diff_text) = match selected_item.as_deref() {
+        Some("all") => {
+            let mut patch = run_git(repo_path, &["diff", "HEAD"]).unwrap_or_default();
+            if patch.trim().is_empty() {
+                patch = run_git(repo_path, &["diff", "--cached"]).unwrap_or_default();
+            }
+            if patch.trim().is_empty() {
+                patch = run_git(repo_path, &["diff"]).unwrap_or_default();
+            }
+            if patch.trim().is_empty() {
+                let mut combined = String::new();
+                for entry in changed_files.iter().take(8) {
+                    if let Some(abs) = resolve_contained_path(repo_path, &entry.path) {
+                        if !combined.is_empty() {
+                            combined.push('\n');
+                        }
+                        combined.push_str(&read_untracked_diff_preview(&abs, &entry.path));
+                    }
+                }
+                patch = combined;
+            }
+            (
+                format!("Working Tree ({branch})"),
+                truncate_lines(&patch, 450),
+            )
+        }
         Some(sel) if sel.starts_with("file:") => {
             let rel = &sel["file:".len()..];
             let mut patch = run_git(repo_path, &["diff", "HEAD", "--", rel]).unwrap_or_default();

@@ -24,15 +24,203 @@ use crate::config::{
 };
 use crate::git_inspector::{RepoInspectorSnapshot, WorkspaceFileEntry};
 use crate::helpers::{
-    herdr_status_to_osc, load_desktop_daemon_config, normalize_newlines_for_vt,
-    parse_git_status_short, path_within_root, save_desktop_daemon_config,
+    format_pasted_terminal_path, herdr_status_to_osc, load_desktop_daemon_config,
+    normalize_newlines_for_vt, parse_git_status_short, path_within_root,
+    save_desktop_daemon_config,
 };
+use crate::port_preview::{PortPreviewTunnelManager, TunnelTargetKey};
 use crate::pty::LocalPtyManager;
 use crate::smart_path::DesktopSmartPathPolicy;
 use crate::{
     ActiveInputTarget, CodaDesktopState, CodaGpuWorkspaceView, SpaceEntry, SplitPane,
     TerminalSessionEntry,
 };
+
+fn default_notify_true() -> bool {
+    true
+}
+
+/// Zero-knowledge offline webhook push settings synced via `/api/v1/me/notifications`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct NotificationWebhookSettings {
+    #[serde(default)]
+    pub bark_url: String,
+    #[serde(default)]
+    pub telegram_bot_token: String,
+    #[serde(default)]
+    pub telegram_chat_id: String,
+    #[serde(default)]
+    pub feishu_webhook_url: String,
+    #[serde(default)]
+    pub discord_webhook_url: String,
+    #[serde(default)]
+    pub generic_webhook_url: String,
+    #[serde(default = "default_notify_true")]
+    pub notify_on_needs_you: bool,
+    #[serde(default = "default_notify_true")]
+    pub notify_on_finished: bool,
+}
+
+impl Default for NotificationWebhookSettings {
+    fn default() -> Self {
+        Self {
+            bark_url: String::new(),
+            telegram_bot_token: String::new(),
+            telegram_chat_id: String::new(),
+            feishu_webhook_url: String::new(),
+            discord_webhook_url: String::new(),
+            generic_webhook_url: String::new(),
+            notify_on_needs_you: true,
+            notify_on_finished: true,
+        }
+    }
+}
+
+pub async fn api_get_notification_webhooks(
+    server_url: &str,
+    token: &str,
+) -> Result<NotificationWebhookSettings, String> {
+    let base = server_url.trim().trim_end_matches('/');
+    if !is_safe_http_url(base) {
+        return Err("Invalid server URL".into());
+    }
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client
+        .get(format!("{base}/api/v1/me/notifications"))
+        .bearer_auth(token.trim())
+        .send()
+        .await
+        .map_err(|e| format!("GET /api/v1/me/notifications failed: {e}"))?;
+    let status = resp.status();
+    let txt = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(format!(
+            "Load notification settings failed (HTTP {}): {}",
+            status.as_u16(),
+            txt.chars().take(160).collect::<String>()
+        ));
+    }
+    serde_json::from_str::<NotificationWebhookSettings>(&txt)
+        .map_err(|e| format!("Invalid notification settings JSON: {e}"))
+}
+
+pub async fn api_put_notification_webhooks(
+    server_url: &str,
+    token: &str,
+    settings: &NotificationWebhookSettings,
+) -> Result<NotificationWebhookSettings, String> {
+    let base = server_url.trim().trim_end_matches('/');
+    if !is_safe_http_url(base) {
+        return Err("Invalid server URL".into());
+    }
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client
+        .put(format!("{base}/api/v1/me/notifications"))
+        .bearer_auth(token.trim())
+        .json(settings)
+        .send()
+        .await
+        .map_err(|e| format!("PUT /api/v1/me/notifications failed: {e}"))?;
+    let status = resp.status();
+    let txt = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(format!(
+            "Save notification settings failed (HTTP {}): {}",
+            status.as_u16(),
+            txt.chars().take(160).collect::<String>()
+        ));
+    }
+    serde_json::from_str::<NotificationWebhookSettings>(&txt).or_else(|_| Ok(settings.clone()))
+}
+
+pub async fn api_test_notification_webhooks(
+    server_url: &str,
+    token: &str,
+) -> Result<(usize, Vec<String>), String> {
+    let base = server_url.trim().trim_end_matches('/');
+    if !is_safe_http_url(base) {
+        return Err("Invalid server URL".into());
+    }
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client
+        .post(format!("{base}/api/v1/me/notifications/test"))
+        .bearer_auth(token.trim())
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .map_err(|e| format!("POST /api/v1/me/notifications/test failed: {e}"))?;
+    let status = resp.status();
+    let txt = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(format!(
+            "Test push failed (HTTP {}): {}",
+            status.as_u16(),
+            txt.chars().take(160).collect::<String>()
+        ));
+    }
+    let val: serde_json::Value = serde_json::from_str(&txt).unwrap_or_default();
+    let delivered = val
+        .get("delivered_channels")
+        .and_then(|v| v.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+    let errors: Vec<String> = val
+        .get("errors")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|x| x.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok((delivered, errors))
+}
+
+pub async fn api_prune_stale_web_devices(
+    server_url: &str,
+    token: &str,
+    max_idle_days: u32,
+) -> Result<u64, String> {
+    let base = server_url.trim().trim_end_matches('/');
+    if !is_safe_http_url(base) {
+        return Err("Invalid server URL".into());
+    }
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client
+        .post(format!("{base}/api/v1/devices/prune-stale"))
+        .bearer_auth(token.trim())
+        .json(&serde_json::json!({ "max_idle_days": max_idle_days }))
+        .send()
+        .await
+        .map_err(|e| format!("POST /api/v1/devices/prune-stale failed: {e}"))?;
+    let status = resp.status();
+    let txt = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(format!(
+            "Prune web devices failed (HTTP {}): {}",
+            status.as_u16(),
+            txt.chars().take(160).collect::<String>()
+        ));
+    }
+    let val: serde_json::Value = serde_json::from_str(&txt).unwrap_or_default();
+    let count = val
+        .get("pruned_count")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    Ok(count)
+}
 
 pub(crate) static EMBEDDED_HOST_STARTED: AtomicBool = AtomicBool::new(false);
 
@@ -51,11 +239,13 @@ pub struct RemoteMeshHub {
     embedded_host_gen: AtomicU64,
     peer_connect_locks: tokio::sync::Mutex<HashMap<Uuid, Arc<tokio::sync::Mutex<()>>>>,
     smart_path: tokio::sync::Mutex<DesktopSmartPathPolicy>,
+    tunnel_mgr: Arc<PortPreviewTunnelManager>,
     watcher_gen: AtomicU64,
 }
 
 impl Drop for RemoteMeshHub {
     fn drop(&mut self) {
+        self.tunnel_mgr.stop_all();
         self.embedded_host_gen.fetch_add(1, Ordering::AcqRel);
         if let Ok(mut guard) = self.embedded_host_handle.try_lock() {
             if let Some(handle) = guard.take() {
@@ -94,6 +284,7 @@ impl RemoteMeshHub {
             embedded_host_gen: AtomicU64::new(0),
             peer_connect_locks: tokio::sync::Mutex::new(HashMap::new()),
             smart_path: tokio::sync::Mutex::new(DesktopSmartPathPolicy::default()),
+            tunnel_mgr: PortPreviewTunnelManager::new(),
             watcher_gen: AtomicU64::new(0),
         })
     }
@@ -300,6 +491,7 @@ impl RemoteMeshHub {
         self.client_identities.lock().await.clear();
         self.peer_connect_locks.lock().await.clear();
         self.smart_path.lock().await.reset_all();
+        self.tunnel_mgr.stop_all();
         DesktopClientIdentityRecord::remove_saved();
 
         let mut removed_remote_sids = Vec::new();
@@ -312,6 +504,11 @@ impl RemoteMeshHub {
             g.embedded_host_active = false;
             g.remote_hosts.clear();
             g.remote_probe_status = None;
+            g.webhook_settings = NotificationWebhookSettings::default();
+            g.webhook_loading = false;
+            g.port_preview.active_tunnel_url = None;
+            g.port_preview.active_tunnel_key = None;
+            g.port_preview.tunnel_starting = false;
             g.clear_settings_ephemeral_inputs();
             g.notify_tracker.reset();
             g.spaces.retain(|sp| !sp.is_remote);
@@ -481,10 +678,18 @@ impl RemoteMeshHub {
             };
             match delete_account_device(&cfg.server_url, tok, device_id).await {
                 Ok(()) => {
+                    hub.tunnel_mgr.stop_all_for_device(device_id);
                     hub.drop_peer(device_id).await;
                     let host_str = device_id.to_string();
                     let mut removed_sids = Vec::new();
                     if let Ok(mut g) = hub.state.lock() {
+                        if g.port_preview.active_tunnel_key.and_then(|k| k.device_id)
+                            == Some(device_id)
+                        {
+                            g.port_preview.active_tunnel_url = None;
+                            g.port_preview.active_tunnel_key = None;
+                            g.port_preview.tunnel_starting = false;
+                        }
                         g.remote_hosts.retain(|h| h.id != device_id);
                         g.spaces.retain(|sp| sp.machine_id != host_str);
                         if g.renaming_host_id == Some(device_id) {
@@ -539,6 +744,7 @@ impl RemoteMeshHub {
 
     pub fn sign_out(self: &Arc<Self>) {
         self.watcher_gen.fetch_add(1, Ordering::AcqRel);
+        self.tunnel_mgr.stop_all();
         EMBEDDED_HOST_STARTED.store(false, Ordering::Release);
 
         let cfg_path = DaemonConfig::default_path();
@@ -568,6 +774,11 @@ impl RemoteMeshHub {
             g.account_email.clear();
             g.auth_account_input.clear();
             g.auth_password_input.clear();
+            g.webhook_settings = NotificationWebhookSettings::default();
+            g.webhook_loading = false;
+            g.port_preview.active_tunnel_url = None;
+            g.port_preview.active_tunnel_key = None;
+            g.port_preview.tunnel_starting = false;
             g.clear_settings_ephemeral_inputs();
             g.notify_tracker.reset();
             g.device_login_code = None;
@@ -2176,6 +2387,149 @@ impl RemoteMeshHub {
         });
     }
 
+    /// Sends an E2EE `PeerMessage::GitDiffRequest` to `device_id` and returns `(branch, status_short, diff_unified)`.
+    pub async fn fetch_remote_git_diff(
+        self: &Arc<Self>,
+        device_id: Uuid,
+        cwd: &str,
+    ) -> Result<(String, String, String), String> {
+        let peer = self
+            .ensure_peer_for_host(device_id)
+            .await
+            .ok_or_else(|| "Remote host is not connected".to_string())?;
+        let req = PeerMessage::GitDiffRequest {
+            req_id: format!("gd-{}", Uuid::new_v4().simple()),
+            cwd: cwd.to_string(),
+        };
+        match peer
+            .request(req, TrafficLane::BulkP1, Duration::from_secs(10))
+            .await
+        {
+            Ok(PeerMessage::GitDiffResponse {
+                branch,
+                status_short,
+                diff_unified,
+                ..
+            }) => Ok((branch, status_short, diff_unified)),
+            Ok(_) => Err("Unexpected E2EE GitDiffResponse from remote host".to_string()),
+            Err(e) => Err(format!("{e}")),
+        }
+    }
+
+    fn apply_remote_git_diff_response(
+        &self,
+        device_id: Uuid,
+        space_id_hint: Option<&str>,
+        cwd: &str,
+        branch: String,
+        status_short: String,
+        diff_unified: String,
+    ) {
+        let changed_files = parse_git_status_short(&status_short);
+        let is_git_repo =
+            !branch.trim().is_empty() || !status_short.trim().is_empty() || !diff_unified.trim().is_empty();
+        let clean_branch = if branch.trim().is_empty() {
+            "online".to_string()
+        } else {
+            branch.trim().to_string()
+        };
+        let host_id_str = device_id.to_string();
+        if let Ok(mut g) = self.state.lock() {
+            g.git_diff_loading = false;
+            for sp in &mut g.spaces {
+                if sp.machine_id == host_id_str
+                    && (space_id_hint == Some(sp.id.as_str()) || sp.path == cwd)
+                {
+                    if is_git_repo {
+                        sp.branch = clean_branch.clone();
+                    }
+                    sp.dirty_files = changed_files.len();
+                }
+            }
+            let active_matches_host = g
+                .focused_session_id()
+                .and_then(|sid| g.session_by_id(sid))
+                .and_then(|s| s.remote_host_id.as_deref())
+                == Some(host_id_str.as_str())
+                || g.active_space()
+                    .map(|sp| sp.is_remote && sp.machine_id == host_id_str)
+                    .unwrap_or(false)
+                || (space_id_hint.is_some() && g.active_space_id.as_deref() == space_id_hint);
+
+            if active_matches_host {
+                if let Some(ref sel) = g.selected_change_path {
+                    if !changed_files.iter().any(|f| &f.path == sel) {
+                        g.selected_change_path = None;
+                    }
+                }
+                let repo_name = Path::new(cwd)
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .filter(|s| !s.is_empty() && *s != ".")
+                    .unwrap_or("remote")
+                    .to_string();
+                g.repo_snapshot = RepoInspectorSnapshot {
+                    repo_path: cwd.to_string(),
+                    repo_name,
+                    is_git_repo,
+                    branch: if is_git_repo {
+                        clean_branch
+                    } else {
+                        String::new()
+                    },
+                    head_summary: format!("{} changed (E2EE remote)", changed_files.len()),
+                    diff_added: diff_unified
+                        .lines()
+                        .filter(|l| l.starts_with('+') && !l.starts_with("+++"))
+                        .count() as u32,
+                    diff_deleted: diff_unified
+                        .lines()
+                        .filter(|l| l.starts_with('-') && !l.starts_with("---"))
+                        .count() as u32,
+                    changed_files,
+                    diff_title: format!("{cwd} · remote diff"),
+                    diff_text: if diff_unified.trim().is_empty() {
+                        "Clean working tree on remote host.".to_string()
+                    } else {
+                        diff_unified
+                    },
+                    ..Default::default()
+                };
+            }
+        }
+        self.ui_dirty.store(true, Ordering::Release);
+    }
+
+    /// Requests an E2EE `GitDiffRequest` for `(device_id, cwd)` and updates the Right Drawer `Changes` inspector.
+    pub fn request_remote_git_diff(self: &Arc<Self>, device_id: Uuid, cwd: String) {
+        if let Ok(mut g) = self.state.lock() {
+            g.git_diff_loading = true;
+        }
+        self.ui_dirty.store(true, Ordering::Release);
+        let hub = Arc::clone(self);
+        self.spawn_bg(async move {
+            match hub.fetch_remote_git_diff(device_id, &cwd).await {
+                Ok((branch, status_short, diff_unified)) => {
+                    hub.apply_remote_git_diff_response(
+                        device_id,
+                        None,
+                        &cwd,
+                        branch,
+                        status_short,
+                        diff_unified,
+                    );
+                }
+                Err(err) => {
+                    if let Ok(mut g) = hub.state.lock() {
+                        g.git_diff_loading = false;
+                        g.status_notice = Some(format!("Remote Git diff failed: {err}"));
+                    }
+                    hub.ui_dirty.store(true, Ordering::Release);
+                }
+            }
+        });
+    }
+
     pub fn refresh_remote_git_diff(
         self: &Arc<Self>,
         host_id: Uuid,
@@ -2185,68 +2539,29 @@ impl RemoteMeshHub {
         let hub = Arc::clone(self);
         let space_id = space_id.to_string();
         let cwd = cwd.to_string();
+        if let Ok(mut g) = hub.state.lock() {
+            if g.active_space_id.as_deref() == Some(space_id.as_str()) {
+                g.git_diff_loading = true;
+            }
+        }
         self.spawn_bg(async move {
-            let Some(peer) = hub.ensure_peer_for_host(host_id).await else {
-                return;
-            };
-            let req = PeerMessage::GitDiffRequest {
-                req_id: format!("gd-{}", Uuid::new_v4().simple()),
-                cwd: cwd.clone(),
-            };
-            if let Ok(PeerMessage::GitDiffResponse {
-                branch,
-                status_short,
-                diff_unified,
-                ..
-            }) = peer
-                .request(req, TrafficLane::BulkP1, Duration::from_secs(8))
-                .await
-            {
-                let changed_files = parse_git_status_short(&status_short);
-                let clean_branch = if branch.trim().is_empty() {
-                    "online".to_string()
-                } else {
-                    branch.trim().to_string()
-                };
-                if let Ok(mut g) = hub.state.lock() {
-                    if let Some(sp) = g.spaces.iter_mut().find(|s| s.id == space_id) {
-                        sp.branch = clean_branch.clone();
-                        sp.dirty_files = changed_files.len();
-                    }
-                    if g.active_space_id.as_deref() == Some(space_id.as_str()) {
-                        let repo_name = Path::new(&cwd)
-                            .file_name()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or("remote")
-                            .to_string();
-                        g.repo_snapshot = RepoInspectorSnapshot {
-                            repo_path: cwd.clone(),
-                            repo_name,
-                            is_git_repo: !status_short.is_empty()
-                                || !diff_unified.is_empty()
-                                || clean_branch != "online",
-                            branch: clean_branch,
-                            head_summary: format!("{} changed (remote)", changed_files.len()),
-                            diff_added: diff_unified
-                                .lines()
-                                .filter(|l| l.starts_with('+') && !l.starts_with("+++"))
-                                .count() as u32,
-                            diff_deleted: diff_unified
-                                .lines()
-                                .filter(|l| l.starts_with('-') && !l.starts_with("---"))
-                                .count() as u32,
-                            changed_files,
-                            diff_title: format!("{cwd} · remote diff"),
-                            diff_text: if diff_unified.trim().is_empty() {
-                                "Clean working tree on remote host.".to_string()
-                            } else {
-                                diff_unified
-                            },
-                            ..Default::default()
-                        };
-                    }
+            match hub.fetch_remote_git_diff(host_id, &cwd).await {
+                Ok((branch, status_short, diff_unified)) => {
+                    hub.apply_remote_git_diff_response(
+                        host_id,
+                        Some(&space_id),
+                        &cwd,
+                        branch,
+                        status_short,
+                        diff_unified,
+                    );
                 }
-                hub.ui_dirty.store(true, Ordering::Release);
+                Err(_) => {
+                    if let Ok(mut g) = hub.state.lock() {
+                        g.git_diff_loading = false;
+                    }
+                    hub.ui_dirty.store(true, Ordering::Release);
+                }
             }
         });
     }
@@ -2432,92 +2747,461 @@ impl RemoteMeshHub {
         });
     }
 
-    pub fn request_remote_port_preview(self: &Arc<Self>, host_id: Uuid, port: u16, path: String) {
+    /// Sends an E2EE `HttpLocalPreviewRequest` to `device_id` and decodes `body_b64` into raw `Vec<u8>` bytes
+    /// so HTML, JS, CSS, PNG, SVG, and WASM assets all traverse intact.
+    pub async fn request_remote_port_preview(
+        self: &Arc<Self>,
+        device_id: Uuid,
+        remote_port: u16,
+        path_and_query: String,
+    ) -> Result<(u16, String, Vec<u8>), String> {
+        let cfg = load_desktop_daemon_config(&DaemonConfig::default_path())
+            .map_err(|_| "Sign in required before previewing remote ports.".to_string())?;
+        let host = self
+            .state
+            .lock()
+            .ok()
+            .and_then(|g| g.remote_hosts.iter().find(|h| h.id == device_id).cloned())
+            .ok_or_else(|| "Remote host not found.".to_string())?;
+        let peer = self
+            .get_or_connect_peer(&cfg, &host)
+            .await
+            .map_err(|err| format!("Host unreachable: {err}"))?;
+        let reply = peer
+            .request(
+                PeerMessage::HttpLocalPreviewRequest {
+                    req_id: format!("pp-{}", Uuid::new_v4().simple()),
+                    port: remote_port,
+                    path: path_and_query,
+                },
+                TrafficLane::BulkP1,
+                Duration::from_secs(12),
+            )
+            .await
+            .map_err(|err| format!("Preview error: {err}"))?;
+        match reply {
+            PeerMessage::HttpLocalPreviewResponse {
+                status_code,
+                content_type,
+                body_b64,
+                ..
+            } => {
+                let raw_bytes = crate::port_preview::decode_remote_preview_raw_bytes(&body_b64)?;
+                Ok((status_code, content_type, raw_bytes))
+            }
+            _ => Err("Unexpected E2EE response from host.".to_string()),
+        }
+    }
+
+    pub fn spawn_remote_port_preview_snapshot(
+        self: &Arc<Self>,
+        device_id: Uuid,
+        port: u16,
+        path: String,
+    ) {
         let hub = Arc::clone(self);
         self.spawn_bg(async move {
-            let Ok(cfg) = load_desktop_daemon_config(&DaemonConfig::default_path()) else {
-                if let Ok(mut g) = hub.state.lock() {
-                    g.port_preview.loading = false;
-                    g.port_preview.status_code = Some(401);
-                    g.port_preview.content_type = "text/plain".to_string();
-                    g.port_preview.body_preview =
-                        "Sign in required before previewing remote ports.".to_string();
+            match hub
+                .request_remote_port_preview(device_id, port, path)
+                .await
+            {
+                Ok((sc, ct, raw_bytes)) => {
+                    let body = crate::port_preview::format_preview_body_bytes(&raw_bytes, &ct);
+                    if let Ok(mut g) = hub.state.lock() {
+                        g.port_preview.loading = false;
+                        g.port_preview.status_code = Some(sc);
+                        g.port_preview.content_type = ct;
+                        g.port_preview.body_preview = body;
+                    }
                 }
-                hub.ui_dirty.store(true, Ordering::Release);
-                return;
-            };
-            let host_opt = hub
-                .state
-                .lock()
-                .ok()
-                .and_then(|g| g.remote_hosts.iter().find(|h| h.id == host_id).cloned());
-            let Some(host) = host_opt else {
-                if let Ok(mut g) = hub.state.lock() {
-                    g.port_preview.loading = false;
-                    g.port_preview.status_code = Some(404);
-                    g.port_preview.content_type = "text/plain".to_string();
-                    g.port_preview.body_preview = "Remote host not found.".to_string();
+                Err(err) => {
+                    let code = if err.contains("Sign in required") {
+                        401
+                    } else if err.contains("not found") {
+                        404
+                    } else {
+                        502
+                    };
+                    if let Ok(mut g) = hub.state.lock() {
+                        g.port_preview.loading = false;
+                        g.port_preview.status_code = Some(code);
+                        g.port_preview.content_type = "text/plain".to_string();
+                        g.port_preview.body_preview = err;
+                    }
                 }
-                hub.ui_dirty.store(true, Ordering::Release);
-                return;
-            };
-            match hub.get_or_connect_peer(&cfg, &host).await {
-                Ok(peer) => {
-                    let reply = peer
-                        .request(
-                            PeerMessage::HttpLocalPreviewRequest {
-                                req_id: format!("pp-{}", Uuid::new_v4().simple()),
+            }
+            hub.ui_dirty.store(true, Ordering::Release);
+        });
+    }
+
+    /// Spawns or reuses a strictly loopback (`127.0.0.1:0`) HTTP/1.1 proxy tunnel for `(device_id, remote_port)`.
+    pub fn open_live_loopback_tunnel(
+        self: &Arc<Self>,
+        device_id: Option<Uuid>,
+        remote_port: u16,
+        initial_path: String,
+        open_in_browser: bool,
+    ) {
+        let key = TunnelTargetKey {
+            device_id,
+            remote_port,
+        };
+        if let Some(existing_port) = self.tunnel_mgr.reusable_local_port(key) {
+            let base_url = format!("http://127.0.0.1:{existing_port}/");
+            let full_url = format!("http://127.0.0.1:{existing_port}{initial_path}");
+            if open_in_browser {
+                let _ = crate::port_preview::open_loopback_tunnel_in_browser(&full_url);
+            }
+            if let Ok(mut g) = self.state.lock() {
+                g.port_preview.tunnel_starting = false;
+                g.port_preview.active_tunnel_url = Some(base_url.clone());
+                g.port_preview.active_tunnel_key = Some(key);
+                g.status_notice = Some(format!("Live tunnel active: {base_url}"));
+            }
+            self.ui_dirty.store(true, Ordering::Release);
+            return;
+        }
+
+        if let Ok(mut g) = self.state.lock() {
+            g.port_preview.tunnel_starting = true;
+        }
+        self.ui_dirty.store(true, Ordering::Release);
+
+        let hub = Arc::clone(self);
+        self.spawn_bg(async move {
+            let hub_for_fetch = Arc::clone(&hub);
+            let spawn_res = crate::port_preview::spawn_loopback_http_proxy_with_fetcher(
+                remote_port,
+                move |port, path_and_query| {
+                    let hub_req = Arc::clone(&hub_for_fetch);
+                    async move {
+                        if let Some(did) = device_id {
+                            hub_req
+                                .request_remote_port_preview(did, port, path_and_query)
+                                .await
+                        } else {
+                            crate::port_preview::fetch_local_port_preview_raw(
                                 port,
-                                path,
-                            },
-                            TrafficLane::BulkP1,
-                            Duration::from_secs(10),
-                        )
-                        .await;
-                    match reply {
-                        Ok(PeerMessage::HttpLocalPreviewResponse {
-                            status_code,
-                            content_type,
-                            body_b64,
-                            ..
-                        }) => {
-                            let (sc, ct, body) = crate::port_preview::decode_remote_preview_response(
-                                status_code,
-                                &content_type,
-                                &body_b64,
-                            );
-                            if let Ok(mut g) = hub.state.lock() {
-                                g.port_preview.loading = false;
-                                g.port_preview.status_code = Some(sc);
-                                g.port_preview.content_type = ct;
-                                g.port_preview.body_preview = body;
-                            }
+                                &path_and_query,
+                                crate::port_preview::max_local_tunnel_body_bytes(),
+                            )
+                            .await
                         }
-                        Ok(_) => {
-                            if let Ok(mut g) = hub.state.lock() {
-                                g.port_preview.loading = false;
-                                g.port_preview.status_code = Some(502);
-                                g.port_preview.content_type = "text/plain".to_string();
-                                g.port_preview.body_preview =
-                                    "Unexpected E2EE response from host.".to_string();
-                            }
-                        }
-                        Err(err) => {
-                            if let Ok(mut g) = hub.state.lock() {
-                                g.port_preview.loading = false;
-                                g.port_preview.status_code = Some(502);
-                                g.port_preview.content_type = "text/plain".to_string();
-                                g.port_preview.body_preview = format!("Preview error: {err}");
-                            }
-                        }
+                    }
+                },
+            )
+            .await;
+
+            match spawn_res {
+                Ok((local_port, stop_tx)) => {
+                    hub.tunnel_mgr.register_tunnel(key, local_port, stop_tx);
+                    let base_url = format!("http://127.0.0.1:{local_port}/");
+                    let full_url = format!("http://127.0.0.1:{local_port}{initial_path}");
+                    if open_in_browser {
+                        let _ = crate::port_preview::open_loopback_tunnel_in_browser(&full_url);
+                    }
+                    if let Ok(mut g) = hub.state.lock() {
+                        g.port_preview.tunnel_starting = false;
+                        g.port_preview.active_tunnel_url = Some(base_url.clone());
+                        g.port_preview.active_tunnel_key = Some(key);
+                        g.status_notice = Some(format!(
+                            "{}: {base_url}",
+                            tr(g.locale, "Live tunnel started", "已启动本地回环实时隧道")
+                        ));
                     }
                 }
                 Err(err) => {
                     if let Ok(mut g) = hub.state.lock() {
-                        g.port_preview.loading = false;
-                        g.port_preview.status_code = Some(502);
-                        g.port_preview.content_type = "text/plain".to_string();
-                        g.port_preview.body_preview = format!("Host unreachable: {err}");
+                        g.port_preview.tunnel_starting = false;
+                        g.status_notice = Some(err);
+                    }
+                }
+            }
+            hub.ui_dirty.store(true, Ordering::Release);
+        });
+    }
+
+    pub fn stop_live_loopback_tunnel(&self, key_opt: Option<TunnelTargetKey>) {
+        if let Some(key) = key_opt {
+            self.tunnel_mgr.stop_tunnel(key);
+        } else {
+            self.tunnel_mgr.stop_all();
+        }
+        if let Ok(mut g) = self.state.lock() {
+            g.port_preview.tunnel_starting = false;
+            g.port_preview.active_tunnel_url = None;
+            g.port_preview.active_tunnel_key = None;
+            g.status_notice = Some(
+                tr(
+                    g.locale,
+                    "Stopped loopback port tunnel",
+                    "已关闭本地回环端口隧道",
+                )
+                .to_string(),
+            );
+        }
+        self.ui_dirty.store(true, Ordering::Release);
+    }
+
+    /// Uploads a file (`UploadTerminalFile`) over E2EE to a remote terminal workspace and returns `(remote_path, bytes)`.
+    pub async fn request_upload_terminal_file(
+        self: &Arc<Self>,
+        device_id: Uuid,
+        terminal: String,
+        filename: String,
+        raw_bytes: Vec<u8>,
+    ) -> Result<(String, usize), String> {
+        let peer = self
+            .ensure_peer_for_host(device_id)
+            .await
+            .ok_or_else(|| "Remote host is not connected".to_string())?;
+        let req = PeerMessage::UploadTerminalFile {
+            req_id: format!("up-{}", Uuid::new_v4().simple()),
+            terminal,
+            filename,
+            data_b64: B64.encode(&raw_bytes),
+        };
+        match peer
+            .request(req, TrafficLane::BulkP1, Duration::from_secs(20))
+            .await
+        {
+            Ok(PeerMessage::UploadTerminalFileResult {
+                ok: true,
+                remote_path: Some(rpath),
+                bytes,
+                ..
+            }) if !rpath.trim().is_empty() => Ok((rpath, bytes)),
+            Ok(PeerMessage::UploadTerminalFileResult { error, .. }) => {
+                Err(error.unwrap_or_else(|| "Remote file upload rejected".to_string()))
+            }
+            Ok(_) => Err("Unexpected E2EE UploadTerminalFile response".to_string()),
+            Err(e) => Err(format!("E2EE upload failed: {e}")),
+        }
+    }
+
+    /// Uploads a clipboard screenshot PNG over E2EE to `terminal` and pastes the shell-escaped path + trailing space.
+    pub fn upload_clipboard_png_and_paste(
+        self: &Arc<Self>,
+        device_id: Uuid,
+        session_id: String,
+        terminal: String,
+        filename: String,
+        png_bytes: Vec<u8>,
+    ) {
+        if let Ok(mut g) = self.state.lock() {
+            g.status_notice = Some(
+                tr(
+                    g.locale,
+                    "Uploading clipboard screenshot over E2EE…",
+                    "正在通过 E2EE 加密上传剪贴板截图…",
+                )
+                .to_string(),
+            );
+        }
+        self.ui_dirty.store(true, Ordering::Release);
+
+        let hub = Arc::clone(self);
+        self.spawn_bg(async move {
+            match hub
+                .request_upload_terminal_file(device_id, terminal.clone(), filename, png_bytes)
+                .await
+            {
+                Ok((remote_path, bytes)) => {
+                    let pasted = format_pasted_terminal_path(&remote_path);
+                    hub.send_remote_pty_input(device_id, &terminal, pasted.into_bytes());
+                    if let Ok(mut g) = hub.state.lock() {
+                        if let Some(s) = g.sessions.iter_mut().find(|s| s.id == session_id) {
+                            s.scroll_offset = 0;
+                        }
+                        g.status_notice = Some(format!(
+                            "{}: {remote_path} ({bytes} B)",
+                            tr(g.locale, "Uploaded screenshot", "截图已加密上传并填入")
+                        ));
+                    }
+                }
+                Err(err) => {
+                    if let Ok(mut g) = hub.state.lock() {
+                        g.status_notice = Some(err);
+                    }
+                }
+            }
+            hub.ui_dirty.store(true, Ordering::Release);
+        });
+    }
+
+    pub fn fetch_notification_webhooks(self: &Arc<Self>) {
+        let hub = Arc::clone(self);
+        self.spawn_bg(async move {
+            let Ok(cfg) = load_desktop_daemon_config(&DaemonConfig::default_path()) else {
+                return;
+            };
+            let Some(ref tok) = cfg.session_token else {
+                return;
+            };
+            if let Ok(mut g) = hub.state.lock() {
+                g.webhook_loading = true;
+            }
+            hub.ui_dirty.store(true, Ordering::Release);
+
+            match api_get_notification_webhooks(&cfg.server_url, tok).await {
+                Ok(settings) => {
+                    if let Ok(mut g) = hub.state.lock() {
+                        g.webhook_loading = false;
+                        g.webhook_settings = settings;
+                    }
+                }
+                Err(_) => {
+                    if let Ok(mut g) = hub.state.lock() {
+                        g.webhook_loading = false;
+                    }
+                }
+            }
+            hub.ui_dirty.store(true, Ordering::Release);
+        });
+    }
+
+    pub fn save_notification_webhooks(self: &Arc<Self>, settings: NotificationWebhookSettings) {
+        let hub = Arc::clone(self);
+        self.spawn_bg(async move {
+            let Ok(cfg) = load_desktop_daemon_config(&DaemonConfig::default_path()) else {
+                if let Ok(mut g) = hub.state.lock() {
+                    g.status_notice = Some(
+                        tr(
+                            g.locale,
+                            "Sign in required to save notification webhooks",
+                            "请先登录账号再保存离线推送 Webhook",
+                        )
+                        .to_string(),
+                    );
+                }
+                hub.ui_dirty.store(true, Ordering::Release);
+                return;
+            };
+            let Some(ref tok) = cfg.session_token else {
+                return;
+            };
+            if let Ok(mut g) = hub.state.lock() {
+                g.webhook_loading = true;
+            }
+            hub.ui_dirty.store(true, Ordering::Release);
+
+            match api_put_notification_webhooks(&cfg.server_url, tok, &settings).await {
+                Ok(updated) => {
+                    if let Ok(mut g) = hub.state.lock() {
+                        g.webhook_loading = false;
+                        g.webhook_settings = updated;
+                        g.status_notice = Some(
+                            tr(
+                                g.locale,
+                                "Saved offline notification webhooks",
+                                "已保存离线通知 Webhook 配置",
+                            )
+                            .to_string(),
+                        );
+                    }
+                }
+                Err(err) => {
+                    if let Ok(mut g) = hub.state.lock() {
+                        g.webhook_loading = false;
+                        g.status_notice = Some(err);
+                    }
+                }
+            }
+            hub.ui_dirty.store(true, Ordering::Release);
+        });
+    }
+
+    pub fn test_notification_webhooks(self: &Arc<Self>) {
+        let hub = Arc::clone(self);
+        self.spawn_bg(async move {
+            let Ok(cfg) = load_desktop_daemon_config(&DaemonConfig::default_path()) else {
+                if let Ok(mut g) = hub.state.lock() {
+                    g.status_notice = Some(
+                        tr(
+                            g.locale,
+                            "Sign in required to test notification webhooks",
+                            "请先登录账号再发送测试推送",
+                        )
+                        .to_string(),
+                    );
+                }
+                hub.ui_dirty.store(true, Ordering::Release);
+                return;
+            };
+            let Some(ref tok) = cfg.session_token else {
+                return;
+            };
+            if let Ok(mut g) = hub.state.lock() {
+                g.webhook_loading = true;
+            }
+            hub.ui_dirty.store(true, Ordering::Release);
+
+            match api_test_notification_webhooks(&cfg.server_url, tok).await {
+                Ok((delivered, errors)) => {
+                    if let Ok(mut g) = hub.state.lock() {
+                        g.webhook_loading = false;
+                        g.status_notice = Some(if errors.is_empty() {
+                            format!(
+                                "{}: {delivered}",
+                                tr(
+                                    g.locale,
+                                    "Test alert delivered to channels",
+                                    "测试推送已送达渠道数"
+                                )
+                            )
+                        } else {
+                            format!("Delivered {delivered}, errors: {}", errors.join("; "))
+                        });
+                    }
+                }
+                Err(err) => {
+                    if let Ok(mut g) = hub.state.lock() {
+                        g.webhook_loading = false;
+                        g.status_notice = Some(err);
+                    }
+                }
+            }
+            hub.ui_dirty.store(true, Ordering::Release);
+        });
+    }
+
+    pub fn prune_offline_web_devices(self: &Arc<Self>) {
+        let hub = Arc::clone(self);
+        self.spawn_bg(async move {
+            let Ok(cfg) = load_desktop_daemon_config(&DaemonConfig::default_path()) else {
+                if let Ok(mut g) = hub.state.lock() {
+                    g.status_notice = Some(
+                        tr(
+                            g.locale,
+                            "Sign in required to prune offline web devices",
+                            "请先登录账号再清理离线 Web 设备",
+                        )
+                        .to_string(),
+                    );
+                }
+                hub.ui_dirty.store(true, Ordering::Release);
+                return;
+            };
+            let Some(ref tok) = cfg.session_token else {
+                return;
+            };
+            match api_prune_stale_web_devices(&cfg.server_url, tok, 0).await {
+                Ok(pruned) => {
+                    if let Ok(mut g) = hub.state.lock() {
+                        g.status_notice = Some(format!(
+                            "{}: {pruned}",
+                            tr(
+                                g.locale,
+                                "Pruned offline web devices",
+                                "已清理离线 Web 设备数量"
+                            )
+                        ));
+                    }
+                    hub.sync_all_hosts_and_sessions().await;
+                }
+                Err(err) => {
+                    if let Ok(mut g) = hub.state.lock() {
+                        g.status_notice = Some(err);
                     }
                 }
             }
@@ -2580,6 +3264,7 @@ pub(crate) fn spawn_device_login(
                             ui_dirty.store(true, Ordering::Release);
                             mesh_hub.ensure_embedded_host();
                             mesh_hub.start_account_sync();
+                            mesh_hub.fetch_notification_webhooks();
                         }
                         Err(err) => {
                             let msg = format!("Login failed: {err}");
@@ -2653,6 +3338,7 @@ pub(crate) fn spawn_password_login(
                     ui_dirty.store(true, Ordering::Release);
                     mesh_hub.ensure_embedded_host();
                     mesh_hub.start_account_sync();
+                    mesh_hub.fetch_notification_webhooks();
                 }
                 Err(err) => {
                     let msg = format!("Login error: {err}");

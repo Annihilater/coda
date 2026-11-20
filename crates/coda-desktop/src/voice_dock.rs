@@ -58,6 +58,17 @@ pub fn update_macos_dock_badge(needs_you_count: usize) {
     }
 }
 
+/// Resolved voice dictation strategy based on configured URL, API key, and host OS.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VoiceDictationMode {
+    /// Cloud Whisper API (with API key) or local loopback Whisper server (`127.0.0.1` / `localhost`, zero key needed).
+    WhisperApi { endpoint: String },
+    /// Zero-config macOS native system dictation (`startDictation:` into terminal IME) when Whisper API key is empty.
+    MacosSystemDictation,
+    /// Non-macOS host with empty API key against a non-loopback endpoint.
+    MissingApiKey,
+}
+
 /// Validates that a Whisper transcription base URL uses `https://` or loopback `http://`.
 pub fn validated_transcription_endpoint(base_url: &str) -> Result<String, String> {
     let trimmed = base_url.trim().trim_end_matches('/');
@@ -80,6 +91,97 @@ pub fn validated_transcription_endpoint(base_url: &str) -> Result<String, String
         return Err("Voice Base URL must use https:// (or http://127.0.0.1 for local Whisper)".into());
     }
     Ok(parsed.to_string())
+}
+
+/// Returns true if `endpoint` targets a local loopback Whisper server (`localhost`, `127.0.0.1`, `::1`).
+pub fn is_loopback_transcription_endpoint(endpoint: &str) -> bool {
+    reqwest::Url::parse(endpoint)
+        .ok()
+        .and_then(|u| {
+            u.host_str()
+                .map(|h| matches!(h, "localhost" | "127.0.0.1" | "::1" | "[::1]"))
+        })
+        .unwrap_or(false)
+}
+
+/// Pure OS-parameterized voice dictation mode resolver (deterministic in unit tests and `--self-test`).
+pub fn resolve_voice_dictation_mode_for_os(
+    base_url: &str,
+    api_key: &str,
+    is_macos: bool,
+) -> Result<VoiceDictationMode, String> {
+    let endpoint = validated_transcription_endpoint(base_url)?;
+    if !api_key.trim().is_empty() || is_loopback_transcription_endpoint(&endpoint) {
+        Ok(VoiceDictationMode::WhisperApi { endpoint })
+    } else if is_macos {
+        Ok(VoiceDictationMode::MacosSystemDictation)
+    } else {
+        Ok(VoiceDictationMode::MissingApiKey)
+    }
+}
+
+/// Resolves the active voice dictation strategy on the current host OS.
+pub fn resolve_voice_dictation_mode(
+    base_url: &str,
+    api_key: &str,
+) -> Result<VoiceDictationMode, String> {
+    resolve_voice_dictation_mode_for_os(base_url, api_key, cfg!(target_os = "macos"))
+}
+
+/// Triggers zero-config macOS System Dictation (`[NSApp sendAction:@selector(startDictation:) to:nil from:nil]`),
+/// streaming recognized speech directly into the active terminal via GPUI's `NSTextInputClient` IME bridge.
+/// Deterministic safe no-op (`false`) when `NSApp` is null in headless `--self-test` / `cargo test`.
+pub fn trigger_macos_system_dictation() -> bool {
+    #[cfg(target_os = "macos")]
+    unsafe {
+        extern "C" {
+            static NSApp: *mut c_void;
+            fn sel_registerName(name: *const c_char) -> *mut c_void;
+            fn objc_msgSend();
+        }
+        if NSApp.is_null() {
+            return false;
+        }
+        type SendActionFn = unsafe extern "C" fn(
+            *mut c_void,
+            *mut c_void,
+            *mut c_void,
+            *mut c_void,
+            *mut c_void,
+        ) -> bool;
+        let send_action: SendActionFn = std::mem::transmute(objc_msgSend as *const ());
+        let action_sel = sel_registerName(c"startDictation:".as_ptr());
+        let dispatch_sel = sel_registerName(c"sendAction:to:from:".as_ptr());
+        send_action(
+            NSApp,
+            dispatch_sel,
+            action_sel,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
+/// Clear status message displayed when Whisper API key is empty and zero-config macOS Dictation is used.
+pub fn macos_dictation_fallback_notice(invoked_appkit: bool, zh: bool) -> &'static str {
+    match (invoked_appkit, zh) {
+        (true, false) => {
+            "macOS System Dictation active — speak directly into terminal (or set Whisper API Key in Settings)"
+        }
+        (true, true) => {
+            "已启动 macOS 原生语音听写 — 请直接说话（或在设置中配置 Whisper API Key）"
+        }
+        (false, false) => {
+            "No Whisper API Key set — press Fn Fn for macOS Dictation, or configure Whisper API Key / 127.0.0.1 in Settings"
+        }
+        (false, true) => {
+            "未配置 Whisper API Key — 可连按两次 Fn 使用 macOS 原生听写，或在设置中配置 Whisper Key / 本地 127.0.0.1"
+        }
+    }
 }
 
 /// Builds an RFC 7578 `multipart/form-data` payload for `/audio/transcriptions`.
@@ -123,7 +225,14 @@ pub async fn transcribe_audio_file(
     api_key: &str,
     model: &str,
 ) -> Result<String, String> {
-    let endpoint = validated_transcription_endpoint(base_url)?;
+    let endpoint = match resolve_voice_dictation_mode(base_url, api_key)? {
+        VoiceDictationMode::WhisperApi { endpoint } => endpoint,
+        VoiceDictationMode::MacosSystemDictation | VoiceDictationMode::MissingApiKey => {
+            return Err(
+                "Whisper API Key is empty — use macOS System Dictation (🎙 Voice / Fn Fn) or configure a Whisper API Key or http://127.0.0.1 endpoint in Settings.".into(),
+            );
+        }
+    };
     let audio_bytes = std::fs::read(audio_path)
         .map_err(|e| format!("Failed reading recorded audio: {e}"))?;
     if audio_bytes.len() < 128 {
@@ -410,5 +519,31 @@ mod tests {
         let mp_str = String::from_utf8_lossy(&mp);
         assert!(mp_str.contains("filename=\"voice.m4a\""));
         assert!(mp_str.contains("whisper-1"));
+
+        // Zero-config macOS fallback resolution & deterministic headless behavior
+        assert_eq!(
+            resolve_voice_dictation_mode_for_os("https://api.openai.com/v1", "", true).unwrap(),
+            VoiceDictationMode::MacosSystemDictation
+        );
+        assert_eq!(
+            resolve_voice_dictation_mode_for_os("https://api.openai.com/v1", "", false).unwrap(),
+            VoiceDictationMode::MissingApiKey
+        );
+        assert_eq!(
+            resolve_voice_dictation_mode_for_os("https://api.openai.com/v1", "sk-test-123", true)
+                .unwrap(),
+            VoiceDictationMode::WhisperApi {
+                endpoint: "https://api.openai.com/v1/audio/transcriptions".to_string()
+            }
+        );
+        assert_eq!(
+            resolve_voice_dictation_mode_for_os("http://127.0.0.1:8080/v1", "", true).unwrap(),
+            VoiceDictationMode::WhisperApi {
+                endpoint: "http://127.0.0.1:8080/v1/audio/transcriptions".to_string()
+            }
+        );
+        assert!(!trigger_macos_system_dictation());
+        assert!(macos_dictation_fallback_notice(false, false).contains("Fn Fn"));
+        assert!(macos_dictation_fallback_notice(true, false).contains("macOS System Dictation"));
     }
 }

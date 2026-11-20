@@ -74,6 +74,25 @@ fn main() -> Result<()> {
         anyhow::ensure!(st.sessions.is_empty(), "default state must not seed fake sessions");
         anyhow::ensure!(st.spaces.is_empty(), "default state must not seed fake spaces");
         anyhow::ensure!(pty_ok, "real local PTY self-test failed to observe echoed marker");
+        anyhow::ensure!(
+            coda_desktop::helpers::format_pasted_terminal_path("/tmp/coda-paste-demo.png")
+                == "/tmp/coda-paste-demo.png ",
+            "clipboard path helper self-test failed"
+        );
+        anyhow::ensure!(
+            !coda_desktop::voice_dock::trigger_macos_system_dictation(),
+            "headless macOS dictation fallback must be a deterministic no-op"
+        );
+        let voice_mode = coda_desktop::voice_dock::resolve_voice_dictation_mode_for_os(
+            "https://api.openai.com/v1",
+            "",
+            true,
+        )
+        .map_err(anyhow::Error::msg)?;
+        anyhow::ensure!(
+            voice_mode == coda_desktop::voice_dock::VoiceDictationMode::MacosSystemDictation,
+            "empty Whisper API key on macOS must select MacosSystemDictation fallback"
+        );
 
         println!(
             "[OK] coda-desktop self-test passed: pty=live, git_repo={}, branch={}, diff_len={}, layout={}",

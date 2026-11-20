@@ -20,7 +20,7 @@ pub mod search_export;
 pub mod smart_path;
 pub mod voice_dock;
 
-pub use crate::remote_mesh::RemoteMeshHub;
+pub use crate::remote_mesh::{NotificationWebhookSettings, RemoteMeshHub};
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -51,7 +51,8 @@ use crate::git_inspector::{
     RepoInspectorSnapshot, WorkspaceFileEntry,
 };
 use crate::helpers::{
-    extract_file_diff_lines, herdr_status_to_osc, load_desktop_daemon_config, utf16_slice,
+    classify_diff_line, extract_file_diff_lines, format_pasted_terminal_path, herdr_status_to_osc,
+    load_desktop_daemon_config, utf16_slice, DiffLineKind,
 };
 #[cfg(test)]
 use crate::helpers::path_within_root;
@@ -82,6 +83,7 @@ actions!(
         ToggleTerminalSearch,
         ExportActiveSession,
         ToggleVoiceDictation,
+        JumpNextNeedsYou,
     ]
 );
 
@@ -121,6 +123,11 @@ pub enum ActiveInputTarget {
     VoiceApiKey,
     PreviewPort,
     PreviewPath,
+    WebhookBarkUrl,
+    WebhookTelegramToken,
+    WebhookTelegramChatId,
+    WebhookFeishuUrl,
+    WebhookDiscordUrl,
 }
 
 /// Primary or Secondary split terminal pane.
@@ -253,6 +260,7 @@ pub enum PaletteAction {
     OpenTerminalSearch,
     ExportActiveSession,
     ToggleVoiceDictation,
+    JumpNextNeedsYou,
 }
 
 /// Root serializable-free desktop state backing the Coda GPUI workbench.
@@ -286,6 +294,7 @@ pub struct CodaDesktopState {
     pub selected_file_rel: Option<String>,
     pub selected_file_content: String,
     pub selected_change_path: Option<String>,
+    pub git_diff_loading: bool,
     pub closed_session_ids: HashSet<String>,
     pub dismissed_spaces: HashSet<String>,
     pub did_auto_seed_local: bool,
@@ -330,6 +339,8 @@ pub struct CodaDesktopState {
     pub voice_api_key: String,
     pub voice_recording: bool,
     pub voice_transcribing: bool,
+    pub webhook_settings: NotificationWebhookSettings,
+    pub webhook_loading: bool,
     pub port_preview: crate::port_preview::PortPreviewState,
     pub status_notice: Option<String>,
 }
@@ -360,6 +371,7 @@ impl Default for CodaDesktopState {
             selected_file_rel: None,
             selected_file_content: String::new(),
             selected_change_path: None,
+            git_diff_loading: false,
             closed_session_ids: HashSet::new(),
             dismissed_spaces: HashSet::new(),
             did_auto_seed_local: false,
@@ -400,6 +412,8 @@ impl Default for CodaDesktopState {
             voice_api_key: String::new(),
             voice_recording: false,
             voice_transcribing: false,
+            webhook_settings: NotificationWebhookSettings::default(),
+            webhook_loading: false,
             port_preview: crate::port_preview::PortPreviewState::default(),
             status_notice: None,
         }
@@ -426,6 +440,25 @@ impl CodaDesktopState {
         self.sessions.iter().find(|s| s.id == id)
     }
 
+    /// Returns the next alive session in `NeedsYou` state, cycling from the currently focused session.
+    pub fn next_needs_you_session_id(&self) -> Option<String> {
+        let needs_you: Vec<&str> = self
+            .sessions
+            .iter()
+            .filter(|s| s.alive && s.effective_state() == AgentLifecycleState::NeedsYou)
+            .map(|s| s.id.as_str())
+            .collect();
+        if needs_you.is_empty() {
+            return None;
+        }
+        if let Some(cur_id) = self.focused_session_id() {
+            if let Some(pos) = needs_you.iter().position(|&id| id == cur_id) {
+                return Some(needs_you[(pos + 1) % needs_you.len()].to_string());
+            }
+        }
+        Some(needs_you[0].to_string())
+    }
+
     /// Clears transient Settings inputs (inline rename + plaintext password buffers) so they never
     /// leak across tab switches, modal closes, Escape, or sign-out.
     pub fn clear_settings_ephemeral_inputs(&mut self) {
@@ -446,6 +479,11 @@ impl CodaDesktopState {
                 | ActiveInputTarget::VoiceBaseUrl
                 | ActiveInputTarget::VoiceModel
                 | ActiveInputTarget::VoiceApiKey
+                | ActiveInputTarget::WebhookBarkUrl
+                | ActiveInputTarget::WebhookTelegramToken
+                | ActiveInputTarget::WebhookTelegramChatId
+                | ActiveInputTarget::WebhookFeishuUrl
+                | ActiveInputTarget::WebhookDiscordUrl
         ) {
             self.input_target = ActiveInputTarget::TerminalDirect;
         }
@@ -616,6 +654,17 @@ impl CodaDesktopState {
             .to_string(),
             detail: "Cmd+Shift+E · markdown export".to_string(),
             action: PaletteAction::ExportActiveSession,
+        });
+        items.push(PaletteItem {
+            kind_tag: "ACTION",
+            label: tr(
+                self.locale,
+                "Jump to Next Needs-You Session",
+                "跳转到下一个待确认 (Needs-You) 会话",
+            )
+            .to_string(),
+            detail: "Cmd+J · Needs Attention".to_string(),
+            action: PaletteAction::JumpNextNeedsYou,
         });
         items.push(PaletteItem {
             kind_tag: "ACTION",
@@ -1033,6 +1082,9 @@ impl CodaGpuWorkspaceView {
         spawn_herdr_discovery(Arc::clone(&state), Arc::clone(&pty_mgr), Arc::clone(&ui_dirty));
         mesh_hub.ensure_embedded_host();
         mesh_hub.start_account_sync();
+        if state.lock().map(|g| g.is_logged_in).unwrap_or(false) {
+            mesh_hub.fetch_notification_webhooks();
+        }
 
         // 50Hz UI pump + 1s hot-reload watcher for `~/.config/coda/layout.json`.
         let ui_dirty_pump = Arc::clone(&ui_dirty);
@@ -1268,10 +1320,27 @@ impl CodaGpuWorkspaceView {
                     (!g.port_preview.path_input.is_empty())
                         .then(|| (g.port_preview.path_input.clone(), false))
                 }
+                ActiveInputTarget::WebhookBarkUrl => {
+                    (!g.webhook_settings.bark_url.is_empty())
+                        .then(|| (g.webhook_settings.bark_url.clone(), false))
+                }
+                ActiveInputTarget::WebhookTelegramChatId => {
+                    (!g.webhook_settings.telegram_chat_id.is_empty())
+                        .then(|| (g.webhook_settings.telegram_chat_id.clone(), false))
+                }
+                ActiveInputTarget::WebhookFeishuUrl => {
+                    (!g.webhook_settings.feishu_webhook_url.is_empty())
+                        .then(|| (g.webhook_settings.feishu_webhook_url.clone(), false))
+                }
+                ActiveInputTarget::WebhookDiscordUrl => {
+                    (!g.webhook_settings.discord_webhook_url.is_empty())
+                        .then(|| (g.webhook_settings.discord_webhook_url.clone(), false))
+                }
                 ActiveInputTarget::AuthPassword
                 | ActiveInputTarget::ChangePwCurrent
                 | ActiveInputTarget::ChangePwNew
-                | ActiveInputTarget::VoiceApiKey => None,
+                | ActiveInputTarget::VoiceApiKey
+                | ActiveInputTarget::WebhookTelegramToken => None,
                 ActiveInputTarget::TerminalDirect if !g.settings_open => {
                     let id = g.focused_session_id()?.to_string();
                     drop(g);
@@ -1318,46 +1387,60 @@ impl CodaGpuWorkspaceView {
     }
 
     fn perform_paste_action(&self, cx: &mut Context<Self>) {
-        if let Some(txt) = cx.read_from_clipboard().and_then(|i| i.text()) {
-            let (target, palette_open, settings_open, focused_id) = self
-                .state
-                .lock()
-                .map(|g| {
-                    (
-                        g.input_target,
-                        g.palette_open,
-                        g.settings_open,
-                        g.focused_session_id().map(|s| s.to_string()),
-                    )
-                })
-                .unwrap_or((ActiveInputTarget::TerminalDirect, false, false, None));
-            if !palette_open && !settings_open && target == ActiveInputTarget::TerminalDirect {
-                if let Some(id) = focused_id {
-                    let bracketed = self
-                        .pty_mgr
-                        .lock()
-                        .map(|m| m.terminal_modes(&id).1)
-                        .unwrap_or(false);
-                    if let Ok(mut g) = self.state.lock() {
-                        if let Some(s) = g.sessions.iter_mut().find(|s| s.id == id) {
-                            s.scroll_offset = 0;
-                        }
-                    }
-                    if bracketed {
-                        // #38: Wrap paste in ?2004h bracketed paste markers & strip any forged terminator.
-                        let safe_txt = txt.replace("\x1b[201~", "");
-                        let mut bytes = Vec::with_capacity(safe_txt.len() + 12);
-                        bytes.extend_from_slice(b"\x1b[200~");
-                        bytes.extend_from_slice(safe_txt.as_bytes());
-                        bytes.extend_from_slice(b"\x1b[201~");
-                        self.send_bytes_to_session(&id, &bytes);
-                    } else {
-                        self.send_bytes_to_session(&id, txt.as_bytes());
-                    }
-                    cx.notify();
-                }
+        let (target, palette_open, settings_open, focused_id) = self
+            .state
+            .lock()
+            .map(|g| {
+                (
+                    g.input_target,
+                    g.palette_open,
+                    g.settings_open,
+                    g.focused_session_id().map(|s| s.to_string()),
+                )
+            })
+            .unwrap_or((ActiveInputTarget::TerminalDirect, false, false, None));
+
+        let clip_text = cx
+            .read_from_clipboard()
+            .and_then(|i| i.text())
+            .filter(|s| !s.is_empty());
+
+        if !palette_open && !settings_open && target == ActiveInputTarget::TerminalDirect {
+            let Some(id) = focused_id else {
                 return;
+            };
+            if let Some(txt) = clip_text {
+                let bracketed = self
+                    .pty_mgr
+                    .lock()
+                    .map(|m| m.terminal_modes(&id).1)
+                    .unwrap_or(false);
+                if let Ok(mut g) = self.state.lock() {
+                    if let Some(s) = g.sessions.iter_mut().find(|s| s.id == id) {
+                        s.scroll_offset = 0;
+                    }
+                }
+                if bracketed {
+                    // #38: Wrap paste in ?2004h bracketed paste markers & strip any forged terminator.
+                    let safe_txt = txt.replace("\x1b[201~", "");
+                    let mut bytes = Vec::with_capacity(safe_txt.len() + 12);
+                    bytes.extend_from_slice(b"\x1b[200~");
+                    bytes.extend_from_slice(safe_txt.as_bytes());
+                    bytes.extend_from_slice(b"\x1b[201~");
+                    self.send_bytes_to_session(&id, &bytes);
+                } else {
+                    self.send_bytes_to_session(&id, txt.as_bytes());
+                }
+                cx.notify();
+            } else {
+                // Clipboard holds no text — check for a screenshot/image PNG and upload or save for the PTY!
+                self.paste_clipboard_image_into_session(&id);
+                cx.notify();
             }
+            return;
+        }
+
+        if let Some(txt) = clip_text {
             let payload = if palette_open
                 || matches!(
                     target,
@@ -1370,6 +1453,10 @@ impl CodaGpuWorkspaceView {
                         | ActiveInputTarget::VoiceModel
                         | ActiveInputTarget::PreviewPort
                         | ActiveInputTarget::PreviewPath
+                        | ActiveInputTarget::WebhookBarkUrl
+                        | ActiveInputTarget::WebhookTelegramChatId
+                        | ActiveInputTarget::WebhookFeishuUrl
+                        | ActiveInputTarget::WebhookDiscordUrl
                 ) {
                 txt.trim().to_string()
             } else if matches!(
@@ -1378,6 +1465,7 @@ impl CodaGpuWorkspaceView {
                     | ActiveInputTarget::ChangePwCurrent
                     | ActiveInputTarget::ChangePwNew
                     | ActiveInputTarget::VoiceApiKey
+                    | ActiveInputTarget::WebhookTelegramToken
             ) {
                 // #39: Strip trailing newline when pasting from password managers.
                 txt.trim_end_matches(&['\r', '\n'][..]).to_string()
@@ -1387,6 +1475,77 @@ impl CodaGpuWorkspaceView {
             self.commit_text_to_active_target(&payload);
             cx.notify();
         }
+    }
+
+    fn paste_clipboard_image_into_session(&self, session_id: &str) {
+        let remote_info = self.state.lock().ok().and_then(|g| {
+            let s = g.session_by_id(session_id)?;
+            let hid = Uuid::parse_str(s.remote_host_id.as_deref()?).ok()?;
+            let term = s.hc_addr.clone()?;
+            Some((hid, term))
+        });
+        let session_id_owned = session_id.to_string();
+        let state_bg = Arc::clone(&self.state);
+        let pty_mgr_bg = Arc::clone(&self.pty_mgr);
+        let mesh_hub_bg = Arc::clone(&self.mesh_hub);
+        let ui_dirty_bg = Arc::clone(&self.ui_dirty);
+
+        std::thread::spawn(move || {
+            let Ok(png_bytes) = crate::helpers::extract_clipboard_png_bytes() else {
+                if let Ok(mut g) = state_bg.lock() {
+                    g.status_notice = Some(
+                        tr(
+                            g.locale,
+                            "Clipboard is empty (copy text or a screenshot first)",
+                            "剪贴板为空（请先复制文本或截图）",
+                        )
+                        .to_string(),
+                    );
+                }
+                ui_dirty_bg.store(true, Ordering::Release);
+                return;
+            };
+
+            if let Some((host_id, term_addr)) = remote_info {
+                let fname = format!(
+                    "clipboard-{}.png",
+                    &Uuid::new_v4().simple().to_string()[..12]
+                );
+                mesh_hub_bg.upload_clipboard_png_and_paste(
+                    host_id,
+                    session_id_owned,
+                    term_addr,
+                    fname,
+                    png_bytes,
+                );
+            } else {
+                match crate::helpers::save_clipboard_png_to_tmp(&png_bytes) {
+                    Ok(saved_path) => {
+                        let pasted = format_pasted_terminal_path(&saved_path.to_string_lossy());
+                        if let Ok(mgr) = pty_mgr_bg.lock() {
+                            let _ = mgr.write_input(&session_id_owned, pasted.as_bytes());
+                        }
+                        if let Ok(mut g) = state_bg.lock() {
+                            if let Some(s) = g.sessions.iter_mut().find(|s| s.id == session_id_owned)
+                            {
+                                s.scroll_offset = 0;
+                            }
+                            g.status_notice = Some(format!(
+                                "{}: {}",
+                                tr(g.locale, "Pasted screenshot", "已粘贴本地截图"),
+                                saved_path.display()
+                            ));
+                        }
+                    }
+                    Err(err) => {
+                        if let Ok(mut g) = state_bg.lock() {
+                            g.status_notice = Some(err);
+                        }
+                    }
+                }
+                ui_dirty_bg.store(true, Ordering::Release);
+            }
+        });
     }
 
     fn adjust_terminal_font_size(&self, delta: Option<f32>) {
@@ -1555,6 +1714,51 @@ impl CodaGpuWorkspaceView {
                     g.port_preview.path_input.push_str(text);
                 }
             }
+            ActiveInputTarget::WebhookBarkUrl => {
+                if let Ok(mut g) = self.state.lock() {
+                    if g.input_selected_all {
+                        g.webhook_settings.bark_url.clear();
+                        g.input_selected_all = false;
+                    }
+                    g.webhook_settings.bark_url.push_str(text);
+                }
+            }
+            ActiveInputTarget::WebhookTelegramToken => {
+                if let Ok(mut g) = self.state.lock() {
+                    if g.input_selected_all {
+                        g.webhook_settings.telegram_bot_token.clear();
+                        g.input_selected_all = false;
+                    }
+                    g.webhook_settings.telegram_bot_token.push_str(text);
+                }
+            }
+            ActiveInputTarget::WebhookTelegramChatId => {
+                if let Ok(mut g) = self.state.lock() {
+                    if g.input_selected_all {
+                        g.webhook_settings.telegram_chat_id.clear();
+                        g.input_selected_all = false;
+                    }
+                    g.webhook_settings.telegram_chat_id.push_str(text);
+                }
+            }
+            ActiveInputTarget::WebhookFeishuUrl => {
+                if let Ok(mut g) = self.state.lock() {
+                    if g.input_selected_all {
+                        g.webhook_settings.feishu_webhook_url.clear();
+                        g.input_selected_all = false;
+                    }
+                    g.webhook_settings.feishu_webhook_url.push_str(text);
+                }
+            }
+            ActiveInputTarget::WebhookDiscordUrl => {
+                if let Ok(mut g) = self.state.lock() {
+                    if g.input_selected_all {
+                        g.webhook_settings.discord_webhook_url.clear();
+                        g.input_selected_all = false;
+                    }
+                    g.webhook_settings.discord_webhook_url.push_str(text);
+                }
+            }
             ActiveInputTarget::CommandPalette => {}
         }
     }
@@ -1605,6 +1809,21 @@ impl CodaGpuWorkspaceView {
                                 ActiveInputTarget::VoiceApiKey => g.voice_api_key.clear(),
                                 ActiveInputTarget::PreviewPort => g.port_preview.port_input.clear(),
                                 ActiveInputTarget::PreviewPath => g.port_preview.path_input.clear(),
+                                ActiveInputTarget::WebhookBarkUrl => {
+                                    g.webhook_settings.bark_url.clear()
+                                }
+                                ActiveInputTarget::WebhookTelegramToken => {
+                                    g.webhook_settings.telegram_bot_token.clear()
+                                }
+                                ActiveInputTarget::WebhookTelegramChatId => {
+                                    g.webhook_settings.telegram_chat_id.clear()
+                                }
+                                ActiveInputTarget::WebhookFeishuUrl => {
+                                    g.webhook_settings.feishu_webhook_url.clear()
+                                }
+                                ActiveInputTarget::WebhookDiscordUrl => {
+                                    g.webhook_settings.discord_webhook_url.clear()
+                                }
                                 _ => {}
                             }
                         }
@@ -1629,6 +1848,11 @@ impl CodaGpuWorkspaceView {
                 }
                 "f" => {
                     self.toggle_terminal_search();
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                "j" => {
+                    self.jump_to_next_needs_you_session();
                     cx.notify();
                     cx.stop_propagation();
                 }
@@ -2164,6 +2388,74 @@ impl CodaGpuWorkspaceView {
                 }
                 _ => {}
             },
+            ActiveInputTarget::WebhookBarkUrl
+            | ActiveInputTarget::WebhookTelegramToken
+            | ActiveInputTarget::WebhookTelegramChatId
+            | ActiveInputTarget::WebhookFeishuUrl
+            | ActiveInputTarget::WebhookDiscordUrl => match key {
+                "backspace" => {
+                    if let Ok(mut g) = self.state.lock() {
+                        let sel_all = g.input_selected_all;
+                        g.input_selected_all = false;
+                        let field = match target {
+                            ActiveInputTarget::WebhookBarkUrl => &mut g.webhook_settings.bark_url,
+                            ActiveInputTarget::WebhookTelegramToken => {
+                                &mut g.webhook_settings.telegram_bot_token
+                            }
+                            ActiveInputTarget::WebhookTelegramChatId => {
+                                &mut g.webhook_settings.telegram_chat_id
+                            }
+                            ActiveInputTarget::WebhookFeishuUrl => {
+                                &mut g.webhook_settings.feishu_webhook_url
+                            }
+                            _ => &mut g.webhook_settings.discord_webhook_url,
+                        };
+                        if sel_all {
+                            field.clear();
+                        } else {
+                            field.pop();
+                        }
+                    }
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                "tab" => {
+                    if let Ok(mut g) = self.state.lock() {
+                        g.input_selected_all = false;
+                        g.input_target = match target {
+                            ActiveInputTarget::WebhookBarkUrl => {
+                                ActiveInputTarget::WebhookTelegramToken
+                            }
+                            ActiveInputTarget::WebhookTelegramToken => {
+                                ActiveInputTarget::WebhookTelegramChatId
+                            }
+                            ActiveInputTarget::WebhookTelegramChatId => {
+                                ActiveInputTarget::WebhookFeishuUrl
+                            }
+                            ActiveInputTarget::WebhookFeishuUrl => {
+                                ActiveInputTarget::WebhookDiscordUrl
+                            }
+                            _ => ActiveInputTarget::WebhookBarkUrl,
+                        };
+                    }
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                "enter" | "return" => {
+                    self.save_notification_webhooks();
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                "escape" => {
+                    if let Ok(mut g) = self.state.lock() {
+                        g.input_selected_all = false;
+                        g.input_target = ActiveInputTarget::TerminalDirect;
+                    }
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                _ => {}
+            },
             ActiveInputTarget::TerminalDirect | ActiveInputTarget::CommandPalette => {}
         }
     }
@@ -2468,28 +2760,98 @@ impl CodaGpuWorkspaceView {
         );
     }
 
+    pub(crate) fn trigger_refresh_git_diff(&self) {
+        let remote_target = self.state.lock().ok().and_then(|g| {
+            if let Some(sid) = g.focused_session_id() {
+                if let Some(sess) = g.session_by_id(sid) {
+                    if let Some(hid) = sess
+                        .remote_host_id
+                        .as_deref()
+                        .and_then(|s| Uuid::parse_str(s).ok())
+                    {
+                        let sp_path = g
+                            .spaces
+                            .iter()
+                            .find(|sp| sp.id == sess.space_id)
+                            .map(|sp| sp.path.clone())
+                            .unwrap_or_else(|| ".".to_string());
+                        let eff_cwd = if !sess.cwd.trim().is_empty() && sess.cwd != "." {
+                            sess.cwd.clone()
+                        } else {
+                            sp_path
+                        };
+                        return Some((hid, eff_cwd));
+                    }
+                }
+            }
+            let sp = g.active_space().filter(|s| s.is_remote)?;
+            let hid = Uuid::parse_str(&sp.machine_id).ok()?;
+            Some((hid, sp.path.clone()))
+        });
+        if let Some((device_id, cwd)) = remote_target {
+            self.mesh_hub.request_remote_git_diff(device_id, cwd);
+        } else {
+            self.refresh_active_space_inspector();
+        }
+    }
+
     fn refresh_inspector_arcs(
         state: &Arc<Mutex<CodaDesktopState>>,
         mesh_hub: &Arc<RemoteMeshHub>,
         inspector_seq: &Arc<AtomicU64>,
         ui_dirty: &Arc<AtomicBool>,
     ) {
-        let (space_id, space_path_str, remote_host_id, browse_rel, selected_change, selected_file_rel) = {
+        let (
+            space_id,
+            space_path_str,
+            remote_host_id,
+            remote_diff_cwd,
+            browse_rel,
+            selected_change,
+            selected_file_rel,
+        ) = {
             let Ok(g) = state.lock() else {
                 return;
             };
+            let focused_remote = g
+                .focused_session_id()
+                .and_then(|sid| g.session_by_id(sid))
+                .and_then(|s| {
+                    let hid = Uuid::parse_str(s.remote_host_id.as_deref()?).ok()?;
+                    Some((hid, s.cwd.clone()))
+                });
             let Some(space) = g.active_space() else {
+                if let Some((hid, sess_cwd)) = focused_remote {
+                    let cwd = if sess_cwd.trim().is_empty() {
+                        ".".to_string()
+                    } else {
+                        sess_cwd
+                    };
+                    drop(g);
+                    mesh_hub.request_remote_git_diff(hid, cwd);
+                }
                 return;
             };
-            let host_uuid = if space.is_remote {
-                Uuid::parse_str(&space.machine_id).ok()
+            let (host_uuid, eff_remote_cwd) = if let Some((hid, sess_cwd)) = focused_remote {
+                let cwd = if !sess_cwd.trim().is_empty() && sess_cwd != "." {
+                    sess_cwd
+                } else {
+                    space.path.clone()
+                };
+                (Some(hid), cwd)
+            } else if space.is_remote {
+                (
+                    Uuid::parse_str(&space.machine_id).ok(),
+                    space.path.clone(),
+                )
             } else {
-                None
+                (None, space.path.clone())
             };
             (
                 space.id.clone(),
                 space.path.clone(),
                 host_uuid,
+                eff_remote_cwd,
                 g.current_browse_rel.clone(),
                 g.selected_change_path.as_ref().map(|p| format!("file:{p}")),
                 g.selected_file_rel.clone(),
@@ -2497,9 +2859,14 @@ impl CodaGpuWorkspaceView {
         };
 
         if let Some(host_id) = remote_host_id {
-            mesh_hub.refresh_remote_git_diff(host_id, &space_id, &space_path_str);
-            if space_path_str != "." {
-                mesh_hub.refresh_remote_directory(host_id, &space_id, &space_path_str, &browse_rel);
+            mesh_hub.request_remote_git_diff(host_id, remote_diff_cwd.clone());
+            let dir_root = if space_path_str != "." {
+                &space_path_str
+            } else {
+                &remote_diff_cwd
+            };
+            if dir_root != "." {
+                mesh_hub.refresh_remote_directory(host_id, &space_id, dir_root, &browse_rel);
             }
             return;
         }
@@ -3454,10 +3821,21 @@ impl CodaGpuWorkspaceView {
                 if let Ok(mut g) = self.state.lock() {
                     g.right_drawer = Some(tab);
                 }
+                if tab == RightDrawerTab::Changes {
+                    self.trigger_refresh_git_diff();
+                } else if tab == RightDrawerTab::Files {
+                    self.refresh_active_space_inspector();
+                }
             }
             PaletteAction::OpenSettings => {
-                if let Ok(mut g) = self.state.lock() {
+                let logged_in = if let Ok(mut g) = self.state.lock() {
                     g.settings_open = true;
+                    g.is_logged_in
+                } else {
+                    false
+                };
+                if logged_in {
+                    self.reload_notification_webhooks();
                 }
             }
             PaletteAction::ToggleLocale => self.toggle_locale(),
@@ -3475,6 +3853,7 @@ impl CodaGpuWorkspaceView {
             }
             PaletteAction::ExportActiveSession => self.export_focused_session_markdown(),
             PaletteAction::ToggleVoiceDictation => self.toggle_voice_recording(),
+            PaletteAction::JumpNextNeedsYou => self.jump_to_next_needs_you_session(),
         }
         if let Ok(mut g) = self.state.lock() {
             g.palette_open = false;
@@ -3502,16 +3881,93 @@ impl CodaGpuWorkspaceView {
     }
 
     fn toggle_settings_modal(&self) {
+        let mut should_fetch_wh = false;
         if let Ok(mut g) = self.state.lock() {
             g.settings_open = !g.settings_open;
             if g.settings_open {
                 g.palette_open = false;
+                should_fetch_wh = g.is_logged_in;
             } else {
                 g.clear_settings_ephemeral_inputs();
             }
             g.input_target = ActiveInputTarget::TerminalDirect;
         }
+        if should_fetch_wh {
+            self.reload_notification_webhooks();
+        }
         self.ui_dirty.store(true, Ordering::Release);
+    }
+
+    pub fn jump_to_next_needs_you_session(&self) {
+        let next_id = self.state.lock().ok().and_then(|mut g| {
+            g.palette_open = false;
+            g.settings_open = false;
+            g.clear_settings_ephemeral_inputs();
+            let loc = g.locale;
+            match g.next_needs_you_session_id() {
+                Some(id) => Some(id),
+                None => {
+                    g.status_notice = Some(
+                        tr(
+                            loc,
+                            "No sessions currently need your attention",
+                            "当前没有等待确认的会话",
+                        )
+                        .to_string(),
+                    );
+                    None
+                }
+            }
+        });
+        if let Some(id) = next_id {
+            self.select_session(&id);
+        }
+        self.ui_dirty.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn reload_notification_webhooks(&self) {
+        self.mesh_hub.fetch_notification_webhooks();
+    }
+
+    pub(crate) fn save_notification_webhooks(&self) {
+        let settings = match self.state.lock() {
+            Ok(mut g) => {
+                g.input_selected_all = false;
+                g.input_target = ActiveInputTarget::TerminalDirect;
+                g.webhook_settings.bark_url = g.webhook_settings.bark_url.trim().to_string();
+                g.webhook_settings.telegram_bot_token =
+                    g.webhook_settings.telegram_bot_token.trim().to_string();
+                g.webhook_settings.telegram_chat_id =
+                    g.webhook_settings.telegram_chat_id.trim().to_string();
+                g.webhook_settings.feishu_webhook_url =
+                    g.webhook_settings.feishu_webhook_url.trim().to_string();
+                g.webhook_settings.discord_webhook_url =
+                    g.webhook_settings.discord_webhook_url.trim().to_string();
+                g.webhook_settings.clone()
+            }
+            Err(_) => return,
+        };
+        self.mesh_hub.save_notification_webhooks(settings);
+    }
+
+    pub(crate) fn test_notification_webhooks(&self) {
+        self.mesh_hub.test_notification_webhooks();
+    }
+
+    pub(crate) fn prune_offline_web_devices(&self) {
+        self.mesh_hub.prune_offline_web_devices();
+    }
+
+    fn resolve_active_remote_host_id(g: &CodaDesktopState) -> Option<Uuid> {
+        g.focused_session_id()
+            .and_then(|sid| g.session_by_id(sid))
+            .and_then(|s| s.remote_host_id.as_deref())
+            .and_then(|raw| Uuid::parse_str(raw).ok())
+            .or_else(|| {
+                g.active_space()
+                    .filter(|sp| sp.is_remote)
+                    .and_then(|sp| Uuid::parse_str(&sp.machine_id).ok())
+            })
     }
 
     fn toggle_terminal_search(&self) {
@@ -3649,10 +4105,7 @@ impl CodaGpuWorkspaceView {
                     g.port_preview.path_input = path.clone();
                     g.input_selected_all = false;
                     g.input_target = ActiveInputTarget::TerminalDirect;
-                    let remote_hid = g
-                        .active_space()
-                        .filter(|sp| sp.is_remote)
-                        .and_then(|sp| Uuid::parse_str(&sp.machine_id).ok());
+                    let remote_hid = Self::resolve_active_remote_host_id(&g);
                     Some((port, path, remote_hid))
                 }
                 Err(err) => {
@@ -3669,7 +4122,8 @@ impl CodaGpuWorkspaceView {
             return;
         };
         if let Some(hid) = remote_hid {
-            self.mesh_hub.request_remote_port_preview(hid, port, path);
+            self.mesh_hub
+                .spawn_remote_port_preview_snapshot(hid, port, path);
         } else {
             let state_bg = Arc::clone(&self.state);
             let ui_dirty_bg = Arc::clone(&self.ui_dirty);
@@ -3692,6 +4146,48 @@ impl CodaGpuWorkspaceView {
             });
         }
         self.ui_dirty.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn open_live_port_tunnel(&self, open_in_browser: bool) {
+        let parsed = {
+            let Ok(mut g) = self.state.lock() else {
+                return;
+            };
+            match crate::port_preview::parse_preview_port_and_path(
+                &g.port_preview.port_input,
+                &g.port_preview.path_input,
+            ) {
+                Ok((port, path)) => {
+                    g.port_preview.path_input = path.clone();
+                    g.input_selected_all = false;
+                    g.input_target = ActiveInputTarget::TerminalDirect;
+                    Some((Self::resolve_active_remote_host_id(&g), port, path))
+                }
+                Err(err) => {
+                    g.status_notice = Some(err);
+                    None
+                }
+            }
+        };
+        if let Some((device_id, remote_port, initial_path)) = parsed {
+            self.mesh_hub.open_live_loopback_tunnel(
+                device_id,
+                remote_port,
+                initial_path,
+                open_in_browser,
+            );
+        } else {
+            self.ui_dirty.store(true, Ordering::Release);
+        }
+    }
+
+    pub(crate) fn stop_active_port_tunnel(&self) {
+        let key_opt = self
+            .state
+            .lock()
+            .ok()
+            .and_then(|g| g.port_preview.active_tunnel_key);
+        self.mesh_hub.stop_live_loopback_tunnel(key_opt);
     }
 
     pub(crate) fn save_voice_preferences(&self) {
@@ -3860,6 +4356,58 @@ impl CodaGpuWorkspaceView {
             });
             self.ui_dirty.store(true, Ordering::Release);
         } else {
+            let (loc, base_url, api_key) = match self.state.lock() {
+                Ok(g) => (g.locale, g.voice_base_url.clone(), g.voice_api_key.clone()),
+                Err(_) => return,
+            };
+            match crate::voice_dock::resolve_voice_dictation_mode(&base_url, &api_key) {
+                Err(err) => {
+                    if let Ok(mut g) = self.state.lock() {
+                        g.voice_recording = false;
+                        g.status_notice = Some(err);
+                    }
+                    self.ui_dirty.store(true, Ordering::Release);
+                    return;
+                }
+                Ok(crate::voice_dock::VoiceDictationMode::MacosSystemDictation) => {
+                    if let Ok(mut g) = self.state.lock() {
+                        g.palette_open = false;
+                        g.settings_open = false;
+                        g.clear_settings_ephemeral_inputs();
+                        g.input_target = ActiveInputTarget::TerminalDirect;
+                    }
+                    let invoked = crate::voice_dock::trigger_macos_system_dictation();
+                    if let Ok(mut g) = self.state.lock() {
+                        g.voice_recording = false;
+                        g.status_notice = Some(
+                            crate::voice_dock::macos_dictation_fallback_notice(
+                                invoked,
+                                loc == UiLocale::Zh,
+                            )
+                            .to_string(),
+                        );
+                    }
+                    self.ui_dirty.store(true, Ordering::Release);
+                    return;
+                }
+                Ok(crate::voice_dock::VoiceDictationMode::MissingApiKey) => {
+                    if let Ok(mut g) = self.state.lock() {
+                        g.voice_recording = false;
+                        g.status_notice = Some(
+                            tr(
+                                loc,
+                                "Configure a Whisper API Key or http://127.0.0.1 endpoint in Settings",
+                                "请在设置中填写 Whisper API Key 或本地 127.0.0.1 地址",
+                            )
+                            .to_string(),
+                        );
+                    }
+                    self.ui_dirty.store(true, Ordering::Release);
+                    return;
+                }
+                Ok(crate::voice_dock::VoiceDictationMode::WhisperApi { .. }) => {}
+            }
+
             match self.voice_ctrl.start_recording() {
                 Ok(()) => {
                     if let Ok(mut g) = self.state.lock() {
@@ -4169,6 +4717,10 @@ impl Render for CodaGpuWorkspaceView {
                 this.toggle_voice_recording();
                 cx.notify();
             }))
+            .on_action(cx.listener(|this, _: &JumpNextNeedsYou, _, cx| {
+                this.jump_to_next_needs_you_session();
+                cx.notify();
+            }))
             .size_full()
             .bg(rgb(palette::CANVAS_BG))
             .text_color(rgb(palette::TEXT_PRIMARY))
@@ -4375,6 +4927,12 @@ impl CodaGpuWorkspaceView {
         let width = st.layout.sidebar_width_px.clamp(200.0, 320.0);
         let accent = st.layout.accent_color_u32();
 
+        let needs_you_sessions: Vec<&TerminalSessionEntry> = st
+            .sessions
+            .iter()
+            .filter(|s| s.alive && s.effective_state() == AgentLifecycleState::NeedsYou)
+            .collect();
+
         // Group Spaces by machine_label preserving discovery order
         let mut machine_groups: Vec<(String, bool, Vec<&SpaceEntry>)> = Vec::new();
         for sp in &st.spaces {
@@ -4483,6 +5041,131 @@ impl CodaGpuWorkspaceView {
                     .flex()
                     .flex_col()
                     .gap(px(14.0))
+                    .when(!needs_you_sessions.is_empty(), |el| {
+                        let count = needs_you_sessions.len();
+                        el.child(
+                            div()
+                                .id("sidebar-needs-attention-group")
+                                .p(px(7.0))
+                                .rounded(px(7.0))
+                                .bg(rgba(0xf59e0b1a))
+                                .border_1()
+                                .border_color(rgba(0xf59e0b66))
+                                .flex()
+                                .flex_col()
+                                .gap(px(5.0))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .justify_between()
+                                        .gap(px(6.0))
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .items_center()
+                                                .gap(px(5.0))
+                                                .child(
+                                                    div()
+                                                        .w(px(6.0))
+                                                        .h(px(6.0))
+                                                        .rounded(px(99.0))
+                                                        .bg(rgb(palette::NEEDS_YOU_AMBER)),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .text_size(px(10.5))
+                                                        .font_weight(FontWeight::BOLD)
+                                                        .text_color(rgb(palette::NEEDS_YOU_AMBER))
+                                                        .child(format!(
+                                                            "{} ({count})",
+                                                            tr(
+                                                                loc,
+                                                                "NEEDS ATTENTION",
+                                                                "待你确认 · NEEDS ATTENTION"
+                                                            )
+                                                        )),
+                                                ),
+                                        )
+                                        .child(
+                                            div()
+                                                .id("btn-sidebar-jump-needs-you")
+                                                .occlude()
+                                                .px(px(5.0))
+                                                .py(px(1.0))
+                                                .rounded(px(4.0))
+                                                .bg(rgba(0xf59e0b2e))
+                                                .border_1()
+                                                .border_color(rgba(0xf59e0b77))
+                                                .cursor_pointer()
+                                                .text_size(px(10.0))
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .text_color(rgb(palette::NEEDS_YOU_AMBER))
+                                                .child("⌘J")
+                                                .on_click(cx.listener(
+                                                    |this, _: &ClickEvent, _, cx| {
+                                                        this.jump_to_next_needs_you_session();
+                                                        cx.notify();
+                                                    },
+                                                )),
+                                        ),
+                                )
+                                .children(needs_you_sessions.into_iter().map(|sess| {
+                                    let sid = sess.id.clone();
+                                    let is_focused = st.focused_session_id() == Some(sess.id.as_str());
+                                    let sp_meta = st
+                                        .spaces
+                                        .iter()
+                                        .find(|s| s.id == sess.space_id)
+                                        .map(|s| format!("{} · {}", s.machine_label, s.name))
+                                        .unwrap_or_else(|| "local".to_string());
+                                    div()
+                                        .id(SharedString::from(format!("needs-attn-row-{}", sess.id)))
+                                        .occlude()
+                                        .px(px(7.0))
+                                        .py(px(5.0))
+                                        .rounded(px(5.0))
+                                        .bg(rgb(if is_focused {
+                                            palette::HOVER_BG
+                                        } else {
+                                            palette::SURFACE_BG
+                                        }))
+                                        .border_1()
+                                        .border_color(rgb(if is_focused {
+                                            palette::NEEDS_YOU_AMBER
+                                        } else {
+                                            palette::BORDER
+                                        }))
+                                        .hover(|h| h.bg(rgb(palette::HOVER_BG)))
+                                        .cursor_pointer()
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(2.0))
+                                        .child(
+                                            div()
+                                                .text_size(px(11.5))
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .text_color(rgb(palette::TEXT_PRIMARY))
+                                                .truncate()
+                                                .child(sess.title.clone()),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_size(px(10.0))
+                                                .text_color(rgb(palette::NEEDS_YOU_AMBER))
+                                                .truncate()
+                                                .child(format!(
+                                                    "{sp_meta} · {}",
+                                                    sess.preview_snippet()
+                                                )),
+                                        )
+                                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                            this.select_session(&sid);
+                                            cx.notify();
+                                        }))
+                                })),
+                        )
+                    })
                     .child(
                         // SPACES SECTION
                         div()
@@ -5288,8 +5971,12 @@ impl CodaGpuWorkspaceView {
                 } else {
                     false
                 };
-                if opened && matches!(tab, RightDrawerTab::Changes | RightDrawerTab::Files) {
-                    this.refresh_active_space_inspector();
+                if opened {
+                    if tab == RightDrawerTab::Changes {
+                        this.trigger_refresh_git_diff();
+                    } else if tab == RightDrawerTab::Files {
+                        this.refresh_active_space_inspector();
+                    }
                 }
                 cx.notify();
             }))
@@ -6577,6 +7264,8 @@ impl CodaGpuWorkspaceView {
                                         .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                                             if tab == RightDrawerTab::Preview {
                                                 this.trigger_active_port_preview();
+                                            } else if tab == RightDrawerTab::Changes {
+                                                this.trigger_refresh_git_diff();
                                             } else {
                                                 this.refresh_active_space_inspector();
                                             }
@@ -6641,7 +7330,118 @@ impl CodaGpuWorkspaceView {
                     .gap(px(10.0))
                     .when(tab == RightDrawerTab::Changes, |el| {
                         let snap = &st.repo_snapshot;
-                        if !snap.is_git_repo {
+                        let is_remote_diff = Self::resolve_active_remote_host_id(st).is_some();
+                        let branch_badge = if snap.branch.is_empty() {
+                            "HEAD".to_string()
+                        } else {
+                            snap.branch.clone()
+                        };
+                        let el = el.child(
+                            div()
+                                .p(px(8.0))
+                                .rounded(px(6.0))
+                                .bg(rgb(palette::SURFACE_BG))
+                                .border_1()
+                                .border_color(rgb(palette::BORDER))
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .gap(px(8.0))
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .flex_1()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(6.0))
+                                        .child(
+                                            div()
+                                                .px(px(6.0))
+                                                .py(px(2.0))
+                                                .rounded(px(4.0))
+                                                .bg(rgb(palette::CHROME_BG))
+                                                .font_family("Menlo")
+                                                .text_size(px(10.5))
+                                                .text_color(rgb(accent))
+                                                .truncate()
+                                                .child(format!("⎇ {branch_badge}")),
+                                        )
+                                        .when(snap.is_git_repo, |row| {
+                                            row.child(
+                                                div()
+                                                    .font_family("Menlo")
+                                                    .text_size(px(10.5))
+                                                    .text_color(rgb(palette::DONE_GREEN))
+                                                    .child(format!("+{}", snap.diff_added)),
+                                            )
+                                            .child(
+                                                div()
+                                                    .font_family("Menlo")
+                                                    .text_size(px(10.5))
+                                                    .text_color(rgb(palette::ERROR_RED))
+                                                    .child(format!("-{}", snap.diff_deleted)),
+                                            )
+                                        })
+                                        .when(is_remote_diff, |row| {
+                                            row.child(
+                                                div()
+                                                    .px(px(5.0))
+                                                    .py(px(1.0))
+                                                    .rounded(px(3.0))
+                                                    .bg(rgba(0x38bdf822))
+                                                    .text_size(px(9.5))
+                                                    .text_color(rgb(palette::WORKING_SKY))
+                                                    .child("E2EE"),
+                                            )
+                                        }),
+                                )
+                                .child(
+                                    div()
+                                        .id("btn-refresh-git-diff")
+                                        .occlude()
+                                        .flex_shrink_0()
+                                        .px(px(8.0))
+                                        .py(px(3.0))
+                                        .rounded(px(5.0))
+                                        .bg(rgb(palette::CHROME_BG))
+                                        .border_1()
+                                        .border_color(rgb(if st.git_diff_loading {
+                                            accent
+                                        } else {
+                                            palette::BORDER_STRONG
+                                        }))
+                                        .hover(|h| h.bg(rgb(palette::HOVER_BG)))
+                                        .cursor_pointer()
+                                        .text_size(px(10.5))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(rgb(palette::TEXT_PRIMARY))
+                                        .child(if st.git_diff_loading {
+                                            tr(loc, "Refreshing…", "刷新中…")
+                                        } else {
+                                            tr(loc, "↻ Refresh Diff", "↻ 刷新 Diff")
+                                        })
+                                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                            this.trigger_refresh_git_diff();
+                                            cx.notify();
+                                        })),
+                                ),
+                        );
+
+                        if st.git_diff_loading && snap.changed_files.is_empty() && !snap.is_git_repo {
+                            el.child(
+                                div()
+                                    .p(px(10.0))
+                                    .rounded(px(6.0))
+                                    .bg(rgb(palette::SURFACE_BG))
+                                    .text_size(px(11.5))
+                                    .text_color(rgb(palette::TEXT_MUTED))
+                                    .child(tr(
+                                        loc,
+                                        "Fetching Git diff over E2EE…",
+                                        "正在通过 E2EE 获取远端 Git Diff…",
+                                    )),
+                            )
+                        } else if !snap.is_git_repo {
                             el.child(
                                 div()
                                     .p(px(10.0))
@@ -6651,8 +7451,8 @@ impl CodaGpuWorkspaceView {
                                     .text_color(rgb(palette::TEXT_DIM))
                                     .child(tr(
                                         loc,
-                                        "Not a Git repository",
-                                        "当前工作区不是 Git 仓库",
+                                        "Not a Git repository (click Refresh Diff after opening a repo)",
+                                        "当前目录不是 Git 仓库（切换到仓库后可点击刷新 Diff）",
                                     )),
                             )
                         } else if snap.changed_files.is_empty() {
@@ -6670,6 +7470,8 @@ impl CodaGpuWorkspaceView {
                                     )),
                             )
                         } else {
+                            let all_selected = st.selected_change_path.is_none();
+                            let total_files = snap.changed_files.len();
                             let diff_lines: Vec<String> = extract_file_diff_lines(
                                 &snap.diff_text,
                                 st.selected_change_path.as_deref(),
@@ -6677,84 +7479,198 @@ impl CodaGpuWorkspaceView {
                             .into_iter()
                             .map(str::to_string)
                             .collect();
-                            el.children(snap.changed_files.iter().take(40).map(|f| {
-                                let path_rel = f.path.clone();
-                                let is_sel =
-                                    st.selected_change_path.as_deref() == Some(f.path.as_str());
+
+                            el.child(
+                                // Clickable file filter pills (`All` + each `status_short` file)
                                 div()
-                                    .id(SharedString::from(format!("change-file-{}", f.path)))
-                                    .occlude()
-                                    .px(px(6.0))
-                                    .py(px(4.0))
-                                    .rounded(px(4.0))
-                                    .bg(rgb(if is_sel {
-                                        palette::HOVER_BG
-                                    } else {
-                                        palette::SIDEBAR_BG
-                                    }))
-                                    .hover(|h| h.bg(rgb(palette::HOVER_BG)))
-                                    .cursor_pointer()
                                     .flex()
-                                    .items_center()
-                                    .gap(px(6.0))
-                                    .font_family("Menlo")
-                                    .text_size(px(11.0))
+                                    .flex_wrap()
+                                    .gap(px(5.0))
                                     .child(
                                         div()
-                                            .text_color(rgb(palette::NEEDS_YOU_AMBER))
-                                            .child(f.status.clone()),
-                                    )
-                                    .child(
-                                        div()
-                                            .min_w_0()
-                                            .flex_1()
-                                            .text_color(rgb(palette::TEXT_PRIMARY))
-                                            .truncate()
-                                            .child(f.path.clone()),
-                                    )
-                                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                        if let Ok(mut g) = this.state.lock() {
-                                            g.selected_change_path = if g.selected_change_path
-                                                .as_deref()
-                                                == Some(path_rel.as_str())
-                                            {
-                                                None
+                                            .id("change-pill-all")
+                                            .occlude()
+                                            .px(px(7.0))
+                                            .py(px(3.0))
+                                            .rounded(px(99.0))
+                                            .bg(rgb(if all_selected {
+                                                palette::HOVER_BG
                                             } else {
-                                                Some(path_rel.clone())
-                                            };
-                                        }
-                                        this.refresh_active_space_inspector();
-                                        cx.notify();
-                                    }))
-                            }))
+                                                palette::SURFACE_BG
+                                            }))
+                                            .border_1()
+                                            .border_color(rgb(if all_selected {
+                                                accent
+                                            } else {
+                                                palette::BORDER
+                                            }))
+                                            .cursor_pointer()
+                                            .font_family("Menlo")
+                                            .text_size(px(10.5))
+                                            .text_color(rgb(if all_selected {
+                                                palette::TEXT_PRIMARY
+                                            } else {
+                                                palette::TEXT_MUTED
+                                            }))
+                                            .child(format!(
+                                                "{} ({total_files})",
+                                                tr(loc, "All", "全部")
+                                            ))
+                                            .on_click(cx.listener(
+                                                move |this, _: &ClickEvent, _, cx| {
+                                                    if let Ok(mut g) = this.state.lock() {
+                                                        g.selected_change_path = None;
+                                                    }
+                                                    if !is_remote_diff {
+                                                        this.refresh_active_space_inspector();
+                                                    }
+                                                    cx.notify();
+                                                },
+                                            )),
+                                    )
+                                    .children(snap.changed_files.iter().take(48).map(|f| {
+                                        let path_rel = f.path.clone();
+                                        let is_sel = st.selected_change_path.as_deref()
+                                            == Some(f.path.as_str());
+                                        let badge_color = match f.status.as_str() {
+                                            "A" | "??" => palette::DONE_GREEN,
+                                            "D" => palette::ERROR_RED,
+                                            "R" | "C" => palette::WORKING_SKY,
+                                            _ => palette::NEEDS_YOU_AMBER,
+                                        };
+                                        let short_label = Path::new(&f.path)
+                                            .file_name()
+                                            .and_then(|s| s.to_str())
+                                            .unwrap_or(&f.path)
+                                            .to_string();
+                                        div()
+                                            .id(SharedString::from(format!(
+                                                "change-file-{}",
+                                                f.path
+                                            )))
+                                            .occlude()
+                                            .px(px(7.0))
+                                            .py(px(3.0))
+                                            .rounded(px(99.0))
+                                            .bg(rgb(if is_sel {
+                                                palette::HOVER_BG
+                                            } else {
+                                                palette::SURFACE_BG
+                                            }))
+                                            .border_1()
+                                            .border_color(rgb(if is_sel {
+                                                accent
+                                            } else {
+                                                palette::BORDER
+                                            }))
+                                            .hover(|h| h.bg(rgb(palette::HOVER_BG)))
+                                            .cursor_pointer()
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(5.0))
+                                            .font_family("Menlo")
+                                            .text_size(px(10.5))
+                                            .child(
+                                                div()
+                                                    .font_weight(FontWeight::SEMIBOLD)
+                                                    .text_color(rgb(badge_color))
+                                                    .child(f.status.clone()),
+                                            )
+                                            .child(
+                                                div()
+                                                    .max_w(px(210.0))
+                                                    .truncate()
+                                                    .text_color(rgb(if is_sel {
+                                                        palette::TEXT_PRIMARY
+                                                    } else {
+                                                        palette::TEXT_MUTED
+                                                    }))
+                                                    .child(short_label),
+                                            )
+                                            .on_click(cx.listener(
+                                                move |this, _: &ClickEvent, _, cx| {
+                                                    if let Ok(mut g) = this.state.lock() {
+                                                        g.selected_change_path =
+                                                            if g.selected_change_path.as_deref()
+                                                                == Some(path_rel.as_str())
+                                                            {
+                                                                None
+                                                            } else {
+                                                                Some(path_rel.clone())
+                                                            };
+                                                    }
+                                                    if !is_remote_diff {
+                                                        this.refresh_active_space_inspector();
+                                                    }
+                                                    cx.notify();
+                                                },
+                                            ))
+                                    })),
+                            )
                             .child(div().h(px(1.0)).w_full().bg(rgb(palette::BORDER)))
                             .when(diff_lines.is_empty(), |d| {
                                 d.child(
                                     div()
+                                        .p(px(8.0))
+                                        .rounded(px(6.0))
+                                        .bg(rgb(palette::SURFACE_BG))
                                         .text_size(px(11.0))
                                         .text_color(rgb(palette::TEXT_DIM))
-                                        .child(tr(loc, "No diff text available", "暂无 Diff 内容")),
+                                        .child(tr(
+                                            loc,
+                                            "Untracked or binary file — open in Files tab to preview full contents",
+                                            "未跟踪或二进制文件 — 可在“文件”侧栏查看内容",
+                                        )),
                                 )
                             })
                             .when(!diff_lines.is_empty(), |d| {
                                 d.child(
                                     div()
+                                        .p(px(8.0))
+                                        .rounded(px(6.0))
+                                        .bg(rgb(palette::CANVAS_BG))
+                                        .border_1()
+                                        .border_color(rgb(palette::BORDER))
                                         .font_family("Menlo")
                                         .text_size(px(11.0))
                                         .flex()
                                         .flex_col()
                                         .gap(px(1.5))
                                         .children(diff_lines.into_iter().map(|line| {
-                                            let color = if line.starts_with('+') {
-                                                palette::DONE_GREEN
-                                            } else if line.starts_with('-') {
-                                                palette::ERROR_RED
-                                            } else if line.starts_with("@@") {
-                                                palette::WORKING_SKY
-                                            } else {
-                                                palette::TEXT_MUTED
+                                            let kind = classify_diff_line(&line);
+                                            let (fg, bg_opt, is_bold) = match kind {
+                                                DiffLineKind::Header => {
+                                                    (palette::TEXT_PRIMARY, None, true)
+                                                }
+                                                DiffLineKind::Hunk => {
+                                                    (0x22d3ee, Some(0x22d3ee14), false)
+                                                }
+                                                DiffLineKind::Addition => {
+                                                    (palette::DONE_GREEN, Some(0x22c55e14), false)
+                                                }
+                                                DiffLineKind::Deletion => {
+                                                    (palette::ERROR_RED, Some(0xf8717114), false)
+                                                }
+                                                DiffLineKind::Context => {
+                                                    (palette::TEXT_MUTED, None, false)
+                                                }
                                             };
-                                            div().text_color(rgb(color)).truncate().child(line)
+                                            div()
+                                                .px(px(4.0))
+                                                .rounded(px(2.0))
+                                                .when_some(bg_opt, |row, bg_rgba| {
+                                                    row.bg(rgba(bg_rgba))
+                                                })
+                                                .when(is_bold, |row| {
+                                                    row.font_weight(FontWeight::BOLD)
+                                                })
+                                                .text_color(rgb(fg))
+                                                .truncate()
+                                                .child(if line.is_empty() {
+                                                    " ".to_string()
+                                                } else {
+                                                    line
+                                                })
                                         })),
                                 )
                             })
@@ -7952,6 +8868,7 @@ pub fn launch_gpui_desktop_app() {
             KeyBinding::new("cmd--", ZoomOutTerminal, None),
             KeyBinding::new("cmd-0", ZoomResetTerminal, None),
             KeyBinding::new("cmd-f", ToggleTerminalSearch, None),
+            KeyBinding::new("cmd-j", JumpNextNeedsYou, None),
             KeyBinding::new("cmd-shift-e", ExportActiveSession, None),
         ]);
         cx.set_menus(vec![
@@ -7991,6 +8908,7 @@ pub fn launch_gpui_desktop_app() {
                 name: "View".into(),
                 items: vec![
                     MenuItem::action("Command Palette…", ToggleCommandPalette),
+                    MenuItem::action("Jump to Next Needs-You Session", JumpNextNeedsYou),
                     MenuItem::action("Toggle Sidebar", ToggleSidebar),
                     MenuItem::separator(),
                     MenuItem::action("Zoom In", ZoomInTerminal),
@@ -8093,6 +9011,139 @@ mod tests {
                 .any(|item| matches!(item.action, PaletteAction::ExportActiveSession)),
             "Command Palette must expose ExportActiveSession"
         );
+
+        state.palette_query = "needs-you".to_string();
+        assert!(
+            state
+                .palette_items()
+                .iter()
+                .any(|item| matches!(item.action, PaletteAction::JumpNextNeedsYou)),
+            "Command Palette must expose JumpNextNeedsYou"
+        );
+    }
+
+    #[test]
+    fn test_needs_you_attention_inbox_cycling() {
+        let mut st = CodaDesktopState::default();
+        assert_eq!(st.next_needs_you_session_id(), None);
+
+        let now = Instant::now();
+        let make_sess = |id: &str, state: AgentLifecycleState, alive: bool| TerminalSessionEntry {
+            id: id.to_string(),
+            title: id.to_string(),
+            space_id: "sp-1".to_string(),
+            cwd: "/tmp".to_string(),
+            started_at: now,
+            last_output_at: now,
+            last_byte_sig: 0,
+            lines: Vec::new(),
+            styled_lines: Vec::new(),
+            scroll_offset: 0,
+            alive,
+            attached_hc: true,
+            hc_addr: Some(id.to_string()),
+            remote_host_id: None,
+            osc_status: Some(Osc7501Status {
+                state,
+                task: Some("Approve command".to_string()),
+                updated_at: now,
+            }),
+        };
+
+        st.sessions.push(make_sess("s1-working", AgentLifecycleState::Working, true));
+        st.sessions.push(make_sess("s2-needs", AgentLifecycleState::NeedsYou, true));
+        st.sessions.push(make_sess("s3-dead", AgentLifecycleState::NeedsYou, false));
+        st.sessions.push(make_sess("s4-remote-needs", AgentLifecycleState::NeedsYou, true));
+
+        st.active_session_id = Some("s1-working".to_string());
+        assert_eq!(st.next_needs_you_session_id().as_deref(), Some("s2-needs"));
+
+        st.active_session_id = Some("s2-needs".to_string());
+        assert_eq!(
+            st.next_needs_you_session_id().as_deref(),
+            Some("s4-remote-needs")
+        );
+
+        st.active_session_id = Some("s4-remote-needs".to_string());
+        assert_eq!(st.next_needs_you_session_id().as_deref(), Some("s2-needs"));
+    }
+
+    #[tokio::test]
+    async fn test_webhook_notifications_and_prune_stale_rest_endpoints() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let base_url = format!("http://127.0.0.1:{port}");
+
+        tokio::spawn(async move {
+            for _ in 0..4 {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = vec![0u8; 4096];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                assert!(
+                    req.contains("Authorization: Bearer test-session-tok")
+                        || req.contains("authorization: Bearer test-session-tok"),
+                    "missing bearer token: {req}"
+                );
+                let body_json = if req.starts_with("GET /api/v1/me/notifications ") {
+                    r#"{"bark_url":"https://api.day.app/k1","telegram_bot_token":"123:ABC","telegram_chat_id":"999","feishu_webhook_url":"","discord_webhook_url":"","generic_webhook_url":"","notify_on_needs_you":true,"notify_on_finished":false}"#
+                } else if req.starts_with("PUT /api/v1/me/notifications ") {
+                    assert!(req.contains("discord.com/api/webhooks/test"));
+                    r#"{"bark_url":"https://api.day.app/k1","telegram_bot_token":"123:ABC","telegram_chat_id":"999","feishu_webhook_url":"https://open.feishu.cn/hook","discord_webhook_url":"https://discord.com/api/webhooks/test","generic_webhook_url":"","notify_on_needs_you":true,"notify_on_finished":true}"#
+                } else if req.starts_with("POST /api/v1/me/notifications/test ") {
+                    r#"{"ok":true,"delivered_channels":["bark","discord"],"errors":[]}"#
+                } else if req.starts_with("POST /api/v1/devices/prune-stale ") {
+                    assert!(req.contains("\"max_idle_days\":0"));
+                    r#"{"ok":true,"pruned_count":4}"#
+                } else {
+                    r#"{"error":"unexpected route"}"#
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body_json.len(),
+                    body_json
+                );
+                let _ = stream.write_all(resp.as_bytes()).await;
+            }
+        });
+
+        let loaded = crate::remote_mesh::api_get_notification_webhooks(&base_url, "test-session-tok")
+            .await
+            .unwrap();
+        assert_eq!(loaded.bark_url, "https://api.day.app/k1");
+        assert_eq!(loaded.telegram_chat_id, "999");
+        assert!(!loaded.notify_on_finished);
+
+        let mut updated_req = loaded.clone();
+        updated_req.feishu_webhook_url = "https://open.feishu.cn/hook".to_string();
+        updated_req.discord_webhook_url = "https://discord.com/api/webhooks/test".to_string();
+        updated_req.notify_on_finished = true;
+        let saved = crate::remote_mesh::api_put_notification_webhooks(
+            &base_url,
+            "test-session-tok",
+            &updated_req,
+        )
+        .await
+        .unwrap();
+        assert_eq!(saved.discord_webhook_url, "https://discord.com/api/webhooks/test");
+        assert!(saved.notify_on_finished);
+
+        let (delivered, errs) =
+            crate::remote_mesh::api_test_notification_webhooks(&base_url, "test-session-tok")
+                .await
+                .unwrap();
+        assert_eq!(delivered, 2);
+        assert!(errs.is_empty());
+
+        let pruned =
+            crate::remote_mesh::api_prune_stale_web_devices(&base_url, "test-session-tok", 0)
+                .await
+                .unwrap();
+        assert_eq!(pruned, 4);
     }
 
     #[test]

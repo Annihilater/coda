@@ -312,13 +312,20 @@ impl CodaGpuWorkspaceView {
                                             }))
                                             .child(tr(loc, en, zh))
                                             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                                let mut should_fetch_wh = false;
                                                 if let Ok(mut g) = this.state.lock() {
                                                     if g.settings_section != sec {
                                                         g.clear_settings_ephemeral_inputs();
+                                                        if sec == SettingsSection::Machines && g.is_logged_in {
+                                                            should_fetch_wh = true;
+                                                        }
                                                     }
                                                     g.settings_section = sec;
                                                     g.input_target =
                                                         ActiveInputTarget::TerminalDirect;
+                                                }
+                                                if should_fetch_wh {
+                                                    this.reload_notification_webhooks();
                                                 }
                                                 cx.notify();
                                             }))
@@ -384,13 +391,24 @@ impl CodaGpuWorkspaceView {
                                             )
                                             .child(
                                                 div()
+                                                    .min_w_0()
+                                                    .truncate()
                                                     .text_size(px(10.5))
-                                                    .text_color(rgb(palette::TEXT_DIM))
-                                                    .child(tr(
-                                                        loc,
-                                                        "Changes save & apply immediately",
-                                                        "更改自动保存并实时生效",
-                                                    )),
+                                                    .text_color(rgb(if st.status_notice.is_some() {
+                                                        palette::NEEDS_YOU_AMBER
+                                                    } else {
+                                                        palette::TEXT_DIM
+                                                    }))
+                                                    .child(
+                                                        st.status_notice.clone().unwrap_or_else(|| {
+                                                            tr(
+                                                                loc,
+                                                                "Changes save & apply immediately",
+                                                                "更改自动保存并实时生效",
+                                                            )
+                                                            .to_string()
+                                                        }),
+                                                    ),
                                             ),
                                     )
                                     .child(
@@ -873,11 +891,19 @@ impl CodaGpuWorkspaceView {
                                         div()
                                             .text_size(px(10.5))
                                             .text_color(rgb(palette::TEXT_DIM))
-                                            .child(tr(
-                                                loc,
-                                                "OpenAI-compatible /audio/transcriptions (HTTPS or local 127.0.0.1)",
-                                                "兼容 OpenAI /audio/transcriptions（HTTPS 或本机 127.0.0.1）",
-                                            )),
+                                            .child(if st.voice_api_key.is_empty() && cfg!(target_os = "macos") {
+                                                tr(
+                                                    loc,
+                                                    "Empty API Key uses zero-config macOS Dictation (or set HTTPS / 127.0.0.1 Whisper)",
+                                                    "API Key 留空时自动回退使用 macOS 原生语音听写（或填写 Whisper Key / 127.0.0.1）",
+                                                )
+                                            } else {
+                                                tr(
+                                                    loc,
+                                                    "OpenAI-compatible /audio/transcriptions (HTTPS or local 127.0.0.1)",
+                                                    "兼容 OpenAI /audio/transcriptions（HTTPS 或本机 127.0.0.1）",
+                                                )
+                                            }),
                                     ),
                             )
                             .child(self.render_setting_pill(
@@ -1536,20 +1562,401 @@ impl CodaGpuWorkspaceView {
                         })
                     }),
             )
+            .child({
+                let wh = &st.webhook_settings;
+                let bark_focus = st.input_target == ActiveInputTarget::WebhookBarkUrl;
+                let tg_tok_focus = st.input_target == ActiveInputTarget::WebhookTelegramToken;
+                let tg_chat_focus = st.input_target == ActiveInputTarget::WebhookTelegramChatId;
+                let feishu_focus = st.input_target == ActiveInputTarget::WebhookFeishuUrl;
+                let discord_focus = st.input_target == ActiveInputTarget::WebhookDiscordUrl;
+                let tg_tok_masked = if wh.telegram_bot_token.is_empty() {
+                    if tg_tok_focus {
+                        "▏".to_string()
+                    } else {
+                        tr(loc, "Telegram Bot Token (123456:ABC...)", "Telegram Bot Token")
+                            .to_string()
+                    }
+                } else {
+                    format!(
+                        "{}{}",
+                        "•".repeat(wh.telegram_bot_token.chars().count().min(24)),
+                        if tg_tok_focus { "▏" } else { "" }
+                    )
+                };
+                let needs_you_on = wh.notify_on_needs_you;
+                let finished_on = wh.notify_on_finished;
+
+                div()
+                    .p(px(10.0))
+                    .rounded(px(7.0))
+                    .bg(rgb(palette::SURFACE_BG))
+                    .border_1()
+                    .border_color(rgb(palette::BORDER))
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.0))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap(px(8.0))
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .flex_1()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(2.0))
+                                    .child(
+                                        div()
+                                            .text_size(px(11.5))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(rgb(palette::TEXT_PRIMARY))
+                                            .child(tr(
+                                                loc,
+                                                "Offline Notification Webhooks",
+                                                "离线告警推送 Webhooks",
+                                            )),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(10.0))
+                                            .text_color(rgb(palette::TEXT_DIM))
+                                            .truncate()
+                                            .child(tr(
+                                                loc,
+                                                "Zero-plaintext metadata push via Bark, Telegram, Feishu & Discord",
+                                                "零终端明文泄露，支持 Bark、Telegram、飞书与 Discord 推送",
+                                            )),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(4.0))
+                                    .child(self.render_setting_pill(
+                                        "settings-webhook-needs-you",
+                                        if needs_you_on {
+                                            tr(loc, "Needs-You ✓", "待确认 ✓")
+                                        } else {
+                                            tr(loc, "Needs-You", "待确认")
+                                        },
+                                        needs_you_on,
+                                        accent,
+                                        cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                            if let Ok(mut g) = this.state.lock() {
+                                                g.webhook_settings.notify_on_needs_you = !needs_you_on;
+                                            }
+                                            cx.notify();
+                                        }),
+                                    ))
+                                    .child(self.render_setting_pill(
+                                        "settings-webhook-finished",
+                                        if finished_on {
+                                            tr(loc, "Finished ✓", "完成 ✓")
+                                        } else {
+                                            tr(loc, "Finished", "完成")
+                                        },
+                                        finished_on,
+                                        accent,
+                                        cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                            if let Ok(mut g) = this.state.lock() {
+                                                g.webhook_settings.notify_on_finished = !finished_on;
+                                            }
+                                            cx.notify();
+                                        }),
+                                    ))
+                                    .child(self.render_setting_pill(
+                                        "settings-webhook-test",
+                                        tr(loc, "Test Push", "测试推送"),
+                                        false,
+                                        accent,
+                                        cx.listener(|this, _: &ClickEvent, _, cx| {
+                                            this.test_notification_webhooks();
+                                            cx.notify();
+                                        }),
+                                    ))
+                                    .child(self.render_setting_pill(
+                                        "settings-webhook-save",
+                                        if st.webhook_loading {
+                                            "…"
+                                        } else {
+                                            tr(loc, "Save Webhooks", "保存推送")
+                                        },
+                                        true,
+                                        accent,
+                                        cx.listener(|this, _: &ClickEvent, _, cx| {
+                                            this.save_notification_webhooks();
+                                            cx.notify();
+                                        }),
+                                    )),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("settings-input-webhook-bark")
+                            .occlude()
+                            .w_full()
+                            .px(px(8.0))
+                            .py(px(5.0))
+                            .rounded(px(4.0))
+                            .bg(rgb(palette::CANVAS_BG))
+                            .border_1()
+                            .border_color(rgb(if bark_focus { accent } else { palette::BORDER }))
+                            .cursor_pointer()
+                            .text_size(px(11.0))
+                            .text_color(rgb(if wh.bark_url.is_empty() && !bark_focus {
+                                palette::TEXT_DIM
+                            } else {
+                                palette::TEXT_PRIMARY
+                            }))
+                            .truncate()
+                            .child(if wh.bark_url.is_empty() {
+                                if bark_focus {
+                                    "▏".to_string()
+                                } else {
+                                    tr(
+                                        loc,
+                                        "Bark URL (https://api.day.app/<device_key>)",
+                                        "Bark 推送地址 (https://api.day.app/<key>)",
+                                    )
+                                    .to_string()
+                                }
+                            } else {
+                                format!("{}{}", wh.bark_url, if bark_focus { "▏" } else { "" })
+                            })
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                if let Ok(mut g) = this.state.lock() {
+                                    g.input_selected_all = false;
+                                    g.input_target = ActiveInputTarget::WebhookBarkUrl;
+                                }
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .child(
+                                div()
+                                    .id("settings-input-webhook-tg-token")
+                                    .occlude()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .px(px(8.0))
+                                    .py(px(5.0))
+                                    .rounded(px(4.0))
+                                    .bg(rgb(palette::CANVAS_BG))
+                                    .border_1()
+                                    .border_color(rgb(if tg_tok_focus {
+                                        accent
+                                    } else {
+                                        palette::BORDER
+                                    }))
+                                    .cursor_pointer()
+                                    .text_size(px(11.0))
+                                    .text_color(rgb(if wh.telegram_bot_token.is_empty() && !tg_tok_focus {
+                                        palette::TEXT_DIM
+                                    } else {
+                                        palette::TEXT_PRIMARY
+                                    }))
+                                    .truncate()
+                                    .child(tg_tok_masked)
+                                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                        if let Ok(mut g) = this.state.lock() {
+                                            g.input_selected_all = false;
+                                            g.input_target = ActiveInputTarget::WebhookTelegramToken;
+                                        }
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .id("settings-input-webhook-tg-chat")
+                                    .occlude()
+                                    .w(px(160.0))
+                                    .px(px(8.0))
+                                    .py(px(5.0))
+                                    .rounded(px(4.0))
+                                    .bg(rgb(palette::CANVAS_BG))
+                                    .border_1()
+                                    .border_color(rgb(if tg_chat_focus {
+                                        accent
+                                    } else {
+                                        palette::BORDER
+                                    }))
+                                    .cursor_pointer()
+                                    .text_size(px(11.0))
+                                    .text_color(rgb(if wh.telegram_chat_id.is_empty() && !tg_chat_focus {
+                                        palette::TEXT_DIM
+                                    } else {
+                                        palette::TEXT_PRIMARY
+                                    }))
+                                    .truncate()
+                                    .child(if wh.telegram_chat_id.is_empty() {
+                                        if tg_chat_focus {
+                                            "▏".to_string()
+                                        } else {
+                                            tr(loc, "Telegram Chat ID", "Telegram Chat ID").to_string()
+                                        }
+                                    } else {
+                                        format!(
+                                            "{}{}",
+                                            wh.telegram_chat_id,
+                                            if tg_chat_focus { "▏" } else { "" }
+                                        )
+                                    })
+                                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                        if let Ok(mut g) = this.state.lock() {
+                                            g.input_selected_all = false;
+                                            g.input_target = ActiveInputTarget::WebhookTelegramChatId;
+                                        }
+                                        cx.notify();
+                                    })),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .child(
+                                div()
+                                    .id("settings-input-webhook-feishu")
+                                    .occlude()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .px(px(8.0))
+                                    .py(px(5.0))
+                                    .rounded(px(4.0))
+                                    .bg(rgb(palette::CANVAS_BG))
+                                    .border_1()
+                                    .border_color(rgb(if feishu_focus {
+                                        accent
+                                    } else {
+                                        palette::BORDER
+                                    }))
+                                    .cursor_pointer()
+                                    .text_size(px(11.0))
+                                    .text_color(rgb(if wh.feishu_webhook_url.is_empty() && !feishu_focus {
+                                        palette::TEXT_DIM
+                                    } else {
+                                        palette::TEXT_PRIMARY
+                                    }))
+                                    .truncate()
+                                    .child(if wh.feishu_webhook_url.is_empty() {
+                                        if feishu_focus {
+                                            "▏".to_string()
+                                        } else {
+                                            tr(
+                                                loc,
+                                                "Feishu Webhook (https://open.feishu.cn/...)",
+                                                "飞书机器人 Webhook 地址",
+                                            )
+                                            .to_string()
+                                        }
+                                    } else {
+                                        format!(
+                                            "{}{}",
+                                            wh.feishu_webhook_url,
+                                            if feishu_focus { "▏" } else { "" }
+                                        )
+                                    })
+                                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                        if let Ok(mut g) = this.state.lock() {
+                                            g.input_selected_all = false;
+                                            g.input_target = ActiveInputTarget::WebhookFeishuUrl;
+                                        }
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .id("settings-input-webhook-discord")
+                                    .occlude()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .px(px(8.0))
+                                    .py(px(5.0))
+                                    .rounded(px(4.0))
+                                    .bg(rgb(palette::CANVAS_BG))
+                                    .border_1()
+                                    .border_color(rgb(if discord_focus {
+                                        accent
+                                    } else {
+                                        palette::BORDER
+                                    }))
+                                    .cursor_pointer()
+                                    .text_size(px(11.0))
+                                    .text_color(rgb(if wh.discord_webhook_url.is_empty() && !discord_focus {
+                                        palette::TEXT_DIM
+                                    } else {
+                                        palette::TEXT_PRIMARY
+                                    }))
+                                    .truncate()
+                                    .child(if wh.discord_webhook_url.is_empty() {
+                                        if discord_focus {
+                                            "▏".to_string()
+                                        } else {
+                                            tr(
+                                                loc,
+                                                "Discord Webhook (https://discord.com/api/webhooks/...)",
+                                                "Discord Webhook 地址",
+                                            )
+                                            .to_string()
+                                        }
+                                    } else {
+                                        format!(
+                                            "{}{}",
+                                            wh.discord_webhook_url,
+                                            if discord_focus { "▏" } else { "" }
+                                        )
+                                    })
+                                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                        if let Ok(mut g) = this.state.lock() {
+                                            g.input_selected_all = false;
+                                            g.input_target = ActiveInputTarget::WebhookDiscordUrl;
+                                        }
+                                        cx.notify();
+                                    })),
+                            ),
+                    )
+            })
             .child(
-                // Machines list (local Mac + Host Mode toggle + ALL remote hosts with Remove action)
+                // Machines list (local Mac + Host Mode toggle + Prune Offline Web Devices + ALL remote hosts)
                 div()
                     .flex()
                     .flex_col()
                     .gap(px(4.0))
                     .child(
                         div()
-                            .text_size(px(10.5))
-                            .text_color(rgb(palette::TEXT_DIM))
-                            .child(format!(
-                                "{} ({})",
-                                tr(loc, "ONLINE MACHINES", "在线设备列表"),
-                                st.remote_hosts.len() + 1
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap(px(8.0))
+                            .child(
+                                div()
+                                    .text_size(px(10.5))
+                                    .text_color(rgb(palette::TEXT_DIM))
+                                    .child(format!(
+                                        "{} ({})",
+                                        tr(loc, "ONLINE MACHINES", "在线设备列表"),
+                                        st.remote_hosts.len() + 1
+                                    )),
+                            )
+                            .child(self.render_setting_pill(
+                                "settings-prune-web-devices",
+                                tr(loc, "Prune Offline Web Devices", "清理离线 Web 设备"),
+                                false,
+                                accent,
+                                cx.listener(|this, _: &ClickEvent, _, cx| {
+                                    this.prune_offline_web_devices();
+                                    cx.notify();
+                                }),
                             )),
                     )
                     .child(
@@ -1977,6 +2384,7 @@ impl CodaGpuWorkspaceView {
         let left_col: &[(&str, &str, &str)] = &[
             ("⌘ ,", "Open Settings", "打开设置"),
             ("⌘ P / ⌘ K", "Command Palette", "命令面板"),
+            ("⌘ J", "Jump to Next Needs-You", "跳转待确认会话"),
             ("⌘ F", "Find in Terminal", "终端内搜索"),
             ("⌘ N / ⌘ T", "New Terminal", "新建终端"),
             ("⌘ W", "Close Active Terminal", "关闭当前终端"),
