@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Coda v0.5.0 — 全端高保真可交互产品原型台 (Product Prototype Studio)</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" />
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <div class="studio-shell">
+    <!-- Top Prototype Studio Toolbar -->
+    <header class="studio-bar">
+      <div class="studio-brand">
+        <svg class="studio-logo" viewBox="0 0 64 64" width="28" height="28" fill="none" aria-hidden="true">
+          <defs>
+            <linearGradient id="coda-bg" x1="32" y1="2" x2="32" y2="62" gradientUnits="userSpaceOnUse">
+              <stop offset="0%" stop-color="#171920" />
+              <stop offset="100%" stop-color="#0b0c10" />
+            </linearGradient>
+            <linearGradient id="coda-arc" x1="14" y1="14" x2="48" y2="50" gradientUnits="userSpaceOnUse">
+              <stop offset="0%" stop-color="#f59e0b" />
+              <stop offset="100%" stop-color="#e06c50" />
+            </linearGradient>
+          </defs>
+          <rect x="2" y="2" width="60" height="60" rx="15" fill="url(#coda-bg)" stroke="#2a2d37" stroke-width="1.5" />
+          <path d="M 44.37 44.37 A 17.5 17.5 0 1 1 38.70 15.83" stroke="url(#coda-arc)" stroke-width="5.5" stroke-linecap="round" />
+          <path d="M 25.5 24.5 L 34 32 L 25.5 39.5" stroke="#f4f4f5" stroke-width="4.5" stroke-linecap="round" stroke-linejoin="round" />
+          <circle cx="46" cy="19" r="4.2" fill="#22c55e" />
+        </svg>
+        <div>
+          <div class="studio-title">Coda Product Prototype</div>
+          <div class="studio-sub" id="studio-sub">v0.5.0 · 全端可交互高保真原型台</div>
+        </div>
+      </div>
+
+      <nav class="device-tabs" id="device-tabs" aria-label="Platform Switcher"></nav>
+
+      <div class="studio-controls">
+        <button class="studio-chip" id="btn-route-sim" title="Simulate smart-path network route"></button>
+        <button class="studio-chip" id="btn-trigger-needs" title="Simulate Agent OSC 7501 Needs-You event"></button>
+        <button class="studio-chip" id="btn-toggle-notes" title="Toggle Product Spec Annotation Drawer"></button>
+        <button class="studio-chip studio-lang" id="btn-toggle-lang">中文</button>
+      </div>
+    </header>
+
+    <!-- Main Stage + Optional Spec Annotation Sidebar -->
+    <div class="studio-body">
+      <main class="studio-stage">
+        <div class="subbar" id="platform-subbar"></div>
+        <div class="stage-viewport" id="stage-viewport"></div>
+      </main>
+
+      <aside class="spec-drawer" id="spec-drawer">
+        <div class="spec-drawer-head">
+          <span id="spec-drawer-title">交互说明与设计标注</span>
+          <button class="icon-btn" id="btn-close-notes">✕</button>
+        </div>
+        <div class="spec-drawer-content" id="spec-drawer-content"></div>
+      </aside>
+    </div>
+  </div>
+
+  <!-- Shared Modal Overlay inside Studio -->
+  <div class="proto-modal-backdrop hidden" id="proto-modal-backdrop">
+    <div class="proto-modal" id="proto-modal"></div>
+  </div>
+
+  <!-- Toast Banner -->
+  <div class="proto-toast hidden" id="proto-toast"></div>
+
+  <script src="./app.js"></script>
+</body>
+</html>
