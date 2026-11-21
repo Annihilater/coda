@@ -24,6 +24,7 @@ pub struct CommitEntry {
 #[derive(Debug, Clone, Default)]
 pub struct RepoInspectorSnapshot {
     pub repo_path: String,
+    pub repo_root: Option<String>,
     pub repo_name: String,
     pub is_git_repo: bool,
     pub branch: String,
@@ -37,6 +38,7 @@ pub struct RepoInspectorSnapshot {
     pub selected_item: Option<String>,
     pub diff_title: String,
     pub diff_text: String,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -114,11 +116,13 @@ pub fn compute_repo_snapshot(
         .to_string();
 
     if !repo_path.is_dir() {
+        let msg = format!("Path does not exist: {}", repo_path.display());
         return RepoInspectorSnapshot {
             repo_path: repo_path.to_string_lossy().to_string(),
             repo_name,
             diff_title: "Directory not found".into(),
-            diff_text: format!("Path does not exist: {}", repo_path.display()),
+            diff_text: msg.clone(),
+            error: Some(msg),
             ..Default::default()
         };
     }
@@ -276,8 +280,14 @@ pub fn compute_repo_snapshot(
         ),
     };
 
+    let resolved_root = run_git(repo_path, &["rev-parse", "--show-toplevel"])
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| repo_path.to_string_lossy().to_string());
+
     RepoInspectorSnapshot {
         repo_path: repo_path.to_string_lossy().to_string(),
+        repo_root: Some(resolved_root),
         repo_name,
         is_git_repo: true,
         branch,
@@ -291,6 +301,7 @@ pub fn compute_repo_snapshot(
         selected_item,
         diff_title,
         diff_text,
+        error: None,
     }
 }
 

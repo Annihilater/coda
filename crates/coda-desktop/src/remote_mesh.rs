@@ -3,8 +3,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
@@ -19,8 +19,8 @@ use coda_protocol::{HerdrTerminalSummary, PeerMessage, RemoteFileItem, TrafficLa
 use uuid::Uuid;
 
 use crate::config::{
-    delete_secret_from_keychain, is_safe_http_url, space_avatar_color, tr,
-    DesktopClientIdentityRecord, DesktopPreferences,
+    delete_secret_from_keychain, invalidate_secret_and_daemon_config_caches, is_safe_http_url,
+    space_avatar_color, tr, DesktopClientIdentityRecord, DesktopPreferences,
 };
 use crate::git_inspector::{RepoInspectorSnapshot, WorkspaceFileEntry};
 use crate::helpers::{
@@ -28,7 +28,9 @@ use crate::helpers::{
     normalize_newlines_for_vt, parse_git_status_short, path_within_root,
     save_desktop_daemon_config,
 };
-use crate::port_preview::{PortPreviewTunnelManager, TunnelTargetKey};
+use crate::port_preview::{
+    PortPreviewTunnelManager, ProxyHttpRequest, ProxyHttpResponse, TunnelTargetKey,
+};
 use crate::pty::LocalPtyManager;
 use crate::smart_path::DesktopSmartPathPolicy;
 use crate::{
@@ -189,10 +191,15 @@ pub async fn api_prune_stale_web_devices(
     server_url: &str,
     token: &str,
     max_idle_days: u32,
+    exclude_device_id: Option<Uuid>,
 ) -> Result<u64, String> {
     let base = server_url.trim().trim_end_matches('/');
     if !is_safe_http_url(base) {
         return Err("Invalid server URL".into());
+    }
+    let mut payload = serde_json::json!({ "max_idle_days": max_idle_days });
+    if let Some(dev_id) = exclude_device_id {
+        payload["exclude_device_id"] = serde_json::json!(dev_id);
     }
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
@@ -201,7 +208,7 @@ pub async fn api_prune_stale_web_devices(
     let resp = client
         .post(format!("{base}/api/v1/devices/prune-stale"))
         .bearer_auth(token.trim())
-        .json(&serde_json::json!({ "max_idle_days": max_idle_days }))
+        .json(&payload)
         .send()
         .await
         .map_err(|e| format!("POST /api/v1/devices/prune-stale failed: {e}"))?;
@@ -223,6 +230,52 @@ pub async fn api_prune_stale_web_devices(
 }
 
 pub(crate) static EMBEDDED_HOST_STARTED: AtomicBool = AtomicBool::new(false);
+static PRIMARY_CLIENT_IDENTITY_CLAIMED: AtomicBool = AtomicBool::new(false);
+
+struct ProcessEmbeddedHostCoordinator {
+    rt: tokio::runtime::Runtime,
+    op_lock: tokio::sync::Mutex<()>,
+    handle: Mutex<Option<EmbeddedHostHandle>>,
+    op_gen: AtomicU64,
+    active_hubs: AtomicUsize,
+}
+
+impl ProcessEmbeddedHostCoordinator {
+    fn global() -> &'static Self {
+        static INSTANCE: OnceLock<ProcessEmbeddedHostCoordinator> = OnceLock::new();
+        INSTANCE.get_or_init(|| {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .worker_threads(1)
+                .build()
+                .expect("failed to start Coda embedded host coordinator runtime");
+            Self {
+                rt,
+                op_lock: tokio::sync::Mutex::new(()),
+                handle: Mutex::new(None),
+                op_gen: AtomicU64::new(0),
+                active_hubs: AtomicUsize::new(0),
+            }
+        })
+    }
+
+    fn is_active(&self) -> bool {
+        self.handle
+            .lock()
+            .map(|g| g.is_some())
+            .unwrap_or(false)
+    }
+
+    fn stop_now(&self) {
+        self.op_gen.fetch_add(1, Ordering::AcqRel);
+        EMBEDDED_HOST_STARTED.store(false, Ordering::Release);
+        if let Ok(mut guard) = self.handle.lock() {
+            if let Some(h) = guard.take() {
+                h.stop();
+            }
+        }
+    }
+}
 
 pub struct RemoteMeshHub {
     rt: Option<tokio::runtime::Runtime>,
@@ -233,26 +286,19 @@ pub struct RemoteMeshHub {
     peers_sync: std::sync::RwLock<HashMap<Uuid, Arc<LivePeerSession>>>,
     client_identities:
         tokio::sync::Mutex<HashMap<Uuid, (Uuid, coda_protocol::StoredDeviceIdentity)>>,
+    owns_primary_client_identity: AtomicBool,
     attached_terms: tokio::sync::Mutex<HashSet<(Uuid, String)>>,
-    embedded_host_handle: tokio::sync::Mutex<Option<EmbeddedHostHandle>>,
-    embedded_host_lock: tokio::sync::Mutex<()>,
-    embedded_host_gen: AtomicU64,
     peer_connect_locks: tokio::sync::Mutex<HashMap<Uuid, Arc<tokio::sync::Mutex<()>>>>,
     smart_path: tokio::sync::Mutex<DesktopSmartPathPolicy>,
     tunnel_mgr: Arc<PortPreviewTunnelManager>,
     watcher_gen: AtomicU64,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    did_shutdown: AtomicBool,
 }
 
 impl Drop for RemoteMeshHub {
     fn drop(&mut self) {
-        self.tunnel_mgr.stop_all();
-        self.embedded_host_gen.fetch_add(1, Ordering::AcqRel);
-        if let Ok(mut guard) = self.embedded_host_handle.try_lock() {
-            if let Some(handle) = guard.take() {
-                handle.stop();
-                EMBEDDED_HOST_STARTED.store(false, Ordering::Release);
-            }
-        }
+        self.shutdown();
         if let Some(rt) = self.rt.take() {
             rt.shutdown_background();
         }
@@ -270,6 +316,13 @@ impl RemoteMeshHub {
             .worker_threads(2)
             .build()
             .expect("failed to start Coda mesh tokio runtime");
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let claimed_primary = PRIMARY_CLIENT_IDENTITY_CLAIMED
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok();
+        ProcessEmbeddedHostCoordinator::global()
+            .active_hubs
+            .fetch_add(1, Ordering::AcqRel);
         Arc::new(Self {
             rt: Some(rt),
             state,
@@ -278,15 +331,63 @@ impl RemoteMeshHub {
             peers: tokio::sync::Mutex::new(HashMap::new()),
             peers_sync: std::sync::RwLock::new(HashMap::new()),
             client_identities: tokio::sync::Mutex::new(HashMap::new()),
+            owns_primary_client_identity: AtomicBool::new(claimed_primary),
             attached_terms: tokio::sync::Mutex::new(HashSet::new()),
-            embedded_host_handle: tokio::sync::Mutex::new(None),
-            embedded_host_lock: tokio::sync::Mutex::new(()),
-            embedded_host_gen: AtomicU64::new(0),
             peer_connect_locks: tokio::sync::Mutex::new(HashMap::new()),
             smart_path: tokio::sync::Mutex::new(DesktopSmartPathPolicy::default()),
             tunnel_mgr: PortPreviewTunnelManager::new(),
             watcher_gen: AtomicU64::new(0),
+            shutdown_tx,
+            did_shutdown: AtomicBool::new(false),
         })
+    }
+
+    /// Cancels all background watchers, closes all live peers and loopback port tunnels, and stops
+    /// the process-global embedded host if no other desktop window remains open (`Bug #1`).
+    pub fn shutdown(&self) {
+        if self
+            .did_shutdown
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        self.watcher_gen.fetch_add(1, Ordering::AcqRel);
+        let _ = self.shutdown_tx.send(true);
+        self.tunnel_mgr.stop_all();
+
+        let peers_to_close: Vec<Arc<LivePeerSession>> = self
+            .peers_sync
+            .write()
+            .map(|mut m| m.drain().map(|(_, p)| p).collect())
+            .unwrap_or_default();
+        for peer in peers_to_close {
+            peer.close();
+        }
+        if let Ok(mut map) = self.peers.try_lock() {
+            map.clear();
+        }
+
+        if self
+            .owns_primary_client_identity
+            .swap(false, Ordering::AcqRel)
+        {
+            PRIMARY_CLIENT_IDENTITY_CLAIMED.store(false, Ordering::Release);
+        }
+
+        let coord = ProcessEmbeddedHostCoordinator::global();
+        let prev = coord.active_hubs.fetch_sub(1, Ordering::AcqRel);
+        if prev <= 1 {
+            coord.stop_now();
+        }
+    }
+
+    pub fn stop_all_tunnels_quiet(&self) {
+        self.tunnel_mgr.stop_all();
+        if let Ok(mut g) = self.state.lock() {
+            g.port_preview.clear_tunnels();
+        }
+        self.ui_dirty.store(true, Ordering::Release);
     }
 
     async fn insert_peer(&self, host_id: Uuid, peer: Arc<LivePeerSession>) -> Option<Arc<LivePeerSession>> {
@@ -335,6 +436,9 @@ impl RemoteMeshHub {
     where
         F: std::future::Future<Output = ()> + Send + 'static,
     {
+        if *self.shutdown_tx.borrow() {
+            return;
+        }
         if let Some(ref rt) = self.rt {
             rt.spawn(fut);
         }
@@ -353,39 +457,52 @@ impl RemoteMeshHub {
                 g.allow_remote_control
             })
             .unwrap_or(true);
+        let coord = ProcessEmbeddedHostCoordinator::global();
+        if coord.is_active() && allow_remote {
+            EMBEDDED_HOST_STARTED.store(true, Ordering::Release);
+            if let Ok(mut g) = self.state.lock() {
+                g.embedded_host_active = true;
+                g.external_daemon_running = false;
+            }
+            self.ui_dirty.store(true, Ordering::Release);
+            return;
+        }
         let ext_pid = active_daemon_lock_pid(&cfg_path);
         let external_running = ext_pid.map(|p| p != std::process::id()).unwrap_or(false);
         if let Ok(mut g) = self.state.lock() {
             g.external_daemon_running = external_running;
+            if !allow_remote {
+                g.embedded_host_active = false;
+            }
         }
         if !allow_remote || external_running {
             self.ui_dirty.store(true, Ordering::Release);
             return;
         }
-        let my_gen = self.embedded_host_gen.fetch_add(1, Ordering::AcqRel) + 1;
-        let hub = Arc::clone(self);
-        self.spawn_bg(async move {
-            let _op_guard = hub.embedded_host_lock.lock().await;
-            if hub.embedded_host_gen.load(Ordering::Acquire) != my_gen {
+        let my_gen = coord.op_gen.fetch_add(1, Ordering::AcqRel) + 1;
+        let weak_hub = Arc::downgrade(self);
+        coord.rt.spawn(async move {
+            let _op_guard = coord.op_lock.lock().await;
+            if coord.op_gen.load(Ordering::Acquire) != my_gen || coord.active_hubs.load(Ordering::Acquire) == 0 {
                 return;
             }
-            if hub.embedded_host_handle.lock().await.is_some() {
-                if let Ok(mut g) = hub.state.lock() {
-                    g.embedded_host_active = true;
-                    g.external_daemon_running = false;
+            if coord.is_active() {
+                EMBEDDED_HOST_STARTED.store(true, Ordering::Release);
+                if let Some(hub) = weak_hub.upgrade() {
+                    if let Ok(mut g) = hub.state.lock() {
+                        g.embedded_host_active = true;
+                        g.external_daemon_running = false;
+                    }
+                    hub.ui_dirty.store(true, Ordering::Release);
                 }
-                hub.ui_dirty.store(true, Ordering::Release);
                 return;
             }
-            if EMBEDDED_HOST_STARTED
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
-            {
-                return;
-            }
+            EMBEDDED_HOST_STARTED.store(true, Ordering::Release);
             let mut started_handle = None;
             for attempt in 0..3 {
-                if hub.embedded_host_gen.load(Ordering::Acquire) != my_gen {
+                if coord.op_gen.load(Ordering::Acquire) != my_gen
+                    || coord.active_hubs.load(Ordering::Acquire) == 0
+                {
                     break;
                 }
                 if let Some(handle) = start_embedded_host_with_handle(&cfg_path).await {
@@ -397,28 +514,35 @@ impl RemoteMeshHub {
                 }
             }
             if let Some(handle) = started_handle {
-                if hub.embedded_host_gen.load(Ordering::Acquire) != my_gen
+                if coord.op_gen.load(Ordering::Acquire) != my_gen
+                    || coord.active_hubs.load(Ordering::Acquire) == 0
                     || !EMBEDDED_HOST_STARTED.load(Ordering::Acquire)
                 {
                     handle.stop();
                     EMBEDDED_HOST_STARTED.store(false, Ordering::Release);
                     return;
                 }
-                *hub.embedded_host_handle.lock().await = Some(handle);
-                if let Ok(mut g) = hub.state.lock() {
-                    g.embedded_host_active = true;
-                    g.external_daemon_running = false;
+                if let Ok(mut slot) = coord.handle.lock() {
+                    *slot = Some(handle);
                 }
-                hub.ui_dirty.store(true, Ordering::Release);
+                if let Some(hub) = weak_hub.upgrade() {
+                    if let Ok(mut g) = hub.state.lock() {
+                        g.embedded_host_active = true;
+                        g.external_daemon_running = false;
+                    }
+                    hub.ui_dirty.store(true, Ordering::Release);
+                }
             } else {
                 EMBEDDED_HOST_STARTED.store(false, Ordering::Release);
-                if let Ok(mut g) = hub.state.lock() {
-                    g.embedded_host_active = false;
-                    g.external_daemon_running = active_daemon_lock_pid(&cfg_path)
-                        .map(|p| p != std::process::id())
-                        .unwrap_or(false);
+                if let Some(hub) = weak_hub.upgrade() {
+                    if let Ok(mut g) = hub.state.lock() {
+                        g.embedded_host_active = false;
+                        g.external_daemon_running = active_daemon_lock_pid(&cfg_path)
+                            .map(|p| p != std::process::id())
+                            .unwrap_or(false);
+                    }
+                    hub.ui_dirty.store(true, Ordering::Release);
                 }
-                hub.ui_dirty.store(true, Ordering::Release);
             }
         });
     }
@@ -453,22 +577,10 @@ impl RemoteMeshHub {
         if enabled {
             self.ensure_embedded_host();
         } else {
-            let my_gen = self.embedded_host_gen.fetch_add(1, Ordering::AcqRel) + 1;
-            let hub = Arc::clone(self);
-            self.spawn_bg(async move {
-                let _op_guard = hub.embedded_host_lock.lock().await;
-                if hub.embedded_host_gen.load(Ordering::Acquire) != my_gen {
-                    return;
-                }
-                EMBEDDED_HOST_STARTED.store(false, Ordering::Release);
-                if let Some(handle) = hub.embedded_host_handle.lock().await.take() {
-                    handle.stop();
-                }
-                if let Ok(mut g) = hub.state.lock() {
-                    g.embedded_host_active = false;
-                }
-                hub.ui_dirty.store(true, Ordering::Release);
-            });
+            ProcessEmbeddedHostCoordinator::global().stop_now();
+            if let Ok(mut g) = self.state.lock() {
+                g.embedded_host_active = false;
+            }
         }
         self.ui_dirty.store(true, Ordering::Release);
     }
@@ -476,14 +588,7 @@ impl RemoteMeshHub {
     /// Cleanly tears down old account peers, remote sessions, and embedded host before switching accounts.
     pub async fn reset_for_account_switch(self: &Arc<Self>) {
         self.watcher_gen.fetch_add(1, Ordering::AcqRel);
-        self.embedded_host_gen.fetch_add(1, Ordering::AcqRel);
-        {
-            let _op_guard = self.embedded_host_lock.lock().await;
-            EMBEDDED_HOST_STARTED.store(false, Ordering::Release);
-            if let Some(handle) = self.embedded_host_handle.lock().await.take() {
-                handle.stop();
-            }
-        }
+        ProcessEmbeddedHostCoordinator::global().stop_now();
         for peer in self.drain_peers().await {
             peer.close();
         }
@@ -493,6 +598,7 @@ impl RemoteMeshHub {
         self.smart_path.lock().await.reset_all();
         self.tunnel_mgr.stop_all();
         DesktopClientIdentityRecord::remove_saved();
+        invalidate_secret_and_daemon_config_caches();
 
         let mut removed_remote_sids = Vec::new();
         if let Ok(mut g) = self.state.lock() {
@@ -506,9 +612,12 @@ impl RemoteMeshHub {
             g.remote_probe_status = None;
             g.webhook_settings = NotificationWebhookSettings::default();
             g.webhook_loading = false;
-            g.port_preview.active_tunnel_url = None;
-            g.port_preview.active_tunnel_key = None;
-            g.port_preview.tunnel_starting = false;
+            g.webhook_loaded_ok = false;
+            g.webhook_dirty = false;
+            g.remote_diff_seq = g.remote_diff_seq.wrapping_add(1);
+            g.git_diff_loading = false;
+            g.port_preview.clear_tunnels();
+            g.bootstrap_modal.reset();
             g.clear_settings_ephemeral_inputs();
             g.notify_tracker.reset();
             g.spaces.retain(|sp| !sp.is_remote);
@@ -683,14 +792,14 @@ impl RemoteMeshHub {
                     let host_str = device_id.to_string();
                     let mut removed_sids = Vec::new();
                     if let Ok(mut g) = hub.state.lock() {
-                        if g.port_preview.active_tunnel_key.and_then(|k| k.device_id)
-                            == Some(device_id)
-                        {
-                            g.port_preview.active_tunnel_url = None;
-                            g.port_preview.active_tunnel_key = None;
-                            g.port_preview.tunnel_starting = false;
-                        }
                         g.remote_hosts.retain(|h| h.id != device_id);
+                        let hosts_snap = g.remote_hosts.clone();
+                        g.port_preview
+                            .sync_from_manager(&hub.tunnel_mgr, &hosts_snap, None);
+                        g.port_preview.tunnel_starting = false;
+                        if g.bootstrap_modal.host_id == Some(device_id) {
+                            g.bootstrap_modal.reset();
+                        }
                         g.spaces.retain(|sp| sp.machine_id != host_str);
                         if g.renaming_host_id == Some(device_id) {
                             g.renaming_host_id = None;
@@ -745,7 +854,7 @@ impl RemoteMeshHub {
     pub fn sign_out(self: &Arc<Self>) {
         self.watcher_gen.fetch_add(1, Ordering::AcqRel);
         self.tunnel_mgr.stop_all();
-        EMBEDDED_HOST_STARTED.store(false, Ordering::Release);
+        ProcessEmbeddedHostCoordinator::global().stop_now();
 
         let cfg_path = DaemonConfig::default_path();
         let prev_cfg = load_desktop_daemon_config(&cfg_path).ok();
@@ -757,6 +866,7 @@ impl RemoteMeshHub {
         }
         delete_secret_from_keychain("session_token");
         DesktopClientIdentityRecord::remove_saved();
+        invalidate_secret_and_daemon_config_caches();
 
         let mut removed_remote_sids = Vec::new();
         if let Ok(mut g) = self.state.lock() {
@@ -776,9 +886,12 @@ impl RemoteMeshHub {
             g.auth_password_input.clear();
             g.webhook_settings = NotificationWebhookSettings::default();
             g.webhook_loading = false;
-            g.port_preview.active_tunnel_url = None;
-            g.port_preview.active_tunnel_key = None;
-            g.port_preview.tunnel_starting = false;
+            g.webhook_loaded_ok = false;
+            g.webhook_dirty = false;
+            g.remote_diff_seq = g.remote_diff_seq.wrapping_add(1);
+            g.git_diff_loading = false;
+            g.port_preview.clear_tunnels();
+            g.bootstrap_modal.reset();
             g.clear_settings_ephemeral_inputs();
             g.notify_tracker.reset();
             g.device_login_code = None;
@@ -821,18 +934,8 @@ impl RemoteMeshHub {
         }
         self.ui_dirty.store(true, Ordering::Release);
 
-        let my_host_gen = self.embedded_host_gen.fetch_add(1, Ordering::AcqRel) + 1;
         let hub = Arc::clone(self);
         self.spawn_bg(async move {
-            {
-                let _op_guard = hub.embedded_host_lock.lock().await;
-                if hub.embedded_host_gen.load(Ordering::Acquire) == my_host_gen {
-                    EMBEDDED_HOST_STARTED.store(false, Ordering::Release);
-                    if let Some(handle) = hub.embedded_host_handle.lock().await.take() {
-                        handle.stop();
-                    }
-                }
-            }
             for peer in hub.drain_peers().await {
                 peer.close();
             }
@@ -852,15 +955,28 @@ impl RemoteMeshHub {
 
     pub fn start_account_sync(self: &Arc<Self>) {
         let my_gen = self.watcher_gen.fetch_add(1, Ordering::AcqRel) + 1;
-        let hub = Arc::clone(self);
+        let weak_hub = Arc::downgrade(self);
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
         self.spawn_bg(async move {
-            hub.sync_all_hosts_and_sessions().await;
+            if let Some(hub) = weak_hub.upgrade() {
+                hub.sync_all_hosts_and_sessions().await;
+            } else {
+                return;
+            }
 
             loop {
-                if hub.watcher_gen.load(Ordering::Acquire) != my_gen {
+                if *shutdown_rx.borrow() {
                     break;
                 }
-                let Ok(cfg) = load_desktop_daemon_config(&DaemonConfig::default_path()) else {
+                let Some(cfg) = ({
+                    let Some(hub) = weak_hub.upgrade() else {
+                        break;
+                    };
+                    if hub.watcher_gen.load(Ordering::Acquire) != my_gen {
+                        break;
+                    }
+                    load_desktop_daemon_config(&DaemonConfig::default_path()).ok()
+                }) else {
                     break;
                 };
                 let Some(ref tok) = cfg.session_token else {
@@ -868,28 +984,48 @@ impl RemoteMeshHub {
                 };
 
                 match subscribe_account_events_ws(&cfg.server_url, tok).await {
-                    Ok(mut rx) => {
-                        while let Some(ev) = rx.recv().await {
-                            if hub.watcher_gen.load(Ordering::Acquire) != my_gen {
-                                return;
-                            }
-                            if ev.role.as_deref() == Some("client") {
+                    Ok(mut rx) => loop {
+                        let ev_opt = tokio::select! {
+                            changed = shutdown_rx.changed() => {
+                                if changed.is_err() || *shutdown_rx.borrow() {
+                                    return;
+                                }
                                 continue;
                             }
-                            if matches!(
-                                ev.kind.as_str(),
-                                "connected" | "devices_changed" | "peer_presence"
-                            ) {
-                                hub.smart_path.lock().await.reset_all();
-                                hub.sync_all_hosts_and_sessions().await;
-                            }
+                            ev = rx.recv() => ev,
+                        };
+                        let Some(ev) = ev_opt else {
+                            break;
+                        };
+                        let Some(hub) = weak_hub.upgrade() else {
+                            return;
+                        };
+                        if hub.watcher_gen.load(Ordering::Acquire) != my_gen {
+                            return;
                         }
-                    }
+                        if ev.role.as_deref() == Some("client") {
+                            continue;
+                        }
+                        if matches!(
+                            ev.kind.as_str(),
+                            "connected" | "devices_changed" | "peer_presence"
+                        ) {
+                            hub.smart_path.lock().await.reset_all();
+                            hub.sync_all_hosts_and_sessions().await;
+                        }
+                    },
                     Err(e) => {
                         tracing::debug!("account /api/v1/events/ws reconnect scheduled: {e}");
                     }
                 }
-                tokio::time::sleep(Duration::from_secs(2)).await;
+                tokio::select! {
+                    changed = shutdown_rx.changed() => {
+                        if changed.is_err() || *shutdown_rx.borrow() {
+                            break;
+                        }
+                    }
+                    _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+                }
             }
         });
     }
@@ -1084,41 +1220,50 @@ impl RemoteMeshHub {
         cfg: &DaemonConfig,
     ) -> (Uuid, coda_protocol::StoredDeviceIdentity, bool) {
         if let Some(existing) = self.client_identities.lock().await.get(&Uuid::nil()).cloned() {
-            (existing.0, existing.1, true)
-        } else if let Some(tok) = cfg.session_token.as_deref() {
-            if let Some((saved_id, saved_ident)) =
-                DesktopClientIdentityRecord::load_matching(&cfg.server_url, tok)
-            {
-                self.client_identities
-                    .lock()
-                    .await
-                    .insert(Uuid::nil(), (saved_id, saved_ident.clone()));
-                (saved_id, saved_ident, true)
-            } else if let Ok(created) = coda_daemon::register_client_identity(
+            return (existing.0, existing.1, true);
+        }
+        let owns_primary = self.owns_primary_client_identity.load(Ordering::Acquire);
+        if let Some(tok) = cfg.session_token.as_deref() {
+            if owns_primary {
+                if let Some((saved_id, saved_ident)) =
+                    DesktopClientIdentityRecord::load_matching(&cfg.server_url, tok)
+                {
+                    self.client_identities
+                        .lock()
+                        .await
+                        .insert(Uuid::nil(), (saved_id, saved_ident.clone()));
+                    return (saved_id, saved_ident, true);
+                }
+            }
+            let client_name = if owns_primary {
+                "desktop-client"
+            } else {
+                "desktop-window"
+            };
+            if let Ok(created) = coda_daemon::register_client_identity(
                 &cfg.server_url,
                 tok,
-                "desktop-client",
+                client_name,
                 "macos",
             )
             .await
             {
-                let _ = DesktopClientIdentityRecord::save_for_token(
-                    &cfg.server_url,
-                    tok,
-                    created.0,
-                    &created.1,
-                );
+                if owns_primary {
+                    let _ = DesktopClientIdentityRecord::save_for_token(
+                        &cfg.server_url,
+                        tok,
+                        created.0,
+                        &created.1,
+                    );
+                }
                 self.client_identities
                     .lock()
                     .await
                     .insert(Uuid::nil(), created.clone());
-                (created.0, created.1, false)
-            } else {
-                (cfg.device_id, cfg.identity.clone(), false)
+                return (created.0, created.1, false);
             }
-        } else {
-            (cfg.device_id, cfg.identity.clone(), false)
         }
+        (cfg.device_id, cfg.identity.clone(), false)
     }
 
     async fn reattach_terms_preserving_screen(
@@ -1271,13 +1416,33 @@ impl RemoteMeshHub {
         relay_peer: Arc<LivePeerSession>,
         host: RemoteHostSummary,
     ) {
-        let hub = Arc::clone(self);
+        let weak_hub = Arc::downgrade(self);
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
         let my_gen = self.watcher_gen.load(Ordering::Acquire);
         self.spawn_bg(async move {
             loop {
-                let delay = hub.smart_path.lock().await.next_delay(host.id);
-                tokio::time::sleep(delay).await;
+                let Some(delay) = ({
+                    let Some(hub) = weak_hub.upgrade() else {
+                        break;
+                    };
+                    let d = hub.smart_path.lock().await.next_delay(host.id);
+                    Some(d)
+                }) else {
+                    break;
+                };
 
+                tokio::select! {
+                    changed = shutdown_rx.changed() => {
+                        if changed.is_err() || *shutdown_rx.borrow() {
+                            break;
+                        }
+                    }
+                    _ = tokio::time::sleep(delay) => {}
+                }
+
+                let Some(hub) = weak_hub.upgrade() else {
+                    break;
+                };
                 if hub.watcher_gen.load(Ordering::Acquire) != my_gen {
                     break;
                 }
@@ -1321,7 +1486,8 @@ impl RemoteMeshHub {
         host: RemoteHostSummary,
     ) {
         let mut rx = arc_sess.subscribe_events();
-        let hub = Arc::clone(self);
+        let weak_hub = Arc::downgrade(self);
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
         let host_id = host.id;
         let host_clone = host.clone();
         let peer_for_task = Arc::clone(&arc_sess);
@@ -1330,21 +1496,40 @@ impl RemoteMeshHub {
         {
             // Decouple `HerdrLiveEvent` full-list RPC sync into a coalesced background task so
             // high-frequency PTY output chunks are never blocked waiting on RPC round-trips.
-            let hub_sync = Arc::clone(self);
+            let weak_hub_sync = Arc::downgrade(self);
+            let mut shutdown_rx_sync = self.shutdown_tx.subscribe();
             let peer_sync = Arc::clone(&arc_sess);
             let host_sync = host.clone();
             let notify_rx = Arc::clone(&sync_notify);
             let stop_flag = Arc::clone(&sync_stop);
             self.spawn_bg(async move {
                 loop {
-                    notify_rx.notified().await;
+                    tokio::select! {
+                        changed = shutdown_rx_sync.changed() => {
+                            if changed.is_err() || *shutdown_rx_sync.borrow() {
+                                break;
+                            }
+                            continue;
+                        }
+                        _ = notify_rx.notified() => {}
+                    }
                     if stop_flag.load(Ordering::Acquire) {
                         break;
                     }
-                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    tokio::select! {
+                        changed = shutdown_rx_sync.changed() => {
+                            if changed.is_err() || *shutdown_rx_sync.borrow() {
+                                break;
+                            }
+                        }
+                        _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+                    }
                     if stop_flag.load(Ordering::Acquire) {
                         break;
                     }
+                    let Some(hub_sync) = weak_hub_sync.upgrade() else {
+                        break;
+                    };
                     hub_sync
                         .sync_with_connected_peer(Arc::clone(&peer_sync), &host_sync)
                         .await;
@@ -1353,7 +1538,23 @@ impl RemoteMeshHub {
         }
         self.spawn_bg(async move {
             loop {
-                match rx.recv().await {
+                let recv_res = tokio::select! {
+                    changed = shutdown_rx.changed() => {
+                        if changed.is_err() || *shutdown_rx.borrow() {
+                            sync_stop.store(true, Ordering::Release);
+                            sync_notify.notify_one();
+                            break;
+                        }
+                        continue;
+                    }
+                    ev = rx.recv() => ev,
+                };
+                let Some(hub) = weak_hub.upgrade() else {
+                    sync_stop.store(true, Ordering::Release);
+                    sync_notify.notify_one();
+                    break;
+                };
+                match recv_res {
                     Ok(PeerAsyncEvent::PtyOutputChunk {
                         terminal,
                         data_b64,
@@ -2366,11 +2567,19 @@ impl RemoteMeshHub {
                 .request(req, TrafficLane::BulkP1, Duration::from_secs(8))
                 .await
             {
-                Ok(PeerMessage::FilePreviewResponse { content, error, .. }) => {
+                Ok(PeerMessage::FilePreviewResponse {
+                    content,
+                    error,
+                    truncated,
+                    ..
+                }) => {
                     if let Ok(mut g) = hub.state.lock() {
                         g.selected_file_rel = Some(rel_path);
                         g.selected_file_content = match error {
                             Some(err) => format!("[Error reading remote file: {err}]"),
+                            None if truncated => {
+                                format!("{content}\n... (truncated on remote host)")
+                            }
                             None => content,
                         };
                     }
@@ -2387,12 +2596,12 @@ impl RemoteMeshHub {
         });
     }
 
-    /// Sends an E2EE `PeerMessage::GitDiffRequest` to `device_id` and returns `(branch, status_short, diff_unified)`.
+    /// Sends an E2EE `PeerMessage::GitDiffRequest` to `device_id` and returns the full `RemoteGitDiffPayload`.
     pub async fn fetch_remote_git_diff(
         self: &Arc<Self>,
         device_id: Uuid,
         cwd: &str,
-    ) -> Result<(String, String, String), String> {
+    ) -> Result<RemoteGitDiffPayload, String> {
         let peer = self
             .ensure_peer_for_host(device_id)
             .await
@@ -2409,8 +2618,18 @@ impl RemoteMeshHub {
                 branch,
                 status_short,
                 diff_unified,
+                is_git_repo,
+                repo_root,
+                error,
                 ..
-            }) => Ok((branch, status_short, diff_unified)),
+            }) => Ok(RemoteGitDiffPayload {
+                branch,
+                status_short,
+                diff_unified,
+                is_git_repo,
+                repo_root,
+                error,
+            }),
             Ok(_) => Err("Unexpected E2EE GitDiffResponse from remote host".to_string()),
             Err(e) => Err(format!("{e}")),
         }
@@ -2418,111 +2637,48 @@ impl RemoteMeshHub {
 
     fn apply_remote_git_diff_response(
         &self,
+        seq: u64,
         device_id: Uuid,
         space_id_hint: Option<&str>,
         cwd: &str,
-        branch: String,
-        status_short: String,
-        diff_unified: String,
+        payload: RemoteGitDiffPayload,
     ) {
-        let changed_files = parse_git_status_short(&status_short);
-        let is_git_repo =
-            !branch.trim().is_empty() || !status_short.trim().is_empty() || !diff_unified.trim().is_empty();
-        let clean_branch = if branch.trim().is_empty() {
-            "online".to_string()
-        } else {
-            branch.trim().to_string()
-        };
-        let host_id_str = device_id.to_string();
         if let Ok(mut g) = self.state.lock() {
-            g.git_diff_loading = false;
-            for sp in &mut g.spaces {
-                if sp.machine_id == host_id_str
-                    && (space_id_hint == Some(sp.id.as_str()) || sp.path == cwd)
-                {
-                    if is_git_repo {
-                        sp.branch = clean_branch.clone();
-                    }
-                    sp.dirty_files = changed_files.len();
-                }
-            }
-            let active_matches_host = g
-                .focused_session_id()
-                .and_then(|sid| g.session_by_id(sid))
-                .and_then(|s| s.remote_host_id.as_deref())
-                == Some(host_id_str.as_str())
-                || g.active_space()
-                    .map(|sp| sp.is_remote && sp.machine_id == host_id_str)
-                    .unwrap_or(false)
-                || (space_id_hint.is_some() && g.active_space_id.as_deref() == space_id_hint);
-
-            if active_matches_host {
-                if let Some(ref sel) = g.selected_change_path {
-                    if !changed_files.iter().any(|f| &f.path == sel) {
-                        g.selected_change_path = None;
-                    }
-                }
-                let repo_name = Path::new(cwd)
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .filter(|s| !s.is_empty() && *s != ".")
-                    .unwrap_or("remote")
-                    .to_string();
-                g.repo_snapshot = RepoInspectorSnapshot {
-                    repo_path: cwd.to_string(),
-                    repo_name,
-                    is_git_repo,
-                    branch: if is_git_repo {
-                        clean_branch
-                    } else {
-                        String::new()
-                    },
-                    head_summary: format!("{} changed (E2EE remote)", changed_files.len()),
-                    diff_added: diff_unified
-                        .lines()
-                        .filter(|l| l.starts_with('+') && !l.starts_with("+++"))
-                        .count() as u32,
-                    diff_deleted: diff_unified
-                        .lines()
-                        .filter(|l| l.starts_with('-') && !l.starts_with("---"))
-                        .count() as u32,
-                    changed_files,
-                    diff_title: format!("{cwd} · remote diff"),
-                    diff_text: if diff_unified.trim().is_empty() {
-                        "Clean working tree on remote host.".to_string()
-                    } else {
-                        diff_unified
-                    },
-                    ..Default::default()
-                };
-            }
+            apply_remote_git_diff_payload_to_state(
+                &mut g,
+                seq,
+                device_id,
+                space_id_hint,
+                cwd,
+                payload,
+            );
         }
         self.ui_dirty.store(true, Ordering::Release);
     }
 
-    /// Requests an E2EE `GitDiffRequest` for `(device_id, cwd)` and updates the Right Drawer `Changes` inspector.
+    /// Requests an E2EE `GitDiffRequest` for `(device_id, cwd)` guarded by monotonic `remote_diff_seq`
+    /// and `(device_id, cwd)` verification (`Bug #7` & `Gap #3`).
     pub fn request_remote_git_diff(self: &Arc<Self>, device_id: Uuid, cwd: String) {
-        if let Ok(mut g) = self.state.lock() {
+        let seq = if let Ok(mut g) = self.state.lock() {
+            g.remote_diff_seq = g.remote_diff_seq.wrapping_add(1);
             g.git_diff_loading = true;
-        }
+            g.remote_diff_seq
+        } else {
+            return;
+        };
         self.ui_dirty.store(true, Ordering::Release);
         let hub = Arc::clone(self);
         self.spawn_bg(async move {
             match hub.fetch_remote_git_diff(device_id, &cwd).await {
-                Ok((branch, status_short, diff_unified)) => {
-                    hub.apply_remote_git_diff_response(
-                        device_id,
-                        None,
-                        &cwd,
-                        branch,
-                        status_short,
-                        diff_unified,
-                    );
+                Ok(payload) => {
+                    hub.apply_remote_git_diff_response(seq, device_id, None, &cwd, payload);
                 }
                 Err(err) => {
                     if let Ok(mut g) = hub.state.lock() {
-                        g.git_diff_loading = false;
-                        g.status_notice = Some(format!("Remote Git diff failed: {err}"));
+                        if g.remote_diff_seq == seq {
+                            g.git_diff_loading = false;
+                            g.status_notice = Some(format!("Remote Git diff failed: {err}"));
+                        }
                     }
                     hub.ui_dirty.store(true, Ordering::Release);
                 }
@@ -2539,28 +2695,40 @@ impl RemoteMeshHub {
         let hub = Arc::clone(self);
         let space_id = space_id.to_string();
         let cwd = cwd.to_string();
-        if let Ok(mut g) = hub.state.lock() {
-            if g.active_space_id.as_deref() == Some(space_id.as_str()) {
+        let seq = if let Ok(mut g) = hub.state.lock() {
+            if g.effective_remote_diff_target()
+                .map(|(did, ref cur_cwd)| did == host_id && cur_cwd == &cwd)
+                .unwrap_or(false)
+            {
+                g.remote_diff_seq = g.remote_diff_seq.wrapping_add(1);
                 g.git_diff_loading = true;
+                g.remote_diff_seq
+            } else {
+                0
             }
-        }
+        } else {
+            return;
+        };
         self.spawn_bg(async move {
             match hub.fetch_remote_git_diff(host_id, &cwd).await {
-                Ok((branch, status_short, diff_unified)) => {
+                Ok(payload) => {
                     hub.apply_remote_git_diff_response(
+                        seq,
                         host_id,
                         Some(&space_id),
                         &cwd,
-                        branch,
-                        status_short,
-                        diff_unified,
+                        payload,
                     );
                 }
                 Err(_) => {
-                    if let Ok(mut g) = hub.state.lock() {
-                        g.git_diff_loading = false;
+                    if seq != 0 {
+                        if let Ok(mut g) = hub.state.lock() {
+                            if g.remote_diff_seq == seq {
+                                g.git_diff_loading = false;
+                            }
+                        }
+                        hub.ui_dirty.store(true, Ordering::Release);
                     }
-                    hub.ui_dirty.store(true, Ordering::Release);
                 }
             }
         });
@@ -2747,32 +2915,43 @@ impl RemoteMeshHub {
         });
     }
 
-    /// Sends an E2EE `HttpLocalPreviewRequest` to `device_id` and decodes `body_b64` into raw `Vec<u8>` bytes
-    /// so HTML, JS, CSS, PNG, SVG, and WASM assets all traverse intact.
-    pub async fn request_remote_port_preview(
+    /// Sends a full-method E2EE `HttpLocalPreviewRequest` (`method`, `headers`, `req_body_b64`) to
+    /// `device_id` and returns `ProxyHttpResponse` including upstream response headers (`Bug #6` / `Gap #1`).
+    pub async fn request_remote_port_preview_full(
         self: &Arc<Self>,
         device_id: Uuid,
         remote_port: u16,
-        path_and_query: String,
-    ) -> Result<(u16, String, Vec<u8>), String> {
-        let cfg = load_desktop_daemon_config(&DaemonConfig::default_path())
-            .map_err(|_| "Sign in required before previewing remote ports.".to_string())?;
-        let host = self
-            .state
-            .lock()
-            .ok()
-            .and_then(|g| g.remote_hosts.iter().find(|h| h.id == device_id).cloned())
-            .ok_or_else(|| "Remote host not found.".to_string())?;
-        let peer = self
-            .get_or_connect_peer(&cfg, &host)
-            .await
-            .map_err(|err| format!("Host unreachable: {err}"))?;
+        req: ProxyHttpRequest,
+    ) -> Result<ProxyHttpResponse, String> {
+        let peer = if let Some(existing) = self.peers.lock().await.get(&device_id).cloned() {
+            existing
+        } else {
+            let cfg = load_desktop_daemon_config(&DaemonConfig::default_path())
+                .map_err(|_| "Sign in required before previewing remote ports.".to_string())?;
+            let host = self
+                .state
+                .lock()
+                .ok()
+                .and_then(|g| g.remote_hosts.iter().find(|h| h.id == device_id).cloned())
+                .ok_or_else(|| "Remote host not found.".to_string())?;
+            self.get_or_connect_peer(&cfg, &host)
+                .await
+                .map_err(|err| format!("Host unreachable: {err}"))?
+        };
+
         let reply = peer
             .request(
                 PeerMessage::HttpLocalPreviewRequest {
                     req_id: format!("pp-{}", Uuid::new_v4().simple()),
                     port: remote_port,
-                    path: path_and_query,
+                    path: req.path_and_query,
+                    method: Some(req.method),
+                    headers: req.headers,
+                    req_body_b64: if req.body.is_empty() {
+                        None
+                    } else {
+                        Some(B64.encode(&req.body))
+                    },
                 },
                 TrafficLane::BulkP1,
                 Duration::from_secs(12),
@@ -2784,13 +2963,51 @@ impl RemoteMeshHub {
                 status_code,
                 content_type,
                 body_b64,
+                headers,
+                truncated,
                 ..
             } => {
+                if truncated && status_code < 400 {
+                    return Ok(ProxyHttpResponse {
+                        status_code: 413,
+                        content_type: "text/plain; charset=utf-8".to_string(),
+                        headers: Vec::new(),
+                        body: b"Payload Too Large (exceeds remote 4 MiB E2EE preview limit)"
+                            .to_vec(),
+                    });
+                }
                 let raw_bytes = crate::port_preview::decode_remote_preview_raw_bytes(&body_b64)?;
-                Ok((status_code, content_type, raw_bytes))
+                Ok(ProxyHttpResponse {
+                    status_code,
+                    content_type,
+                    headers,
+                    body: raw_bytes,
+                })
             }
             _ => Err("Unexpected E2EE response from host.".to_string()),
         }
+    }
+
+    /// Sends an E2EE `GET` `HttpLocalPreviewRequest` to `device_id` and decodes `body_b64` into raw `Vec<u8>`.
+    pub async fn request_remote_port_preview(
+        self: &Arc<Self>,
+        device_id: Uuid,
+        remote_port: u16,
+        path_and_query: String,
+    ) -> Result<(u16, String, Vec<u8>), String> {
+        let resp = self
+            .request_remote_port_preview_full(
+                device_id,
+                remote_port,
+                ProxyHttpRequest {
+                    method: "GET".to_string(),
+                    path_and_query,
+                    headers: Vec::new(),
+                    body: Vec::new(),
+                },
+            )
+            .await?;
+        Ok((resp.status_code, resp.content_type, resp.body))
     }
 
     pub fn spawn_remote_port_preview_snapshot(
@@ -2834,7 +3051,7 @@ impl RemoteMeshHub {
         });
     }
 
-    /// Spawns or reuses a strictly loopback (`127.0.0.1:0`) HTTP/1.1 proxy tunnel for `(device_id, remote_port)`.
+    /// Spawns or reuses a strictly loopback (`127.0.0.1:0`) full-method HTTP/1.1 proxy tunnel for `(device_id, remote_port)`.
     pub fn open_live_loopback_tunnel(
         self: &Arc<Self>,
         device_id: Option<Uuid>,
@@ -2854,8 +3071,9 @@ impl RemoteMeshHub {
             }
             if let Ok(mut g) = self.state.lock() {
                 g.port_preview.tunnel_starting = false;
-                g.port_preview.active_tunnel_url = Some(base_url.clone());
-                g.port_preview.active_tunnel_key = Some(key);
+                let hosts = g.remote_hosts.clone();
+                g.port_preview
+                    .sync_from_manager(&self.tunnel_mgr, &hosts, Some(key));
                 g.status_notice = Some(format!("Live tunnel active: {base_url}"));
             }
             self.ui_dirty.store(true, Ordering::Release);
@@ -2870,19 +3088,19 @@ impl RemoteMeshHub {
         let hub = Arc::clone(self);
         self.spawn_bg(async move {
             let hub_for_fetch = Arc::clone(&hub);
-            let spawn_res = crate::port_preview::spawn_loopback_http_proxy_with_fetcher(
+            let spawn_res = crate::port_preview::spawn_loopback_http_proxy_with_full_fetcher(
                 remote_port,
-                move |port, path_and_query| {
+                move |port, proxy_req| {
                     let hub_req = Arc::clone(&hub_for_fetch);
                     async move {
                         if let Some(did) = device_id {
                             hub_req
-                                .request_remote_port_preview(did, port, path_and_query)
+                                .request_remote_port_preview_full(did, port, proxy_req)
                                 .await
                         } else {
-                            crate::port_preview::fetch_local_port_preview_raw(
+                            crate::port_preview::fetch_local_port_preview_full(
                                 port,
-                                &path_and_query,
+                                proxy_req,
                                 crate::port_preview::max_local_tunnel_body_bytes(),
                             )
                             .await
@@ -2902,8 +3120,9 @@ impl RemoteMeshHub {
                     }
                     if let Ok(mut g) = hub.state.lock() {
                         g.port_preview.tunnel_starting = false;
-                        g.port_preview.active_tunnel_url = Some(base_url.clone());
-                        g.port_preview.active_tunnel_key = Some(key);
+                        let hosts = g.remote_hosts.clone();
+                        g.port_preview
+                            .sync_from_manager(&hub.tunnel_mgr, &hosts, Some(key));
                         g.status_notice = Some(format!(
                             "{}: {base_url}",
                             tr(g.locale, "Live tunnel started", "已启动本地回环实时隧道")
@@ -2929,8 +3148,9 @@ impl RemoteMeshHub {
         }
         if let Ok(mut g) = self.state.lock() {
             g.port_preview.tunnel_starting = false;
-            g.port_preview.active_tunnel_url = None;
-            g.port_preview.active_tunnel_key = None;
+            let hosts = g.remote_hosts.clone();
+            g.port_preview
+                .sync_from_manager(&self.tunnel_mgr, &hosts, None);
             g.status_notice = Some(
                 tr(
                     g.locale,
@@ -3047,12 +3267,19 @@ impl RemoteMeshHub {
                 Ok(settings) => {
                     if let Ok(mut g) = hub.state.lock() {
                         g.webhook_loading = false;
-                        g.webhook_settings = settings;
+                        g.webhook_loaded_ok = true;
+                        // Never overwrite in-progress user edits made while GET was in flight (`Bug #11b`).
+                        if !g.webhook_dirty {
+                            g.webhook_settings = settings;
+                        }
                     }
                 }
-                Err(_) => {
+                Err(err) => {
                     if let Ok(mut g) = hub.state.lock() {
                         g.webhook_loading = false;
+                        if g.settings_open {
+                            g.status_notice = Some(err);
+                        }
                     }
                 }
             }
@@ -3089,6 +3316,8 @@ impl RemoteMeshHub {
                 Ok(updated) => {
                     if let Ok(mut g) = hub.state.lock() {
                         g.webhook_loading = false;
+                        g.webhook_loaded_ok = true;
+                        g.webhook_dirty = false;
                         g.webhook_settings = updated;
                         g.status_notice = Some(
                             tr(
@@ -3185,7 +3414,18 @@ impl RemoteMeshHub {
             let Some(ref tok) = cfg.session_token else {
                 return;
             };
-            match api_prune_stale_web_devices(&cfg.server_url, tok, 0).await {
+            let exclude_id = hub
+                .client_identities
+                .lock()
+                .await
+                .get(&Uuid::nil())
+                .map(|(id, _)| *id)
+                .or_else(|| {
+                    DesktopClientIdentityRecord::load_matching(&cfg.server_url, tok)
+                        .map(|(id, _)| id)
+                })
+                .or(Some(cfg.device_id));
+            match api_prune_stale_web_devices(&cfg.server_url, tok, 0, exclude_id).await {
                 Ok(pruned) => {
                     if let Ok(mut g) = hub.state.lock() {
                         g.status_notice = Some(format!(
@@ -3208,6 +3448,307 @@ impl RemoteMeshHub {
             hub.ui_dirty.store(true, Ordering::Release);
         });
     }
+
+    /// Creates a new folder or clones a Git repository on `host_id` over E2EE `BootstrapWorkspace` (`Gap #2`),
+    /// then refreshes remote workspaces, selects the new space, and spawns a shell session in it.
+    pub fn bootstrap_remote_workspace(
+        self: &Arc<Self>,
+        host_id: Uuid,
+        parent_dir: String,
+        folder_name: String,
+        git_clone_url: Option<String>,
+    ) {
+        let hub = Arc::clone(self);
+        self.spawn_bg(async move {
+            let Some(peer) = hub.ensure_peer_for_host(host_id).await else {
+                if let Ok(mut g) = hub.state.lock() {
+                    g.bootstrap_modal.loading = false;
+                    g.bootstrap_modal.error = Some(
+                        tr(
+                            g.locale,
+                            "Remote host is offline or unreachable",
+                            "远端主机当前离线或无法连接",
+                        )
+                        .to_string(),
+                    );
+                }
+                hub.ui_dirty.store(true, Ordering::Release);
+                return;
+            };
+
+            let req = PeerMessage::BootstrapWorkspace {
+                req_id: format!("bw-{}", Uuid::new_v4().simple()),
+                parent_dir: parent_dir.clone(),
+                folder_name: folder_name.clone(),
+                git_clone_url: git_clone_url.clone(),
+            };
+            match peer
+                .request(req, TrafficLane::ControlP0, Duration::from_secs(65))
+                .await
+            {
+                Ok(PeerMessage::BootstrapWorkspaceResult {
+                    ok: true,
+                    workspace_path,
+                    detail,
+                    ..
+                }) => {
+                    let clean_ws_path = workspace_path.trim().to_string();
+                    let new_space_id = format!("remote:{host_id}:{clean_ws_path}");
+                    let fallback_space_id = format!("remote:{host_id}");
+                    let repo_name = Path::new(&clean_ws_path)
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or(&folder_name)
+                        .to_string();
+
+                    // Refresh host workspaces including the newly created parent/workspace directory.
+                    let _ = peer
+                        .request(
+                            PeerMessage::ListWorkspaces {
+                                req_id: format!("ws-{}", Uuid::new_v4().simple()),
+                                root_dirs: vec![parent_dir, clean_ws_path.clone()],
+                            },
+                            TrafficLane::BulkP1,
+                            Duration::from_secs(10),
+                        )
+                        .await;
+
+                    if let Some(host_summary) = hub
+                        .state
+                        .lock()
+                        .ok()
+                        .and_then(|g| g.remote_hosts.iter().find(|h| h.id == host_id).cloned())
+                    {
+                        hub.sync_with_connected_peer(Arc::clone(&peer), &host_summary)
+                            .await;
+                    }
+
+                    let mut need_spawn_shell = false;
+                    if let Ok(mut g) = hub.state.lock() {
+                        let host_name = g
+                            .remote_hosts
+                            .iter()
+                            .find(|h| h.id == host_id)
+                            .map(|h| h.name.clone())
+                            .unwrap_or_else(|| "remote".to_string());
+                        g.dismissed_spaces.remove(&new_space_id);
+                        g.spaces.retain(|s| s.id != fallback_space_id);
+                        if !g.spaces.iter().any(|s| s.id == new_space_id) {
+                            g.spaces.push(SpaceEntry {
+                                id: new_space_id.clone(),
+                                avatar_color: space_avatar_color(&repo_name),
+                                name: repo_name.clone(),
+                                path: clean_ws_path.clone(),
+                                machine_id: host_id.to_string(),
+                                machine_label: host_name,
+                                is_remote: true,
+                                branch: if git_clone_url.is_some() {
+                                    "main".to_string()
+                                } else {
+                                    "folder".to_string()
+                                },
+                                dirty_files: 0,
+                                ahead: 0,
+                                behind: 0,
+                            });
+                        }
+                        g.active_space_id = Some(new_space_id.clone());
+                        g.current_browse_rel.clear();
+                        g.selected_file_rel = None;
+                        g.selected_file_content.clear();
+                        g.selected_change_path = None;
+                        let existing_sess = g
+                            .sessions
+                            .iter()
+                            .find(|s| s.space_id == new_space_id)
+                            .map(|s| s.id.clone());
+                        g.active_session_id = existing_sess.clone();
+                        need_spawn_shell = existing_sess.is_none();
+                        g.bootstrap_modal.reset();
+                        g.input_target = ActiveInputTarget::TerminalDirect;
+                        g.status_notice = Some(format!(
+                            "{}: {repo_name} ({detail})",
+                            tr(
+                                g.locale,
+                                "Remote workspace ready",
+                                "远端工作区已就绪"
+                            )
+                        ));
+                    }
+
+                    let pref_space = new_space_id.clone();
+                    let mut prefs = DesktopPreferences::load_or_default();
+                    prefs.dismissed_spaces.retain(|x| x != &pref_space);
+                    prefs.selected_repo_path = Some(pref_space);
+                    let _ = prefs.save();
+
+                    hub.refresh_remote_git_diff(host_id, &new_space_id, &clean_ws_path);
+                    hub.refresh_remote_directory(host_id, &new_space_id, &clean_ws_path, "");
+                    if need_spawn_shell {
+                        hub.spawn_remote_terminal_or_agent(
+                            host_id,
+                            "shell",
+                            &clean_ws_path,
+                            &new_space_id,
+                        );
+                    }
+                }
+                Ok(PeerMessage::BootstrapWorkspaceResult { detail, .. }) => {
+                    if let Ok(mut g) = hub.state.lock() {
+                        g.bootstrap_modal.loading = false;
+                        g.bootstrap_modal.error = Some(detail);
+                    }
+                }
+                Ok(_) => {
+                    if let Ok(mut g) = hub.state.lock() {
+                        g.bootstrap_modal.loading = false;
+                        g.bootstrap_modal.error =
+                            Some("Unexpected BootstrapWorkspace response".to_string());
+                    }
+                }
+                Err(err) => {
+                    if let Ok(mut g) = hub.state.lock() {
+                        g.bootstrap_modal.loading = false;
+                        g.bootstrap_modal.error = Some(format!("Bootstrap error: {err}"));
+                    }
+                }
+            }
+            hub.ui_dirty.store(true, Ordering::Release);
+        });
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RemoteGitDiffPayload {
+    pub branch: String,
+    pub status_short: String,
+    pub diff_unified: String,
+    pub is_git_repo: bool,
+    pub repo_root: Option<String>,
+    pub error: Option<String>,
+}
+
+/// Applies a remote `GitDiffResponse` payload into `CodaDesktopState`, enforcing the monotonic
+/// `(seq, device_id, cwd)` guard so stale responses or split-pane local focus never clobber `repo_snapshot` (`Bug #7`).
+pub(crate) fn apply_remote_git_diff_payload_to_state(
+    g: &mut CodaDesktopState,
+    seq: u64,
+    device_id: Uuid,
+    space_id_hint: Option<&str>,
+    cwd: &str,
+    payload: RemoteGitDiffPayload,
+) -> bool {
+    let changed_files = parse_git_status_short(&payload.status_short);
+    let legacy_empty_non_git = payload.repo_root.is_none()
+        && payload.branch.trim().is_empty()
+        && payload.status_short.trim().is_empty()
+        && payload.diff_unified.trim().is_empty();
+    let eff_is_git_repo = payload.is_git_repo && !legacy_empty_non_git;
+    let clean_branch = if payload.branch.trim().is_empty() {
+        if eff_is_git_repo {
+            "HEAD".to_string()
+        } else {
+            "online".to_string()
+        }
+    } else {
+        payload.branch.trim().to_string()
+    };
+    let host_id_str = device_id.to_string();
+
+    // Update sidebar space badge ONLY for the exact `(device_id, cwd)` space.
+    for sp in &mut g.spaces {
+        if sp.machine_id == host_id_str
+            && (space_id_hint == Some(sp.id.as_str()) || sp.path == cwd)
+        {
+            if eff_is_git_repo {
+                sp.branch = clean_branch.clone();
+            }
+            sp.dirty_files = changed_files.len();
+        }
+    }
+
+    // Strict `(seq, device_id, cwd)` guard before touching `git_diff_loading` or `repo_snapshot`!
+    if seq == 0 || g.remote_diff_seq != seq {
+        return false;
+    }
+    let Some((cur_dev, cur_cwd)) = g.effective_remote_diff_target() else {
+        return false;
+    };
+    if cur_dev != device_id || cur_cwd != cwd {
+        return false;
+    }
+
+    g.git_diff_loading = false;
+    if let Some(ref sel) = g.selected_change_path {
+        if !changed_files.iter().any(|f| &f.path == sel) {
+            g.selected_change_path = None;
+        }
+    }
+
+    let root_for_name = payload
+        .repo_root
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or(cwd);
+    let repo_name = Path::new(root_for_name)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty() && *s != ".")
+        .unwrap_or("remote")
+        .to_string();
+    let clean_err = payload
+        .error
+        .map(|e| e.trim().to_string())
+        .filter(|e| !e.is_empty());
+
+    let (diff_title, diff_text) = if let Some(ref err_msg) = clean_err {
+        ("Remote Git diff error".to_string(), err_msg.clone())
+    } else if !eff_is_git_repo {
+        (
+            "Not a Git repository".to_string(),
+            format!("Remote directory `{cwd}` is not a Git repository."),
+        )
+    } else if payload.diff_unified.trim().is_empty() {
+        (
+            format!("{root_for_name} · remote diff"),
+            "Clean working tree on remote host.".to_string(),
+        )
+    } else {
+        (
+            format!("{root_for_name} · remote diff"),
+            payload.diff_unified.clone(),
+        )
+    };
+
+    g.repo_snapshot = RepoInspectorSnapshot {
+        repo_path: root_for_name.to_string(),
+        repo_root: payload.repo_root,
+        repo_name,
+        is_git_repo: eff_is_git_repo,
+        branch: if eff_is_git_repo {
+            clean_branch
+        } else {
+            String::new()
+        },
+        head_summary: format!("{} changed (E2EE remote)", changed_files.len()),
+        diff_added: payload
+            .diff_unified
+            .lines()
+            .filter(|l| l.starts_with('+') && !l.starts_with("+++"))
+            .count() as u32,
+        diff_deleted: payload
+            .diff_unified
+            .lines()
+            .filter(|l| l.starts_with('-') && !l.starts_with("---"))
+            .count() as u32,
+        changed_files,
+        diff_title,
+        diff_text,
+        error: clean_err,
+        ..Default::default()
+    };
+    true
 }
 
 pub(crate) fn spawn_device_login(

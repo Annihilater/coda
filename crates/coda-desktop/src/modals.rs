@@ -316,7 +316,11 @@ impl CodaGpuWorkspaceView {
                                                 if let Ok(mut g) = this.state.lock() {
                                                     if g.settings_section != sec {
                                                         g.clear_settings_ephemeral_inputs();
-                                                        if sec == SettingsSection::Machines && g.is_logged_in {
+                                                        if sec == SettingsSection::Machines
+                                                            && g.is_logged_in
+                                                            && !g.webhook_dirty
+                                                            && !g.webhook_loading
+                                                        {
                                                             should_fetch_wh = true;
                                                         }
                                                     }
@@ -1569,6 +1573,7 @@ impl CodaGpuWorkspaceView {
                 let tg_chat_focus = st.input_target == ActiveInputTarget::WebhookTelegramChatId;
                 let feishu_focus = st.input_target == ActiveInputTarget::WebhookFeishuUrl;
                 let discord_focus = st.input_target == ActiveInputTarget::WebhookDiscordUrl;
+                let generic_focus = st.input_target == ActiveInputTarget::WebhookGenericUrl;
                 let tg_tok_masked = if wh.telegram_bot_token.is_empty() {
                     if tg_tok_focus {
                         "▏".to_string()
@@ -1626,8 +1631,8 @@ impl CodaGpuWorkspaceView {
                                             .truncate()
                                             .child(tr(
                                                 loc,
-                                                "Zero-plaintext metadata push via Bark, Telegram, Feishu & Discord",
-                                                "零终端明文泄露，支持 Bark、Telegram、飞书与 Discord 推送",
+                                                "Zero-plaintext metadata push via Bark, Telegram, Feishu, Discord & Generic HTTP",
+                                                "零终端明文泄露，支持 Bark、Telegram、飞书、Discord 与自定义 Webhook",
                                             )),
                                     ),
                             )
@@ -1649,6 +1654,7 @@ impl CodaGpuWorkspaceView {
                                         cx.listener(move |this, _: &ClickEvent, _, cx| {
                                             if let Ok(mut g) = this.state.lock() {
                                                 g.webhook_settings.notify_on_needs_you = !needs_you_on;
+                                                g.webhook_dirty = true;
                                             }
                                             cx.notify();
                                         }),
@@ -1665,6 +1671,7 @@ impl CodaGpuWorkspaceView {
                                         cx.listener(move |this, _: &ClickEvent, _, cx| {
                                             if let Ok(mut g) = this.state.lock() {
                                                 g.webhook_settings.notify_on_finished = !finished_on;
+                                                g.webhook_dirty = true;
                                             }
                                             cx.notify();
                                         }),
@@ -1924,6 +1931,55 @@ impl CodaGpuWorkspaceView {
                                         cx.notify();
                                     })),
                             ),
+                    )
+                    .child(
+                        div()
+                            .id("settings-input-webhook-generic")
+                            .occlude()
+                            .w_full()
+                            .px(px(8.0))
+                            .py(px(5.0))
+                            .rounded(px(4.0))
+                            .bg(rgb(palette::CANVAS_BG))
+                            .border_1()
+                            .border_color(rgb(if generic_focus {
+                                accent
+                            } else {
+                                palette::BORDER
+                            }))
+                            .cursor_pointer()
+                            .text_size(px(11.0))
+                            .text_color(rgb(if wh.generic_webhook_url.is_empty() && !generic_focus {
+                                palette::TEXT_DIM
+                            } else {
+                                palette::TEXT_PRIMARY
+                            }))
+                            .truncate()
+                            .child(if wh.generic_webhook_url.is_empty() {
+                                if generic_focus {
+                                    "▏".to_string()
+                                } else {
+                                    tr(
+                                        loc,
+                                        "Generic Webhook URL (https://hooks.example.com/...)",
+                                        "自定义 Webhook POST 地址 (https://hooks.example.com/...)",
+                                    )
+                                    .to_string()
+                                }
+                            } else {
+                                format!(
+                                    "{}{}",
+                                    wh.generic_webhook_url,
+                                    if generic_focus { "▏" } else { "" }
+                                )
+                            })
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                if let Ok(mut g) = this.state.lock() {
+                                    g.input_selected_all = false;
+                                    g.input_target = ActiveInputTarget::WebhookGenericUrl;
+                                }
+                                cx.notify();
+                            })),
                     )
             })
             .child(
@@ -2574,4 +2630,476 @@ fn render_settings_row(label: &str, hint: &str, control: impl IntoElement) -> im
                 ),
         )
         .child(div().flex_shrink_0().child(control))
+}
+
+impl CodaGpuWorkspaceView {
+    pub(crate) fn render_remote_bootstrap_modal_overlay(
+        &self,
+        st: &CodaDesktopState,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let loc = st.locale;
+        let accent = st.layout.accent_color_u32();
+        let bm = &st.bootstrap_modal;
+        let parent_focus = st.input_target == ActiveInputTarget::BootstrapParentDir;
+        let url_focus = st.input_target == ActiveInputTarget::BootstrapGitCloneUrl;
+        let folder_focus = st.input_target == ActiveInputTarget::BootstrapFolderName;
+        let derived_folder =
+            crate::helpers::derive_folder_name_from_git_url(&bm.git_clone_url);
+        let is_loading = bm.loading;
+
+        div()
+            .id("bootstrap-backdrop")
+            .occlude()
+            .absolute()
+            .inset_0()
+            .bg(rgba(0x000000aa))
+            .flex()
+            .items_center()
+            .justify_center()
+            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                if !is_loading {
+                    if let Ok(mut g) = this.state.lock() {
+                        g.bootstrap_modal.reset();
+                        g.input_target = ActiveInputTarget::TerminalDirect;
+                    }
+                    cx.notify();
+                }
+            }))
+            .child(
+                div()
+                    .id("bootstrap-modal")
+                    .occlude()
+                    .w(px(520.0))
+                    .rounded(px(10.0))
+                    .bg(rgb(palette::CHROME_BG))
+                    .border_1()
+                    .border_color(rgb(palette::BORDER_STRONG))
+                    .overflow_hidden()
+                    .flex()
+                    .flex_col()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                        cx.stop_propagation();
+                    })
+                    .on_click(|_, _, cx| {
+                        cx.stop_propagation();
+                    })
+                    .child(
+                        div()
+                            .h(px(40.0))
+                            .px(px(14.0))
+                            .border_b_1()
+                            .border_color(rgb(palette::BORDER))
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_size(px(13.0))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(palette::TEXT_PRIMARY))
+                                    .child(tr(
+                                        loc,
+                                        "New Remote Workspace / Git Clone",
+                                        "新建远端工作区 / Git Clone",
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .id("btn-close-bootstrap-modal")
+                                    .occlude()
+                                    .px(px(6.0))
+                                    .py(px(2.0))
+                                    .rounded(px(4.0))
+                                    .hover(|h| h.bg(rgb(palette::HOVER_BG)))
+                                    .cursor_pointer()
+                                    .text_size(px(12.5))
+                                    .text_color(rgb(palette::TEXT_MUTED))
+                                    .child("×")
+                                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                        if !is_loading {
+                                            if let Ok(mut g) = this.state.lock() {
+                                                g.bootstrap_modal.reset();
+                                                g.input_target = ActiveInputTarget::TerminalDirect;
+                                            }
+                                            cx.notify();
+                                        }
+                                    })),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .p(px(14.0))
+                            .flex()
+                            .flex_col()
+                            .gap(px(10.0))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(4.0))
+                                    .child(
+                                        div()
+                                            .text_size(px(10.5))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(rgb(palette::TEXT_DIM))
+                                            .child(tr(loc, "TARGET REMOTE HOST", "目标远端主机")),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_wrap()
+                                            .gap(px(6.0))
+                                            .children(st.remote_hosts.iter().map(|host| {
+                                                let hid = host.id;
+                                                let is_sel = bm.host_id == Some(hid);
+                                                div()
+                                                    .id(SharedString::from(format!(
+                                                        "bootstrap-host-{hid}"
+                                                    )))
+                                                    .occlude()
+                                                    .px(px(8.0))
+                                                    .py(px(4.0))
+                                                    .rounded(px(5.0))
+                                                    .bg(rgb(if is_sel {
+                                                        palette::HOVER_BG
+                                                    } else {
+                                                        palette::SURFACE_BG
+                                                    }))
+                                                    .border_1()
+                                                    .border_color(rgb(if is_sel {
+                                                        accent
+                                                    } else {
+                                                        palette::BORDER
+                                                    }))
+                                                    .cursor_pointer()
+                                                    .flex()
+                                                    .items_center()
+                                                    .gap(px(5.0))
+                                                    .child(
+                                                        div()
+                                                            .w(px(6.0))
+                                                            .h(px(6.0))
+                                                            .rounded(px(99.0))
+                                                            .bg(rgb(if host.is_online {
+                                                                palette::DONE_GREEN
+                                                            } else {
+                                                                palette::TEXT_DIM
+                                                            })),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .text_size(px(11.0))
+                                                            .text_color(rgb(if is_sel {
+                                                                palette::TEXT_PRIMARY
+                                                            } else {
+                                                                palette::TEXT_MUTED
+                                                            }))
+                                                            .child(host.name.clone()),
+                                                    )
+                                                    .on_click(cx.listener(
+                                                        move |this, _: &ClickEvent, _, cx| {
+                                                            if let Ok(mut g) = this.state.lock() {
+                                                                g.bootstrap_modal.host_id =
+                                                                    Some(hid);
+                                                                g.bootstrap_modal.error = None;
+                                                            }
+                                                            cx.notify();
+                                                        },
+                                                    ))
+                                            })),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(4.0))
+                                    .child(
+                                        div()
+                                            .text_size(px(10.5))
+                                            .text_color(rgb(palette::TEXT_MUTED))
+                                            .child(tr(
+                                                loc,
+                                                "Parent Directory on Remote Host",
+                                                "远端父目录路径",
+                                            )),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("bootstrap-input-parent-dir")
+                                            .occlude()
+                                            .w_full()
+                                            .px(px(9.0))
+                                            .py(px(6.0))
+                                            .rounded(px(5.0))
+                                            .bg(rgb(palette::CANVAS_BG))
+                                            .border_1()
+                                            .border_color(rgb(if parent_focus {
+                                                accent
+                                            } else {
+                                                palette::BORDER
+                                            }))
+                                            .cursor_pointer()
+                                            .font_family("Menlo")
+                                            .text_size(px(11.5))
+                                            .text_color(rgb(
+                                                if bm.parent_dir.is_empty() && !parent_focus {
+                                                    palette::TEXT_DIM
+                                                } else {
+                                                    palette::TEXT_PRIMARY
+                                                },
+                                            ))
+                                            .truncate()
+                                            .child(if bm.parent_dir.is_empty() {
+                                                if parent_focus {
+                                                    "▏".to_string()
+                                                } else {
+                                                    "~/workspace".to_string()
+                                                }
+                                            } else {
+                                                format!(
+                                                    "{}{}",
+                                                    bm.parent_dir,
+                                                    if parent_focus { "▏" } else { "" }
+                                                )
+                                            })
+                                            .on_click(cx.listener(
+                                                |this, _: &ClickEvent, _, cx| {
+                                                    if let Ok(mut g) = this.state.lock() {
+                                                        g.input_selected_all = false;
+                                                        g.input_target =
+                                                            ActiveInputTarget::BootstrapParentDir;
+                                                    }
+                                                    cx.notify();
+                                                },
+                                            )),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(4.0))
+                                    .child(
+                                        div()
+                                            .text_size(px(10.5))
+                                            .text_color(rgb(palette::TEXT_MUTED))
+                                            .child(tr(
+                                                loc,
+                                                "Git Clone URL (Optional — leave blank to create an empty folder)",
+                                                "Git Clone 地址（选填 — 留空则新建空文件夹）",
+                                            )),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("bootstrap-input-git-url")
+                                            .occlude()
+                                            .w_full()
+                                            .px(px(9.0))
+                                            .py(px(6.0))
+                                            .rounded(px(5.0))
+                                            .bg(rgb(palette::CANVAS_BG))
+                                            .border_1()
+                                            .border_color(rgb(if url_focus {
+                                                accent
+                                            } else {
+                                                palette::BORDER
+                                            }))
+                                            .cursor_pointer()
+                                            .font_family("Menlo")
+                                            .text_size(px(11.5))
+                                            .text_color(rgb(
+                                                if bm.git_clone_url.is_empty() && !url_focus {
+                                                    palette::TEXT_DIM
+                                                } else {
+                                                    palette::TEXT_PRIMARY
+                                                },
+                                            ))
+                                            .truncate()
+                                            .child(if bm.git_clone_url.is_empty() {
+                                                if url_focus {
+                                                    "▏".to_string()
+                                                } else {
+                                                    "https://github.com/org/repo.git".to_string()
+                                                }
+                                            } else {
+                                                format!(
+                                                    "{}{}",
+                                                    bm.git_clone_url,
+                                                    if url_focus { "▏" } else { "" }
+                                                )
+                                            })
+                                            .on_click(cx.listener(
+                                                |this, _: &ClickEvent, _, cx| {
+                                                    if let Ok(mut g) = this.state.lock() {
+                                                        g.input_selected_all = false;
+                                                        g.input_target =
+                                                            ActiveInputTarget::BootstrapGitCloneUrl;
+                                                    }
+                                                    cx.notify();
+                                                },
+                                            )),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(4.0))
+                                    .child(
+                                        div()
+                                            .text_size(px(10.5))
+                                            .text_color(rgb(palette::TEXT_MUTED))
+                                            .child(tr(
+                                                loc,
+                                                "Workspace Folder Name",
+                                                "工作区文件夹名称",
+                                            )),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("bootstrap-input-folder-name")
+                                            .occlude()
+                                            .w_full()
+                                            .px(px(9.0))
+                                            .py(px(6.0))
+                                            .rounded(px(5.0))
+                                            .bg(rgb(palette::CANVAS_BG))
+                                            .border_1()
+                                            .border_color(rgb(if folder_focus {
+                                                accent
+                                            } else {
+                                                palette::BORDER
+                                            }))
+                                            .cursor_pointer()
+                                            .font_family("Menlo")
+                                            .text_size(px(11.5))
+                                            .text_color(rgb(
+                                                if bm.folder_name.is_empty() && !folder_focus {
+                                                    palette::TEXT_DIM
+                                                } else {
+                                                    palette::TEXT_PRIMARY
+                                                },
+                                            ))
+                                            .truncate()
+                                            .child(if bm.folder_name.is_empty() {
+                                                if folder_focus {
+                                                    "▏".to_string()
+                                                } else if let Some(auto_name) = derived_folder {
+                                                    format!(
+                                                        "{auto_name} ({})",
+                                                        tr(loc, "auto from URL", "自动取自仓库名")
+                                                    )
+                                                } else {
+                                                    "my-project".to_string()
+                                                }
+                                            } else {
+                                                format!(
+                                                    "{}{}",
+                                                    bm.folder_name,
+                                                    if folder_focus { "▏" } else { "" }
+                                                )
+                                            })
+                                            .on_click(cx.listener(
+                                                |this, _: &ClickEvent, _, cx| {
+                                                    if let Ok(mut g) = this.state.lock() {
+                                                        g.input_selected_all = false;
+                                                        g.input_target =
+                                                            ActiveInputTarget::BootstrapFolderName;
+                                                    }
+                                                    cx.notify();
+                                                },
+                                            )),
+                                    ),
+                            )
+                            .when_some(bm.error.clone(), |el, err| {
+                                el.child(
+                                    div()
+                                        .px(px(9.0))
+                                        .py(px(6.0))
+                                        .rounded(px(5.0))
+                                        .bg(rgb(palette::CANVAS_BG))
+                                        .border_1()
+                                        .border_color(rgb(palette::ERROR_RED))
+                                        .text_size(px(11.0))
+                                        .text_color(rgb(palette::ERROR_RED))
+                                        .child(err),
+                                )
+                            })
+                            .child(
+                                div()
+                                    .pt(px(4.0))
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .gap(px(8.0))
+                                    .child(self.render_setting_pill(
+                                        "btn-bootstrap-local-picker",
+                                        tr(loc, "Browse Local Mac Folder…", "选择本机文件夹…"),
+                                        false,
+                                        accent,
+                                        cx.listener(|this, _: &ClickEvent, _, cx| {
+                                            if let Ok(mut g) = this.state.lock() {
+                                                g.bootstrap_modal.reset();
+                                                g.input_target = ActiveInputTarget::TerminalDirect;
+                                            }
+                                            this.add_local_workspace_folder();
+                                            cx.notify();
+                                        }),
+                                    ))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(6.0))
+                                            .child(self.render_setting_pill(
+                                                "btn-bootstrap-cancel",
+                                                tr(loc, "Cancel", "取消"),
+                                                false,
+                                                accent,
+                                                cx.listener(
+                                                    move |this, _: &ClickEvent, _, cx| {
+                                                        if !is_loading {
+                                                            if let Ok(mut g) = this.state.lock() {
+                                                                g.bootstrap_modal.reset();
+                                                                g.input_target = ActiveInputTarget::TerminalDirect;
+                                                            }
+                                                            cx.notify();
+                                                        }
+                                                    },
+                                                ),
+                                            ))
+                                            .child(
+                                                div()
+                                                    .id("btn-bootstrap-submit")
+                                                    .occlude()
+                                                    .px(px(12.0))
+                                                    .py(px(5.0))
+                                                    .rounded(px(5.0))
+                                                    .bg(rgb(accent))
+                                                    .hover(|h| h.opacity(0.92))
+                                                    .cursor_pointer()
+                                                    .text_size(px(11.5))
+                                                    .font_weight(FontWeight::SEMIBOLD)
+                                                    .text_color(rgb(0x09090b))
+                                                    .child(if bm.loading {
+                                                        tr(loc, "Working…", "正在处理…")
+                                                    } else if bm.git_clone_url.trim().is_empty() {
+                                                        tr(loc, "Create Folder", "创建文件夹")
+                                                    } else {
+                                                        tr(loc, "Clone & Open", "克隆并进入")
+                                                    })
+                                                    .on_click(cx.listener(
+                                                        |this, _: &ClickEvent, _, cx| {
+                                                            this.submit_remote_bootstrap_workspace();
+                                                            cx.notify();
+                                                        },
+                                                    )),
+                                            ),
+                                    ),
+                            ),
+                    ),
+            )
+    }
 }

@@ -1868,6 +1868,13 @@ impl LocalPtyManager {
         let _ = std::io::stdout().flush();
         self.ui_dirty.store(true, Ordering::SeqCst);
     }
+
+    /// Cleanly tears down all window PTY handles on window close (detaching `hc attach` sessions
+    /// via `0x1c` so persistent `herdr-core` sessions stay alive while closing window child processes).
+    pub fn shutdown_all(&mut self) {
+        self.sessions.clear();
+        self.remote_buffers.clear();
+    }
 }
 
 fn build_pty_snapshot_cached(

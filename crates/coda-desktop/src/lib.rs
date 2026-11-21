@@ -128,6 +128,10 @@ pub enum ActiveInputTarget {
     WebhookTelegramChatId,
     WebhookFeishuUrl,
     WebhookDiscordUrl,
+    WebhookGenericUrl,
+    BootstrapParentDir,
+    BootstrapFolderName,
+    BootstrapGitCloneUrl,
 }
 
 /// Primary or Secondary split terminal pane.
@@ -254,6 +258,7 @@ pub enum PaletteAction {
     ToggleSplit,
     ToggleSidebar,
     AddSpaceFolder,
+    OpenRemoteBootstrapModal,
     OpenDrawer(RightDrawerTab),
     OpenSettings,
     ToggleLocale,
@@ -261,6 +266,54 @@ pub enum PaletteAction {
     ExportActiveSession,
     ToggleVoiceDictation,
     JumpNextNeedsYou,
+}
+
+/// Modal state for creating a new remote workspace folder or running `git clone` over E2EE (`Gap #2`).
+#[derive(Debug, Clone)]
+pub struct RemoteBootstrapModalState {
+    pub open: bool,
+    pub host_id: Option<Uuid>,
+    pub parent_dir: String,
+    pub folder_name: String,
+    pub git_clone_url: String,
+    pub loading: bool,
+    pub error: Option<String>,
+}
+
+impl Default for RemoteBootstrapModalState {
+    fn default() -> Self {
+        Self {
+            open: false,
+            host_id: None,
+            parent_dir: "~/workspace".to_string(),
+            folder_name: String::new(),
+            git_clone_url: String::new(),
+            loading: false,
+            error: None,
+        }
+    }
+}
+
+impl RemoteBootstrapModalState {
+    pub fn open_for_host(&mut self, host_id: Option<Uuid>) {
+        self.open = true;
+        self.host_id = host_id;
+        if self.parent_dir.trim().is_empty() {
+            self.parent_dir = "~/workspace".to_string();
+        }
+        self.folder_name.clear();
+        self.git_clone_url.clear();
+        self.loading = false;
+        self.error = None;
+    }
+
+    pub fn reset(&mut self) {
+        self.open = false;
+        self.loading = false;
+        self.error = None;
+        self.folder_name.clear();
+        self.git_clone_url.clear();
+    }
 }
 
 /// Root serializable-free desktop state backing the Coda GPUI workbench.
@@ -295,6 +348,7 @@ pub struct CodaDesktopState {
     pub selected_file_content: String,
     pub selected_change_path: Option<String>,
     pub git_diff_loading: bool,
+    pub remote_diff_seq: u64,
     pub closed_session_ids: HashSet<String>,
     pub dismissed_spaces: HashSet<String>,
     pub did_auto_seed_local: bool,
@@ -341,7 +395,10 @@ pub struct CodaDesktopState {
     pub voice_transcribing: bool,
     pub webhook_settings: NotificationWebhookSettings,
     pub webhook_loading: bool,
+    pub webhook_loaded_ok: bool,
+    pub webhook_dirty: bool,
     pub port_preview: crate::port_preview::PortPreviewState,
+    pub bootstrap_modal: RemoteBootstrapModalState,
     pub status_notice: Option<String>,
 }
 
@@ -372,6 +429,7 @@ impl Default for CodaDesktopState {
             selected_file_content: String::new(),
             selected_change_path: None,
             git_diff_loading: false,
+            remote_diff_seq: 0,
             closed_session_ids: HashSet::new(),
             dismissed_spaces: HashSet::new(),
             did_auto_seed_local: false,
@@ -414,7 +472,10 @@ impl Default for CodaDesktopState {
             voice_transcribing: false,
             webhook_settings: NotificationWebhookSettings::default(),
             webhook_loading: false,
+            webhook_loaded_ok: false,
+            webhook_dirty: false,
             port_preview: crate::port_preview::PortPreviewState::default(),
+            bootstrap_modal: RemoteBootstrapModalState::default(),
             status_notice: None,
         }
     }
@@ -440,23 +501,131 @@ impl CodaDesktopState {
         self.sessions.iter().find(|s| s.id == id)
     }
 
-    /// Returns the next alive session in `NeedsYou` state, cycling from the currently focused session.
-    pub fn next_needs_you_session_id(&self) -> Option<String> {
-        let needs_you: Vec<&str> = self
-            .sessions
-            .iter()
-            .filter(|s| s.alive && s.effective_state() == AgentLifecycleState::NeedsYou)
-            .map(|s| s.id.as_str())
-            .collect();
-        if needs_you.is_empty() {
-            return None;
-        }
-        if let Some(cur_id) = self.focused_session_id() {
-            if let Some(pos) = needs_you.iter().position(|&id| id == cur_id) {
-                return Some(needs_you[(pos + 1) % needs_you.len()].to_string());
+    /// Resolves `(device_id, cwd)` ONLY when the currently focused terminal session (or active
+    /// space when no session is focused) targets a remote host — preventing split-pane local focus
+    /// from being overwritten by a remote `GitDiffResponse` (`Bug #7`).
+    pub fn effective_remote_diff_target(&self) -> Option<(Uuid, String)> {
+        if let Some(sid) = self.focused_session_id() {
+            if let Some(sess) = self.session_by_id(sid) {
+                let raw_hid = sess.remote_host_id.as_deref()?;
+                let hid = Uuid::parse_str(raw_hid).ok()?;
+                let sp_path = self
+                    .spaces
+                    .iter()
+                    .find(|sp| sp.id == sess.space_id)
+                    .map(|sp| sp.path.clone())
+                    .unwrap_or_else(|| ".".to_string());
+                let eff_cwd = if !sess.cwd.trim().is_empty() && sess.cwd != "." {
+                    sess.cwd.clone()
+                } else {
+                    sp_path
+                };
+                return Some((hid, eff_cwd));
             }
         }
-        Some(needs_you[0].to_string())
+        let sp = self.active_space().filter(|s| s.is_remote)?;
+        let hid = Uuid::parse_str(&sp.machine_id).ok()?;
+        Some((hid, sp.path.clone()))
+    }
+
+    /// Returns the next alive session in `NeedsYou` state using a circular scan over `self.sessions`
+    /// starting at `(cur_idx + 1) % len`, so approving `S2` in `[S1, S2, S3]` advances to `S3`
+    /// instead of wrapping backwards to `S1` (`Bug #8`).
+    pub fn next_needs_you_session_id(&self) -> Option<String> {
+        let len = self.sessions.len();
+        if len == 0 {
+            return None;
+        }
+        let start_idx = self
+            .focused_session_id()
+            .and_then(|cur_id| self.sessions.iter().position(|s| s.id == cur_id))
+            .map(|idx| (idx + 1) % len)
+            .unwrap_or(0);
+        for offset in 0..len {
+            let s = &self.sessions[(start_idx + offset) % len];
+            if s.alive && s.effective_state() == AgentLifecycleState::NeedsYou {
+                return Some(s.id.clone());
+            }
+        }
+        None
+    }
+
+    /// Applies session selection with split-pane deduplication (switching `focused_pane` if the
+    /// target session is already open in the opposite pane) and `LayoutMode::Terminals` grid
+    /// visibility auto-switch when the target session is beyond the 4-tile grid (`Bug #8`).
+    pub fn apply_select_session(&mut self, session_id: &str) -> Option<(bool, bool)> {
+        let (sess_idx, space_id, is_local_sess) = self
+            .sessions
+            .iter()
+            .enumerate()
+            .find(|(_, s)| s.id == session_id)
+            .map(|(idx, s)| (idx, s.space_id.clone(), s.remote_host_id.is_none()))?;
+
+        let space_changed = self.active_space_id.as_deref() != Some(space_id.as_str());
+        self.active_space_id = Some(space_id.clone());
+        if space_changed {
+            self.current_browse_rel.clear();
+            self.selected_file_rel = None;
+            self.selected_file_content.clear();
+            self.selected_change_path = None;
+        }
+        if is_local_sess {
+            self.remote_diff_seq = self.remote_diff_seq.wrapping_add(1);
+            self.git_diff_loading = false;
+        }
+
+        let mut layout_changed = false;
+        if self.layout.split_terminals {
+            if self.active_session_id.as_deref() == Some(session_id) {
+                self.focused_pane = SplitPane::Primary;
+            } else if self.split_session_id.as_deref() == Some(session_id) {
+                self.focused_pane = SplitPane::Secondary;
+            } else if self.focused_pane == SplitPane::Secondary {
+                self.split_session_id = Some(session_id.to_string());
+                if space_changed {
+                    let primary_in_space = self
+                        .active_session_id
+                        .as_deref()
+                        .and_then(|id| self.session_by_id(id))
+                        .map(|s| s.space_id == space_id)
+                        .unwrap_or(false);
+                    if !primary_in_space {
+                        self.active_session_id = self
+                            .sessions
+                            .iter()
+                            .find(|s| s.space_id == space_id && s.id != session_id)
+                            .map(|s| s.id.clone());
+                    }
+                }
+            } else {
+                self.active_session_id = Some(session_id.to_string());
+                if space_changed {
+                    let secondary_in_space = self
+                        .split_session_id
+                        .as_deref()
+                        .and_then(|id| self.session_by_id(id))
+                        .map(|s| s.space_id == space_id)
+                        .unwrap_or(false);
+                    if !secondary_in_space {
+                        self.split_session_id = self
+                            .sessions
+                            .iter()
+                            .find(|s| s.space_id == space_id && s.id != session_id)
+                            .map(|s| s.id.clone());
+                    }
+                }
+            }
+        } else {
+            self.active_session_id = Some(session_id.to_string());
+        }
+
+        if self.layout.layout == LayoutMode::Terminals && sess_idx >= 4 {
+            self.layout.layout = LayoutMode::Workbench;
+            layout_changed = true;
+        }
+
+        self.input_target = ActiveInputTarget::TerminalDirect;
+        Some((space_changed, layout_changed))
     }
 
     /// Clears transient Settings inputs (inline rename + plaintext password buffers) so they never
@@ -484,6 +653,7 @@ impl CodaDesktopState {
                 | ActiveInputTarget::WebhookTelegramChatId
                 | ActiveInputTarget::WebhookFeishuUrl
                 | ActiveInputTarget::WebhookDiscordUrl
+                | ActiveInputTarget::WebhookGenericUrl
         ) {
             self.input_target = ActiveInputTarget::TerminalDirect;
         }
@@ -602,6 +772,17 @@ impl CodaDesktopState {
             label: tr(self.locale, "Add Workspace Folder...", "添加本地工作区...").to_string(),
             detail: "Finder picker".to_string(),
             action: PaletteAction::AddSpaceFolder,
+        });
+        items.push(PaletteItem {
+            kind_tag: "ACTION",
+            label: tr(
+                self.locale,
+                "New Remote Workspace / Git Clone…",
+                "新建远端工作区 / Git Clone…",
+            )
+            .to_string(),
+            detail: "E2EE · mkdir / git clone".to_string(),
+            action: PaletteAction::OpenRemoteBootstrapModal,
         });
         items.push(PaletteItem {
             kind_tag: "ACTION",
@@ -748,6 +929,17 @@ pub struct CodaGpuWorkspaceView {
     pty_synced_gen: Mutex<HashMap<String, (u64, bool, u64)>>,
     inspector_seq: Arc<AtomicU64>,
     voice_ctrl: Arc<crate::voice_dock::DesktopVoiceController>,
+    herdr_shutdown_tx: tokio::sync::watch::Sender<bool>,
+}
+
+impl Drop for CodaGpuWorkspaceView {
+    fn drop(&mut self) {
+        let _ = self.herdr_shutdown_tx.send(true);
+        self.mesh_hub.shutdown();
+        if let Ok(mut mgr) = self.pty_mgr.lock() {
+            mgr.shutdown_all();
+        }
+    }
 }
 
 impl Focusable for CodaGpuWorkspaceView {
@@ -949,6 +1141,7 @@ impl CodaGpuWorkspaceView {
             Arc::clone(&ui_dirty),
         );
         let inspector_seq = Arc::new(AtomicU64::new(0));
+        let (herdr_shutdown_tx, herdr_shutdown_rx) = tokio::sync::watch::channel(false);
 
         let view = Self {
             state: Arc::clone(&state),
@@ -966,6 +1159,7 @@ impl CodaGpuWorkspaceView {
             pty_synced_gen: Mutex::new(HashMap::new()),
             inspector_seq: Arc::clone(&inspector_seq),
             voice_ctrl: crate::voice_dock::DesktopVoiceController::new(),
+            herdr_shutdown_tx,
         };
 
         // Run filesystem/git discovery and default config creation off the GPUI UI thread.
@@ -1079,7 +1273,12 @@ impl CodaGpuWorkspaceView {
             ui_dirty_bg.store(true, Ordering::Release);
         });
 
-        spawn_herdr_discovery(Arc::clone(&state), Arc::clone(&pty_mgr), Arc::clone(&ui_dirty));
+        spawn_herdr_discovery(
+            Arc::downgrade(&state),
+            Arc::downgrade(&pty_mgr),
+            Arc::downgrade(&ui_dirty),
+            herdr_shutdown_rx,
+        );
         mesh_hub.ensure_embedded_host();
         mesh_hub.start_account_sync();
         if state.lock().map(|g| g.is_logged_in).unwrap_or(false) {
@@ -1144,7 +1343,7 @@ impl CodaGpuWorkspaceView {
         true
     }
 
-    fn update_prefs_async<F>(f: F)
+    pub(crate) fn update_prefs_async<F>(f: F)
     where
         F: FnOnce(&mut DesktopPreferences) + Send + 'static,
     {
@@ -1387,7 +1586,7 @@ impl CodaGpuWorkspaceView {
     }
 
     fn perform_paste_action(&self, cx: &mut Context<Self>) {
-        let (target, palette_open, settings_open, focused_id) = self
+        let (target, palette_open, settings_open, bootstrap_open, focused_id) = self
             .state
             .lock()
             .map(|g| {
@@ -1395,21 +1594,30 @@ impl CodaGpuWorkspaceView {
                     g.input_target,
                     g.palette_open,
                     g.settings_open,
+                    g.bootstrap_modal.open,
                     g.focused_session_id().map(|s| s.to_string()),
                 )
             })
-            .unwrap_or((ActiveInputTarget::TerminalDirect, false, false, None));
+            .unwrap_or((ActiveInputTarget::TerminalDirect, false, false, false, None));
 
         let clip_text = cx
             .read_from_clipboard()
             .and_then(|i| i.text())
             .filter(|s| !s.is_empty());
 
-        if !palette_open && !settings_open && target == ActiveInputTarget::TerminalDirect {
+        if !palette_open
+            && !settings_open
+            && !bootstrap_open
+            && target == ActiveInputTarget::TerminalDirect
+        {
             let Some(id) = focused_id else {
                 return;
             };
-            if let Some(txt) = clip_text {
+            let maybe_finder_image = clip_text
+                .as_deref()
+                .map(crate::helpers::looks_like_copied_image_filename)
+                .unwrap_or(false);
+            if let Some(txt) = clip_text.filter(|_| !maybe_finder_image) {
                 let bracketed = self
                     .pty_mgr
                     .lock()
@@ -1421,8 +1629,7 @@ impl CodaGpuWorkspaceView {
                     }
                 }
                 if bracketed {
-                    // #38: Wrap paste in ?2004h bracketed paste markers & strip any forged terminator.
-                    let safe_txt = txt.replace("\x1b[201~", "");
+                    let safe_txt = crate::helpers::sanitize_bracketed_paste_text(&txt);
                     let mut bytes = Vec::with_capacity(safe_txt.len() + 12);
                     bytes.extend_from_slice(b"\x1b[200~");
                     bytes.extend_from_slice(safe_txt.as_bytes());
@@ -1433,8 +1640,13 @@ impl CodaGpuWorkspaceView {
                 }
                 cx.notify();
             } else {
-                // Clipboard holds no text — check for a screenshot/image PNG and upload or save for the PTY!
-                self.paste_clipboard_image_into_session(&id);
+                // Either clipboard holds no text OR looks like a Finder-copied image filename —
+                // check `«class furl»` / `«class PNGf»` with bounded 5s timeout & fallback to text!
+                let fallback_txt = cx
+                    .read_from_clipboard()
+                    .and_then(|i| i.text())
+                    .filter(|s| !s.is_empty());
+                self.paste_clipboard_image_into_session(&id, fallback_txt);
                 cx.notify();
             }
             return;
@@ -1457,6 +1669,10 @@ impl CodaGpuWorkspaceView {
                         | ActiveInputTarget::WebhookTelegramChatId
                         | ActiveInputTarget::WebhookFeishuUrl
                         | ActiveInputTarget::WebhookDiscordUrl
+                        | ActiveInputTarget::WebhookGenericUrl
+                        | ActiveInputTarget::BootstrapParentDir
+                        | ActiveInputTarget::BootstrapFolderName
+                        | ActiveInputTarget::BootstrapGitCloneUrl
                 ) {
                 txt.trim().to_string()
             } else if matches!(
@@ -1477,7 +1693,7 @@ impl CodaGpuWorkspaceView {
         }
     }
 
-    fn paste_clipboard_image_into_session(&self, session_id: &str) {
+    fn paste_clipboard_image_into_session(&self, session_id: &str, fallback_text: Option<String>) {
         let remote_info = self.state.lock().ok().and_then(|g| {
             let s = g.session_by_id(session_id)?;
             let hid = Uuid::parse_str(s.remote_host_id.as_deref()?).ok()?;
@@ -1491,59 +1707,142 @@ impl CodaGpuWorkspaceView {
         let ui_dirty_bg = Arc::clone(&self.ui_dirty);
 
         std::thread::spawn(move || {
-            let Ok(png_bytes) = crate::helpers::extract_clipboard_png_bytes() else {
-                if let Ok(mut g) = state_bg.lock() {
-                    g.status_notice = Some(
-                        tr(
-                            g.locale,
-                            "Clipboard is empty (copy text or a screenshot first)",
-                            "剪贴板为空（请先复制文本或截图）",
-                        )
-                        .to_string(),
-                    );
-                }
-                ui_dirty_bg.store(true, Ordering::Release);
-                return;
-            };
-
-            if let Some((host_id, term_addr)) = remote_info {
-                let fname = format!(
-                    "clipboard-{}.png",
-                    &Uuid::new_v4().simple().to_string()[..12]
-                );
-                mesh_hub_bg.upload_clipboard_png_and_paste(
-                    host_id,
-                    session_id_owned,
-                    term_addr,
-                    fname,
-                    png_bytes,
-                );
-            } else {
-                match crate::helpers::save_clipboard_png_to_tmp(&png_bytes) {
-                    Ok(saved_path) => {
-                        let pasted = format_pasted_terminal_path(&saved_path.to_string_lossy());
+            let extracted = crate::helpers::extract_clipboard_image_or_file();
+            match extracted {
+                Ok(crate::helpers::ClipboardImagePayload::LocalImageFile(file_path)) => {
+                    if let Some((host_id, term_addr)) = remote_info {
+                        match std::fs::read(&file_path) {
+                            Ok(raw_bytes) => {
+                                let ext = file_path
+                                    .extension()
+                                    .and_then(|e| e.to_str())
+                                    .filter(|e| !e.is_empty())
+                                    .unwrap_or("png");
+                                let fname = format!(
+                                    "clipboard-{}.{ext}",
+                                    &Uuid::new_v4().simple().to_string()[..12]
+                                );
+                                mesh_hub_bg.upload_clipboard_png_and_paste(
+                                    host_id,
+                                    session_id_owned,
+                                    term_addr,
+                                    fname,
+                                    raw_bytes,
+                                );
+                            }
+                            Err(e) => {
+                                if let Ok(mut g) = state_bg.lock() {
+                                    g.status_notice =
+                                        Some(format!("Failed reading copied image file: {e}"));
+                                }
+                                ui_dirty_bg.store(true, Ordering::Release);
+                            }
+                        }
+                    } else {
+                        let pasted = format_pasted_terminal_path(&file_path.to_string_lossy());
                         if let Ok(mgr) = pty_mgr_bg.lock() {
                             let _ = mgr.write_input(&session_id_owned, pasted.as_bytes());
                         }
                         if let Ok(mut g) = state_bg.lock() {
-                            if let Some(s) = g.sessions.iter_mut().find(|s| s.id == session_id_owned)
+                            if let Some(s) =
+                                g.sessions.iter_mut().find(|s| s.id == session_id_owned)
                             {
                                 s.scroll_offset = 0;
                             }
                             g.status_notice = Some(format!(
                                 "{}: {}",
-                                tr(g.locale, "Pasted screenshot", "已粘贴本地截图"),
-                                saved_path.display()
+                                tr(g.locale, "Pasted image path", "已粘贴图片文件路径"),
+                                file_path.display()
                             ));
                         }
-                    }
-                    Err(err) => {
-                        if let Ok(mut g) = state_bg.lock() {
-                            g.status_notice = Some(err);
-                        }
+                        ui_dirty_bg.store(true, Ordering::Release);
                     }
                 }
-                ui_dirty_bg.store(true, Ordering::Release);
+                Ok(crate::helpers::ClipboardImagePayload::PngBytes(png_bytes)) => {
+                    if let Some((host_id, term_addr)) = remote_info {
+                        let fname = format!(
+                            "clipboard-{}.png",
+                            &Uuid::new_v4().simple().to_string()[..12]
+                        );
+                        mesh_hub_bg.upload_clipboard_png_and_paste(
+                            host_id,
+                            session_id_owned,
+                            term_addr,
+                            fname,
+                            png_bytes,
+                        );
+                    } else {
+                        match crate::helpers::save_clipboard_png_to_tmp(&png_bytes) {
+                            Ok(saved_path) => {
+                                let pasted =
+                                    format_pasted_terminal_path(&saved_path.to_string_lossy());
+                                if let Ok(mgr) = pty_mgr_bg.lock() {
+                                    let _ = mgr.write_input(&session_id_owned, pasted.as_bytes());
+                                }
+                                if let Ok(mut g) = state_bg.lock() {
+                                    if let Some(s) =
+                                        g.sessions.iter_mut().find(|s| s.id == session_id_owned)
+                                    {
+                                        s.scroll_offset = 0;
+                                    }
+                                    g.status_notice = Some(format!(
+                                        "{}: {}",
+                                        tr(g.locale, "Pasted screenshot", "已粘贴本地截图"),
+                                        saved_path.display()
+                                    ));
+                                }
+                            }
+                            Err(err) => {
+                                if let Ok(mut g) = state_bg.lock() {
+                                    g.status_notice = Some(err);
+                                }
+                            }
+                        }
+                        ui_dirty_bg.store(true, Ordering::Release);
+                    }
+                }
+                Err(err) => {
+                    if let Some(txt) = fallback_text {
+                        let bracketed = pty_mgr_bg
+                            .lock()
+                            .map(|m| m.terminal_modes(&session_id_owned).1)
+                            .unwrap_or(false);
+                        let payload = if bracketed {
+                            let safe_txt = crate::helpers::sanitize_bracketed_paste_text(&txt);
+                            let mut b = Vec::with_capacity(safe_txt.len() + 12);
+                            b.extend_from_slice(b"\x1b[200~");
+                            b.extend_from_slice(safe_txt.as_bytes());
+                            b.extend_from_slice(b"\x1b[201~");
+                            b
+                        } else {
+                            txt.into_bytes()
+                        };
+                        if let Some((host_id, term_addr)) = remote_info {
+                            mesh_hub_bg.send_remote_pty_input(host_id, &term_addr, payload);
+                        } else if let Ok(mgr) = pty_mgr_bg.lock() {
+                            let _ = mgr.write_input(&session_id_owned, &payload);
+                        }
+                        if let Ok(mut g) = state_bg.lock() {
+                            if let Some(s) =
+                                g.sessions.iter_mut().find(|s| s.id == session_id_owned)
+                            {
+                                s.scroll_offset = 0;
+                            }
+                        }
+                    } else if !err.contains("already in progress") {
+                        if let Ok(mut g) = state_bg.lock() {
+                            g.status_notice = Some(
+                                tr(
+                                    g.locale,
+                                    "Clipboard is empty (copy text or a screenshot first)",
+                                    "剪贴板为空（请先复制文本或截图）",
+                                )
+                                .to_string(),
+                            );
+                        }
+                    }
+                    ui_dirty_bg.store(true, Ordering::Release);
+                }
             }
         });
     }
@@ -1721,6 +2020,7 @@ impl CodaGpuWorkspaceView {
                         g.input_selected_all = false;
                     }
                     g.webhook_settings.bark_url.push_str(text);
+                    g.webhook_dirty = true;
                 }
             }
             ActiveInputTarget::WebhookTelegramToken => {
@@ -1730,6 +2030,7 @@ impl CodaGpuWorkspaceView {
                         g.input_selected_all = false;
                     }
                     g.webhook_settings.telegram_bot_token.push_str(text);
+                    g.webhook_dirty = true;
                 }
             }
             ActiveInputTarget::WebhookTelegramChatId => {
@@ -1739,6 +2040,7 @@ impl CodaGpuWorkspaceView {
                         g.input_selected_all = false;
                     }
                     g.webhook_settings.telegram_chat_id.push_str(text);
+                    g.webhook_dirty = true;
                 }
             }
             ActiveInputTarget::WebhookFeishuUrl => {
@@ -1748,6 +2050,7 @@ impl CodaGpuWorkspaceView {
                         g.input_selected_all = false;
                     }
                     g.webhook_settings.feishu_webhook_url.push_str(text);
+                    g.webhook_dirty = true;
                 }
             }
             ActiveInputTarget::WebhookDiscordUrl => {
@@ -1757,6 +2060,47 @@ impl CodaGpuWorkspaceView {
                         g.input_selected_all = false;
                     }
                     g.webhook_settings.discord_webhook_url.push_str(text);
+                    g.webhook_dirty = true;
+                }
+            }
+            ActiveInputTarget::WebhookGenericUrl => {
+                if let Ok(mut g) = self.state.lock() {
+                    if g.input_selected_all {
+                        g.webhook_settings.generic_webhook_url.clear();
+                        g.input_selected_all = false;
+                    }
+                    g.webhook_settings.generic_webhook_url.push_str(text);
+                    g.webhook_dirty = true;
+                }
+            }
+            ActiveInputTarget::BootstrapParentDir => {
+                if let Ok(mut g) = self.state.lock() {
+                    if g.input_selected_all {
+                        g.bootstrap_modal.parent_dir.clear();
+                        g.input_selected_all = false;
+                    }
+                    g.bootstrap_modal.parent_dir.push_str(text);
+                    g.bootstrap_modal.error = None;
+                }
+            }
+            ActiveInputTarget::BootstrapFolderName => {
+                if let Ok(mut g) = self.state.lock() {
+                    if g.input_selected_all {
+                        g.bootstrap_modal.folder_name.clear();
+                        g.input_selected_all = false;
+                    }
+                    g.bootstrap_modal.folder_name.push_str(text);
+                    g.bootstrap_modal.error = None;
+                }
+            }
+            ActiveInputTarget::BootstrapGitCloneUrl => {
+                if let Ok(mut g) = self.state.lock() {
+                    if g.input_selected_all {
+                        g.bootstrap_modal.git_clone_url.clear();
+                        g.input_selected_all = false;
+                    }
+                    g.bootstrap_modal.git_clone_url.push_str(text);
+                    g.bootstrap_modal.error = None;
                 }
             }
             ActiveInputTarget::CommandPalette => {}
@@ -1810,19 +2154,40 @@ impl CodaGpuWorkspaceView {
                                 ActiveInputTarget::PreviewPort => g.port_preview.port_input.clear(),
                                 ActiveInputTarget::PreviewPath => g.port_preview.path_input.clear(),
                                 ActiveInputTarget::WebhookBarkUrl => {
-                                    g.webhook_settings.bark_url.clear()
+                                    g.webhook_settings.bark_url.clear();
+                                    g.webhook_dirty = true;
                                 }
                                 ActiveInputTarget::WebhookTelegramToken => {
-                                    g.webhook_settings.telegram_bot_token.clear()
+                                    g.webhook_settings.telegram_bot_token.clear();
+                                    g.webhook_dirty = true;
                                 }
                                 ActiveInputTarget::WebhookTelegramChatId => {
-                                    g.webhook_settings.telegram_chat_id.clear()
+                                    g.webhook_settings.telegram_chat_id.clear();
+                                    g.webhook_dirty = true;
                                 }
                                 ActiveInputTarget::WebhookFeishuUrl => {
-                                    g.webhook_settings.feishu_webhook_url.clear()
+                                    g.webhook_settings.feishu_webhook_url.clear();
+                                    g.webhook_dirty = true;
                                 }
                                 ActiveInputTarget::WebhookDiscordUrl => {
-                                    g.webhook_settings.discord_webhook_url.clear()
+                                    g.webhook_settings.discord_webhook_url.clear();
+                                    g.webhook_dirty = true;
+                                }
+                                ActiveInputTarget::WebhookGenericUrl => {
+                                    g.webhook_settings.generic_webhook_url.clear();
+                                    g.webhook_dirty = true;
+                                }
+                                ActiveInputTarget::BootstrapParentDir => {
+                                    g.bootstrap_modal.parent_dir.clear();
+                                    g.bootstrap_modal.error = None;
+                                }
+                                ActiveInputTarget::BootstrapFolderName => {
+                                    g.bootstrap_modal.folder_name.clear();
+                                    g.bootstrap_modal.error = None;
+                                }
+                                ActiveInputTarget::BootstrapGitCloneUrl => {
+                                    g.bootstrap_modal.git_clone_url.clear();
+                                    g.bootstrap_modal.error = None;
                                 }
                                 _ => {}
                             }
@@ -1939,6 +2304,24 @@ impl CodaGpuWorkspaceView {
                 if let Ok(mut g) = self.state.lock() {
                     g.settings_open = false;
                     g.clear_settings_ephemeral_inputs();
+                }
+                cx.notify();
+                cx.stop_propagation();
+            }
+            return;
+        }
+
+        let bootstrap_open = self
+            .state
+            .lock()
+            .map(|g| g.bootstrap_modal.open)
+            .unwrap_or(false);
+        if bootstrap_open && target == ActiveInputTarget::TerminalDirect {
+            if key == "escape" {
+                if let Ok(mut g) = self.state.lock() {
+                    if !g.bootstrap_modal.loading {
+                        g.bootstrap_modal.reset();
+                    }
                 }
                 cx.notify();
                 cx.stop_propagation();
@@ -2392,11 +2775,13 @@ impl CodaGpuWorkspaceView {
             | ActiveInputTarget::WebhookTelegramToken
             | ActiveInputTarget::WebhookTelegramChatId
             | ActiveInputTarget::WebhookFeishuUrl
-            | ActiveInputTarget::WebhookDiscordUrl => match key {
+            | ActiveInputTarget::WebhookDiscordUrl
+            | ActiveInputTarget::WebhookGenericUrl => match key {
                 "backspace" => {
                     if let Ok(mut g) = self.state.lock() {
                         let sel_all = g.input_selected_all;
                         g.input_selected_all = false;
+                        g.webhook_dirty = true;
                         let field = match target {
                             ActiveInputTarget::WebhookBarkUrl => &mut g.webhook_settings.bark_url,
                             ActiveInputTarget::WebhookTelegramToken => {
@@ -2408,7 +2793,10 @@ impl CodaGpuWorkspaceView {
                             ActiveInputTarget::WebhookFeishuUrl => {
                                 &mut g.webhook_settings.feishu_webhook_url
                             }
-                            _ => &mut g.webhook_settings.discord_webhook_url,
+                            ActiveInputTarget::WebhookDiscordUrl => {
+                                &mut g.webhook_settings.discord_webhook_url
+                            }
+                            _ => &mut g.webhook_settings.generic_webhook_url,
                         };
                         if sel_all {
                             field.clear();
@@ -2435,6 +2823,9 @@ impl CodaGpuWorkspaceView {
                             ActiveInputTarget::WebhookFeishuUrl => {
                                 ActiveInputTarget::WebhookDiscordUrl
                             }
+                            ActiveInputTarget::WebhookDiscordUrl => {
+                                ActiveInputTarget::WebhookGenericUrl
+                            }
                             _ => ActiveInputTarget::WebhookBarkUrl,
                         };
                     }
@@ -2450,6 +2841,66 @@ impl CodaGpuWorkspaceView {
                     if let Ok(mut g) = self.state.lock() {
                         g.input_selected_all = false;
                         g.input_target = ActiveInputTarget::TerminalDirect;
+                    }
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                _ => {}
+            },
+            ActiveInputTarget::BootstrapParentDir
+            | ActiveInputTarget::BootstrapGitCloneUrl
+            | ActiveInputTarget::BootstrapFolderName => match key {
+                "backspace" => {
+                    if let Ok(mut g) = self.state.lock() {
+                        let sel_all = g.input_selected_all;
+                        g.input_selected_all = false;
+                        g.bootstrap_modal.error = None;
+                        let field = match target {
+                            ActiveInputTarget::BootstrapParentDir => {
+                                &mut g.bootstrap_modal.parent_dir
+                            }
+                            ActiveInputTarget::BootstrapGitCloneUrl => {
+                                &mut g.bootstrap_modal.git_clone_url
+                            }
+                            _ => &mut g.bootstrap_modal.folder_name,
+                        };
+                        if sel_all {
+                            field.clear();
+                        } else {
+                            field.pop();
+                        }
+                    }
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                "tab" => {
+                    if let Ok(mut g) = self.state.lock() {
+                        g.input_selected_all = false;
+                        g.input_target = match target {
+                            ActiveInputTarget::BootstrapParentDir => {
+                                ActiveInputTarget::BootstrapGitCloneUrl
+                            }
+                            ActiveInputTarget::BootstrapGitCloneUrl => {
+                                ActiveInputTarget::BootstrapFolderName
+                            }
+                            _ => ActiveInputTarget::BootstrapParentDir,
+                        };
+                    }
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                "enter" | "return" => {
+                    self.submit_remote_bootstrap_workspace();
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                "escape" => {
+                    if let Ok(mut g) = self.state.lock() {
+                        if !g.bootstrap_modal.loading {
+                            g.bootstrap_modal.reset();
+                            g.input_selected_all = false;
+                            g.input_target = ActiveInputTarget::TerminalDirect;
+                        }
                     }
                     cx.notify();
                     cx.stop_propagation();
@@ -2761,33 +3212,11 @@ impl CodaGpuWorkspaceView {
     }
 
     pub(crate) fn trigger_refresh_git_diff(&self) {
-        let remote_target = self.state.lock().ok().and_then(|g| {
-            if let Some(sid) = g.focused_session_id() {
-                if let Some(sess) = g.session_by_id(sid) {
-                    if let Some(hid) = sess
-                        .remote_host_id
-                        .as_deref()
-                        .and_then(|s| Uuid::parse_str(s).ok())
-                    {
-                        let sp_path = g
-                            .spaces
-                            .iter()
-                            .find(|sp| sp.id == sess.space_id)
-                            .map(|sp| sp.path.clone())
-                            .unwrap_or_else(|| ".".to_string());
-                        let eff_cwd = if !sess.cwd.trim().is_empty() && sess.cwd != "." {
-                            sess.cwd.clone()
-                        } else {
-                            sp_path
-                        };
-                        return Some((hid, eff_cwd));
-                    }
-                }
-            }
-            let sp = g.active_space().filter(|s| s.is_remote)?;
-            let hid = Uuid::parse_str(&sp.machine_id).ok()?;
-            Some((hid, sp.path.clone()))
-        });
+        let remote_target = self
+            .state
+            .lock()
+            .ok()
+            .and_then(|g| g.effective_remote_diff_target());
         if let Some((device_id, cwd)) = remote_target {
             self.mesh_hub.request_remote_git_diff(device_id, cwd);
         } else {
@@ -2810,62 +3239,72 @@ impl CodaGpuWorkspaceView {
             selected_change,
             selected_file_rel,
         ) = {
-            let Ok(g) = state.lock() else {
+            let Ok(mut g) = state.lock() else {
                 return;
             };
-            let focused_remote = g
-                .focused_session_id()
-                .and_then(|sid| g.session_by_id(sid))
-                .and_then(|s| {
-                    let hid = Uuid::parse_str(s.remote_host_id.as_deref()?).ok()?;
-                    Some((hid, s.cwd.clone()))
-                });
-            let Some(space) = g.active_space() else {
-                if let Some((hid, sess_cwd)) = focused_remote {
-                    let cwd = if sess_cwd.trim().is_empty() {
-                        ".".to_string()
-                    } else {
-                        sess_cwd
-                    };
-                    drop(g);
-                    mesh_hub.request_remote_git_diff(hid, cwd);
-                }
-                return;
-            };
-            let (host_uuid, eff_remote_cwd) = if let Some((hid, sess_cwd)) = focused_remote {
-                let cwd = if !sess_cwd.trim().is_empty() && sess_cwd != "." {
-                    sess_cwd
-                } else {
-                    space.path.clone()
-                };
-                (Some(hid), cwd)
-            } else if space.is_remote {
+            if let Some((hid, eff_cwd)) = g.effective_remote_diff_target() {
+                let (sp_id, sp_path) = g
+                    .active_space()
+                    .filter(|sp| sp.is_remote && Uuid::parse_str(&sp.machine_id).ok() == Some(hid))
+                    .map(|sp| (sp.id.clone(), sp.path.clone()))
+                    .unwrap_or_else(|| (String::new(), ".".to_string()));
                 (
-                    Uuid::parse_str(&space.machine_id).ok(),
-                    space.path.clone(),
+                    sp_id,
+                    sp_path,
+                    Some(hid),
+                    eff_cwd,
+                    g.current_browse_rel.clone(),
+                    g.selected_change_path.as_ref().map(|p| format!("file:{p}")),
+                    g.selected_file_rel.clone(),
                 )
             } else {
-                (None, space.path.clone())
-            };
-            (
-                space.id.clone(),
-                space.path.clone(),
-                host_uuid,
-                eff_remote_cwd,
-                g.current_browse_rel.clone(),
-                g.selected_change_path.as_ref().map(|p| format!("file:{p}")),
-                g.selected_file_rel.clone(),
-            )
+                // Invalidate any in-flight remote GitDiffRequest so a late response cannot
+                // clobber the local space or focused local split-pane snapshot.
+                g.remote_diff_seq = g.remote_diff_seq.wrapping_add(1);
+                g.git_diff_loading = false;
+
+                let local_target = g
+                    .focused_session_id()
+                    .and_then(|sid| g.session_by_id(sid))
+                    .filter(|s| s.remote_host_id.is_none())
+                    .and_then(|s| {
+                        g.spaces
+                            .iter()
+                            .find(|sp| !sp.is_remote && sp.id == s.space_id)
+                            .map(|sp| (sp.id.clone(), sp.path.clone()))
+                            .or_else(|| {
+                                (!s.cwd.trim().is_empty() && s.cwd != ".")
+                                    .then(|| (s.space_id.clone(), s.cwd.clone()))
+                            })
+                    })
+                    .or_else(|| {
+                        g.active_space()
+                            .filter(|sp| !sp.is_remote)
+                            .map(|sp| (sp.id.clone(), sp.path.clone()))
+                    });
+                let Some((sp_id, sp_path)) = local_target else {
+                    return;
+                };
+                (
+                    sp_id,
+                    sp_path,
+                    None,
+                    String::new(),
+                    g.current_browse_rel.clone(),
+                    g.selected_change_path.as_ref().map(|p| format!("file:{p}")),
+                    g.selected_file_rel.clone(),
+                )
+            }
         };
 
         if let Some(host_id) = remote_host_id {
             mesh_hub.request_remote_git_diff(host_id, remote_diff_cwd.clone());
-            let dir_root = if space_path_str != "." {
+            let dir_root = if space_path_str != "." && !space_path_str.is_empty() {
                 &space_path_str
             } else {
                 &remote_diff_cwd
             };
-            if dir_root != "." {
+            if dir_root != "." && !space_id.is_empty() {
                 mesh_hub.refresh_remote_directory(host_id, &space_id, dir_root, &browse_rel);
             }
             return;
@@ -2907,11 +3346,19 @@ impl CodaGpuWorkspaceView {
                     sp.ahead = 0;
                     sp.behind = 0;
                 }
-                if g.active_space_id.as_deref() == Some(space_id.as_str()) {
+                let still_targeting_local_space = g.effective_remote_diff_target().is_none()
+                    && (g.active_space_id.as_deref() == Some(space_id.as_str())
+                        || g.focused_session_id()
+                            .and_then(|sid| g.session_by_id(sid))
+                            .map(|s| s.remote_host_id.is_none() && s.space_id == space_id)
+                            .unwrap_or(false));
+                if still_targeting_local_space {
                     g.repo_snapshot = snap;
-                    g.dir_entries = entries;
-                    if let Some(preview) = file_preview {
-                        g.selected_file_content = preview;
+                    if g.active_space_id.as_deref() == Some(space_id.as_str()) {
+                        g.dir_entries = entries;
+                        if let Some(preview) = file_preview {
+                            g.selected_file_content = preview;
+                        }
                     }
                 }
             }
@@ -3360,32 +3807,15 @@ impl CodaGpuWorkspaceView {
     }
 
     fn select_session(&self, session_id: &str) {
-        let Ok(mut g) = self.state.lock() else {
+        let Some((_space_changed, layout_changed)) = (match self.state.lock() {
+            Ok(mut g) => g.apply_select_session(session_id),
+            Err(_) => return,
+        }) else {
             return;
         };
-        let Some(space_id) = g
-            .sessions
-            .iter()
-            .find(|s| s.id == session_id)
-            .map(|s| s.space_id.clone())
-        else {
-            return;
-        };
-        let space_changed = g.active_space_id.as_deref() != Some(space_id.as_str());
-        g.active_space_id = Some(space_id);
-        if space_changed {
-            g.current_browse_rel.clear();
-            g.selected_file_rel = None;
-            g.selected_file_content.clear();
-            g.selected_change_path = None;
+        if layout_changed {
+            self.persist_layout_config();
         }
-        if g.layout.split_terminals && g.focused_pane == SplitPane::Secondary {
-            g.split_session_id = Some(session_id.to_string());
-        } else {
-            g.active_session_id = Some(session_id.to_string());
-        }
-        g.input_target = ActiveInputTarget::TerminalDirect;
-        drop(g);
         self.refresh_active_space_inspector();
     }
 
@@ -3410,6 +3840,8 @@ impl CodaGpuWorkspaceView {
     ) {
         let mut need_spawn = false;
         if let Ok(mut g) = state.lock() {
+            g.remote_diff_seq = g.remote_diff_seq.wrapping_add(1);
+            g.git_diff_loading = false;
             g.active_space_id = Some(space_id.to_string());
             g.current_browse_rel.clear();
             g.selected_file_rel = None;
@@ -3537,6 +3969,7 @@ impl CodaGpuWorkspaceView {
         if let Ok(mut mgr) = self.pty_mgr.lock() {
             mgr.kill_session(session_id);
         }
+        self.mesh_hub.stop_all_tunnels_quiet();
         if let Ok(mut g) = self.state.lock() {
             g.sessions.retain(|s| s.id != session_id);
             g.notify_tracker.prune_session(session_id);
@@ -3577,6 +4010,7 @@ impl CodaGpuWorkspaceView {
         for sid in session_ids {
             self.close_session(&sid);
         }
+        self.mesh_hub.stop_all_tunnels_quiet();
 
         if let Ok(mut g) = self.state.lock() {
             let removed_path = g
@@ -3733,7 +4167,21 @@ impl CodaGpuWorkspaceView {
         self.open_workspace_entry(&parent_rel, true);
     }
 
-    fn add_workspace_folder(&self) {
+    pub(crate) fn add_workspace_folder(&self) {
+        let remote_hid = self.state.lock().ok().and_then(|g| {
+            g.active_space()
+                .filter(|sp| sp.is_remote)
+                .and_then(|sp| Uuid::parse_str(&sp.machine_id).ok())
+                .or_else(|| Self::resolve_active_remote_host_id(&g))
+        });
+        if let Some(hid) = remote_hid {
+            self.open_remote_bootstrap_modal(Some(hid));
+        } else {
+            self.add_local_workspace_folder();
+        }
+    }
+
+    pub(crate) fn add_local_workspace_folder(&self) {
         let state_bg = Arc::clone(&self.state);
         let pty_mgr_bg = Arc::clone(&self.pty_mgr);
         let mesh_hub_bg = Arc::clone(&self.mesh_hub);
@@ -3794,7 +4242,104 @@ impl CodaGpuWorkspaceView {
         });
     }
 
+    pub(crate) fn open_remote_bootstrap_modal(&self, preferred_host: Option<Uuid>) {
+        if let Ok(mut g) = self.state.lock() {
+            let resolved_host = preferred_host
+                .or_else(|| Self::resolve_active_remote_host_id(&g))
+                .or_else(|| g.remote_hosts.iter().find(|h| h.is_online).map(|h| h.id))
+                .or_else(|| g.remote_hosts.first().map(|h| h.id));
+            g.palette_open = false;
+            g.palette_query.clear();
+            g.palette_selected = 0;
+            g.settings_open = false;
+            g.clear_settings_ephemeral_inputs();
+            g.bootstrap_modal.open = true;
+            g.bootstrap_modal.host_id = resolved_host;
+            if g.bootstrap_modal.parent_dir.trim().is_empty() {
+                g.bootstrap_modal.parent_dir = "~/workspace".to_string();
+            }
+            g.bootstrap_modal.folder_name.clear();
+            g.bootstrap_modal.git_clone_url.clear();
+            g.bootstrap_modal.loading = false;
+            g.bootstrap_modal.error = None;
+            g.input_selected_all = false;
+            g.input_target = ActiveInputTarget::BootstrapParentDir;
+        }
+        self.ui_dirty.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn submit_remote_bootstrap_workspace(&self) {
+        let params = {
+            let Ok(mut g) = self.state.lock() else {
+                return;
+            };
+            if g.bootstrap_modal.loading {
+                return;
+            }
+            let loc = g.locale;
+            let Some(device_id) = g.bootstrap_modal.host_id else {
+                g.bootstrap_modal.error = Some(
+                    tr(
+                        loc,
+                        "Select an online remote host first.",
+                        "请先选择一个在线远端主机。",
+                    )
+                    .to_string(),
+                );
+                self.ui_dirty.store(true, Ordering::Release);
+                return;
+            };
+            let parent_raw = g.bootstrap_modal.parent_dir.trim().to_string();
+            let parent_dir = if parent_raw.is_empty() {
+                "~/workspace".to_string()
+            } else {
+                parent_raw
+            };
+            let git_url_raw = g.bootstrap_modal.git_clone_url.trim().to_string();
+            let git_clone_url = (!git_url_raw.is_empty()).then_some(git_url_raw);
+            let folder_raw = g.bootstrap_modal.folder_name.trim().to_string();
+            let eff_folder = if !folder_raw.is_empty() {
+                folder_raw
+            } else if let Some(ref url) = git_clone_url {
+                crate::helpers::derive_folder_name_from_git_url(url).unwrap_or_default()
+            } else {
+                String::new()
+            };
+            if eff_folder.is_empty()
+                || eff_folder == "."
+                || eff_folder == ".."
+                || eff_folder.contains('/')
+                || eff_folder.contains('\\')
+            {
+                g.bootstrap_modal.error = Some(
+                    tr(
+                        loc,
+                        "Enter a single folder name (no slashes) or a valid Git repository URL.",
+                        "请输入合法的单层目录名称（不含斜杠）或有效的 Git 仓库地址。",
+                    )
+                    .to_string(),
+                );
+                self.ui_dirty.store(true, Ordering::Release);
+                return;
+            }
+            g.bootstrap_modal.parent_dir = parent_dir.clone();
+            g.bootstrap_modal.folder_name = eff_folder.clone();
+            g.bootstrap_modal.loading = true;
+            g.bootstrap_modal.error = None;
+            g.input_selected_all = false;
+            (device_id, parent_dir, eff_folder, git_clone_url)
+        };
+        self.mesh_hub
+            .bootstrap_remote_workspace(params.0, params.1, params.2, params.3);
+        self.ui_dirty.store(true, Ordering::Release);
+    }
+
     fn execute_palette_action(&self, action: PaletteAction) {
+        if let Ok(mut g) = self.state.lock() {
+            g.palette_open = false;
+            g.palette_query.clear();
+            g.palette_selected = 0;
+        }
         match action {
             PaletteAction::FocusSpace(id) => self.select_space(&id),
             PaletteAction::FocusSession(id) => self.select_session(&id),
@@ -3816,7 +4361,21 @@ impl CodaGpuWorkspaceView {
                 }
                 self.persist_layout_config();
             }
-            PaletteAction::AddSpaceFolder => self.add_workspace_folder(),
+            PaletteAction::AddSpaceFolder => {
+                self.add_workspace_folder();
+                if self
+                    .state
+                    .lock()
+                    .map(|g| g.bootstrap_modal.open)
+                    .unwrap_or(false)
+                {
+                    return;
+                }
+            }
+            PaletteAction::OpenRemoteBootstrapModal => {
+                self.open_remote_bootstrap_modal(None);
+                return;
+            }
             PaletteAction::OpenDrawer(tab) => {
                 if let Ok(mut g) = self.state.lock() {
                     g.right_drawer = Some(tab);
@@ -3828,22 +4387,21 @@ impl CodaGpuWorkspaceView {
                 }
             }
             PaletteAction::OpenSettings => {
-                let logged_in = if let Ok(mut g) = self.state.lock() {
+                let should_fetch = if let Ok(mut g) = self.state.lock() {
+                    g.bootstrap_modal.open = false;
                     g.settings_open = true;
-                    g.is_logged_in
+                    g.is_logged_in && !g.webhook_dirty && !g.webhook_loading
                 } else {
                     false
                 };
-                if logged_in {
+                if should_fetch {
                     self.reload_notification_webhooks();
                 }
             }
             PaletteAction::ToggleLocale => self.toggle_locale(),
             PaletteAction::OpenTerminalSearch => {
                 if let Ok(mut g) = self.state.lock() {
-                    g.palette_open = false;
-                    g.palette_query.clear();
-                    g.palette_selected = 0;
+                    g.bootstrap_modal.open = false;
                     g.settings_open = false;
                     g.terminal_search_open = true;
                     g.input_selected_all = !g.terminal_search_query.is_empty();
@@ -3856,10 +4414,9 @@ impl CodaGpuWorkspaceView {
             PaletteAction::JumpNextNeedsYou => self.jump_to_next_needs_you_session(),
         }
         if let Ok(mut g) = self.state.lock() {
-            g.palette_open = false;
-            g.palette_query.clear();
-            g.palette_selected = 0;
-            g.input_target = ActiveInputTarget::TerminalDirect;
+            if !g.bootstrap_modal.open {
+                g.input_target = ActiveInputTarget::TerminalDirect;
+            }
         }
     }
 
@@ -3886,7 +4443,8 @@ impl CodaGpuWorkspaceView {
             g.settings_open = !g.settings_open;
             if g.settings_open {
                 g.palette_open = false;
-                should_fetch_wh = g.is_logged_in;
+                g.bootstrap_modal.open = false;
+                should_fetch_wh = g.is_logged_in && !g.webhook_dirty && !g.webhook_loading;
             } else {
                 g.clear_settings_ephemeral_inputs();
             }
@@ -3902,6 +4460,7 @@ impl CodaGpuWorkspaceView {
         let next_id = self.state.lock().ok().and_then(|mut g| {
             g.palette_open = false;
             g.settings_open = false;
+            g.bootstrap_modal.open = false;
             g.clear_settings_ephemeral_inputs();
             let loc = g.locale;
             match g.next_needs_you_session_id() {
@@ -3930,24 +4489,21 @@ impl CodaGpuWorkspaceView {
     }
 
     pub(crate) fn save_notification_webhooks(&self) {
-        let settings = match self.state.lock() {
-            Ok(mut g) => {
-                g.input_selected_all = false;
-                g.input_target = ActiveInputTarget::TerminalDirect;
-                g.webhook_settings.bark_url = g.webhook_settings.bark_url.trim().to_string();
-                g.webhook_settings.telegram_bot_token =
-                    g.webhook_settings.telegram_bot_token.trim().to_string();
-                g.webhook_settings.telegram_chat_id =
-                    g.webhook_settings.telegram_chat_id.trim().to_string();
-                g.webhook_settings.feishu_webhook_url =
-                    g.webhook_settings.feishu_webhook_url.trim().to_string();
-                g.webhook_settings.discord_webhook_url =
-                    g.webhook_settings.discord_webhook_url.trim().to_string();
-                g.webhook_settings.clone()
-            }
+        let outcome = match self.state.lock() {
+            Ok(mut g) => prepare_webhook_save(&mut g),
             Err(_) => return,
         };
-        self.mesh_hub.save_notification_webhooks(settings);
+        match outcome {
+            Ok(settings) => {
+                self.mesh_hub.save_notification_webhooks(settings);
+            }
+            Err(should_reload) => {
+                if should_reload {
+                    self.reload_notification_webhooks();
+                }
+                self.ui_dirty.store(true, Ordering::Release);
+            }
+        }
     }
 
     pub(crate) fn test_notification_webhooks(&self) {
@@ -3959,15 +4515,7 @@ impl CodaGpuWorkspaceView {
     }
 
     fn resolve_active_remote_host_id(g: &CodaDesktopState) -> Option<Uuid> {
-        g.focused_session_id()
-            .and_then(|sid| g.session_by_id(sid))
-            .and_then(|s| s.remote_host_id.as_deref())
-            .and_then(|raw| Uuid::parse_str(raw).ok())
-            .or_else(|| {
-                g.active_space()
-                    .filter(|sp| sp.is_remote)
-                    .and_then(|sp| Uuid::parse_str(&sp.machine_id).ok())
-            })
+        g.effective_remote_diff_target().map(|(hid, _)| hid)
     }
 
     fn toggle_terminal_search(&self) {
@@ -4181,12 +4729,7 @@ impl CodaGpuWorkspaceView {
         }
     }
 
-    pub(crate) fn stop_active_port_tunnel(&self) {
-        let key_opt = self
-            .state
-            .lock()
-            .ok()
-            .and_then(|g| g.port_preview.active_tunnel_key);
+    pub(crate) fn stop_port_tunnel(&self, key_opt: Option<crate::port_preview::TunnelTargetKey>) {
         self.mesh_hub.stop_live_loopback_tunnel(key_opt);
     }
 
@@ -4301,7 +4844,8 @@ impl CodaGpuWorkspaceView {
                                 .lock()
                                 .map(|m| m.terminal_modes(&id).1)
                                 .unwrap_or(false);
-                            let safe_txt = transcript.replace("\x1b[201~", "");
+                            let safe_txt =
+                                crate::helpers::sanitize_bracketed_paste_text(&transcript);
                             let payload = if bracketed {
                                 let mut b = Vec::with_capacity(safe_txt.len() + 12);
                                 b.extend_from_slice(b"\x1b[200~");
@@ -4567,6 +5111,7 @@ impl Render for CodaGpuWorkspaceView {
         };
         let terminal_ime_active = !st.palette_open
             && !st.settings_open
+            && !st.bootstrap_modal.open
             && st.input_target == ActiveInputTarget::TerminalDirect
             && st.layout.layout == LayoutMode::Workbench
             && focused_pane_has_sess;
@@ -4620,6 +5165,7 @@ impl Render for CodaGpuWorkspaceView {
                     g.palette_open = !g.palette_open;
                     if g.palette_open {
                         g.settings_open = false;
+                        g.bootstrap_modal.open = false;
                         g.clear_settings_ephemeral_inputs();
                         g.palette_query.clear();
                         g.palette_selected = 0;
@@ -4799,6 +5345,9 @@ impl Render for CodaGpuWorkspaceView {
             .when(st.settings_open, |el| {
                 el.child(self.render_settings_modal_overlay(&st, cx))
             })
+            .when(st.bootstrap_modal.open, |el| {
+                el.child(self.render_remote_bootstrap_modal_overlay(&st, cx))
+            })
     }
 }
 
@@ -4933,13 +5482,34 @@ impl CodaGpuWorkspaceView {
             .filter(|s| s.alive && s.effective_state() == AgentLifecycleState::NeedsYou)
             .collect();
 
-        // Group Spaces by machine_label preserving discovery order
-        let mut machine_groups: Vec<(String, bool, Vec<&SpaceEntry>)> = Vec::new();
+        // Group Spaces by machine_id / machine_label preserving discovery order,
+        // and include online remote hosts even before their first workspace is created.
+        let mut machine_groups: Vec<(String, String, bool, Vec<&SpaceEntry>)> = Vec::new();
         for sp in &st.spaces {
-            if let Some(grp) = machine_groups.iter_mut().find(|g| g.0 == sp.machine_label) {
-                grp.2.push(sp);
+            if let Some(grp) = machine_groups.iter_mut().find(|g| {
+                if sp.is_remote {
+                    g.0 == sp.machine_id
+                } else {
+                    !g.2 && g.1 == sp.machine_label
+                }
+            }) {
+                grp.3.push(sp);
             } else {
-                machine_groups.push((sp.machine_label.clone(), sp.is_remote, vec![sp]));
+                machine_groups.push((
+                    sp.machine_id.clone(),
+                    sp.machine_label.clone(),
+                    sp.is_remote,
+                    vec![sp],
+                ));
+            }
+        }
+        for host in &st.remote_hosts {
+            if !host.is_online {
+                continue;
+            }
+            let hid_str = host.id.to_string();
+            if !machine_groups.iter().any(|g| g.2 && g.0 == hid_str) {
+                machine_groups.push((hid_str, host.name.clone(), true, Vec::new()));
             }
         }
 
@@ -5203,25 +5773,107 @@ impl CodaGpuWorkspaceView {
                                             })),
                                     ),
                             )
-                            .children(machine_groups.into_iter().map(|(machine, is_remote, list)| {
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap(px(2.0))
-                                    .child(
-                                        div()
-                                            .px(px(6.0))
-                                            .pt(px(4.0))
-                                            .text_size(px(10.5))
-                                            .text_color(rgb(palette::TEXT_DIM))
-                                            .truncate()
-                                            .child(if is_remote {
-                                                machine
-                                            } else {
-                                                format!("{} · {machine}", tr(loc, "This Mac", "本机"))
-                                            }),
-                                    )
-                                    .children(list.into_iter().map(|sp| {
+                            .children(machine_groups.into_iter().map(
+                                |(machine_id, machine, is_remote, list)| {
+                                    let host_uuid_opt = is_remote
+                                        .then(|| Uuid::parse_str(&machine_id).ok())
+                                        .flatten();
+                                    let add_btn_id = if is_remote {
+                                        format!("btn-add-remote-space-{machine_id}")
+                                    } else {
+                                        "btn-add-local-space".to_string()
+                                    };
+                                    let is_empty_remote = is_remote && list.is_empty();
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(2.0))
+                                        .child(
+                                            div()
+                                                .px(px(6.0))
+                                                .pt(px(4.0))
+                                                .flex()
+                                                .items_center()
+                                                .justify_between()
+                                                .gap(px(4.0))
+                                                .child(
+                                                    div()
+                                                        .min_w_0()
+                                                        .flex_1()
+                                                        .text_size(px(10.5))
+                                                        .text_color(rgb(palette::TEXT_DIM))
+                                                        .truncate()
+                                                        .child(if is_remote {
+                                                            machine
+                                                        } else {
+                                                            format!(
+                                                                "{} · {machine}",
+                                                                tr(loc, "This Mac", "本机")
+                                                            )
+                                                        }),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .id(SharedString::from(add_btn_id))
+                                                        .occlude()
+                                                        .flex_shrink_0()
+                                                        .px(px(4.0))
+                                                        .py(px(0.5))
+                                                        .rounded(px(3.0))
+                                                        .hover(|h| {
+                                                            h.bg(rgb(palette::HOVER_BG))
+                                                                .text_color(rgb(
+                                                                    palette::TEXT_PRIMARY,
+                                                                ))
+                                                        })
+                                                        .cursor_pointer()
+                                                        .text_size(px(11.0))
+                                                        .text_color(rgb(palette::TEXT_MUTED))
+                                                        .child("+")
+                                                        .on_click(cx.listener(
+                                                            move |this, _: &ClickEvent, _, cx| {
+                                                                if is_remote {
+                                                                    this.open_remote_bootstrap_modal(
+                                                                        host_uuid_opt,
+                                                                    );
+                                                                } else {
+                                                                    this.add_local_workspace_folder();
+                                                                }
+                                                                cx.notify();
+                                                            },
+                                                        )),
+                                                ),
+                                        )
+                                        .when(is_empty_remote, |grp| {
+                                            grp.child(
+                                                div()
+                                                    .id(SharedString::from(format!(
+                                                        "empty-remote-bootstrap-{machine_id}"
+                                                    )))
+                                                    .occlude()
+                                                    .px(px(8.0))
+                                                    .py(px(4.0))
+                                                    .rounded(px(5.0))
+                                                    .hover(|h| h.bg(rgb(palette::HOVER_BG)))
+                                                    .cursor_pointer()
+                                                    .text_size(px(10.5))
+                                                    .text_color(rgb(accent))
+                                                    .child(tr(
+                                                        loc,
+                                                        "+ Create folder / Git clone…",
+                                                        "+ 新建目录 / Git 克隆…",
+                                                    ))
+                                                    .on_click(cx.listener(
+                                                        move |this, _: &ClickEvent, _, cx| {
+                                                            this.open_remote_bootstrap_modal(
+                                                                host_uuid_opt,
+                                                            );
+                                                            cx.notify();
+                                                        },
+                                                    )),
+                                            )
+                                        })
+                                        .children(list.into_iter().map(|sp| {
                                         let is_active =
                                             st.active_space_id.as_deref() == Some(&sp.id);
                                         let sp_id = sp.id.clone();
@@ -5349,7 +6001,8 @@ impl CodaGpuWorkspaceView {
                                                 },
                                             ))
                                     }))
-                            })),
+                                },
+                            )),
                     )
                     .child(
                         // AGENTS INBOX SECTION
@@ -6095,6 +6748,7 @@ impl CodaGpuWorkspaceView {
         let pane_ime_active = is_focused
             && !st.palette_open
             && !st.settings_open
+            && !st.bootstrap_modal.open
             && st.input_target == ActiveInputTarget::TerminalDirect
             && st.layout.layout == LayoutMode::Workbench;
         let ime_marked = self.marked_text.clone();
@@ -6966,7 +7620,8 @@ impl CodaGpuWorkspaceView {
             .children(visible_sessions.into_iter().map(|sess| {
                 let sid = sess.id.clone();
                 let sid_close = sess.id.clone();
-                let is_active = st.active_session_id.as_deref() == Some(&sess.id);
+                let is_active = st.focused_session_id() == Some(sess.id.as_str())
+                    || st.active_session_id.as_deref() == Some(&sess.id);
                 div()
                     .id(SharedString::from(format!("tile-{}", sess.id)))
                     .occlude()
@@ -7427,7 +8082,19 @@ impl CodaGpuWorkspaceView {
                                 ),
                         );
 
-                        if st.git_diff_loading && snap.changed_files.is_empty() && !snap.is_git_repo {
+                        let el = el.when_some(snap.repo_root.as_ref(), |el, root_str| {
+                            el.child(
+                                div()
+                                    .px(px(6.0))
+                                    .font_family("Menlo")
+                                    .text_size(px(10.0))
+                                    .text_color(rgb(palette::TEXT_DIM))
+                                    .truncate()
+                                    .child(display_compact_path(root_str)),
+                            )
+                        });
+
+                        if st.git_diff_loading && snap.changed_files.is_empty() && !snap.is_git_repo && snap.error.is_none() {
                             el.child(
                                 div()
                                     .p(px(10.0))
@@ -7441,19 +8108,72 @@ impl CodaGpuWorkspaceView {
                                         "正在通过 E2EE 获取远端 Git Diff…",
                                     )),
                             )
+                        } else if let Some(ref err_msg) = snap.error {
+                            el.child(
+                                div()
+                                    .p(px(10.0))
+                                    .rounded(px(6.0))
+                                    .bg(rgba(0xf871711a))
+                                    .border_1()
+                                    .border_color(rgb(palette::ERROR_RED))
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(4.0))
+                                    .child(
+                                        div()
+                                            .text_size(px(11.5))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(rgb(palette::ERROR_RED))
+                                            .child(tr(
+                                                loc,
+                                                "Git status / diff error",
+                                                "Git 状态 / Diff 读取失败",
+                                            )),
+                                    )
+                                    .child(
+                                        div()
+                                            .font_family("Menlo")
+                                            .text_size(px(10.5))
+                                            .text_color(rgb(palette::TEXT_MUTED))
+                                            .child(err_msg.clone()),
+                                    ),
+                            )
                         } else if !snap.is_git_repo {
+                            let detail = snap.diff_text.trim();
                             el.child(
                                 div()
                                     .p(px(10.0))
                                     .rounded(px(6.0))
                                     .bg(rgb(palette::SURFACE_BG))
-                                    .text_size(px(11.5))
-                                    .text_color(rgb(palette::TEXT_DIM))
-                                    .child(tr(
-                                        loc,
-                                        "Not a Git repository (click Refresh Diff after opening a repo)",
-                                        "当前目录不是 Git 仓库（切换到仓库后可点击刷新 Diff）",
-                                    )),
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(4.0))
+                                    .child(
+                                        div()
+                                            .text_size(px(11.5))
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(rgb(palette::TEXT_MUTED))
+                                            .child(tr(
+                                                loc,
+                                                "Not a Git repository",
+                                                "当前目录不是 Git 仓库",
+                                            )),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(10.5))
+                                            .text_color(rgb(palette::TEXT_DIM))
+                                            .child(if detail.is_empty() {
+                                                tr(
+                                                    loc,
+                                                    "Open a Git repository or click Refresh Diff after `git init`.",
+                                                    "切换到 Git 仓库或在执行 `git init` 后点击刷新 Diff。",
+                                                )
+                                                .to_string()
+                                            } else {
+                                                detail.to_string()
+                                            }),
+                                    ),
                             )
                         } else if snap.changed_files.is_empty() {
                             el.child(
@@ -8713,10 +9433,53 @@ async fn reconcile_local_herdr_sessions(
     ui_dirty.store(true, Ordering::Release);
 }
 
+pub(crate) fn prepare_webhook_save(
+    g: &mut CodaDesktopState,
+) -> Result<NotificationWebhookSettings, bool> {
+    g.input_selected_all = false;
+    g.input_target = ActiveInputTarget::TerminalDirect;
+    let loc = g.locale;
+    if !g.is_logged_in {
+        g.status_notice = Some(
+            tr(
+                loc,
+                "Sign in first to configure notification webhooks",
+                "请先登录账号后再保存推送配置",
+            )
+            .to_string(),
+        );
+        return Err(false);
+    }
+    if g.webhook_loading || !g.webhook_loaded_ok {
+        let should_reload = !g.webhook_loading;
+        g.status_notice = Some(
+            tr(
+                loc,
+                "Cloud webhook configuration has not finished loading; reloading first so saved URLs are not overwritten.",
+                "云端现有 Webhook 配置尚未加载成功，已阻止盲写覆盖并正在重新拉取。",
+            )
+            .to_string(),
+        );
+        return Err(should_reload);
+    }
+    g.webhook_settings.bark_url = g.webhook_settings.bark_url.trim().to_string();
+    g.webhook_settings.telegram_bot_token =
+        g.webhook_settings.telegram_bot_token.trim().to_string();
+    g.webhook_settings.telegram_chat_id = g.webhook_settings.telegram_chat_id.trim().to_string();
+    g.webhook_settings.feishu_webhook_url =
+        g.webhook_settings.feishu_webhook_url.trim().to_string();
+    g.webhook_settings.discord_webhook_url =
+        g.webhook_settings.discord_webhook_url.trim().to_string();
+    g.webhook_settings.generic_webhook_url =
+        g.webhook_settings.generic_webhook_url.trim().to_string();
+    Ok(g.webhook_settings.clone())
+}
+
 fn spawn_herdr_discovery(
-    state_bg: Arc<Mutex<CodaDesktopState>>,
-    pty_mgr: Arc<Mutex<LocalPtyManager>>,
-    ui_dirty: Arc<AtomicBool>,
+    weak_state: std::sync::Weak<Mutex<CodaDesktopState>>,
+    weak_pty: std::sync::Weak<Mutex<LocalPtyManager>>,
+    weak_dirty: std::sync::Weak<AtomicBool>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) {
     std::thread::spawn(move || {
         let Ok(rt) = tokio::runtime::Builder::new_current_thread()
@@ -8726,35 +9489,96 @@ fn spawn_herdr_discovery(
             return;
         };
         rt.block_on(async move {
+            if *shutdown_rx.borrow() {
+                return;
+            }
+            if weak_state.strong_count() == 0 || weak_pty.strong_count() == 0 {
+                return;
+            }
+
             let hc_bin = match discover_hc_binary() {
                 Some(p) => p,
                 None => match ensure_or_install_hc_binary().await {
                     Ok(p) => p,
                     Err(_) => {
-                        spawn_local_fallback_shell(&state_bg, &pty_mgr, &ui_dirty);
+                        if !*shutdown_rx.borrow() {
+                            if let (Some(state_bg), Some(pty_mgr), Some(ui_dirty)) = (
+                                weak_state.upgrade(),
+                                weak_pty.upgrade(),
+                                weak_dirty.upgrade(),
+                            ) {
+                                spawn_local_fallback_shell(&state_bg, &pty_mgr, &ui_dirty);
+                            }
+                        }
                         return;
                     }
                 },
             };
 
+            if *shutdown_rx.borrow() {
+                return;
+            }
+
             let Ok(hc) = HerdrClient::connect_with_bin(hc_bin.clone()).await else {
-                spawn_local_fallback_shell(&state_bg, &pty_mgr, &ui_dirty);
+                if !*shutdown_rx.borrow() {
+                    if let (Some(state_bg), Some(pty_mgr), Some(ui_dirty)) = (
+                        weak_state.upgrade(),
+                        weak_pty.upgrade(),
+                        weak_dirty.upgrade(),
+                    ) {
+                        spawn_local_fallback_shell(&state_bg, &pty_mgr, &ui_dirty);
+                    }
+                }
                 return;
             };
             let ver = hc.info().version.clone();
-            if let Ok(mut g) = state_bg.lock() {
-                g.hc_available = true;
-                g.hc_version = Some(ver);
-                g.hc_path = Some(hc_bin.clone());
+            {
+                let (Some(state_bg), Some(pty_mgr), Some(ui_dirty)) = (
+                    weak_state.upgrade(),
+                    weak_pty.upgrade(),
+                    weak_dirty.upgrade(),
+                ) else {
+                    return;
+                };
+                if let Ok(mut g) = state_bg.lock() {
+                    g.hc_available = true;
+                    g.hc_version = Some(ver);
+                    g.hc_path = Some(hc_bin.clone());
+                }
+                reconcile_local_herdr_sessions(&hc, &hc_bin, &state_bg, &pty_mgr, &ui_dirty).await;
             }
-
-            reconcile_local_herdr_sessions(&hc, &hc_bin, &state_bg, &pty_mgr, &ui_dirty).await;
 
             // Continuously subscribe to `herdr-core` `events.subscribe` so terminals created or
             // updated by iOS/iPadOS on this Mac appear & attach live in GPUI Desktop.
+            // Hold only `Weak` references across waits and abort immediately on window close.
             loop {
+                if *shutdown_rx.borrow()
+                    || weak_state.strong_count() == 0
+                    || weak_pty.strong_count() == 0
+                {
+                    break;
+                }
                 if let Ok(mut ev_rx) = hc.subscribe_live_events().await {
-                    while let Some(ev) = ev_rx.recv().await {
+                    loop {
+                        let ev_opt = tokio::select! {
+                            _ = shutdown_rx.changed() => {
+                                if *shutdown_rx.borrow() {
+                                    return;
+                                }
+                                continue;
+                            }
+                            ev = ev_rx.recv() => ev,
+                        };
+                        let Some(ev) = ev_opt else {
+                            break;
+                        };
+                        let (Some(state_bg), Some(pty_mgr), Some(ui_dirty)) = (
+                            weak_state.upgrade(),
+                            weak_pty.upgrade(),
+                            weak_dirty.upgrade(),
+                        ) else {
+                            return;
+                        };
                         let kind = ev
                             .get("kind")
                             .or_else(|| ev.get("type"))
@@ -8791,7 +9615,14 @@ fn spawn_herdr_discovery(
                             .await;
                     }
                 }
-                tokio::time::sleep(Duration::from_secs(2)).await;
+                tokio::select! {
+                    _ = shutdown_rx.changed() => {
+                        if *shutdown_rx.borrow() {
+                            break;
+                        }
+                    }
+                    _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+                }
             }
         });
     });
@@ -9093,11 +9924,16 @@ mod tests {
                     r#"{"bark_url":"https://api.day.app/k1","telegram_bot_token":"123:ABC","telegram_chat_id":"999","feishu_webhook_url":"","discord_webhook_url":"","generic_webhook_url":"","notify_on_needs_you":true,"notify_on_finished":false}"#
                 } else if req.starts_with("PUT /api/v1/me/notifications ") {
                     assert!(req.contains("discord.com/api/webhooks/test"));
-                    r#"{"bark_url":"https://api.day.app/k1","telegram_bot_token":"123:ABC","telegram_chat_id":"999","feishu_webhook_url":"https://open.feishu.cn/hook","discord_webhook_url":"https://discord.com/api/webhooks/test","generic_webhook_url":"","notify_on_needs_you":true,"notify_on_finished":true}"#
+                    assert!(req.contains("hooks.example.com/coda"));
+                    r#"{"bark_url":"https://api.day.app/k1","telegram_bot_token":"123:ABC","telegram_chat_id":"999","feishu_webhook_url":"https://open.feishu.cn/hook","discord_webhook_url":"https://discord.com/api/webhooks/test","generic_webhook_url":"https://hooks.example.com/coda","notify_on_needs_you":true,"notify_on_finished":true}"#
                 } else if req.starts_with("POST /api/v1/me/notifications/test ") {
                     r#"{"ok":true,"delivered_channels":["bark","discord"],"errors":[]}"#
                 } else if req.starts_with("POST /api/v1/devices/prune-stale ") {
                     assert!(req.contains("\"max_idle_days\":0"));
+                    assert!(
+                        req.contains("\"exclude_device_id\":\"11111111-2222-3333-4444-555555555555\""),
+                        "expected exclude_device_id in prune body: {req}"
+                    );
                     r#"{"ok":true,"pruned_count":4}"#
                 } else {
                     r#"{"error":"unexpected route"}"#
@@ -9121,6 +9957,7 @@ mod tests {
         let mut updated_req = loaded.clone();
         updated_req.feishu_webhook_url = "https://open.feishu.cn/hook".to_string();
         updated_req.discord_webhook_url = "https://discord.com/api/webhooks/test".to_string();
+        updated_req.generic_webhook_url = "https://hooks.example.com/coda".to_string();
         updated_req.notify_on_finished = true;
         let saved = crate::remote_mesh::api_put_notification_webhooks(
             &base_url,
@@ -9130,6 +9967,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(saved.discord_webhook_url, "https://discord.com/api/webhooks/test");
+        assert_eq!(saved.generic_webhook_url, "https://hooks.example.com/coda");
         assert!(saved.notify_on_finished);
 
         let (delivered, errs) =
@@ -9139,11 +9977,271 @@ mod tests {
         assert_eq!(delivered, 2);
         assert!(errs.is_empty());
 
-        let pruned =
-            crate::remote_mesh::api_prune_stale_web_devices(&base_url, "test-session-tok", 0)
-                .await
-                .unwrap();
+        let exclude_id = Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap();
+        let pruned = crate::remote_mesh::api_prune_stale_web_devices(
+            &base_url,
+            "test-session-tok",
+            0,
+            Some(exclude_id),
+        )
+        .await
+        .unwrap();
         assert_eq!(pruned, 4);
+    }
+
+    #[test]
+    fn test_cmd_j_circular_scan_split_pane_smart_focus_and_grid_auto_switch() {
+        let mut st = CodaDesktopState::default();
+        let now = Instant::now();
+        let make_sess = |id: &str, state: AgentLifecycleState| TerminalSessionEntry {
+            id: id.to_string(),
+            title: id.to_string(),
+            space_id: "sp-1".to_string(),
+            cwd: "/tmp".to_string(),
+            started_at: now,
+            last_output_at: now,
+            last_byte_sig: 0,
+            lines: Vec::new(),
+            styled_lines: Vec::new(),
+            scroll_offset: 0,
+            alive: true,
+            attached_hc: true,
+            hc_addr: Some(id.to_string()),
+            remote_host_id: None,
+            osc_status: Some(Osc7501Status {
+                state,
+                task: Some("Approve".to_string()),
+                updated_at: now,
+            }),
+        };
+
+        // [S1(NeedsYou), S2(Working after user approved it), S3(NeedsYou)]:
+        // Pressing Cmd+J while S2 is focused must advance circularly to S3, NOT jump backwards to S1!
+        st.sessions.push(make_sess("s1", AgentLifecycleState::NeedsYou));
+        st.sessions.push(make_sess("s2", AgentLifecycleState::Working));
+        st.sessions.push(make_sess("s3", AgentLifecycleState::NeedsYou));
+        st.active_session_id = Some("s2".to_string());
+        assert_eq!(
+            st.next_needs_you_session_id().as_deref(),
+            Some("s3"),
+            "Cmd+J from approved S2 must advance forward to S3 before wrapping to S1"
+        );
+
+        // Split-pane smart focus: if S3 is already open in Secondary while Primary is focused on S1,
+        // selecting S3 switches focused_pane to Secondary instead of duplicating S3 in both panes.
+        st.layout.split_terminals = true;
+        st.focused_pane = SplitPane::Primary;
+        st.active_session_id = Some("s1".to_string());
+        st.split_session_id = Some("s3".to_string());
+        let (space_changed, layout_changed) = st
+            .apply_select_session("s3")
+            .expect("s3 should be selectable");
+        assert!(space_changed);
+        assert!(!layout_changed);
+        assert_eq!(st.focused_pane, SplitPane::Secondary);
+        assert_eq!(st.active_session_id.as_deref(), Some("s1"));
+        assert_eq!(st.split_session_id.as_deref(), Some("s3"));
+
+        // Grid mode auto-switch: selecting session at index >= 4 in LayoutMode::Terminals switches to Workbench.
+        st.layout.split_terminals = false;
+        st.layout.layout = LayoutMode::Terminals;
+        st.sessions.push(make_sess("s4", AgentLifecycleState::Idle));
+        st.sessions.push(make_sess("s5", AgentLifecycleState::NeedsYou));
+        let (same_space_changed, switched_layout) = st
+            .apply_select_session("s5")
+            .expect("s5 should be selectable");
+        assert!(!same_space_changed);
+        assert!(switched_layout);
+        assert_eq!(st.layout.layout, LayoutMode::Workbench);
+        assert_eq!(st.active_session_id.as_deref(), Some("s5"));
+    }
+
+    #[test]
+    fn test_remote_git_diff_monotonic_seq_cwd_and_split_local_guard() {
+        let mut st = CodaDesktopState::default();
+        let host_a = Uuid::new_v4();
+        let host_b = Uuid::new_v4();
+        st.spaces.push(SpaceEntry {
+            id: format!("remote:{host_a}:/srv/app"),
+            name: "app".to_string(),
+            path: "/srv/app".to_string(),
+            machine_id: host_a.to_string(),
+            machine_label: "linux-a".to_string(),
+            is_remote: true,
+            branch: "main".to_string(),
+            dirty_files: 0,
+            ahead: 0,
+            behind: 0,
+            avatar_color: 0x38bdf8,
+        });
+        st.active_space_id = Some(format!("remote:{host_a}:/srv/app"));
+        st.remote_diff_seq = 5;
+        st.git_diff_loading = true;
+
+        let make_payload = |cwd: &str, is_git: bool, err: Option<&str>| {
+            crate::remote_mesh::RemoteGitDiffPayload {
+                is_git_repo: is_git,
+                repo_root: is_git.then(|| cwd.to_string()),
+                branch: "feat/v1".to_string(),
+                status_short: "M  src/main.rs\n".to_string(),
+                diff_unified: "+new line\n-old line\n".to_string(),
+                error: err.map(str::to_string),
+            }
+        };
+
+        // Stale seq (4 != 5) must be ignored
+        assert!(!crate::remote_mesh::apply_remote_git_diff_payload_to_state(
+            &mut st,
+            4,
+            host_a,
+            None,
+            "/srv/app",
+            make_payload("/srv/app", true, None)
+        ));
+        assert!(st.git_diff_loading);
+
+        // Wrong host or wrong cwd must be ignored
+        assert!(!crate::remote_mesh::apply_remote_git_diff_payload_to_state(
+            &mut st,
+            5,
+            host_b,
+            None,
+            "/srv/app",
+            make_payload("/srv/app", true, None)
+        ));
+        assert!(!crate::remote_mesh::apply_remote_git_diff_payload_to_state(
+            &mut st,
+            5,
+            host_a,
+            None,
+            "/srv/other",
+            make_payload("/srv/other", true, None)
+        ));
+
+        // Matching (seq=5, host_a, "/srv/app") applies cleanly
+        assert!(crate::remote_mesh::apply_remote_git_diff_payload_to_state(
+            &mut st,
+            5,
+            host_a,
+            None,
+            "/srv/app",
+            make_payload("/srv/app", true, None)
+        ));
+        assert!(!st.git_diff_loading);
+        assert!(st.repo_snapshot.is_git_repo);
+        assert_eq!(st.repo_snapshot.branch, "feat/v1");
+        assert_eq!(st.repo_snapshot.repo_root.as_deref(), Some("/srv/app"));
+        assert_eq!(st.repo_snapshot.changed_files.len(), 1);
+
+        // If split-pane Secondary is focused on a LOCAL session while active_space is remote,
+        // effective_remote_diff_target() is None and remote responses cannot clobber local snapshot!
+        let now = Instant::now();
+        st.sessions.push(TerminalSessionEntry {
+            id: "local-1".to_string(),
+            title: "local".to_string(),
+            space_id: "local:/Users/dev/local-repo".to_string(),
+            cwd: "/Users/dev/local-repo".to_string(),
+            started_at: now,
+            last_output_at: now,
+            last_byte_sig: 0,
+            lines: Vec::new(),
+            styled_lines: Vec::new(),
+            scroll_offset: 0,
+            alive: true,
+            attached_hc: false,
+            hc_addr: None,
+            remote_host_id: None,
+            osc_status: None,
+        });
+        st.layout.split_terminals = true;
+        st.focused_pane = SplitPane::Secondary;
+        st.split_session_id = Some("local-1".to_string());
+        st.repo_snapshot.branch = "local-branch".to_string();
+        st.remote_diff_seq = 6;
+        assert_eq!(st.effective_remote_diff_target(), None);
+        assert!(!crate::remote_mesh::apply_remote_git_diff_payload_to_state(
+            &mut st,
+            6,
+            host_a,
+            None,
+            "/srv/app",
+            make_payload("/srv/app", true, None)
+        ));
+        assert_eq!(st.repo_snapshot.branch, "local-branch");
+
+        // Non-git / error reporting when focused back on remote
+        st.layout.split_terminals = false;
+        st.focused_pane = SplitPane::Primary;
+        st.remote_diff_seq = 7;
+        assert!(crate::remote_mesh::apply_remote_git_diff_payload_to_state(
+            &mut st,
+            7,
+            host_a,
+            None,
+            "/srv/app",
+            make_payload("/srv/app", false, Some("fatal: dubious ownership"))
+        ));
+        assert!(!st.repo_snapshot.is_git_repo);
+        assert_eq!(
+            st.repo_snapshot.error.as_deref(),
+            Some("fatal: dubious ownership")
+        );
+    }
+
+    #[test]
+    fn test_webhook_load_save_guard_prevents_blind_overwrite() {
+        let mut st = CodaDesktopState::default();
+        assert_eq!(prepare_webhook_save(&mut st), Err(false));
+
+        st.is_logged_in = true;
+        st.webhook_loaded_ok = false;
+        st.webhook_loading = false;
+        // Must block PUT and request reload (Err(true)) so server URLs are not wiped
+        assert_eq!(prepare_webhook_save(&mut st), Err(true));
+        assert!(st.status_notice.is_some());
+
+        st.webhook_loading = true;
+        assert_eq!(prepare_webhook_save(&mut st), Err(false));
+
+        st.webhook_loading = false;
+        st.webhook_loaded_ok = true;
+        st.webhook_settings.generic_webhook_url = "  https://hooks.example.org/notify  ".to_string();
+        let dto = prepare_webhook_save(&mut st).expect("loaded webhook settings should allow save");
+        assert_eq!(dto.generic_webhook_url, "https://hooks.example.org/notify");
+    }
+
+    #[test]
+    fn test_remote_mesh_hub_weak_tasks_and_clean_drop() {
+        struct OverrideReset;
+        impl Drop for OverrideReset {
+            fn drop(&mut self) {
+                set_config_root_override(None);
+            }
+        }
+        let tmp_dir = std::env::temp_dir().join(format!("coda-hub-drop-test-{}", Uuid::new_v4()));
+        set_config_root_override(Some(tmp_dir.clone()));
+        let _reset = OverrideReset;
+
+        let state = Arc::new(Mutex::new(CodaDesktopState::default()));
+        let dirty = Arc::new(AtomicBool::new(false));
+        let pty_mgr = Arc::new(Mutex::new(LocalPtyManager::new(Arc::clone(&dirty))));
+        let hub = RemoteMeshHub::new(state, pty_mgr, dirty);
+        hub.start_account_sync();
+
+        // Background tasks inside RemoteMeshHub MUST hold Weak<RemoteMeshHub>, never strong Arcs!
+        assert_eq!(
+            Arc::strong_count(&hub),
+            1,
+            "RemoteMeshHub background tasks must hold Weak<RemoteMeshHub> so Drop is reachable on window close"
+        );
+        let weak_hub = Arc::downgrade(&hub);
+        hub.shutdown();
+        drop(hub);
+        assert!(
+            weak_hub.upgrade().is_none(),
+            "dropping view's Arc<RemoteMeshHub> must immediately drop RemoteMeshHub"
+        );
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 
     #[test]

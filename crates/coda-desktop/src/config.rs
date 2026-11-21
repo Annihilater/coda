@@ -1,23 +1,37 @@
 //! Runtime environment normalization, persisted desktop preferences, i18n strings,
 //! and real local Git repository discovery for `coda-desktop`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, RwLock};
+use std::sync::{Mutex, OnceLock, RwLock};
 
 use serde::{Deserialize, Serialize};
 
 static CONFIG_DIR_OVERRIDE: RwLock<Option<PathBuf>> = RwLock::new(None);
 static ATOMIC_WRITE_SEQ: AtomicU64 = AtomicU64::new(1);
 static ATOMIC_WRITE_LOCK: Mutex<()> = Mutex::new(());
+static KEYCHAIN_SECRET_CACHE: OnceLock<Mutex<HashMap<String, Option<String>>>> = OnceLock::new();
+
+fn keychain_cache() -> &'static Mutex<HashMap<String, Option<String>>> {
+    KEYCHAIN_SECRET_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Clears in-memory Keychain and `DaemonConfig` caches (called on logout, account switch, or test root override).
+pub fn invalidate_secret_and_daemon_config_caches() {
+    if let Ok(mut g) = keychain_cache().lock() {
+        g.clear();
+    }
+    crate::helpers::invalidate_desktop_daemon_config_cache();
+}
 
 /// Sets or clears an explicit configuration root directory override (used by `--self-test` and unit tests).
 pub fn set_config_root_override(dir: Option<PathBuf>) {
     if let Ok(mut g) = CONFIG_DIR_OVERRIDE.write() {
         *g = dir;
     }
+    invalidate_secret_and_daemon_config_caches();
 }
 
 /// Writes `bytes` atomically to `path` with explicit Unix file permissions (`mode`), `sync_all`, and rename.
@@ -146,14 +160,15 @@ pub fn is_macos_app_bundle() -> bool {
     }
 }
 
-/// Persists a sensitive token/secret in the macOS Keychain when running inside `Coda.app` (`#8`).
+/// Persists a sensitive token/secret in the macOS Keychain when running inside `Coda.app` (`#8`),
+/// updating the in-memory Keychain cache so subsequent reads never spawn `/usr/bin/security`.
 pub fn save_secret_in_keychain(account: &str, secret: &str) -> bool {
     #[cfg(target_os = "macos")]
     {
         if !is_macos_app_bundle() {
             return false;
         }
-        std::process::Command::new("/usr/bin/security")
+        let ok = std::process::Command::new("/usr/bin/security")
             .args([
                 "add-generic-password",
                 "-U",
@@ -169,7 +184,13 @@ pub fn save_secret_in_keychain(account: &str, secret: &str) -> bool {
             .stderr(std::process::Stdio::null())
             .status()
             .map(|s| s.success())
-            .unwrap_or(false)
+            .unwrap_or(false);
+        if ok {
+            if let Ok(mut cache) = keychain_cache().lock() {
+                cache.insert(account.to_string(), Some(secret.to_string()));
+            }
+        }
+        ok
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -178,14 +199,24 @@ pub fn save_secret_in_keychain(account: &str, secret: &str) -> bool {
     }
 }
 
-/// Loads a sensitive token/secret from the macOS Keychain when running inside `Coda.app` (`#8`).
+/// Loads a sensitive token/secret from the macOS Keychain when running inside `Coda.app` (`#8`),
+/// memoizing both `Some(...)` and `None` in memory so GPUI render frames and Tokio workers never
+/// repeatedly spawn `/usr/bin/security`.
 pub fn load_secret_from_keychain(account: &str) -> Option<String> {
+    if let Ok(cache) = keychain_cache().lock() {
+        if let Some(cached) = cache.get(account) {
+            return cached.clone();
+        }
+    }
     #[cfg(target_os = "macos")]
     {
         if !is_macos_app_bundle() {
+            if let Ok(mut cache) = keychain_cache().lock() {
+                cache.insert(account.to_string(), None);
+            }
             return None;
         }
-        let out = std::process::Command::new("/usr/bin/security")
+        let resolved = std::process::Command::new("/usr/bin/security")
             .args([
                 "find-generic-password",
                 "-s",
@@ -197,22 +228,29 @@ pub fn load_secret_from_keychain(account: &str) -> Option<String> {
             .stdin(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .output()
-            .ok()?;
-        if !out.status.success() {
-            return None;
+            .ok()
+            .filter(|out| out.status.success())
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+            .filter(|s| !s.is_empty());
+        if let Ok(mut cache) = keychain_cache().lock() {
+            cache.insert(account.to_string(), resolved.clone());
         }
-        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if s.is_empty() { None } else { Some(s) }
+        resolved
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = account;
+        if let Ok(mut cache) = keychain_cache().lock() {
+            cache.insert(account.to_string(), None);
+        }
         None
     }
 }
 
-/// Deletes a sensitive token/secret from the macOS Keychain (`#8`).
+/// Deletes a sensitive token/secret from the macOS Keychain (`#8`) and invalidates its cached entry.
 pub fn delete_secret_from_keychain(account: &str) {
+    if let Ok(mut cache) = keychain_cache().lock() {
+        cache.insert(account.to_string(), None);
+    }
     #[cfg(target_os = "macos")]
     {
         if !is_macos_app_bundle() {
