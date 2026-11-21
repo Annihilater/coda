@@ -69,11 +69,41 @@ fn main() -> Result<()> {
 
         let git_snap = compute_repo_snapshot(&cwd, None);
         let st = CodaDesktopState::default();
+        let starter_snippets = coda_desktop::config::load_snippets_from_disk_or_default();
+        coda_desktop::config::save_snippets_to_disk(&starter_snippets)?;
+        let reloaded_snippets = coda_desktop::config::load_snippets_from_disk_or_default();
         set_config_root_override(None);
         let _ = std::fs::remove_dir_all(&tmp_cfg);
         anyhow::ensure!(st.sessions.is_empty(), "default state must not seed fake sessions");
         anyhow::ensure!(st.spaces.is_empty(), "default state must not seed fake spaces");
         anyhow::ensure!(pty_ok, "real local PTY self-test failed to observe echoed marker");
+        anyhow::ensure!(
+            reloaded_snippets.len() == 4,
+            "snippets.json cache roundtrip self-test failed"
+        );
+        anyhow::ensure!(
+            coda_desktop::self_update::is_newer_version("v1.1.0", "1.0.0")
+                && !coda_desktop::self_update::is_newer_version("v1.0.0", "1.0.0"),
+            "self-update semver comparator self-test failed"
+        );
+        anyhow::ensure!(
+            coda_desktop::self_update::detect_macos_app_bundle_root(std::path::Path::new(
+                "/Applications/Coda.app/Contents/MacOS/coda-desktop"
+            )) == Some(std::path::PathBuf::from("/Applications/Coda.app")),
+            "macOS .app bundle root detection self-test failed"
+        );
+        anyhow::ensure!(
+            coda_desktop::helpers::build_invite_registration_url("https://codahub.dev/", "CODA-XYZ")
+                == "https://codahub.dev/register?invite=CODA-XYZ",
+            "invite registration URL helper self-test failed"
+        );
+        anyhow::ensure!(
+            coda_desktop::helpers::extract_reset_token_and_origin(
+                "https://codahub.dev/reset-password?token=rst_selftest123"
+            )
+            .0 == "rst_selftest123",
+            "password reset token extraction self-test failed"
+        );
         anyhow::ensure!(
             coda_desktop::helpers::format_pasted_terminal_path("/tmp/coda-paste-demo.png")
                 == "/tmp/coda-paste-demo.png ",

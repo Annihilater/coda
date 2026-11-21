@@ -20,13 +20,15 @@ use uuid::Uuid;
 
 use crate::config::{
     delete_secret_from_keychain, invalidate_secret_and_daemon_config_caches, is_safe_http_url,
-    space_avatar_color, tr, DesktopClientIdentityRecord, DesktopPreferences,
+    load_snippets_from_disk_or_default, save_snippets_to_disk, space_avatar_color, tr,
+    validate_and_normalize_snippets, DesktopClientIdentityRecord, DesktopPreferences,
+    PromptSnippet, PromptSnippetsEnvelope,
 };
 use crate::git_inspector::{RepoInspectorSnapshot, WorkspaceFileEntry};
 use crate::helpers::{
-    format_pasted_terminal_path, herdr_status_to_osc, load_desktop_daemon_config,
-    normalize_newlines_for_vt, parse_git_status_short, path_within_root,
-    save_desktop_daemon_config,
+    extract_reset_token_and_origin, format_pasted_terminal_path, herdr_status_to_osc,
+    load_desktop_daemon_config, normalize_newlines_for_vt, parse_git_status_short,
+    path_within_root, save_desktop_daemon_config,
 };
 use crate::port_preview::{
     PortPreviewTunnelManager, ProxyHttpRequest, ProxyHttpResponse, TunnelTargetKey,
@@ -227,6 +229,386 @@ pub async fn api_prune_stale_web_devices(
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
     Ok(count)
+}
+
+/// Authenticated user profile returned by `GET /api/v1/auth/me`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AccountProfileMe {
+    pub id: Uuid,
+    #[serde(default)]
+    pub email: String,
+    #[serde(default)]
+    pub handle: String,
+    #[serde(default)]
+    pub display_name: String,
+    #[serde(default)]
+    pub is_admin: bool,
+}
+
+/// Admin invite code entry returned by `GET /api/v1/invites` and `POST /api/v1/invites`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AdminInviteCodeItem {
+    pub code: String,
+    #[serde(default)]
+    pub note: String,
+    #[serde(default)]
+    pub max_uses: i32,
+    #[serde(default)]
+    pub used_count: i32,
+}
+
+/// Registered friend/user summary returned by `GET /api/v1/admin/users`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AdminFriendUserItem {
+    pub id: Uuid,
+    pub handle: String,
+    #[serde(default)]
+    pub email: String,
+    #[serde(default)]
+    pub display_name: String,
+    #[serde(default)]
+    pub is_admin: bool,
+    #[serde(default)]
+    pub online_devices: usize,
+    #[serde(default)]
+    pub total_devices: usize,
+}
+
+/// Password reset deep-link minted by `POST /api/v1/admin/users/{id}/reset-link`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AdminPasswordResetLinkResult {
+    pub user_id: Uuid,
+    #[serde(default)]
+    pub handle: String,
+    #[serde(default)]
+    pub reset_token: String,
+    pub reset_url: String,
+    #[serde(default)]
+    pub expires_in_secs: u64,
+}
+
+fn extract_api_error_message(txt: &str, status: reqwest::StatusCode, context: &str) -> String {
+    if let Ok(val) = serde_json::from_str::<serde_json::Value>(txt) {
+        if let Some(msg) = val
+            .get("error")
+            .or_else(|| val.get("message"))
+            .and_then(|v| v.as_str())
+        {
+            if !msg.trim().is_empty() {
+                return format!("{context}: {}", msg.trim());
+            }
+        }
+    }
+    format!(
+        "{context} (HTTP {}): {}",
+        status.as_u16(),
+        txt.trim().chars().take(160).collect::<String>()
+    )
+}
+
+pub async fn api_get_auth_me(server_url: &str, token: &str) -> Result<AccountProfileMe, String> {
+    let base = server_url.trim().trim_end_matches('/');
+    if !is_safe_http_url(base) {
+        return Err("Invalid server URL".into());
+    }
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client
+        .get(format!("{base}/api/v1/auth/me"))
+        .bearer_auth(token.trim())
+        .send()
+        .await
+        .map_err(|e| format!("GET /api/v1/auth/me failed: {e}"))?;
+    let status = resp.status();
+    let txt = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(extract_api_error_message(&txt, status, "Load account profile failed"));
+    }
+    serde_json::from_str::<AccountProfileMe>(&txt)
+        .map_err(|e| format!("Invalid /api/v1/auth/me JSON: {e}"))
+}
+
+pub async fn api_get_prompt_snippets(
+    server_url: &str,
+    token: &str,
+) -> Result<Vec<PromptSnippet>, String> {
+    let base = server_url.trim().trim_end_matches('/');
+    if !is_safe_http_url(base) {
+        return Err("Invalid server URL".into());
+    }
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client
+        .get(format!("{base}/api/v1/me/snippets"))
+        .bearer_auth(token.trim())
+        .send()
+        .await
+        .map_err(|e| format!("GET /api/v1/me/snippets failed: {e}"))?;
+    let status = resp.status();
+    let txt = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(extract_api_error_message(&txt, status, "Load prompt snippets failed"));
+    }
+    let parsed = serde_json::from_str::<PromptSnippetsEnvelope>(&txt)
+        .map(|env| env.snippets)
+        .or_else(|_| serde_json::from_str::<Vec<PromptSnippet>>(&txt))
+        .map_err(|e| format!("Invalid /api/v1/me/snippets JSON: {e}"))?;
+    validate_and_normalize_snippets(parsed)
+}
+
+pub async fn api_put_prompt_snippets(
+    server_url: &str,
+    token: &str,
+    snippets: &[PromptSnippet],
+) -> Result<Vec<PromptSnippet>, String> {
+    let base = server_url.trim().trim_end_matches('/');
+    if !is_safe_http_url(base) {
+        return Err("Invalid server URL".into());
+    }
+    let clean = validate_and_normalize_snippets(snippets.to_vec())?;
+    let payload = PromptSnippetsEnvelope {
+        snippets: clean.clone(),
+    };
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client
+        .put(format!("{base}/api/v1/me/snippets"))
+        .bearer_auth(token.trim())
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|e| format!("PUT /api/v1/me/snippets failed: {e}"))?;
+    let status = resp.status();
+    let txt = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(extract_api_error_message(&txt, status, "Save prompt snippets failed"));
+    }
+    serde_json::from_str::<PromptSnippetsEnvelope>(&txt)
+        .map(|env| env.snippets)
+        .map_err(|e| e.to_string())
+        .and_then(validate_and_normalize_snippets)
+        .or(Ok(clean))
+}
+
+pub async fn api_list_invites(
+    server_url: &str,
+    token: &str,
+) -> Result<Vec<AdminInviteCodeItem>, String> {
+    let base = server_url.trim().trim_end_matches('/');
+    if !is_safe_http_url(base) {
+        return Err("Invalid server URL".into());
+    }
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client
+        .get(format!("{base}/api/v1/invites"))
+        .bearer_auth(token.trim())
+        .send()
+        .await
+        .map_err(|e| format!("GET /api/v1/invites failed: {e}"))?;
+    let status = resp.status();
+    let txt = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(extract_api_error_message(&txt, status, "Load invites failed"));
+    }
+    if let Ok(arr) = serde_json::from_str::<Vec<AdminInviteCodeItem>>(&txt) {
+        return Ok(arr);
+    }
+    #[derive(serde::Deserialize)]
+    struct InvitesWrap {
+        invites: Vec<AdminInviteCodeItem>,
+    }
+    serde_json::from_str::<InvitesWrap>(&txt)
+        .map(|w| w.invites)
+        .map_err(|e| format!("Invalid /api/v1/invites JSON: {e}"))
+}
+
+pub async fn api_create_invite(
+    server_url: &str,
+    token: &str,
+    note: &str,
+    max_uses: i32,
+    valid_days: i64,
+) -> Result<AdminInviteCodeItem, String> {
+    let base = server_url.trim().trim_end_matches('/');
+    if !is_safe_http_url(base) {
+        return Err("Invalid server URL".into());
+    }
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client
+        .post(format!("{base}/api/v1/invites"))
+        .bearer_auth(token.trim())
+        .json(&serde_json::json!({
+            "note": note.trim(),
+            "max_uses": max_uses,
+            "valid_days": valid_days,
+        }))
+        .send()
+        .await
+        .map_err(|e| format!("POST /api/v1/invites failed: {e}"))?;
+    let status = resp.status();
+    let txt = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(extract_api_error_message(&txt, status, "Create invite failed"));
+    }
+    serde_json::from_str::<AdminInviteCodeItem>(&txt)
+        .map_err(|e| format!("Invalid create invite JSON: {e}"))
+}
+
+pub async fn api_delete_invite(
+    server_url: &str,
+    token: &str,
+    code: &str,
+) -> Result<(), String> {
+    let base = server_url.trim().trim_end_matches('/');
+    if !is_safe_http_url(base) {
+        return Err("Invalid server URL".into());
+    }
+    let clean_code = code.trim();
+    if clean_code.is_empty()
+        || !clean_code
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+    {
+        return Err("Invalid invite code".into());
+    }
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client
+        .delete(format!("{base}/api/v1/invites/{clean_code}"))
+        .bearer_auth(token.trim())
+        .send()
+        .await
+        .map_err(|e| format!("DELETE /api/v1/invites/{clean_code} failed: {e}"))?;
+    let status = resp.status();
+    let txt = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(extract_api_error_message(&txt, status, "Delete invite failed"));
+    }
+    Ok(())
+}
+
+pub async fn api_get_admin_users(
+    server_url: &str,
+    token: &str,
+) -> Result<Vec<AdminFriendUserItem>, String> {
+    let base = server_url.trim().trim_end_matches('/');
+    if !is_safe_http_url(base) {
+        return Err("Invalid server URL".into());
+    }
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client
+        .get(format!("{base}/api/v1/admin/users"))
+        .bearer_auth(token.trim())
+        .send()
+        .await
+        .map_err(|e| format!("GET /api/v1/admin/users failed: {e}"))?;
+    let status = resp.status();
+    let txt = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(extract_api_error_message(&txt, status, "Load registered friends failed"));
+    }
+    #[derive(serde::Deserialize)]
+    struct UsersEnvelope {
+        users: Vec<AdminFriendUserItem>,
+    }
+    serde_json::from_str::<UsersEnvelope>(&txt)
+        .map(|env| env.users)
+        .or_else(|_| serde_json::from_str::<Vec<AdminFriendUserItem>>(&txt))
+        .map_err(|e| format!("Invalid /api/v1/admin/users JSON: {e}"))
+}
+
+pub async fn api_create_admin_user_reset_link(
+    server_url: &str,
+    token: &str,
+    user_id: Uuid,
+) -> Result<AdminPasswordResetLinkResult, String> {
+    let base = server_url.trim().trim_end_matches('/');
+    if !is_safe_http_url(base) {
+        return Err("Invalid server URL".into());
+    }
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client
+        .post(format!("{base}/api/v1/admin/users/{user_id}/reset-link"))
+        .bearer_auth(token.trim())
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .map_err(|e| format!("POST /api/v1/admin/users/{user_id}/reset-link failed: {e}"))?;
+    let status = resp.status();
+    let txt = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(extract_api_error_message(&txt, status, "Mint password reset link failed"));
+    }
+    serde_json::from_str::<AdminPasswordResetLinkResult>(&txt)
+        .map_err(|e| format!("Invalid reset-link response JSON: {e}"))
+}
+
+pub async fn api_reset_password_with_token(
+    server_url: &str,
+    raw_token_or_url: &str,
+    new_password: &str,
+) -> Result<String, String> {
+    let (clean_tok, extracted_origin) = extract_reset_token_and_origin(raw_token_or_url);
+    if clean_tok.is_empty() {
+        return Err("Enter your password reset token (`rst_...`) or reset link".into());
+    }
+    if new_password.len() < 8 || new_password.len() > 256 {
+        return Err("New password must be between 8 and 256 characters".into());
+    }
+    let eff_srv = extracted_origin
+        .as_deref()
+        .unwrap_or(server_url)
+        .trim()
+        .trim_end_matches('/');
+    if !is_safe_http_url(eff_srv) {
+        return Err("Invalid server URL".into());
+    }
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(12))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client
+        .post(format!("{eff_srv}/api/v1/auth/reset-password"))
+        .json(&serde_json::json!({
+            "token": clean_tok,
+            "new_password": new_password,
+        }))
+        .send()
+        .await
+        .map_err(|e| format!("POST /api/v1/auth/reset-password failed: {e}"))?;
+    let status = resp.status();
+    let txt = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(extract_api_error_message(&txt, status, "Password reset failed"));
+    }
+    let val: serde_json::Value = serde_json::from_str(&txt).unwrap_or_default();
+    let handle = val
+        .get("handle")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    Ok(handle)
 }
 
 pub(crate) static EMBEDDED_HOST_STARTED: AtomicBool = AtomicBool::new(false);
@@ -610,6 +992,11 @@ impl RemoteMeshHub {
             g.embedded_host_active = false;
             g.remote_hosts.clear();
             g.remote_probe_status = None;
+            g.account_handle.clear();
+            g.account_is_admin = false;
+            g.admin_invites.clear();
+            g.admin_users.clear();
+            g.admin_loading = false;
             g.webhook_settings = NotificationWebhookSettings::default();
             g.webhook_loading = false;
             g.webhook_loaded_ok = false;
@@ -882,6 +1269,11 @@ impl RemoteMeshHub {
             g.embedded_host_active = false;
             g.external_daemon_running = external_daemon_owns_cfg;
             g.account_email.clear();
+            g.account_handle.clear();
+            g.account_is_admin = false;
+            g.admin_invites.clear();
+            g.admin_users.clear();
+            g.admin_loading = false;
             g.auth_account_input.clear();
             g.auth_password_input.clear();
             g.webhook_settings = NotificationWebhookSettings::default();
@@ -3647,6 +4039,480 @@ impl RemoteMeshHub {
             hub.ui_dirty.store(true, Ordering::Release);
         });
     }
+
+    /// Checks `/api/v1/site-info` (with fallback to GitHub Releases `/releases/latest`) for a newer `Coda.app` version.
+    pub fn check_desktop_self_update(self: &Arc<Self>, manual_feedback: bool) {
+        let server_url = if let Ok(mut g) = self.state.lock() {
+            if g.self_update.checking || g.self_update.updating {
+                return;
+            }
+            g.self_update.checking = true;
+            g.self_update.error_message = None;
+            if manual_feedback {
+                g.self_update.progress_message = Some(
+                    tr(g.locale, "Checking for updates…", "正在检查新版本…").to_string(),
+                );
+            }
+            g.server_url.clone()
+        } else {
+            return;
+        };
+        self.ui_dirty.store(true, Ordering::Release);
+
+        let weak_hub = Arc::downgrade(self);
+        self.spawn_bg(async move {
+            let res = crate::self_update::check_for_desktop_update(
+                &server_url,
+                crate::self_update::CURRENT_DESKTOP_VERSION,
+            )
+            .await;
+            let Some(hub) = weak_hub.upgrade() else {
+                return;
+            };
+            if let Ok(mut g) = hub.state.lock() {
+                g.self_update.checking = false;
+                g.self_update.progress_message = None;
+                match res {
+                    Ok(chk) => {
+                        g.self_update.latest_version = Some(chk.latest_version.clone());
+                        g.self_update.server_matches_latest = chk.server_matches_latest;
+                        g.self_update.update_available = chk.update_available;
+                        if manual_feedback {
+                            g.status_notice = Some(if chk.update_available {
+                                format!(
+                                    "{}: {}",
+                                    tr(g.locale, "Update available", "发现新版本"),
+                                    chk.latest_version
+                                )
+                            } else {
+                                format!(
+                                    "{} (v{})",
+                                    tr(
+                                        g.locale,
+                                        "Coda.app is up to date",
+                                        "当前已是最新版本"
+                                    ),
+                                    g.self_update.current_version
+                                )
+                            });
+                        }
+                    }
+                    Err(err) => {
+                        if manual_feedback {
+                            g.self_update.error_message = Some(err.clone());
+                            g.status_notice = Some(err);
+                        }
+                    }
+                }
+            }
+            hub.ui_dirty.store(true, Ordering::Release);
+        });
+    }
+
+    /// Downloads `coda-macos-aarch64-vX.Y.Z.tar.gz` + `SHA256SUMS`, strictly verifies SHA-256,
+    /// stages & smoke-checks `<staged_bin> --version`, atomically swaps the executable, and relaunches `Coda.app`.
+    pub fn trigger_desktop_self_update_and_restart(self: &Arc<Self>) {
+        let params = if let Ok(mut g) = self.state.lock() {
+            if g.self_update.updating {
+                return;
+            }
+            let Some(ref tag) = g.self_update.latest_version else {
+                return;
+            };
+            if !g.self_update.update_available {
+                return;
+            }
+            if !cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+                let msg = tr(
+                    g.locale,
+                    "In-app binary updater currently targets macOS Apple Silicon (aarch64)",
+                    "应用内一键更新当前仅适用于 macOS Apple Silicon (aarch64)",
+                )
+                .to_string();
+                g.self_update.error_message = Some(msg.clone());
+                g.status_notice = Some(msg);
+                self.ui_dirty.store(true, Ordering::Release);
+                return;
+            }
+            let tag_cloned = tag.clone();
+            let srv = g.server_url.clone();
+            let srv_matches = g.self_update.server_matches_latest;
+            g.self_update.updating = true;
+            g.self_update.error_message = None;
+            g.self_update.progress_message = Some(format!(
+                "{} {tag_cloned}…",
+                tr(g.locale, "Preparing update", "正在准备更新")
+            ));
+            (srv, tag_cloned, srv_matches)
+        } else {
+            return;
+        };
+        self.ui_dirty.store(true, Ordering::Release);
+
+        let weak_hub = Arc::downgrade(self);
+        self.spawn_bg(async move {
+            let exe_path = match crate::self_update::resolve_clean_exe_path() {
+                Ok(p) => p,
+                Err(err) => {
+                    if let Some(hub) = weak_hub.upgrade() {
+                        if let Ok(mut g) = hub.state.lock() {
+                            g.self_update.updating = false;
+                            g.self_update.progress_message = None;
+                            g.self_update.error_message = Some(err.clone());
+                            g.status_notice = Some(err);
+                        }
+                        hub.ui_dirty.store(true, Ordering::Release);
+                    }
+                    return;
+                }
+            };
+
+            let weak_for_progress = weak_hub.clone();
+            let res = crate::self_update::download_verify_and_stage_update(
+                &params.0,
+                &params.1,
+                params.2,
+                &exe_path,
+                move |step_msg| {
+                    if let Some(hub) = weak_for_progress.upgrade() {
+                        if let Ok(mut g) = hub.state.lock() {
+                            g.self_update.progress_message = Some(step_msg.to_string());
+                        }
+                        hub.ui_dirty.store(true, Ordering::Release);
+                    }
+                },
+            )
+            .await;
+
+            let Some(hub) = weak_hub.upgrade() else {
+                return;
+            };
+            match res {
+                Ok(_ver_out) => {
+                    if let Ok(mut g) = hub.state.lock() {
+                        g.self_update.progress_message = Some(
+                            tr(
+                                g.locale,
+                                "Update verified! Relaunching Coda.app…",
+                                "校验通过！正在重启 Coda.app…",
+                            )
+                            .to_string(),
+                        );
+                    }
+                    hub.ui_dirty.store(true, Ordering::Release);
+                    tokio::time::sleep(Duration::from_millis(120)).await;
+                    hub.stop_all_tunnels_quiet();
+                    if let Err(err) =
+                        crate::self_update::relaunch_updated_desktop_and_exit(&exe_path)
+                    {
+                        if let Ok(mut g) = hub.state.lock() {
+                            g.self_update.updating = false;
+                            g.self_update.progress_message = None;
+                            g.self_update.error_message = Some(err.clone());
+                            g.status_notice = Some(err);
+                        }
+                        hub.ui_dirty.store(true, Ordering::Release);
+                    }
+                }
+                Err(err) => {
+                    if let Ok(mut g) = hub.state.lock() {
+                        g.self_update.updating = false;
+                        g.self_update.progress_message = None;
+                        g.self_update.error_message = Some(err.clone());
+                        g.status_notice = Some(err);
+                    }
+                    hub.ui_dirty.store(true, Ordering::Release);
+                }
+            }
+        });
+    }
+
+    /// Fetches user prompt snippets from `GET /api/v1/me/snippets`, caching to `~/.config/coda/snippets.json`
+    /// and falling back to local disk cache when offline.
+    pub fn fetch_prompt_snippets(self: &Arc<Self>) {
+        let weak_hub = Arc::downgrade(self);
+        self.spawn_bg(async move {
+            let Ok(cfg) = load_desktop_daemon_config(&DaemonConfig::default_path()) else {
+                let cached = load_snippets_from_disk_or_default();
+                if let Some(hub) = weak_hub.upgrade() {
+                    if let Ok(mut g) = hub.state.lock() {
+                        g.prompt_snippets = cached;
+                    }
+                    hub.ui_dirty.store(true, Ordering::Release);
+                }
+                return;
+            };
+            let Some(ref tok) = cfg.session_token else {
+                return;
+            };
+            if let Some(hub) = weak_hub.upgrade() {
+                if let Ok(mut g) = hub.state.lock() {
+                    g.snippets_loading = true;
+                }
+                hub.ui_dirty.store(true, Ordering::Release);
+            }
+            match api_get_prompt_snippets(&cfg.server_url, tok).await {
+                Ok(snippets) => {
+                    let _ = save_snippets_to_disk(&snippets);
+                    if let Some(hub) = weak_hub.upgrade() {
+                        if let Ok(mut g) = hub.state.lock() {
+                            g.snippets_loading = false;
+                            g.prompt_snippets = snippets;
+                        }
+                        hub.ui_dirty.store(true, Ordering::Release);
+                    }
+                }
+                Err(_) => {
+                    let cached = load_snippets_from_disk_or_default();
+                    if let Some(hub) = weak_hub.upgrade() {
+                        if let Ok(mut g) = hub.state.lock() {
+                            g.snippets_loading = false;
+                            g.prompt_snippets = cached;
+                        }
+                        hub.ui_dirty.store(true, Ordering::Release);
+                    }
+                }
+            }
+        });
+    }
+
+    /// Saves `snippets` to `~/.config/coda/snippets.json` and syncs `PUT /api/v1/me/snippets` when signed in.
+    pub fn save_prompt_snippets(
+        self: &Arc<Self>,
+        snippets: Vec<PromptSnippet>,
+        success_notice: Option<String>,
+    ) {
+        let clean = match validate_and_normalize_snippets(snippets) {
+            Ok(c) => c,
+            Err(err) => {
+                if let Ok(mut g) = self.state.lock() {
+                    g.status_notice = Some(err);
+                }
+                self.ui_dirty.store(true, Ordering::Release);
+                return;
+            }
+        };
+        let _ = save_snippets_to_disk(&clean);
+        if let Ok(mut g) = self.state.lock() {
+            g.prompt_snippets = clean.clone();
+            if let Some(ref note) = success_notice {
+                g.status_notice = Some(note.clone());
+            }
+        }
+        self.ui_dirty.store(true, Ordering::Release);
+
+        let weak_hub = Arc::downgrade(self);
+        self.spawn_bg(async move {
+            let Ok(cfg) = load_desktop_daemon_config(&DaemonConfig::default_path()) else {
+                return;
+            };
+            let Some(ref tok) = cfg.session_token else {
+                return;
+            };
+            if let Some(hub) = weak_hub.upgrade() {
+                if let Ok(mut g) = hub.state.lock() {
+                    g.snippets_loading = true;
+                }
+                hub.ui_dirty.store(true, Ordering::Release);
+            }
+            match api_put_prompt_snippets(&cfg.server_url, tok, &clean).await {
+                Ok(remote_saved) => {
+                    let _ = save_snippets_to_disk(&remote_saved);
+                    if let Some(hub) = weak_hub.upgrade() {
+                        if let Ok(mut g) = hub.state.lock() {
+                            g.snippets_loading = false;
+                            g.prompt_snippets = remote_saved;
+                        }
+                        hub.ui_dirty.store(true, Ordering::Release);
+                    }
+                }
+                Err(err) => {
+                    if let Some(hub) = weak_hub.upgrade() {
+                        if let Ok(mut g) = hub.state.lock() {
+                            g.snippets_loading = false;
+                            g.status_notice = Some(err);
+                        }
+                        hub.ui_dirty.store(true, Ordering::Release);
+                    }
+                }
+            }
+        });
+    }
+
+    /// Fetches `/api/v1/auth/me` and, when `is_admin == true`, loads invite codes (`/api/v1/invites`)
+    /// and registered friends (`/api/v1/admin/users`).
+    pub fn refresh_account_profile_and_admin_data(self: &Arc<Self>) {
+        let weak_hub = Arc::downgrade(self);
+        self.spawn_bg(async move {
+            let Ok(cfg) = load_desktop_daemon_config(&DaemonConfig::default_path()) else {
+                return;
+            };
+            let Some(ref tok) = cfg.session_token else {
+                return;
+            };
+            let Ok(me) = api_get_auth_me(&cfg.server_url, tok).await else {
+                return;
+            };
+            if let Some(hub) = weak_hub.upgrade() {
+                if let Ok(mut g) = hub.state.lock() {
+                    g.account_handle = me.handle.clone();
+                    if !me.email.is_empty() {
+                        g.account_email = me.email.clone();
+                    }
+                    g.account_is_admin = me.is_admin;
+                    if me.is_admin {
+                        g.admin_loading = true;
+                    } else {
+                        g.admin_invites.clear();
+                        g.admin_users.clear();
+                        g.admin_loading = false;
+                    }
+                }
+                hub.ui_dirty.store(true, Ordering::Release);
+            }
+            if !me.is_admin {
+                return;
+            }
+            let (invites_res, users_res) = tokio::join!(
+                api_list_invites(&cfg.server_url, tok),
+                api_get_admin_users(&cfg.server_url, tok),
+            );
+            if let Some(hub) = weak_hub.upgrade() {
+                if let Ok(mut g) = hub.state.lock() {
+                    g.admin_loading = false;
+                    if let Ok(inv) = invites_res {
+                        g.admin_invites = inv;
+                    }
+                    if let Ok(users) = users_res {
+                        g.admin_users = users;
+                    }
+                }
+                hub.ui_dirty.store(true, Ordering::Release);
+            }
+        });
+    }
+
+    pub fn create_admin_invite_code(self: &Arc<Self>, note: String) {
+        let weak_hub = Arc::downgrade(self);
+        self.spawn_bg(async move {
+            let Ok(cfg) = load_desktop_daemon_config(&DaemonConfig::default_path()) else {
+                return;
+            };
+            let Some(ref tok) = cfg.session_token else {
+                return;
+            };
+            match api_create_invite(&cfg.server_url, tok, &note, 5, 30).await {
+                Ok(created) => {
+                    let link = crate::helpers::build_invite_registration_url(
+                        &cfg.server_url,
+                        &created.code,
+                    );
+                    if let Some(hub) = weak_hub.upgrade() {
+                        if let Ok(mut g) = hub.state.lock() {
+                            g.admin_invites.insert(0, created.clone());
+                            g.pending_clipboard_copy = Some(link);
+                            g.status_notice = Some(format!(
+                                "{}: {}",
+                                tr(
+                                    g.locale,
+                                    "Created & copied invite link",
+                                    "已生成并复制好友邀请注册链接"
+                                ),
+                                created.code
+                            ));
+                        }
+                        hub.ui_dirty.store(true, Ordering::Release);
+                    }
+                }
+                Err(err) => {
+                    if let Some(hub) = weak_hub.upgrade() {
+                        if let Ok(mut g) = hub.state.lock() {
+                            g.status_notice = Some(err);
+                        }
+                        hub.ui_dirty.store(true, Ordering::Release);
+                    }
+                }
+            }
+        });
+    }
+
+    pub fn delete_admin_invite_code(self: &Arc<Self>, code: String) {
+        let weak_hub = Arc::downgrade(self);
+        self.spawn_bg(async move {
+            let Ok(cfg) = load_desktop_daemon_config(&DaemonConfig::default_path()) else {
+                return;
+            };
+            let Some(ref tok) = cfg.session_token else {
+                return;
+            };
+            match api_delete_invite(&cfg.server_url, tok, &code).await {
+                Ok(()) => {
+                    if let Some(hub) = weak_hub.upgrade() {
+                        if let Ok(mut g) = hub.state.lock() {
+                            g.admin_invites.retain(|i| i.code != code);
+                            g.status_notice = Some(format!(
+                                "{}: {code}",
+                                tr(g.locale, "Revoked invite code", "已撤销邀请码")
+                            ));
+                        }
+                        hub.ui_dirty.store(true, Ordering::Release);
+                    }
+                }
+                Err(err) => {
+                    if let Some(hub) = weak_hub.upgrade() {
+                        if let Ok(mut g) = hub.state.lock() {
+                            g.status_notice = Some(err);
+                        }
+                        hub.ui_dirty.store(true, Ordering::Release);
+                    }
+                }
+            }
+        });
+    }
+
+    /// Calls `POST /api/v1/admin/users/{id}/reset-link` and copies `reset_url` directly to the macOS clipboard.
+    pub fn create_and_copy_friend_reset_link(self: &Arc<Self>, user_id: Uuid, handle: String) {
+        let weak_hub = Arc::downgrade(self);
+        self.spawn_bg(async move {
+            let Ok(cfg) = load_desktop_daemon_config(&DaemonConfig::default_path()) else {
+                return;
+            };
+            let Some(ref tok) = cfg.session_token else {
+                return;
+            };
+            match api_create_admin_user_reset_link(&cfg.server_url, tok, user_id).await {
+                Ok(res) => {
+                    let eff_handle = if res.handle.trim().is_empty() {
+                        handle
+                    } else {
+                        res.handle
+                    };
+                    if let Some(hub) = weak_hub.upgrade() {
+                        if let Ok(mut g) = hub.state.lock() {
+                            g.pending_clipboard_copy = Some(res.reset_url);
+                            g.status_notice = Some(format!(
+                                "{} @{eff_handle} (24h)",
+                                tr(
+                                    g.locale,
+                                    "Copied password reset link for",
+                                    "已复制一次性重置密码链接："
+                                )
+                            ));
+                        }
+                        hub.ui_dirty.store(true, Ordering::Release);
+                    }
+                }
+                Err(err) => {
+                    if let Some(hub) = weak_hub.upgrade() {
+                        if let Ok(mut g) = hub.state.lock() {
+                            g.status_notice = Some(err);
+                        }
+                        hub.ui_dirty.store(true, Ordering::Release);
+                    }
+                }
+            }
+        });
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -3836,6 +4702,9 @@ pub(crate) fn spawn_device_login(
                             mesh_hub.ensure_embedded_host();
                             mesh_hub.start_account_sync();
                             mesh_hub.fetch_notification_webhooks();
+                            mesh_hub.fetch_prompt_snippets();
+                            mesh_hub.refresh_account_profile_and_admin_data();
+                            mesh_hub.check_desktop_self_update(false);
                         }
                         Err(err) => {
                             let msg = format!("Login failed: {err}");
@@ -3910,6 +4779,9 @@ pub(crate) fn spawn_password_login(
                     mesh_hub.ensure_embedded_host();
                     mesh_hub.start_account_sync();
                     mesh_hub.fetch_notification_webhooks();
+                    mesh_hub.fetch_prompt_snippets();
+                    mesh_hub.refresh_account_profile_and_admin_data();
+                    mesh_hub.check_desktop_self_update(false);
                 }
                 Err(err) => {
                     let msg = format!("Login error: {err}");
@@ -3917,6 +4789,78 @@ pub(crate) fn spawn_password_login(
                         g.auth_loading = false;
                         g.auth_error = Some(msg.clone());
                         g.status_notice = Some(msg);
+                    }
+                    ui_dirty.store(true, Ordering::Release);
+                }
+            }
+        });
+    });
+}
+
+pub(crate) fn spawn_password_reset_with_token(
+    state_bg: Arc<Mutex<CodaDesktopState>>,
+    ui_dirty: Arc<AtomicBool>,
+    server_url: String,
+    raw_token_or_url: String,
+    new_password: String,
+) {
+    std::thread::spawn(move || {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
+            return;
+        };
+        rt.block_on(async move {
+            let (_, maybe_origin) = extract_reset_token_and_origin(&raw_token_or_url);
+            match api_reset_password_with_token(&server_url, &raw_token_or_url, &new_password).await
+            {
+                Ok(handle) => {
+                    if let Some(ref orig) = maybe_origin {
+                        let clean_orig = orig.clone();
+                        CodaGpuWorkspaceView::update_prefs_async(move |p| {
+                            p.server_url = clean_orig;
+                        });
+                    }
+                    if let Ok(mut g) = state_bg.lock() {
+                        if let Some(orig) = maybe_origin {
+                            g.server_url = orig;
+                        }
+                        g.auth_loading = false;
+                        g.auth_error = None;
+                        g.auth_reset_mode = false;
+                        g.auth_reset_token_input.clear();
+                        g.auth_reset_new_pw_input.clear();
+                        if !handle.is_empty() {
+                            g.auth_account_input = handle.clone();
+                        }
+                        g.input_selected_all = false;
+                        g.input_target = ActiveInputTarget::AuthPassword;
+                        g.status_notice = Some(if handle.is_empty() {
+                            tr(
+                                g.locale,
+                                "Password reset complete! Sign in with your new password.",
+                                "密码重置成功！请使用新密码登录。",
+                            )
+                            .to_string()
+                        } else {
+                            format!(
+                                "{} @{handle}",
+                                tr(
+                                    g.locale,
+                                    "Password reset complete — sign in as",
+                                    "密码重置成功，请使用新密码登录"
+                                )
+                            )
+                        });
+                    }
+                    ui_dirty.store(true, Ordering::Release);
+                }
+                Err(err) => {
+                    if let Ok(mut g) = state_bg.lock() {
+                        g.auth_loading = false;
+                        g.auth_error = Some(err.clone());
+                        g.status_notice = Some(err);
                     }
                     ui_dirty.store(true, Ordering::Release);
                 }

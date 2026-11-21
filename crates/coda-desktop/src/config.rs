@@ -316,6 +316,8 @@ pub struct DesktopPreferences {
     pub voice_model: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub voice_api_key: String,
+    #[serde(default)]
+    pub quickstart_dismissed: bool,
 }
 
 fn default_server_url() -> String {
@@ -335,6 +337,7 @@ impl Default for DesktopPreferences {
             voice_base_url: default_voice_base_url(),
             voice_model: default_voice_model(),
             voice_api_key: String::new(),
+            quickstart_dismissed: false,
         }
     }
 }
@@ -872,4 +875,131 @@ pub fn is_safe_http_url(raw: &str) -> bool {
     (trimmed.starts_with("https://") || trimmed.starts_with("http://"))
         && trimmed.len() <= 2048
         && !trimmed.chars().any(|c| c.is_control() || c.is_whitespace())
+}
+
+pub const MAX_PROMPT_SNIPPETS: usize = 24;
+pub const MAX_SNIPPET_TITLE_CHARS: usize = 60;
+pub const MAX_SNIPPET_PROMPT_CHARS: usize = 4000;
+
+/// Cross-device saved prompt snippet synced via `GET/PUT /api/v1/me/snippets`
+/// and cached locally at `~/.config/coda/snippets.json`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptSnippet {
+    pub id: String,
+    pub title: String,
+    pub prompt: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PromptSnippetsEnvelope {
+    #[serde(default)]
+    pub snippets: Vec<PromptSnippet>,
+}
+
+/// Curated starter prompt snippets matching `coda-server` v1.1.0 defaults.
+pub fn default_prompt_snippets() -> Vec<PromptSnippet> {
+    vec![
+        PromptSnippet {
+            id: "s1".to_string(),
+            title: "Run Tests & Fix".to_string(),
+            prompt: "Run the full test suite, fix any failures or compiler warnings, and summarize what changed.".to_string(),
+        },
+        PromptSnippet {
+            id: "s2".to_string(),
+            title: "Review Git Diff".to_string(),
+            prompt: "Review the current git diff carefully for bugs, edge cases, or regressions before committing.".to_string(),
+        },
+        PromptSnippet {
+            id: "s3".to_string(),
+            title: "Continue".to_string(),
+            prompt: "Continue with the next steps until everything is complete and verified."
+                .to_string(),
+        },
+        PromptSnippet {
+            id: "s4".to_string(),
+            title: "Clean Commit".to_string(),
+            prompt: "Stage and commit the current changes with a concise conventional commit message."
+                .to_string(),
+        },
+    ]
+}
+
+/// Returns `~/.config/coda/snippets.json` (respecting `set_config_root_override` in tests).
+pub fn snippets_cache_path() -> PathBuf {
+    config_root_dir()
+        .unwrap_or_else(|| PathBuf::from(".config/coda"))
+        .join("snippets.json")
+}
+
+/// Validates and normalizes a list of prompt snippets before local persistence or `PUT /api/v1/me/snippets`.
+pub fn validate_and_normalize_snippets(
+    items: Vec<PromptSnippet>,
+) -> Result<Vec<PromptSnippet>, String> {
+    if items.len() > MAX_PROMPT_SNIPPETS {
+        return Err(format!(
+            "Maximum {MAX_PROMPT_SNIPPETS} saved prompt snippets allowed"
+        ));
+    }
+    let mut out = Vec::with_capacity(items.len());
+    let mut seen_ids = HashSet::new();
+    for item in items {
+        let id = item.id.trim().to_string();
+        let title = item.title.trim().to_string();
+        let prompt = item.prompt.trim().to_string();
+        if id.is_empty() || title.is_empty() || prompt.is_empty() {
+            return Err("Snippet id, title, and prompt must be non-empty".to_string());
+        }
+        if title.chars().count() > MAX_SNIPPET_TITLE_CHARS {
+            return Err(format!(
+                "Snippet title exceeds {MAX_SNIPPET_TITLE_CHARS} characters"
+            ));
+        }
+        if prompt.chars().count() > MAX_SNIPPET_PROMPT_CHARS || prompt.len() > MAX_SNIPPET_PROMPT_CHARS {
+            return Err(format!(
+                "Snippet prompt exceeds {MAX_SNIPPET_PROMPT_CHARS} characters"
+            ));
+        }
+        let eff_id = if seen_ids.insert(id.clone()) {
+            id
+        } else {
+            let gen_id = format!("snip-{}", &uuid::Uuid::new_v4().simple().to_string()[..10]);
+            seen_ids.insert(gen_id.clone());
+            gen_id
+        };
+        out.push(PromptSnippet {
+            id: eff_id,
+            title,
+            prompt,
+        });
+    }
+    Ok(out)
+}
+
+/// Loads saved prompt snippets from `~/.config/coda/snippets.json`, falling back to curated defaults
+/// when the cache file does not exist yet or cannot be parsed.
+pub fn load_snippets_from_disk_or_default() -> Vec<PromptSnippet> {
+    let path = snippets_cache_path();
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return default_prompt_snippets();
+    };
+    if let Ok(env) = serde_json::from_str::<PromptSnippetsEnvelope>(&raw) {
+        if let Ok(clean) = validate_and_normalize_snippets(env.snippets) {
+            return clean;
+        }
+    }
+    if let Ok(arr) = serde_json::from_str::<Vec<PromptSnippet>>(&raw) {
+        if let Ok(clean) = validate_and_normalize_snippets(arr) {
+            return clean;
+        }
+    }
+    default_prompt_snippets()
+}
+
+/// Atomically persists `snippets` to `~/.config/coda/snippets.json` (`0o600`).
+pub fn save_snippets_to_disk(snippets: &[PromptSnippet]) -> anyhow::Result<()> {
+    let env = PromptSnippetsEnvelope {
+        snippets: snippets.to_vec(),
+    };
+    let body = serde_json::to_string_pretty(&env)?;
+    write_file_atomic_mode(&snippets_cache_path(), body.as_bytes(), 0o600)
 }

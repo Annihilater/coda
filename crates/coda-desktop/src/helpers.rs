@@ -298,16 +298,172 @@ pub fn format_pasted_terminal_path(path: &str) -> String {
     format!("{} ", shell_escape_terminal_path(path))
 }
 
-/// Iteratively strips forged bracketed-paste start/end escape sequences until fixed-point.
+/// Iteratively strips forged bracketed-paste start/end escape sequences (CSI and C1) and NULs until fixed-point.
 pub fn sanitize_bracketed_paste_text(text: &str) -> String {
-    let mut cur = text.to_string();
+    let mut cur = text.replace('\0', "");
     loop {
-        let next = cur.replace("\x1b[200~", "").replace("\x1b[201~", "");
+        let next = cur
+            .replace("\x1b[200~", "")
+            .replace("\x1b[201~", "")
+            .replace("\u{009b}200~", "")
+            .replace("\u{009b}201~", "");
         if next.len() == cur.len() {
             return next;
         }
         cur = next;
     }
+}
+
+/// Returns `true` when `title` identifies a known full-screen coding agent TUI that expects
+/// multi-line prompt submissions wrapped in `?2004h` bracketed paste.
+pub fn session_looks_like_agent_tui(title: &str) -> bool {
+    let lower = title.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+    ["claude", "codex", "grok", "agy", "antigravity", "gemini"]
+        .iter()
+        .any(|kw| {
+            lower == *kw
+                || lower.starts_with(&format!("{kw} "))
+                || lower.starts_with(&format!("{kw}:"))
+                || lower.starts_with(&format!("{kw}-"))
+                || lower.contains(&format!("· {kw}"))
+                || lower.contains(&format!("/{kw}"))
+        })
+}
+
+/// Resolves whether smart bracketed paste (`\x1b[200~...\x1b[201~`) should be used for a prompt submission.
+pub fn resolve_effective_bracketed_paste(vt_bracketed_paste: bool, session_title: &str) -> bool {
+    vt_bracketed_paste || session_looks_like_agent_tui(session_title)
+}
+
+/// Encodes a prompt or saved snippet into a terminal submission payload (`+ \r`), wrapping in
+/// sanitized `\x1b[200~...\x1b[201~\r` when `use_bracketed` is true, or normalized plain text + `\r`
+/// when sending to plain non-bracketed shells (`/bin/sh`, `dash`, `psql`, `python`).
+pub fn encode_smart_bracketed_paste_submit(prompt: &str, use_bracketed: bool) -> Vec<u8> {
+    let sanitized = sanitize_bracketed_paste_text(prompt)
+        .replace("\r\n", "\n")
+        .trim_end_matches(&['\r', '\n'][..])
+        .to_string();
+    if use_bracketed {
+        let mut out = Vec::with_capacity(sanitized.len() + 14);
+        out.extend_from_slice(b"\x1b[200~");
+        out.extend_from_slice(sanitized.as_bytes());
+        out.extend_from_slice(b"\x1b[201~\r");
+        out
+    } else {
+        let mut out = Vec::with_capacity(sanitized.len() + 1);
+        out.extend_from_slice(sanitized.as_bytes());
+        out.push(b'\r');
+        out
+    }
+}
+
+fn percent_encode_query_component(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for b in raw.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+fn percent_decode_lossy(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(hex_str) = std::str::from_utf8(&bytes[i + 1..i + 3]) {
+                if let Ok(val) = u8::from_str_radix(hex_str, 16) {
+                    out.push(val);
+                    i += 3;
+                    continue;
+                }
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
+/// Builds the 1-line daemon enrollment shell command for `server_url`.
+pub fn build_daemon_install_command(server_url: &str) -> String {
+    let base = server_url.trim().trim_end_matches('/');
+    let eff = if crate::config::is_safe_http_url(base) {
+        base
+    } else {
+        "https://codahub.dev"
+    };
+    format!("curl -fsSL {eff}/install.sh | sh")
+}
+
+/// Builds a friend registration invite deep-link (`<server_url>/register?invite=<CODE>`).
+pub fn build_invite_registration_url(server_url: &str, code: &str) -> String {
+    let base = server_url.trim().trim_end_matches('/');
+    let eff = if crate::config::is_safe_http_url(base) {
+        base
+    } else {
+        "https://codahub.dev"
+    };
+    let clean_code = percent_encode_query_component(code.trim());
+    format!("{eff}/register?invite={clean_code}")
+}
+
+/// Extracts `(clean_reset_token, optional_server_origin)` from either a raw `rst_...` token
+/// or a full `https://.../reset-password?token=rst_...` URL pasted from WeChat/Messages.
+pub fn extract_reset_token_and_origin(raw_input: &str) -> (String, Option<String>) {
+    let trimmed = raw_input.trim();
+    if trimmed.is_empty() {
+        return (String::new(), None);
+    }
+
+    let origin = if trimmed.starts_with("https://") || trimmed.starts_with("http://") {
+        let scheme_end = trimmed.find("://").map(|i| i + 3).unwrap_or(0);
+        let rest = &trimmed[scheme_end..];
+        let authority_end = rest
+            .find(['/', '?', '#'])
+            .map(|i| scheme_end + i)
+            .unwrap_or(trimmed.len());
+        let cand = &trimmed[..authority_end];
+        if authority_end > scheme_end && crate::config::is_safe_http_url(cand) {
+            Some(cand.to_string())
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    if let Some((_, query_and_frag)) = trimmed.split_once('?') {
+        let query = query_and_frag.split('#').next().unwrap_or(query_and_frag);
+        for pair in query.split('&') {
+            if let Some((k, v)) = pair.split_once('=') {
+                if k.trim() == "token" {
+                    let decoded = percent_decode_lossy(v.trim()).trim().to_string();
+                    if !decoded.is_empty() {
+                        return (decoded, origin);
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(idx) = trimmed.find("token=") {
+        let after = &trimmed[idx + 6..];
+        let val = after.split(['&', '#', ' ', '\t', '\r', '\n']).next().unwrap_or("");
+        let decoded = percent_decode_lossy(val.trim()).trim().to_string();
+        if !decoded.is_empty() {
+            return (decoded, origin);
+        }
+    }
+
+    (trimmed.to_string(), origin)
 }
 
 /// Derives a safe default folder name from a Git clone URL (e.g. `https://github.com/org/repo.git` -> `"repo"`).
@@ -782,5 +938,49 @@ index 1111111..2222222 100644
         // Selecting an untracked file absent from `git diff` must NOT leak `src/a.rs` hunks.
         let untracked = extract_file_diff_lines(unified, Some("src/new_helper.rs"));
         assert!(untracked.is_empty());
+    }
+
+    #[test]
+    fn test_smart_bracketed_paste_invite_url_and_reset_token_helpers() {
+        assert!(session_looks_like_agent_tui("claude"));
+        assert!(session_looks_like_agent_tui("Codex · coda"));
+        assert!(session_looks_like_agent_tui("Antigravity"));
+        assert!(session_looks_like_agent_tui("agy"));
+        assert!(session_looks_like_agent_tui("grok-cli"));
+        assert!(!session_looks_like_agent_tui("zsh"));
+        assert!(!session_looks_like_agent_tui("/bin/sh"));
+
+        assert!(resolve_effective_bracketed_paste(false, "claude"));
+        assert!(resolve_effective_bracketed_paste(true, "zsh"));
+        assert!(!resolve_effective_bracketed_paste(false, "/bin/sh"));
+
+        let attack = "line1\r\nline2\x1b[\x1b[201~201~\u{009b}201~safe\0\n";
+        assert_eq!(
+            encode_smart_bracketed_paste_submit(attack, true),
+            b"\x1b[200~line1\nline2safe\x1b[201~\r".to_vec()
+        );
+        assert_eq!(
+            encode_smart_bracketed_paste_submit(attack, false),
+            b"line1\nline2safe\r".to_vec()
+        );
+
+        assert_eq!(
+            build_daemon_install_command("https://codahub.dev/"),
+            "curl -fsSL https://codahub.dev/install.sh | sh"
+        );
+        assert_eq!(
+            build_invite_registration_url("https://codahub.dev/", "CODA-AB12CD"),
+            "https://codahub.dev/register?invite=CODA-AB12CD"
+        );
+
+        let (tok1, orig1) = extract_reset_token_and_origin(
+            "  https://mesh.example.com:8443/reset-password?token=rst_AbcDef_1234567890#top  ",
+        );
+        assert_eq!(tok1, "rst_AbcDef_1234567890");
+        assert_eq!(orig1.as_deref(), Some("https://mesh.example.com:8443"));
+
+        let (tok2, orig2) = extract_reset_token_and_origin("rst_rawTokenValue998877");
+        assert_eq!(tok2, "rst_rawTokenValue998877");
+        assert_eq!(orig2, None);
     }
 }

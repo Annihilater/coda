@@ -17,6 +17,7 @@ pub mod port_preview;
 pub mod pty;
 pub mod remote_mesh;
 pub mod search_export;
+pub mod self_update;
 pub mod smart_path;
 pub mod voice_dock;
 
@@ -43,22 +44,27 @@ use uuid::Uuid;
 use crate::config::{
     detect_local_machine_name, discover_local_git_repositories, display_compact_path,
     ensure_agents_md_manual, ensure_macos_gui_path, is_safe_http_url,
-    pick_folder_via_native_dialog, reveal_in_finder, space_avatar_color, tr, DesktopPreferences,
-    LayoutMode, MalleableLayoutConfig, UiLocale,
+    load_snippets_from_disk_or_default, pick_folder_via_native_dialog, reveal_in_finder,
+    space_avatar_color, tr, DesktopPreferences, LayoutMode, MalleableLayoutConfig, PromptSnippet,
+    UiLocale, MAX_PROMPT_SNIPPETS,
 };
 use crate::git_inspector::{
     compute_repo_snapshot, list_workspace_dir, read_workspace_file_preview, resolve_contained_path,
     RepoInspectorSnapshot, WorkspaceFileEntry,
 };
 use crate::helpers::{
-    classify_diff_line, extract_file_diff_lines, format_pasted_terminal_path, herdr_status_to_osc,
-    load_desktop_daemon_config, utf16_slice, DiffLineKind,
+    build_daemon_install_command, classify_diff_line, encode_smart_bracketed_paste_submit,
+    extract_file_diff_lines, format_pasted_terminal_path, herdr_status_to_osc,
+    load_desktop_daemon_config, resolve_effective_bracketed_paste, utf16_slice, DiffLineKind,
 };
 #[cfg(test)]
 use crate::helpers::path_within_root;
 use crate::notify::{dispatch_native_notification, DesktopNotificationTracker};
 use crate::pty::{AgentLifecycleState, LocalPtyManager, Osc7501Status, StyledTerminalLine};
-use crate::remote_mesh::{spawn_device_login, spawn_password_login};
+use crate::remote_mesh::{
+    spawn_device_login, spawn_password_login, spawn_password_reset_with_token,
+    AdminFriendUserItem, AdminInviteCodeItem,
+};
 
 actions!(
     coda_desktop,
@@ -132,6 +138,12 @@ pub enum ActiveInputTarget {
     BootstrapParentDir,
     BootstrapFolderName,
     BootstrapGitCloneUrl,
+    TerminalComposerInput,
+    SnippetTitleInput,
+    SnippetPromptInput,
+    AuthResetToken,
+    AuthResetNewPassword,
+    AdminInviteNote,
 }
 
 /// Primary or Secondary split terminal pane.
@@ -266,6 +278,8 @@ pub enum PaletteAction {
     ExportActiveSession,
     ToggleVoiceDictation,
     JumpNextNeedsYou,
+    RunSnippet { title: String, prompt: String },
+    OpenAppUpdate,
 }
 
 /// Modal state for creating a new remote workspace folder or running `git clone` over E2EE (`Gap #2`).
@@ -399,6 +413,23 @@ pub struct CodaDesktopState {
     pub webhook_dirty: bool,
     pub port_preview: crate::port_preview::PortPreviewState,
     pub bootstrap_modal: RemoteBootstrapModalState,
+    pub self_update: crate::self_update::SelfUpdateUiState,
+    pub prompt_snippets: Vec<PromptSnippet>,
+    pub snippets_loading: bool,
+    pub snippet_title_input: String,
+    pub snippet_prompt_input: String,
+    pub composer_draft_input: String,
+    pub quickstart_dismissed: bool,
+    pub auth_reset_mode: bool,
+    pub auth_reset_token_input: String,
+    pub auth_reset_new_pw_input: String,
+    pub account_handle: String,
+    pub account_is_admin: bool,
+    pub admin_loading: bool,
+    pub admin_invites: Vec<AdminInviteCodeItem>,
+    pub admin_invite_note_input: String,
+    pub admin_users: Vec<AdminFriendUserItem>,
+    pub pending_clipboard_copy: Option<String>,
     pub status_notice: Option<String>,
 }
 
@@ -476,6 +507,23 @@ impl Default for CodaDesktopState {
             webhook_dirty: false,
             port_preview: crate::port_preview::PortPreviewState::default(),
             bootstrap_modal: RemoteBootstrapModalState::default(),
+            self_update: crate::self_update::SelfUpdateUiState::default(),
+            prompt_snippets: crate::config::default_prompt_snippets(),
+            snippets_loading: false,
+            snippet_title_input: String::new(),
+            snippet_prompt_input: String::new(),
+            composer_draft_input: String::new(),
+            quickstart_dismissed: false,
+            auth_reset_mode: false,
+            auth_reset_token_input: String::new(),
+            auth_reset_new_pw_input: String::new(),
+            account_handle: String::new(),
+            account_is_admin: false,
+            admin_loading: false,
+            admin_invites: Vec::new(),
+            admin_invite_note_input: String::new(),
+            admin_users: Vec::new(),
+            pending_clipboard_copy: None,
             status_notice: None,
         }
     }
@@ -636,6 +684,10 @@ impl CodaDesktopState {
         self.pw_change_expanded = false;
         self.pw_current_input.clear();
         self.pw_new_input.clear();
+        self.auth_reset_mode = false;
+        self.auth_reset_token_input.clear();
+        self.auth_reset_new_pw_input.clear();
+        self.admin_invite_note_input.clear();
         self.input_selected_all = false;
         if matches!(
             self.input_target,
@@ -645,6 +697,11 @@ impl CodaDesktopState {
                 | ActiveInputTarget::AuthServerUrl
                 | ActiveInputTarget::AuthAccount
                 | ActiveInputTarget::AuthPassword
+                | ActiveInputTarget::AuthResetToken
+                | ActiveInputTarget::AuthResetNewPassword
+                | ActiveInputTarget::AdminInviteNote
+                | ActiveInputTarget::SnippetTitleInput
+                | ActiveInputTarget::SnippetPromptInput
                 | ActiveInputTarget::VoiceBaseUrl
                 | ActiveInputTarget::VoiceModel
                 | ActiveInputTarget::VoiceApiKey
@@ -864,6 +921,42 @@ impl CodaDesktopState {
             detail: self.locale.label().to_string(),
             action: PaletteAction::ToggleLocale,
         });
+        if self.self_update.update_available {
+            if let Some(ref tag) = self.self_update.latest_version {
+                items.insert(
+                    0,
+                    PaletteItem {
+                        kind_tag: "UPDATE",
+                        label: format!("✨ Update Coda.app to {tag}"),
+                        detail: format!(
+                            "Current v{} · SHA-256 verified",
+                            self.self_update.current_version
+                        ),
+                        action: PaletteAction::OpenAppUpdate,
+                    },
+                );
+            }
+        }
+        for snip in &self.prompt_snippets {
+            let preview_line: String = snip
+                .prompt
+                .lines()
+                .next()
+                .unwrap_or("")
+                .trim()
+                .chars()
+                .take(64)
+                .collect();
+            items.push(PaletteItem {
+                kind_tag: "SNIPPET",
+                label: format!("Snippet: {}", snip.title),
+                detail: preview_line,
+                action: PaletteAction::RunSnippet {
+                    title: snip.title.clone(),
+                    prompt: snip.prompt.clone(),
+                },
+            });
+        }
 
         let q = self.palette_query.trim().to_ascii_lowercase();
         if q.is_empty() {
@@ -1061,6 +1154,8 @@ impl CodaGpuWorkspaceView {
         init_state.voice_base_url = prefs.voice_base_url.clone();
         init_state.voice_model = prefs.voice_model.clone();
         init_state.voice_api_key = prefs.voice_api_key.clone();
+        init_state.quickstart_dismissed = prefs.quickstart_dismissed;
+        init_state.prompt_snippets = load_snippets_from_disk_or_default();
         init_state.layout = layout_cfg;
         init_state.layout_mtime = layout_mtime;
         init_state.hc_path = discover_hc_binary();
@@ -1072,6 +1167,7 @@ impl CodaGpuWorkspaceView {
         if let Ok(dcfg) = load_desktop_daemon_config(&daemon_cfg_path) {
             init_state.server_url = dcfg.server_url.clone();
             init_state.local_host_device_id = Some(dcfg.device_id);
+            init_state.account_handle = dcfg.owner_handle.clone();
             if dcfg.session_token.is_some() {
                 init_state.is_logged_in = true;
                 init_state.account_email = dcfg
@@ -1281,8 +1377,11 @@ impl CodaGpuWorkspaceView {
         );
         mesh_hub.ensure_embedded_host();
         mesh_hub.start_account_sync();
+        mesh_hub.check_desktop_self_update(false);
         if state.lock().map(|g| g.is_logged_in).unwrap_or(false) {
             mesh_hub.fetch_notification_webhooks();
+            mesh_hub.fetch_prompt_snippets();
+            mesh_hub.refresh_account_profile_and_admin_data();
         }
 
         // 50Hz UI pump + 1s hot-reload watcher for `~/.config/coda/layout.json`.
@@ -1301,6 +1400,14 @@ impl CodaGpuWorkspaceView {
                         let mut changed = false;
                         if dirty {
                             view.sync_pty_snapshots_into_state();
+                            if let Some(clip_str) = view
+                                .state
+                                .lock()
+                                .ok()
+                                .and_then(|mut g| g.pending_clipboard_copy.take())
+                            {
+                                cx.write_to_clipboard(ClipboardItem::new_string(clip_str));
+                            }
                             changed = true;
                         }
                         if check_layout && view.poll_layout_json_hot_reload() {
@@ -1535,7 +1642,28 @@ impl CodaGpuWorkspaceView {
                     (!g.webhook_settings.discord_webhook_url.is_empty())
                         .then(|| (g.webhook_settings.discord_webhook_url.clone(), false))
                 }
+                ActiveInputTarget::TerminalComposerInput => {
+                    (!g.composer_draft_input.is_empty())
+                        .then(|| (g.composer_draft_input.clone(), false))
+                }
+                ActiveInputTarget::SnippetTitleInput => {
+                    (!g.snippet_title_input.is_empty())
+                        .then(|| (g.snippet_title_input.clone(), false))
+                }
+                ActiveInputTarget::SnippetPromptInput => {
+                    (!g.snippet_prompt_input.is_empty())
+                        .then(|| (g.snippet_prompt_input.clone(), false))
+                }
+                ActiveInputTarget::AuthResetToken => {
+                    (!g.auth_reset_token_input.is_empty())
+                        .then(|| (g.auth_reset_token_input.clone(), false))
+                }
+                ActiveInputTarget::AdminInviteNote => {
+                    (!g.admin_invite_note_input.is_empty())
+                        .then(|| (g.admin_invite_note_input.clone(), false))
+                }
                 ActiveInputTarget::AuthPassword
+                | ActiveInputTarget::AuthResetNewPassword
                 | ActiveInputTarget::ChangePwCurrent
                 | ActiveInputTarget::ChangePwNew
                 | ActiveInputTarget::VoiceApiKey
@@ -1673,11 +1801,15 @@ impl CodaGpuWorkspaceView {
                         | ActiveInputTarget::BootstrapParentDir
                         | ActiveInputTarget::BootstrapFolderName
                         | ActiveInputTarget::BootstrapGitCloneUrl
+                        | ActiveInputTarget::SnippetTitleInput
+                        | ActiveInputTarget::AuthResetToken
+                        | ActiveInputTarget::AdminInviteNote
                 ) {
                 txt.trim().to_string()
             } else if matches!(
                 target,
                 ActiveInputTarget::AuthPassword
+                    | ActiveInputTarget::AuthResetNewPassword
                     | ActiveInputTarget::ChangePwCurrent
                     | ActiveInputTarget::ChangePwNew
                     | ActiveInputTarget::VoiceApiKey
@@ -2103,6 +2235,62 @@ impl CodaGpuWorkspaceView {
                     g.bootstrap_modal.error = None;
                 }
             }
+            ActiveInputTarget::TerminalComposerInput => {
+                if let Ok(mut g) = self.state.lock() {
+                    if g.input_selected_all {
+                        g.composer_draft_input.clear();
+                        g.input_selected_all = false;
+                    }
+                    g.composer_draft_input.push_str(text);
+                }
+            }
+            ActiveInputTarget::SnippetTitleInput => {
+                if let Ok(mut g) = self.state.lock() {
+                    if g.input_selected_all {
+                        g.snippet_title_input.clear();
+                        g.input_selected_all = false;
+                    }
+                    g.snippet_title_input.push_str(text);
+                }
+            }
+            ActiveInputTarget::SnippetPromptInput => {
+                if let Ok(mut g) = self.state.lock() {
+                    if g.input_selected_all {
+                        g.snippet_prompt_input.clear();
+                        g.input_selected_all = false;
+                    }
+                    g.snippet_prompt_input.push_str(text);
+                }
+            }
+            ActiveInputTarget::AuthResetToken => {
+                if let Ok(mut g) = self.state.lock() {
+                    if g.input_selected_all {
+                        g.auth_reset_token_input.clear();
+                        g.input_selected_all = false;
+                    }
+                    g.auth_reset_token_input.push_str(text);
+                    g.auth_error = None;
+                }
+            }
+            ActiveInputTarget::AuthResetNewPassword => {
+                if let Ok(mut g) = self.state.lock() {
+                    if g.input_selected_all {
+                        g.auth_reset_new_pw_input.clear();
+                        g.input_selected_all = false;
+                    }
+                    g.auth_reset_new_pw_input.push_str(text);
+                    g.auth_error = None;
+                }
+            }
+            ActiveInputTarget::AdminInviteNote => {
+                if let Ok(mut g) = self.state.lock() {
+                    if g.input_selected_all {
+                        g.admin_invite_note_input.clear();
+                        g.input_selected_all = false;
+                    }
+                    g.admin_invite_note_input.push_str(text);
+                }
+            }
             ActiveInputTarget::CommandPalette => {}
         }
     }
@@ -2188,6 +2376,26 @@ impl CodaGpuWorkspaceView {
                                 ActiveInputTarget::BootstrapGitCloneUrl => {
                                     g.bootstrap_modal.git_clone_url.clear();
                                     g.bootstrap_modal.error = None;
+                                }
+                                ActiveInputTarget::TerminalComposerInput => {
+                                    g.composer_draft_input.clear();
+                                }
+                                ActiveInputTarget::SnippetTitleInput => {
+                                    g.snippet_title_input.clear();
+                                }
+                                ActiveInputTarget::SnippetPromptInput => {
+                                    g.snippet_prompt_input.clear();
+                                }
+                                ActiveInputTarget::AuthResetToken => {
+                                    g.auth_reset_token_input.clear();
+                                    g.auth_error = None;
+                                }
+                                ActiveInputTarget::AuthResetNewPassword => {
+                                    g.auth_reset_new_pw_input.clear();
+                                    g.auth_error = None;
+                                }
+                                ActiveInputTarget::AdminInviteNote => {
+                                    g.admin_invite_note_input.clear();
                                 }
                                 _ => {}
                             }
@@ -2907,8 +3115,473 @@ impl CodaGpuWorkspaceView {
                 }
                 _ => {}
             },
+            ActiveInputTarget::TerminalComposerInput => match key {
+                "backspace" => {
+                    if let Ok(mut g) = self.state.lock() {
+                        if g.input_selected_all {
+                            g.composer_draft_input.clear();
+                            g.input_selected_all = false;
+                        } else {
+                            g.composer_draft_input.pop();
+                        }
+                    }
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                "enter" | "return" => {
+                    if mods.shift {
+                        if let Ok(mut g) = self.state.lock() {
+                            g.composer_draft_input.push('\n');
+                        }
+                    } else {
+                        self.submit_terminal_composer_draft(None);
+                    }
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                "escape" => {
+                    if let Ok(mut g) = self.state.lock() {
+                        g.input_selected_all = false;
+                        g.input_target = ActiveInputTarget::TerminalDirect;
+                    }
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                _ => {}
+            },
+            ActiveInputTarget::SnippetTitleInput | ActiveInputTarget::SnippetPromptInput => {
+                match key {
+                    "backspace" => {
+                        if let Ok(mut g) = self.state.lock() {
+                            let sel_all = g.input_selected_all;
+                            g.input_selected_all = false;
+                            let field = if target == ActiveInputTarget::SnippetTitleInput {
+                                &mut g.snippet_title_input
+                            } else {
+                                &mut g.snippet_prompt_input
+                            };
+                            if sel_all {
+                                field.clear();
+                            } else {
+                                field.pop();
+                            }
+                        }
+                        cx.notify();
+                        cx.stop_propagation();
+                    }
+                    "tab" => {
+                        if let Ok(mut g) = self.state.lock() {
+                            g.input_selected_all = false;
+                            g.input_target = if target == ActiveInputTarget::SnippetTitleInput {
+                                ActiveInputTarget::SnippetPromptInput
+                            } else {
+                                ActiveInputTarget::SnippetTitleInput
+                            };
+                        }
+                        cx.notify();
+                        cx.stop_propagation();
+                    }
+                    "enter" | "return" => {
+                        if target == ActiveInputTarget::SnippetTitleInput {
+                            if let Ok(mut g) = self.state.lock() {
+                                g.input_selected_all = false;
+                                g.input_target = ActiveInputTarget::SnippetPromptInput;
+                            }
+                        } else if mods.shift {
+                            if let Ok(mut g) = self.state.lock() {
+                                g.snippet_prompt_input.push('\n');
+                            }
+                        } else {
+                            self.submit_add_custom_snippet();
+                        }
+                        cx.notify();
+                        cx.stop_propagation();
+                    }
+                    "escape" => {
+                        if let Ok(mut g) = self.state.lock() {
+                            g.input_selected_all = false;
+                            g.input_target = ActiveInputTarget::TerminalDirect;
+                        }
+                        cx.notify();
+                        cx.stop_propagation();
+                    }
+                    _ => {}
+                }
+            }
+            ActiveInputTarget::AuthResetToken => match key {
+                "backspace" => {
+                    if let Ok(mut g) = self.state.lock() {
+                        if g.input_selected_all {
+                            g.auth_reset_token_input.clear();
+                            g.input_selected_all = false;
+                        } else {
+                            g.auth_reset_token_input.pop();
+                        }
+                        g.auth_error = None;
+                    }
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                "tab" | "enter" | "return" => {
+                    if let Ok(mut g) = self.state.lock() {
+                        g.input_selected_all = false;
+                        g.input_target = ActiveInputTarget::AuthResetNewPassword;
+                    }
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                "escape" => {
+                    if let Ok(mut g) = self.state.lock() {
+                        g.auth_reset_mode = false;
+                        g.auth_reset_token_input.clear();
+                        g.auth_reset_new_pw_input.clear();
+                        g.input_selected_all = false;
+                        g.input_target = ActiveInputTarget::TerminalDirect;
+                    }
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                _ => {}
+            },
+            ActiveInputTarget::AuthResetNewPassword => match key {
+                "backspace" => {
+                    if let Ok(mut g) = self.state.lock() {
+                        if g.input_selected_all {
+                            g.auth_reset_new_pw_input.clear();
+                            g.input_selected_all = false;
+                        } else {
+                            g.auth_reset_new_pw_input.pop();
+                        }
+                        g.auth_error = None;
+                    }
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                "tab" => {
+                    if let Ok(mut g) = self.state.lock() {
+                        g.input_selected_all = false;
+                        g.input_target = ActiveInputTarget::AuthResetToken;
+                    }
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                "enter" | "return" => {
+                    self.submit_password_reset_token();
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                "escape" => {
+                    if let Ok(mut g) = self.state.lock() {
+                        g.auth_reset_mode = false;
+                        g.auth_reset_token_input.clear();
+                        g.auth_reset_new_pw_input.clear();
+                        g.input_selected_all = false;
+                        g.input_target = ActiveInputTarget::TerminalDirect;
+                    }
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                _ => {}
+            },
+            ActiveInputTarget::AdminInviteNote => match key {
+                "backspace" => {
+                    if let Ok(mut g) = self.state.lock() {
+                        if g.input_selected_all {
+                            g.admin_invite_note_input.clear();
+                            g.input_selected_all = false;
+                        } else {
+                            g.admin_invite_note_input.pop();
+                        }
+                    }
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                "enter" | "return" => {
+                    self.submit_create_admin_invite();
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                "escape" => {
+                    if let Ok(mut g) = self.state.lock() {
+                        g.input_selected_all = false;
+                        g.input_target = ActiveInputTarget::TerminalDirect;
+                    }
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                _ => {}
+            },
             ActiveInputTarget::TerminalDirect | ActiveInputTarget::CommandPalette => {}
         }
+    }
+
+    /// Sends a saved prompt snippet or composer prompt into `target_session_id` (or the focused session)
+    /// using smart `?2004h` / Agent-TUI bracketed paste (`\x1b[200~...\x1b[201~\r`).
+    pub(crate) fn send_prompt_snippet_to_session(
+        &self,
+        target_session_id: Option<&str>,
+        title_hint: &str,
+        prompt: &str,
+    ) {
+        if prompt.trim().is_empty() {
+            return;
+        }
+        let session_meta = {
+            let Ok(mut g) = self.state.lock() else {
+                return;
+            };
+            let loc = g.locale;
+            let resolved_sid = target_session_id
+                .map(str::to_string)
+                .or_else(|| g.focused_session_id().map(str::to_string));
+            let Some(sid) = resolved_sid else {
+                g.status_notice = Some(
+                    tr(
+                        loc,
+                        "Open or start a terminal session first to send snippet",
+                        "请先打开或新建一个终端会话再发送提示词",
+                    )
+                    .to_string(),
+                );
+                self.ui_dirty.store(true, Ordering::Release);
+                return;
+            };
+            let sess_title = g
+                .session_by_id(&sid)
+                .map(|s| s.title.clone())
+                .unwrap_or_default();
+            if let Some(s) = g.sessions.iter_mut().find(|s| s.id == sid) {
+                s.scroll_offset = 0;
+            }
+            g.status_notice = Some(format!(
+                "{}: {title_hint}",
+                tr(loc, "Sent prompt", "已发送提示词")
+            ));
+            (sid, sess_title)
+        };
+        let vt_bracketed = self
+            .pty_mgr
+            .lock()
+            .map(|m| m.terminal_modes(&session_meta.0).1)
+            .unwrap_or(false);
+        let use_bracketed = resolve_effective_bracketed_paste(vt_bracketed, &session_meta.1);
+        let payload = encode_smart_bracketed_paste_submit(prompt, use_bracketed);
+        self.send_bytes_to_session(&session_meta.0, &payload);
+        self.ui_dirty.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn submit_terminal_composer_draft(&self, target_session_id: Option<&str>) {
+        let draft = {
+            let Ok(mut g) = self.state.lock() else {
+                return;
+            };
+            let d = g.composer_draft_input.trim().to_string();
+            if d.is_empty() {
+                g.input_target = ActiveInputTarget::TerminalDirect;
+                return;
+            }
+            g.composer_draft_input.clear();
+            g.input_selected_all = false;
+            g.input_target = ActiveInputTarget::TerminalDirect;
+            d
+        };
+        let label: String = draft.lines().next().unwrap_or("Composer").chars().take(36).collect();
+        self.send_prompt_snippet_to_session(target_session_id, &label, &draft);
+    }
+
+    pub(crate) fn save_composer_draft_as_snippet(&self) {
+        let (next_list, notice) = {
+            let Ok(mut g) = self.state.lock() else {
+                return;
+            };
+            let loc = g.locale;
+            let raw_prompt = g.composer_draft_input.trim().to_string();
+            if raw_prompt.is_empty() {
+                g.settings_open = true;
+                g.settings_section = SettingsSection::Runtime;
+                g.input_target = ActiveInputTarget::SnippetTitleInput;
+                self.ui_dirty.store(true, Ordering::Release);
+                return;
+            }
+            if g.prompt_snippets.len() >= MAX_PROMPT_SNIPPETS {
+                g.status_notice = Some(format!(
+                    "{} ({MAX_PROMPT_SNIPPETS})",
+                    tr(loc, "Snippet limit reached", "常用提示词数量已达上限")
+                ));
+                self.ui_dirty.store(true, Ordering::Release);
+                return;
+            }
+            let auto_title: String = raw_prompt
+                .lines()
+                .next()
+                .unwrap_or("Snippet")
+                .trim()
+                .chars()
+                .take(28)
+                .collect();
+            let id = format!("snip-{}", &Uuid::new_v4().simple().to_string()[..10]);
+            let mut list = g.prompt_snippets.clone();
+            list.push(PromptSnippet {
+                id,
+                title: auto_title.clone(),
+                prompt: raw_prompt,
+            });
+            g.input_selected_all = false;
+            let note = format!(
+                "{}: {auto_title}",
+                tr(loc, "Saved prompt snippet", "已保存常用提示词")
+            );
+            (list, note)
+        };
+        self.mesh_hub.save_prompt_snippets(next_list, Some(notice));
+    }
+
+    pub(crate) fn submit_add_custom_snippet(&self) {
+        let (next_list, notice) = {
+            let Ok(mut g) = self.state.lock() else {
+                return;
+            };
+            let loc = g.locale;
+            let title = g.snippet_title_input.trim().to_string();
+            let prompt = g.snippet_prompt_input.trim().to_string();
+            if title.is_empty() || prompt.is_empty() {
+                g.status_notice = Some(
+                    tr(
+                        loc,
+                        "Enter both snippet title and prompt text",
+                        "请输入提示词标题与内容",
+                    )
+                    .to_string(),
+                );
+                self.ui_dirty.store(true, Ordering::Release);
+                return;
+            }
+            if g.prompt_snippets.len() >= MAX_PROMPT_SNIPPETS {
+                g.status_notice = Some(format!(
+                    "{} ({MAX_PROMPT_SNIPPETS})",
+                    tr(loc, "Maximum 24 snippets reached", "最多可保存 24 条常用提示词")
+                ));
+                self.ui_dirty.store(true, Ordering::Release);
+                return;
+            }
+            let id = format!("snip-{}", &Uuid::new_v4().simple().to_string()[..10]);
+            let mut list = g.prompt_snippets.clone();
+            list.push(PromptSnippet {
+                id,
+                title: title.clone(),
+                prompt,
+            });
+            g.snippet_title_input.clear();
+            g.snippet_prompt_input.clear();
+            g.input_selected_all = false;
+            g.input_target = ActiveInputTarget::TerminalDirect;
+            let note = format!(
+                "{}: {title}",
+                tr(loc, "Added prompt snippet", "已添加常用提示词")
+            );
+            (list, note)
+        };
+        self.mesh_hub.save_prompt_snippets(next_list, Some(notice));
+    }
+
+    pub(crate) fn delete_custom_snippet(&self, snippet_id: &str) {
+        let (next_list, notice) = {
+            let Ok(g) = self.state.lock() else {
+                return;
+            };
+            let loc = g.locale;
+            let removed_title = g
+                .prompt_snippets
+                .iter()
+                .find(|s| s.id == snippet_id)
+                .map(|s| s.title.clone())
+                .unwrap_or_else(|| snippet_id.to_string());
+            let list: Vec<PromptSnippet> = g
+                .prompt_snippets
+                .iter()
+                .filter(|s| s.id != snippet_id)
+                .cloned()
+                .collect();
+            let note = format!(
+                "{}: {removed_title}",
+                tr(loc, "Deleted snippet", "已删除提示词")
+            );
+            (list, note)
+        };
+        self.mesh_hub.save_prompt_snippets(next_list, Some(notice));
+    }
+
+    pub(crate) fn submit_password_reset_token(&self) {
+        let (srv, raw_tok, new_pw) = {
+            let Ok(mut g) = self.state.lock() else {
+                return;
+            };
+            let loc = g.locale;
+            let s = g.server_url.trim().to_string();
+            let t = g.auth_reset_token_input.trim().to_string();
+            let p = g.auth_reset_new_pw_input.clone();
+            let (clean_tok, extracted_origin) =
+                crate::helpers::extract_reset_token_and_origin(&t);
+            let eff_srv = extracted_origin.as_deref().unwrap_or(&s);
+            if !is_safe_http_url(eff_srv) {
+                g.auth_error = Some(
+                    tr(
+                        loc,
+                        "Invalid server URL (must start with http:// or https://)",
+                        "无效的服务端地址（必须以 http:// 或 https:// 开头）",
+                    )
+                    .to_string(),
+                );
+                return;
+            }
+            if clean_tok.is_empty() || p.len() < 8 {
+                g.auth_error = Some(
+                    tr(
+                        loc,
+                        "Paste reset link / rst_... token and enter a new password (8+ chars)",
+                        "请粘贴重置链接或 rst_... 口令，并输入至少 8 位新密码",
+                    )
+                    .to_string(),
+                );
+                return;
+            }
+            g.auth_loading = true;
+            g.auth_error = None;
+            g.input_selected_all = false;
+            (s, t, p)
+        };
+        spawn_password_reset_with_token(
+            Arc::clone(&self.state),
+            Arc::clone(&self.ui_dirty),
+            srv,
+            raw_tok,
+            new_pw,
+        );
+    }
+
+    pub(crate) fn submit_create_admin_invite(&self) {
+        let note = {
+            let Ok(mut g) = self.state.lock() else {
+                return;
+            };
+            let n = g.admin_invite_note_input.trim().to_string();
+            g.admin_invite_note_input.clear();
+            g.input_selected_all = false;
+            g.input_target = ActiveInputTarget::TerminalDirect;
+            n
+        };
+        self.mesh_hub.create_admin_invite_code(note);
+    }
+
+    pub(crate) fn open_app_update_settings(&self) {
+        if let Ok(mut g) = self.state.lock() {
+            g.palette_open = false;
+            g.bootstrap_modal.open = false;
+            g.settings_open = true;
+            g.settings_section = SettingsSection::Appearance;
+            g.input_target = ActiveInputTarget::TerminalDirect;
+        }
+        self.ui_dirty.store(true, Ordering::Release);
     }
 
     fn submit_rename_device(&self) {
@@ -4387,16 +5060,22 @@ impl CodaGpuWorkspaceView {
                 }
             }
             PaletteAction::OpenSettings => {
-                let should_fetch = if let Ok(mut g) = self.state.lock() {
+                let is_logged = if let Ok(mut g) = self.state.lock() {
                     g.bootstrap_modal.open = false;
                     g.settings_open = true;
-                    g.is_logged_in && !g.webhook_dirty && !g.webhook_loading
+                    g.is_logged_in
                 } else {
                     false
                 };
-                if should_fetch {
-                    self.reload_notification_webhooks();
+                if is_logged {
+                    self.reload_account_settings_data();
                 }
+            }
+            PaletteAction::OpenAppUpdate => {
+                self.open_app_update_settings();
+            }
+            PaletteAction::RunSnippet { title, prompt } => {
+                self.send_prompt_snippet_to_session(None, &title, &prompt);
             }
             PaletteAction::ToggleLocale => self.toggle_locale(),
             PaletteAction::OpenTerminalSearch => {
@@ -4437,21 +5116,34 @@ impl CodaGpuWorkspaceView {
         self.ui_dirty.store(true, Ordering::Release);
     }
 
+    pub(crate) fn reload_account_settings_data(&self) {
+        let should_wh = self
+            .state
+            .lock()
+            .map(|g| g.is_logged_in && !g.webhook_dirty && !g.webhook_loading)
+            .unwrap_or(false);
+        if should_wh {
+            self.reload_notification_webhooks();
+        }
+        self.mesh_hub.fetch_prompt_snippets();
+        self.mesh_hub.refresh_account_profile_and_admin_data();
+    }
+
     fn toggle_settings_modal(&self) {
-        let mut should_fetch_wh = false;
+        let mut should_sync = false;
         if let Ok(mut g) = self.state.lock() {
             g.settings_open = !g.settings_open;
             if g.settings_open {
                 g.palette_open = false;
                 g.bootstrap_modal.open = false;
-                should_fetch_wh = g.is_logged_in && !g.webhook_dirty && !g.webhook_loading;
+                should_sync = g.is_logged_in;
             } else {
                 g.clear_settings_ephemeral_inputs();
             }
             g.input_target = ActiveInputTarget::TerminalDirect;
         }
-        if should_fetch_wh {
-            self.reload_notification_webhooks();
+        if should_sync {
+            self.reload_account_settings_data();
         }
         self.ui_dirty.store(true, Ordering::Release);
     }
@@ -5017,6 +5709,7 @@ impl CodaGpuWorkspaceView {
         Self::update_prefs_async(move |prefs| {
             prefs.server_url = trimmed;
         });
+        self.mesh_hub.check_desktop_self_update(false);
         self.ui_dirty.store(true, Ordering::Release);
     }
 
@@ -6485,6 +7178,43 @@ impl CodaGpuWorkspaceView {
                     .flex()
                     .items_center()
                     .gap(px(6.0))
+                    .when(st.self_update.update_available, |el| {
+                        let tag = st
+                            .self_update
+                            .latest_version
+                            .clone()
+                            .unwrap_or_else(|| "latest".to_string());
+                        let is_updating = st.self_update.updating;
+                        let pill_label = if is_updating {
+                            format!(
+                                "⟳ {} {tag}…",
+                                tr(loc, "Updating", "更新中")
+                            )
+                        } else {
+                            format!("✨ Update {tag}")
+                        };
+                        el.child(
+                            div()
+                                .id("btn-topbar-self-update")
+                                .occlude()
+                                .px(px(9.0))
+                                .py(px(4.0))
+                                .rounded(px(99.0))
+                                .bg(rgba(0x22c55e24))
+                                .border_1()
+                                .border_color(rgb(palette::DONE_GREEN))
+                                .hover(|h| h.bg(rgba(0x22c55e38)))
+                                .cursor_pointer()
+                                .text_size(px(11.0))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(palette::DONE_GREEN))
+                                .child(pill_label)
+                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                    this.open_app_update_settings();
+                                    cx.notify();
+                                })),
+                        )
+                    })
                     .child(
                         div()
                             .id("btn-split-toggle")
@@ -6691,6 +7421,17 @@ impl CodaGpuWorkspaceView {
         let line_h = (font_size_px * 1.32).round();
 
         let Some(sess) = sess else {
+            let show_quickstart = pane_slot == SplitPane::Primary
+                && st.remote_hosts.is_empty()
+                && st.sessions.is_empty()
+                && !st.quickstart_dismissed;
+            if show_quickstart {
+                return self.render_quickstart_onboarding_card(st, cx).into_any_element();
+            }
+            let can_reopen_quickstart = pane_slot == SplitPane::Primary
+                && st.remote_hosts.is_empty()
+                && st.sessions.is_empty()
+                && st.quickstart_dismissed;
             return div()
                 .size_full()
                 .bg(rgb(palette::CANVAS_BG))
@@ -6707,26 +7448,58 @@ impl CodaGpuWorkspaceView {
                 )
                 .child(
                     div()
-                        .id(SharedString::from(format!("empty-spawn-{pane_slot:?}")))
-                        .occlude()
-                        .px(px(12.0))
-                        .py(px(6.0))
-                        .rounded(px(6.0))
-                        .bg(rgb(palette::SURFACE_BG))
-                        .border_1()
-                        .border_color(rgb(palette::BORDER_STRONG))
-                        .hover(|h| h.bg(rgb(palette::HOVER_BG)))
-                        .cursor_pointer()
-                        .text_size(px(12.0))
-                        .text_color(rgb(palette::TEXT_PRIMARY))
-                        .child(tr(loc, "+ Start Shell", "+ 启动终端"))
-                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                            if let Ok(mut g) = this.state.lock() {
-                                g.focused_pane = pane_slot;
-                            }
-                            this.spawn_terminal_in_active_space(None);
-                            cx.notify();
-                        })),
+                        .flex()
+                        .items_center()
+                        .gap(px(8.0))
+                        .child(
+                            div()
+                                .id(SharedString::from(format!("empty-spawn-{pane_slot:?}")))
+                                .occlude()
+                                .px(px(12.0))
+                                .py(px(6.0))
+                                .rounded(px(6.0))
+                                .bg(rgb(palette::SURFACE_BG))
+                                .border_1()
+                                .border_color(rgb(palette::BORDER_STRONG))
+                                .hover(|h| h.bg(rgb(palette::HOVER_BG)))
+                                .cursor_pointer()
+                                .text_size(px(12.0))
+                                .text_color(rgb(palette::TEXT_PRIMARY))
+                                .child(tr(loc, "+ Start Shell", "+ 启动终端"))
+                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                    if let Ok(mut g) = this.state.lock() {
+                                        g.focused_pane = pane_slot;
+                                    }
+                                    this.spawn_terminal_in_active_space(None);
+                                    cx.notify();
+                                })),
+                        )
+                        .when(can_reopen_quickstart, |el| {
+                            el.child(
+                                div()
+                                    .id("btn-reopen-quickstart")
+                                    .occlude()
+                                    .px(px(10.0))
+                                    .py(px(6.0))
+                                    .rounded(px(6.0))
+                                    .border_1()
+                                    .border_color(rgb(palette::BORDER))
+                                    .hover(|h| h.bg(rgb(palette::HOVER_BG)))
+                                    .cursor_pointer()
+                                    .text_size(px(11.5))
+                                    .text_color(rgb(accent))
+                                    .child(tr(loc, "3-Step Quickstart", "三步快速向导"))
+                                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                        if let Ok(mut g) = this.state.lock() {
+                                            g.quickstart_dismissed = false;
+                                        }
+                                        Self::update_prefs_async(|p| {
+                                            p.quickstart_dismissed = false;
+                                        });
+                                        cx.notify();
+                                    })),
+                            )
+                        }),
                 )
                 .into_any_element();
         };
@@ -7412,6 +8185,14 @@ impl CodaGpuWorkspaceView {
                                 ),
                         ),
                 )
+            })
+            .when(is_focused, |el| {
+                el.child(self.render_terminal_composer_and_snippets_bar(
+                    st,
+                    &sess.id,
+                    pane_slot,
+                    cx,
+                ))
             })
             .child(
                 // Minimal terminal status footer strip (26px)
@@ -8548,6 +9329,7 @@ impl CodaGpuWorkspaceView {
                         self.render_mesh_drawer_body(st, el, cx)
                     }),
             )
+            .child(self.render_drawer_snippets_footer(st, cx))
     }
 
     fn render_mesh_drawer_body(
@@ -8948,6 +9730,38 @@ impl CodaGpuWorkspaceView {
                                 cx.notify();
                             })),
                     )
+                    .child(
+                        div()
+                            .id("btn-drawer-open-reset-token")
+                            .occlude()
+                            .px(px(8.0))
+                            .py(px(4.0))
+                            .rounded(px(4.0))
+                            .hover(|h| h.bg(rgb(palette::HOVER_BG)))
+                            .cursor_pointer()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_size(px(10.5))
+                            .text_color(rgb(accent))
+                            .child(tr(
+                                loc,
+                                "Reset Password with Token…",
+                                "使用重置口令重置密码…",
+                            ))
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                if let Ok(mut g) = this.state.lock() {
+                                    g.settings_open = true;
+                                    g.settings_section = SettingsSection::Machines;
+                                    g.auth_form_expanded = true;
+                                    g.auth_reset_mode = true;
+                                    g.auth_error = None;
+                                    g.input_selected_all = false;
+                                    g.input_target = ActiveInputTarget::AuthResetToken;
+                                }
+                                cx.notify();
+                            })),
+                    )
                     .when_some(st.auth_error.clone(), |el, err| {
                         el.child(
                             div()
@@ -9105,6 +9919,663 @@ impl CodaGpuWorkspaceView {
         }))
     }
 
+    fn render_quickstart_onboarding_card(
+        &self,
+        st: &CodaDesktopState,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let loc = st.locale;
+        let accent = st.layout.accent_color_u32();
+        let install_cmd = build_daemon_install_command(&st.server_url);
+        let install_cmd_copy = install_cmd.clone();
+
+        let agent_buttons: &[(&str, &str)] = &[
+            ("Claude Code", "claude"),
+            ("Codex", "codex"),
+            ("Grok", "grok"),
+            ("AGY", "agy"),
+            ("Gemini", "gemini"),
+        ];
+
+        div()
+            .size_full()
+            .bg(rgb(palette::CANVAS_BG))
+            .p(px(24.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                div()
+                    .id("quickstart-onboarding-card")
+                    .occlude()
+                    .w(px(560.0))
+                    .p(px(18.0))
+                    .rounded(px(10.0))
+                    .bg(rgb(palette::CHROME_BG))
+                    .border_1()
+                    .border_color(rgb(palette::BORDER_STRONG))
+                    .flex()
+                    .flex_col()
+                    .gap(px(12.0))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap(px(8.0))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(2.0))
+                                    .child(
+                                        div()
+                                            .text_size(px(14.0))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(rgb(palette::TEXT_PRIMARY))
+                                            .child(tr(
+                                                loc,
+                                                "3-Step Quickstart · Coda Agent Mesh",
+                                                "三步快速上手 · Coda 多端智能体工作台",
+                                            )),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(11.0))
+                                            .text_color(rgb(palette::TEXT_DIM))
+                                            .child(tr(
+                                                loc,
+                                                "Zero-knowledge E2EE terminals across Mac, Linux, Web & iPhone",
+                                                "零知识端到端加密连接 Mac、Linux 服务器、网页端与 iPhone",
+                                            )),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .id("btn-dismiss-quickstart")
+                                    .occlude()
+                                    .px(px(7.0))
+                                    .py(px(3.0))
+                                    .rounded(px(5.0))
+                                    .hover(|h| h.bg(rgb(palette::HOVER_BG)))
+                                    .cursor_pointer()
+                                    .text_size(px(11.0))
+                                    .text_color(rgb(palette::TEXT_MUTED))
+                                    .child(tr(loc, "Dismiss ×", "关闭 ×"))
+                                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                        if let Ok(mut g) = this.state.lock() {
+                                            g.quickstart_dismissed = true;
+                                        }
+                                        Self::update_prefs_async(|p| {
+                                            p.quickstart_dismissed = true;
+                                        });
+                                        cx.notify();
+                                    })),
+                            ),
+                    )
+                    // Step 1: Bind Mac or Linux server
+                    .child(
+                        div()
+                            .p(px(11.0))
+                            .rounded(px(7.0))
+                            .bg(rgb(palette::SURFACE_BG))
+                            .border_1()
+                            .border_color(rgb(palette::BORDER))
+                            .flex()
+                            .flex_col()
+                            .gap(px(7.0))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .gap(px(8.0))
+                                    .child(
+                                        div()
+                                            .text_size(px(12.0))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(rgb(palette::TEXT_PRIMARY))
+                                            .child(tr(
+                                                loc,
+                                                "1. Bind your Mac or Linux server",
+                                                "1. 绑定本机或远端 Linux 服务器",
+                                            )),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(6.0))
+                                            .child(
+                                                div()
+                                                    .id("btn-quickstart-copy-install")
+                                                    .occlude()
+                                                    .px(px(9.0))
+                                                    .py(px(4.0))
+                                                    .rounded(px(5.0))
+                                                    .bg(rgb(accent))
+                                                    .hover(|h| h.opacity(0.92))
+                                                    .cursor_pointer()
+                                                    .text_size(px(11.0))
+                                                    .font_weight(FontWeight::SEMIBOLD)
+                                                    .text_color(rgb(0x09090b))
+                                                    .child(tr(
+                                                        loc,
+                                                        "Copy 1-Line Install",
+                                                        "复制一行装机命令",
+                                                    ))
+                                                    .on_click(cx.listener(
+                                                        move |this, _: &ClickEvent, _, cx| {
+                                                            cx.write_to_clipboard(
+                                                                ClipboardItem::new_string(
+                                                                    install_cmd_copy.clone(),
+                                                                ),
+                                                            );
+                                                            if let Ok(mut g) = this.state.lock() {
+                                                                g.status_notice = Some(
+                                                                    tr(
+                                                                        g.locale,
+                                                                        "Copied 1-line daemon install command",
+                                                                        "已复制守护进程一行安装命令",
+                                                                    )
+                                                                    .to_string(),
+                                                                );
+                                                            }
+                                                            cx.notify();
+                                                        },
+                                                    )),
+                                            )
+                                            .child(
+                                                div()
+                                                    .id("btn-quickstart-account")
+                                                    .occlude()
+                                                    .px(px(8.0))
+                                                    .py(px(4.0))
+                                                    .rounded(px(5.0))
+                                                    .bg(rgb(palette::CHROME_BG))
+                                                    .border_1()
+                                                    .border_color(rgb(palette::BORDER))
+                                                    .hover(|h| h.bg(rgb(palette::HOVER_BG)))
+                                                    .cursor_pointer()
+                                                    .text_size(px(11.0))
+                                                    .text_color(rgb(palette::TEXT_PRIMARY))
+                                                    .child(if st.is_logged_in {
+                                                        tr(loc, "Nodes & Account", "账号与节点")
+                                                    } else {
+                                                        tr(loc, "Sign In", "登录账号")
+                                                    })
+                                                    .on_click(cx.listener(
+                                                        |this, _: &ClickEvent, _, cx| {
+                                                            let is_logged =
+                                                                if let Ok(mut g) = this.state.lock() {
+                                                                    g.settings_open = true;
+                                                                    g.settings_section =
+                                                                        SettingsSection::Machines;
+                                                                    if !g.is_logged_in {
+                                                                        g.auth_form_expanded = true;
+                                                                        g.input_target =
+                                                                            ActiveInputTarget::AuthAccount;
+                                                                    }
+                                                                    g.is_logged_in
+                                                                } else {
+                                                                    false
+                                                                };
+                                                            if is_logged {
+                                                                this.reload_account_settings_data();
+                                                            }
+                                                            cx.notify();
+                                                        },
+                                                    )),
+                                            ),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .px(px(8.0))
+                                    .py(px(5.0))
+                                    .rounded(px(4.0))
+                                    .bg(rgb(palette::CANVAS_BG))
+                                    .border_1()
+                                    .border_color(rgb(palette::BORDER))
+                                    .font_family("Menlo")
+                                    .text_size(px(10.5))
+                                    .text_color(rgb(palette::TEXT_MUTED))
+                                    .truncate()
+                                    .child(install_cmd),
+                            ),
+                    )
+                    // Step 2: Launch Claude Code / Codex / Grok / AGY
+                    .child(
+                        div()
+                            .p(px(11.0))
+                            .rounded(px(7.0))
+                            .bg(rgb(palette::SURFACE_BG))
+                            .border_1()
+                            .border_color(rgb(palette::BORDER))
+                            .flex()
+                            .flex_col()
+                            .gap(px(7.0))
+                            .child(
+                                div()
+                                    .text_size(px(12.0))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(palette::TEXT_PRIMARY))
+                                    .child(tr(
+                                        loc,
+                                        "2. Launch Claude Code / Codex / Grok / AGY",
+                                        "2. 一键启动 Claude Code / Codex / Grok / AGY",
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_wrap()
+                                    .items_center()
+                                    .gap(px(6.0))
+                                    .children(agent_buttons.iter().map(|&(label, cmd)| {
+                                        div()
+                                            .id(SharedString::from(format!(
+                                                "btn-quickstart-agent-{cmd}"
+                                            )))
+                                            .occlude()
+                                            .px(px(9.0))
+                                            .py(px(4.0))
+                                            .rounded(px(5.0))
+                                            .bg(rgb(palette::CHROME_BG))
+                                            .border_1()
+                                            .border_color(rgb(palette::BORDER_STRONG))
+                                            .hover(|h| {
+                                                h.bg(rgb(palette::HOVER_BG))
+                                                    .border_color(rgb(accent))
+                                            })
+                                            .cursor_pointer()
+                                            .text_size(px(11.0))
+                                            .text_color(rgb(palette::TEXT_PRIMARY))
+                                            .child(label)
+                                            .on_click(cx.listener(
+                                                move |this, _: &ClickEvent, _, cx| {
+                                                    this.launch_agent_session(cmd);
+                                                    cx.notify();
+                                                },
+                                            ))
+                                    }))
+                                    .child(
+                                        div()
+                                            .id("btn-quickstart-shell")
+                                            .occlude()
+                                            .px(px(9.0))
+                                            .py(px(4.0))
+                                            .rounded(px(5.0))
+                                            .bg(rgb(palette::CHROME_BG))
+                                            .border_1()
+                                            .border_color(rgb(palette::BORDER))
+                                            .hover(|h| h.bg(rgb(palette::HOVER_BG)))
+                                            .cursor_pointer()
+                                            .text_size(px(11.0))
+                                            .text_color(rgb(palette::TEXT_MUTED))
+                                            .child(tr(loc, "+ Shell", "+ 本地终端"))
+                                            .on_click(cx.listener(
+                                                |this, _: &ClickEvent, _, cx| {
+                                                    this.spawn_terminal_in_active_space(None);
+                                                    cx.notify();
+                                                },
+                                            )),
+                                    ),
+                            ),
+                    )
+                    // Step 3: Configure Lock-Screen Push / Alerts
+                    .child(
+                        div()
+                            .p(px(11.0))
+                            .rounded(px(7.0))
+                            .bg(rgb(palette::SURFACE_BG))
+                            .border_1()
+                            .border_color(rgb(palette::BORDER))
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap(px(10.0))
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .flex_1()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(2.0))
+                                    .child(
+                                        div()
+                                            .text_size(px(12.0))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(rgb(palette::TEXT_PRIMARY))
+                                            .child(tr(
+                                                loc,
+                                                "3. Configure Lock-Screen Push / Alerts",
+                                                "3. 配置锁屏推送与离线告警通知",
+                                            )),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(10.5))
+                                            .text_color(rgb(palette::TEXT_DIM))
+                                            .truncate()
+                                            .child(tr(
+                                                loc,
+                                                "Get instant Needs-You & task completion pushes via Bark, Telegram, Feishu, or Discord",
+                                                "当智能体等待审批 (Needs-You) 或完成任务时推送到手机锁屏与群聊",
+                                            )),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .id("btn-quickstart-configure-alerts")
+                                    .occlude()
+                                    .flex_shrink_0()
+                                    .px(px(9.0))
+                                    .py(px(4.0))
+                                    .rounded(px(5.0))
+                                    .bg(rgb(palette::CHROME_BG))
+                                    .border_1()
+                                    .border_color(rgb(accent))
+                                    .hover(|h| h.bg(rgb(palette::HOVER_BG)))
+                                    .cursor_pointer()
+                                    .text_size(px(11.0))
+                                    .text_color(rgb(accent))
+                                    .child(tr(loc, "Configure Alerts", "配置推送告警"))
+                                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                        let is_logged = if let Ok(mut g) = this.state.lock() {
+                                            g.settings_open = true;
+                                            g.settings_section = SettingsSection::Machines;
+                                            g.input_selected_all = false;
+                                            g.input_target = ActiveInputTarget::WebhookBarkUrl;
+                                            g.is_logged_in
+                                        } else {
+                                            false
+                                        };
+                                        if is_logged {
+                                            this.reload_account_settings_data();
+                                        }
+                                        cx.notify();
+                                    })),
+                            ),
+                    ),
+            )
+    }
+
+    fn render_terminal_composer_and_snippets_bar(
+        &self,
+        st: &CodaDesktopState,
+        session_id: &str,
+        pane_slot: SplitPane,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let loc = st.locale;
+        let accent = st.layout.accent_color_u32();
+        let composer_focused = st.input_target == ActiveInputTarget::TerminalComposerInput;
+        let draft_display = if st.composer_draft_input.is_empty() {
+            if composer_focused {
+                "▏".to_string()
+            } else {
+                tr(
+                    loc,
+                    "Compose prompt (smart paste ↵) or click a snippet…",
+                    "输入多行提示词（智能括号粘贴 ↵）或点击下方常用指令…",
+                )
+                .to_string()
+            }
+        } else {
+            let flat = st.composer_draft_input.replace('\n', " ↵ ");
+            if composer_focused {
+                format!("{flat}▏")
+            } else {
+                flat
+            }
+        };
+        let sid_send = session_id.to_string();
+
+        div()
+            .flex_shrink_0()
+            .px(px(10.0))
+            .py(px(5.0))
+            .bg(rgb(palette::CHROME_BG))
+            .border_t_1()
+            .border_color(rgb(palette::BORDER))
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap(px(6.0))
+            .child(
+                div()
+                    .min_w_0()
+                    .flex_1()
+                    .flex()
+                    .items_center()
+                    .gap(px(5.0))
+                    .child(
+                        div()
+                            .id(SharedString::from(format!(
+                                "term-composer-input-{pane_slot:?}"
+                            )))
+                            .occlude()
+                            .min_w(px(170.0))
+                            .flex_1()
+                            .px(px(8.0))
+                            .py(px(3.5))
+                            .rounded(px(5.0))
+                            .bg(rgb(palette::CANVAS_BG))
+                            .border_1()
+                            .border_color(rgb(if composer_focused {
+                                accent
+                            } else {
+                                palette::BORDER
+                            }))
+                            .cursor_pointer()
+                            .text_size(px(11.0))
+                            .text_color(rgb(
+                                if st.composer_draft_input.is_empty() && !composer_focused {
+                                    palette::TEXT_DIM
+                                } else {
+                                    palette::TEXT_PRIMARY
+                                },
+                            ))
+                            .truncate()
+                            .child(draft_display)
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                cx.stop_propagation();
+                            })
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                cx.stop_propagation();
+                                if let Ok(mut g) = this.state.lock() {
+                                    g.input_selected_all = false;
+                                    g.input_target = ActiveInputTarget::TerminalComposerInput;
+                                }
+                                cx.notify();
+                            })),
+                    )
+                    .when(!st.composer_draft_input.trim().is_empty(), |el| {
+                        el.child(
+                            div()
+                                .id(SharedString::from(format!(
+                                    "term-composer-send-{pane_slot:?}"
+                                )))
+                                .occlude()
+                                .flex_shrink_0()
+                                .px(px(8.0))
+                                .py(px(3.0))
+                                .rounded(px(4.0))
+                                .bg(rgb(accent))
+                                .cursor_pointer()
+                                .text_size(px(10.5))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(0x09090b))
+                                .child(tr(loc, "Send ↵", "发送 ↵"))
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                    cx.stop_propagation();
+                                })
+                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                    cx.stop_propagation();
+                                    this.submit_terminal_composer_draft(Some(&sid_send));
+                                    cx.notify();
+                                })),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .gap(px(4.0))
+                    .children(st.prompt_snippets.iter().take(4).enumerate().map(|(idx, snip)| {
+                        let s_title = snip.title.clone();
+                        let s_prompt = snip.prompt.clone();
+                        let sid_chip = session_id.to_string();
+                        div()
+                            .id(SharedString::from(format!(
+                                "term-snip-chip-{pane_slot:?}-{idx}"
+                            )))
+                            .occlude()
+                            .px(px(7.0))
+                            .py(px(2.5))
+                            .rounded(px(99.0))
+                            .bg(rgb(palette::SURFACE_BG))
+                            .border_1()
+                            .border_color(rgb(palette::BORDER))
+                            .hover(|h| {
+                                h.bg(rgb(palette::HOVER_BG))
+                                    .border_color(rgb(accent))
+                                    .text_color(rgb(palette::TEXT_PRIMARY))
+                            })
+                            .cursor_pointer()
+                            .text_size(px(10.5))
+                            .text_color(rgb(palette::TEXT_MUTED))
+                            .child(format!("⚡ {}", snip.title))
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                cx.stop_propagation();
+                            })
+                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                cx.stop_propagation();
+                                this.send_prompt_snippet_to_session(
+                                    Some(&sid_chip),
+                                    &s_title,
+                                    &s_prompt,
+                                );
+                                cx.notify();
+                            }))
+                    }))
+                    .child(
+                        div()
+                            .id(SharedString::from(format!(
+                                "term-snip-manage-{pane_slot:?}"
+                            )))
+                            .occlude()
+                            .px(px(6.0))
+                            .py(px(2.5))
+                            .rounded(px(99.0))
+                            .hover(|h| h.bg(rgb(palette::HOVER_BG)))
+                            .cursor_pointer()
+                            .text_size(px(10.5))
+                            .text_color(rgb(accent))
+                            .child(if st.composer_draft_input.trim().is_empty() {
+                                tr(loc, "+ Snippets", "+ 提示词")
+                            } else {
+                                tr(loc, "+ Save", "+ 存为常用")
+                            })
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                cx.stop_propagation();
+                            })
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                cx.stop_propagation();
+                                this.save_composer_draft_as_snippet();
+                                cx.notify();
+                            })),
+                    ),
+            )
+    }
+
+    fn render_drawer_snippets_footer(
+        &self,
+        st: &CodaDesktopState,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let loc = st.locale;
+        let accent = st.layout.accent_color_u32();
+
+        div()
+            .flex_shrink_0()
+            .p(px(8.0))
+            .border_t_1()
+            .border_color(rgb(palette::BORDER))
+            .bg(rgb(palette::CHROME_BG))
+            .flex()
+            .flex_col()
+            .gap(px(5.0))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(palette::TEXT_DIM))
+                            .child(tr(loc, "PROMPT SNIPPETS (1-CLICK)", "常用提示词（一键发送）")),
+                    )
+                    .child(
+                        div()
+                            .id("drawer-manage-snippets")
+                            .occlude()
+                            .px(px(5.0))
+                            .py(px(1.5))
+                            .rounded(px(4.0))
+                            .hover(|h| h.bg(rgb(palette::HOVER_BG)))
+                            .cursor_pointer()
+                            .text_size(px(10.0))
+                            .text_color(rgb(accent))
+                            .child(tr(loc, "Manage…", "管理…"))
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                if let Ok(mut g) = this.state.lock() {
+                                    g.settings_open = true;
+                                    g.settings_section = SettingsSection::Runtime;
+                                    g.input_target = ActiveInputTarget::SnippetTitleInput;
+                                }
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap(px(4.0))
+                    .children(st.prompt_snippets.iter().take(6).enumerate().map(|(idx, snip)| {
+                        let s_title = snip.title.clone();
+                        let s_prompt = snip.prompt.clone();
+                        div()
+                            .id(SharedString::from(format!("drawer-snip-chip-{idx}")))
+                            .occlude()
+                            .px(px(7.0))
+                            .py(px(2.5))
+                            .rounded(px(99.0))
+                            .bg(rgb(palette::SURFACE_BG))
+                            .border_1()
+                            .border_color(rgb(palette::BORDER))
+                            .hover(|h| {
+                                h.bg(rgb(palette::HOVER_BG))
+                                    .border_color(rgb(accent))
+                                    .text_color(rgb(palette::TEXT_PRIMARY))
+                            })
+                            .cursor_pointer()
+                            .text_size(px(10.5))
+                            .text_color(rgb(palette::TEXT_MUTED))
+                            .child(format!("⚡ {}", snip.title))
+                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                this.send_prompt_snippet_to_session(None, &s_title, &s_prompt);
+                                cx.notify();
+                            }))
+                    })),
+            )
+    }
 }
 
 
@@ -10466,5 +11937,183 @@ mod tests {
                 );
             });
         }
+    }
+
+    #[test]
+    fn test_v11_snippets_disk_cache_palette_and_app_update_palette() {
+        let _cfg_lock = CONFIG_OVERRIDE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        struct OverrideReset;
+        impl Drop for OverrideReset {
+            fn drop(&mut self) {
+                set_config_root_override(None);
+            }
+        }
+        let tmp_dir = std::env::temp_dir().join(format!("coda-snip-test-{}", Uuid::new_v4()));
+        set_config_root_override(Some(tmp_dir.clone()));
+        let _guard = OverrideReset;
+
+        // Without cache file, curated starter snippets load cleanly
+        let defaults = crate::config::load_snippets_from_disk_or_default();
+        assert_eq!(defaults.len(), 4);
+        assert!(defaults.iter().any(|s| s.title == "Run Tests & Fix"));
+
+        // Save custom snippets to ~/.config/coda/snippets.json and reload
+        let custom = vec![
+            PromptSnippet {
+                id: "c1".to_string(),
+                title: "Audit Security".to_string(),
+                prompt: "Audit authentication, SSRF, and E2EE boundaries.".to_string(),
+            },
+            PromptSnippet {
+                id: "c2".to_string(),
+                title: "Ship Release".to_string(),
+                prompt: "Run cargo test --workspace and summarize.".to_string(),
+            },
+        ];
+        crate::config::save_snippets_to_disk(&custom).expect("save snippets.json");
+        assert!(tmp_dir.join("snippets.json").is_file());
+        let reloaded = crate::config::load_snippets_from_disk_or_default();
+        assert_eq!(reloaded, custom);
+
+        // Command Palette registers each snippet as `Snippet: <title>` and surfaces `OpenAppUpdate` when available
+        let mut st = CodaDesktopState::default();
+        st.prompt_snippets = reloaded;
+        st.self_update.update_available = true;
+        st.self_update.latest_version = Some("v9.9.0".to_string());
+
+        let all_items = st.palette_items();
+        assert!(
+            matches!(all_items.first().map(|i| &i.action), Some(PaletteAction::OpenAppUpdate)),
+            "Update available must place OpenAppUpdate at top of Command Palette"
+        );
+        st.palette_query = "snippet: audit".to_string();
+        let snip_matches = st.palette_items();
+        assert_eq!(snip_matches.len(), 1);
+        assert_eq!(snip_matches[0].label, "Snippet: Audit Security");
+        assert!(matches!(
+            &snip_matches[0].action,
+            PaletteAction::RunSnippet { title, prompt }
+            if title == "Audit Security" && prompt.contains("E2EE boundaries")
+        ));
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_v11_snippets_admin_friends_invites_and_reset_password_endpoints() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let friend_id = Uuid::parse_str("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").unwrap();
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let base_url = format!("http://127.0.0.1:{port}");
+        let srv_url = base_url.clone();
+
+        tokio::spawn(async move {
+            for _ in 0..8 {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = vec![0u8; 8192];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let body_json = if req.starts_with("GET /api/v1/auth/me ") {
+                    r#"{"id":"11111111-1111-1111-1111-111111111111","email":"admin@coda.dev","handle":"admin","display_name":"Admin","is_admin":true}"#.to_string()
+                } else if req.starts_with("GET /api/v1/me/snippets ") {
+                    r#"{"snippets":[{"id":"s1","title":"Run Tests","prompt":"cargo test"}]}"#.to_string()
+                } else if req.starts_with("PUT /api/v1/me/snippets ") {
+                    assert!(req.contains("Deploy Check"));
+                    r#"{"snippets":[{"id":"s1","title":"Run Tests","prompt":"cargo test"},{"id":"s2","title":"Deploy Check","prompt":"check health"}]}"#.to_string()
+                } else if req.starts_with("GET /api/v1/invites ") {
+                    r#"[{"code":"CODA-FRIEND1","note":"Alice","max_uses":5,"used_count":1}]"#.to_string()
+                } else if req.starts_with("POST /api/v1/invites ") {
+                    r#"{"code":"CODA-NEW999","note":"Bob","max_uses":5,"used_count":0}"#.to_string()
+                } else if req.starts_with("GET /api/v1/admin/users ") {
+                    format!(
+                        r#"{{"users":[{{"id":"{friend_id}","handle":"alice","email":"alice@coda.dev","display_name":"Alice","is_admin":false,"online_devices":2,"total_devices":3}}]}}"#
+                    )
+                } else if req.starts_with(&format!("POST /api/v1/admin/users/{friend_id}/reset-link ")) {
+                    format!(
+                        r#"{{"ok":true,"user_id":"{friend_id}","handle":"alice","reset_token":"rst_testtoken1234567890","reset_url":"{srv_url}/reset-password?token=rst_testtoken1234567890","expires_in_secs":86400}}"#
+                    )
+                } else if req.starts_with("POST /api/v1/auth/reset-password ") {
+                    assert!(
+                        req.contains("\"token\":\"rst_testtoken1234567890\""),
+                        "expected extracted raw token in reset-password body: {req}"
+                    );
+                    assert!(req.contains("\"new_password\":\"NewStrongPass123!\""));
+                    r#"{"ok":true,"handle":"alice"}"#.to_string()
+                } else {
+                    r#"{"error":"unexpected"}"#.to_string()
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body_json.len(),
+                    body_json
+                );
+                let _ = stream.write_all(resp.as_bytes()).await;
+            }
+        });
+
+        let me = crate::remote_mesh::api_get_auth_me(&base_url, "adm-tok")
+            .await
+            .unwrap();
+        assert!(me.is_admin);
+        assert_eq!(me.handle, "admin");
+
+        let snips = crate::remote_mesh::api_get_prompt_snippets(&base_url, "adm-tok")
+            .await
+            .unwrap();
+        assert_eq!(snips.len(), 1);
+        assert_eq!(snips[0].title, "Run Tests");
+
+        let mut next_snips = snips;
+        next_snips.push(PromptSnippet {
+            id: "s2".to_string(),
+            title: "Deploy Check".to_string(),
+            prompt: "check health".to_string(),
+        });
+        let saved_snips =
+            crate::remote_mesh::api_put_prompt_snippets(&base_url, "adm-tok", &next_snips)
+                .await
+                .unwrap();
+        assert_eq!(saved_snips.len(), 2);
+
+        let invites = crate::remote_mesh::api_list_invites(&base_url, "adm-tok")
+            .await
+            .unwrap();
+        assert_eq!(invites[0].code, "CODA-FRIEND1");
+        let created_inv =
+            crate::remote_mesh::api_create_invite(&base_url, "adm-tok", "Bob", 5, 30)
+                .await
+                .unwrap();
+        assert_eq!(created_inv.code, "CODA-NEW999");
+
+        let friends = crate::remote_mesh::api_get_admin_users(&base_url, "adm-tok")
+            .await
+            .unwrap();
+        assert_eq!(friends.len(), 1);
+        assert_eq!(friends[0].handle, "alice");
+        assert_eq!(friends[0].online_devices, 2);
+        assert_eq!(friends[0].total_devices, 3);
+
+        let reset_link = crate::remote_mesh::api_create_admin_user_reset_link(
+            &base_url, "adm-tok", friend_id,
+        )
+        .await
+        .unwrap();
+        assert!(reset_link.reset_url.contains("token=rst_testtoken1234567890"));
+
+        // Friend pastes the full WeChat reset URL directly into Coda.app Sign-In reset form
+        let reset_handle = crate::remote_mesh::api_reset_password_with_token(
+            "https://codahub.dev",
+            &reset_link.reset_url,
+            "NewStrongPass123!",
+        )
+        .await
+        .unwrap();
+        assert_eq!(reset_handle, "alice");
     }
 }

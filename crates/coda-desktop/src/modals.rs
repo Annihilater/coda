@@ -4,14 +4,15 @@ use std::sync::Arc;
 
 use coda_herdr::discover_hc_binary;
 use gpui::{
-    div, prelude::*, px, rgb, rgba, App, ClickEvent, Context, FontWeight, MouseButton,
-    SharedString, Window,
+    div, prelude::*, px, rgb, rgba, App, ClickEvent, ClipboardItem, Context, FontWeight,
+    MouseButton, SharedString, Window,
 };
 
 use crate::config::{
     config_root_dir, display_compact_path, reveal_in_finder, tr, LayoutMode, MalleableLayoutConfig,
-    UiLocale,
+    UiLocale, MAX_PROMPT_SNIPPETS,
 };
+use crate::helpers::build_invite_registration_url;
 use crate::remote_mesh::spawn_device_login;
 use crate::search_export::format_host_health_compact;
 use crate::{
@@ -312,24 +313,25 @@ impl CodaGpuWorkspaceView {
                                             }))
                                             .child(tr(loc, en, zh))
                                             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                                let mut should_fetch_wh = false;
+                                                let mut should_sync = false;
                                                 if let Ok(mut g) = this.state.lock() {
                                                     if g.settings_section != sec {
                                                         g.clear_settings_ephemeral_inputs();
-                                                        if sec == SettingsSection::Machines
-                                                            && g.is_logged_in
-                                                            && !g.webhook_dirty
-                                                            && !g.webhook_loading
+                                                        if matches!(
+                                                            sec,
+                                                            SettingsSection::Machines
+                                                                | SettingsSection::Runtime
+                                                        ) && g.is_logged_in
                                                         {
-                                                            should_fetch_wh = true;
+                                                            should_sync = true;
                                                         }
                                                     }
                                                     g.settings_section = sec;
                                                     g.input_target =
                                                         ActiveInputTarget::TerminalDirect;
                                                 }
-                                                if should_fetch_wh {
-                                                    this.reload_notification_webhooks();
+                                                if should_sync {
+                                                    this.reload_account_settings_data();
                                                 }
                                                 cx.notify();
                                             }))
@@ -484,6 +486,7 @@ impl CodaGpuWorkspaceView {
             .flex()
             .flex_col()
             .gap(px(8.0))
+            .child(self.render_settings_app_update_card(st, cx))
             .child(render_settings_row(
                 tr(loc, "Language", "界面语言"),
                 tr(loc, "Desktop UI localization", "切换桌面客户端显示语言"),
@@ -1035,6 +1038,7 @@ impl CodaGpuWorkspaceView {
                             })),
                     )
             })
+            .child(self.render_settings_snippets_card(st, cx))
     }
 
     fn render_settings_machines_pane(
@@ -1359,6 +1363,10 @@ impl CodaGpuWorkspaceView {
                         })
                     })
                     .when(show_auth_form, |el| {
+                        let reset_mode = st.auth_reset_mode;
+                        let tok_focused = st.input_target == ActiveInputTarget::AuthResetToken;
+                        let rpw_focused =
+                            st.input_target == ActiveInputTarget::AuthResetNewPassword;
                         el.child(
                             div()
                                 .flex()
@@ -1369,7 +1377,15 @@ impl CodaGpuWorkspaceView {
                                         .text_size(px(11.5))
                                         .font_weight(FontWeight::SEMIBOLD)
                                         .text_color(rgb(palette::TEXT_PRIMARY))
-                                        .child(tr(loc, "Coda Account Sign In", "Coda 账号登录")),
+                                        .child(if reset_mode {
+                                            tr(
+                                                loc,
+                                                "Reset Password with Token",
+                                                "使用一次性口令重置密码",
+                                            )
+                                        } else {
+                                            tr(loc, "Coda Account Sign In", "Coda 账号登录")
+                                        }),
                                 )
                                 .child(
                                     div()
@@ -1377,33 +1393,66 @@ impl CodaGpuWorkspaceView {
                                         .items_center()
                                         .gap(px(6.0))
                                         .child(self.render_setting_pill(
-                                            "settings-btn-browser-signin",
-                                            tr(
-                                                loc,
-                                                "Sign in via Browser",
-                                                "浏览器一键授权登录",
-                                            ),
-                                            false,
+                                            "settings-btn-toggle-reset-token",
+                                            if reset_mode {
+                                                tr(loc, "Back to Sign In", "返回账号登录")
+                                            } else {
+                                                tr(
+                                                    loc,
+                                                    "Reset Password with Token",
+                                                    "使用重置口令改密",
+                                                )
+                                            },
+                                            reset_mode,
                                             accent,
-                                            cx.listener(|this, _: &ClickEvent, _, cx| {
-                                                let srv = this
-                                                    .state
-                                                    .lock()
-                                                    .map(|mut g| {
-                                                        g.auth_loading = true;
-                                                        g.auth_error = None;
-                                                        g.server_url.clone()
-                                                    })
-                                                    .unwrap_or_default();
-                                                spawn_device_login(
-                                                    Arc::clone(&this.state),
-                                                    Arc::clone(&this.ui_dirty),
-                                                    Arc::clone(&this.mesh_hub),
-                                                    srv,
-                                                );
+                                            cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                                if let Ok(mut g) = this.state.lock() {
+                                                    g.auth_reset_mode = !reset_mode;
+                                                    g.auth_error = None;
+                                                    g.input_selected_all = false;
+                                                    if g.auth_reset_mode {
+                                                        g.input_target =
+                                                            ActiveInputTarget::AuthResetToken;
+                                                    } else {
+                                                        g.auth_reset_token_input.clear();
+                                                        g.auth_reset_new_pw_input.clear();
+                                                        g.input_target =
+                                                            ActiveInputTarget::AuthAccount;
+                                                    }
+                                                }
                                                 cx.notify();
                                             }),
                                         ))
+                                        .when(!reset_mode, |c| {
+                                            c.child(self.render_setting_pill(
+                                                "settings-btn-browser-signin",
+                                                tr(
+                                                    loc,
+                                                    "Sign in via Browser",
+                                                    "浏览器一键授权登录",
+                                                ),
+                                                false,
+                                                accent,
+                                                cx.listener(|this, _: &ClickEvent, _, cx| {
+                                                    let srv = this
+                                                        .state
+                                                        .lock()
+                                                        .map(|mut g| {
+                                                            g.auth_loading = true;
+                                                            g.auth_error = None;
+                                                            g.server_url.clone()
+                                                        })
+                                                        .unwrap_or_default();
+                                                    spawn_device_login(
+                                                        Arc::clone(&this.state),
+                                                        Arc::clone(&this.ui_dirty),
+                                                        Arc::clone(&this.mesh_hub),
+                                                        srv,
+                                                    );
+                                                    cx.notify();
+                                                }),
+                                            ))
+                                        })
                                         .when(st.is_logged_in, |c| {
                                             c.child(self.render_setting_pill(
                                                 "settings-collapse-auth",
@@ -1413,6 +1462,9 @@ impl CodaGpuWorkspaceView {
                                                 cx.listener(|this, _: &ClickEvent, _, cx| {
                                                     if let Ok(mut g) = this.state.lock() {
                                                         g.auth_form_expanded = false;
+                                                        g.auth_reset_mode = false;
+                                                        g.auth_reset_token_input.clear();
+                                                        g.auth_reset_new_pw_input.clear();
                                                         g.input_target =
                                                             ActiveInputTarget::TerminalDirect;
                                                     }
@@ -1422,126 +1474,274 @@ impl CodaGpuWorkspaceView {
                                         }),
                                 ),
                         )
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap(px(6.0))
-                                .child(
-                                    div()
-                                        .id("settings-input-auth-email")
-                                        .occlude()
-                                        .flex_1()
-                                        .px(px(8.0))
-                                        .py(px(5.0))
-                                        .rounded(px(4.0))
-                                        .bg(rgb(palette::CANVAS_BG))
-                                        .border_1()
-                                        .border_color(rgb(if acct_focused {
-                                            accent
-                                        } else {
-                                            palette::BORDER
-                                        }))
-                                        .cursor_pointer()
-                                        .text_size(px(11.0))
-                                        .text_color(rgb(
-                                            if st.auth_account_input.is_empty() && !acct_focused {
-                                                palette::TEXT_DIM
+                        .when(!reset_mode, |el2| {
+                            el2.child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(6.0))
+                                    .child(
+                                        div()
+                                            .id("settings-input-auth-email")
+                                            .occlude()
+                                            .flex_1()
+                                            .px(px(8.0))
+                                            .py(px(5.0))
+                                            .rounded(px(4.0))
+                                            .bg(rgb(palette::CANVAS_BG))
+                                            .border_1()
+                                            .border_color(rgb(if acct_focused {
+                                                accent
                                             } else {
-                                                palette::TEXT_PRIMARY
-                                            },
-                                        ))
-                                        .child(if st.auth_account_input.is_empty() {
-                                            if acct_focused {
-                                                "|".to_string()
+                                                palette::BORDER
+                                            }))
+                                            .cursor_pointer()
+                                            .text_size(px(11.0))
+                                            .text_color(rgb(
+                                                if st.auth_account_input.is_empty() && !acct_focused
+                                                {
+                                                    palette::TEXT_DIM
+                                                } else {
+                                                    palette::TEXT_PRIMARY
+                                                },
+                                            ))
+                                            .child(if st.auth_account_input.is_empty() {
+                                                if acct_focused {
+                                                    "|".to_string()
+                                                } else {
+                                                    tr(loc, "Email / Username", "账号邮箱")
+                                                        .to_string()
+                                                }
+                                            } else if acct_focused {
+                                                format!("{}|", st.auth_account_input)
                                             } else {
-                                                tr(loc, "Email / Username", "账号邮箱").to_string()
-                                            }
-                                        } else if acct_focused {
-                                            format!("{}|", st.auth_account_input)
-                                        } else {
-                                            st.auth_account_input.clone()
-                                        })
-                                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                            if let Ok(mut g) = this.state.lock() {
-                                                g.input_target = ActiveInputTarget::AuthAccount;
-                                                g.input_selected_all = false;
-                                            }
-                                            cx.notify();
-                                        })),
-                                )
-                                .child(
-                                    div()
-                                        .id("settings-input-auth-pass")
-                                        .occlude()
-                                        .flex_1()
-                                        .px(px(8.0))
-                                        .py(px(5.0))
-                                        .rounded(px(4.0))
-                                        .bg(rgb(palette::CANVAS_BG))
-                                        .border_1()
-                                        .border_color(rgb(if pass_focused {
-                                            accent
-                                        } else {
-                                            palette::BORDER
-                                        }))
-                                        .cursor_pointer()
-                                        .text_size(px(11.0))
-                                        .text_color(rgb(
-                                            if st.auth_password_input.is_empty() && !pass_focused {
-                                                palette::TEXT_DIM
+                                                st.auth_account_input.clone()
+                                            })
+                                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                                if let Ok(mut g) = this.state.lock() {
+                                                    g.input_target = ActiveInputTarget::AuthAccount;
+                                                    g.input_selected_all = false;
+                                                }
+                                                cx.notify();
+                                            })),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("settings-input-auth-pass")
+                                            .occlude()
+                                            .flex_1()
+                                            .px(px(8.0))
+                                            .py(px(5.0))
+                                            .rounded(px(4.0))
+                                            .bg(rgb(palette::CANVAS_BG))
+                                            .border_1()
+                                            .border_color(rgb(if pass_focused {
+                                                accent
                                             } else {
-                                                palette::TEXT_PRIMARY
-                                            },
-                                        ))
-                                        .child(if st.auth_password_input.is_empty() {
-                                            if pass_focused {
-                                                "|".to_string()
+                                                palette::BORDER
+                                            }))
+                                            .cursor_pointer()
+                                            .text_size(px(11.0))
+                                            .text_color(rgb(
+                                                if st.auth_password_input.is_empty()
+                                                    && !pass_focused
+                                                {
+                                                    palette::TEXT_DIM
+                                                } else {
+                                                    palette::TEXT_PRIMARY
+                                                },
+                                            ))
+                                            .child(if st.auth_password_input.is_empty() {
+                                                if pass_focused {
+                                                    "|".to_string()
+                                                } else {
+                                                    tr(loc, "Password", "密码").to_string()
+                                                }
                                             } else {
-                                                tr(loc, "Password", "密码").to_string()
-                                            }
-                                        } else {
-                                            let dots =
-                                                "*".repeat(st.auth_password_input.chars().count());
-                                            if pass_focused {
-                                                format!("{dots}|")
+                                                let dots = "*".repeat(
+                                                    st.auth_password_input.chars().count(),
+                                                );
+                                                if pass_focused {
+                                                    format!("{dots}|")
+                                                } else {
+                                                    dots
+                                                }
+                                            })
+                                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                                if let Ok(mut g) = this.state.lock() {
+                                                    g.input_target =
+                                                        ActiveInputTarget::AuthPassword;
+                                                    g.input_selected_all = false;
+                                                }
+                                                cx.notify();
+                                            })),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("settings-btn-password-signin")
+                                            .occlude()
+                                            .flex_shrink_0()
+                                            .px(px(12.0))
+                                            .py(px(5.0))
+                                            .rounded(px(4.0))
+                                            .bg(rgb(accent))
+                                            .hover(|h| h.opacity(0.9))
+                                            .cursor_pointer()
+                                            .text_size(px(11.0))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(rgb(palette::CANVAS_BG))
+                                            .child(if st.auth_loading {
+                                                tr(loc, "Signing in…", "登录中…")
                                             } else {
-                                                dots
-                                            }
-                                        })
-                                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                            if let Ok(mut g) = this.state.lock() {
-                                                g.input_target = ActiveInputTarget::AuthPassword;
-                                                g.input_selected_all = false;
-                                            }
-                                            cx.notify();
-                                        })),
-                                )
-                                .child(
-                                    div()
-                                        .id("settings-btn-password-signin")
-                                        .occlude()
-                                        .flex_shrink_0()
-                                        .px(px(12.0))
-                                        .py(px(5.0))
-                                        .rounded(px(4.0))
-                                        .bg(rgb(accent))
-                                        .hover(|h| h.opacity(0.9))
-                                        .cursor_pointer()
-                                        .text_size(px(11.0))
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(rgb(palette::CANVAS_BG))
-                                        .child(if st.auth_loading {
-                                            tr(loc, "Signing in…", "登录中…")
-                                        } else {
-                                            tr(loc, "Sign In", "登录")
-                                        })
-                                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                            this.submit_password_login();
-                                            cx.notify();
-                                        })),
-                                ),
-                        )
+                                                tr(loc, "Sign In", "登录")
+                                            })
+                                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                                this.submit_password_login();
+                                                cx.notify();
+                                            })),
+                                    ),
+                            )
+                        })
+                        .when(reset_mode, |el2| {
+                            let pw_dots =
+                                "•".repeat(st.auth_reset_new_pw_input.chars().count().min(32));
+                            el2.child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(6.0))
+                                    .child(
+                                        div()
+                                            .id("settings-input-reset-token")
+                                            .occlude()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .px(px(8.0))
+                                            .py(px(5.0))
+                                            .rounded(px(4.0))
+                                            .bg(rgb(palette::CANVAS_BG))
+                                            .border_1()
+                                            .border_color(rgb(if tok_focused {
+                                                accent
+                                            } else {
+                                                palette::BORDER
+                                            }))
+                                            .cursor_pointer()
+                                            .font_family("Menlo")
+                                            .text_size(px(10.5))
+                                            .text_color(rgb(
+                                                if st.auth_reset_token_input.is_empty()
+                                                    && !tok_focused
+                                                {
+                                                    palette::TEXT_DIM
+                                                } else {
+                                                    palette::TEXT_PRIMARY
+                                                },
+                                            ))
+                                            .truncate()
+                                            .child(if st.auth_reset_token_input.is_empty() {
+                                                if tok_focused {
+                                                    "▏".to_string()
+                                                } else {
+                                                    tr(
+                                                        loc,
+                                                        "Paste reset link or rst_... token",
+                                                        "粘贴重置链接或 rst_... 口令",
+                                                    )
+                                                    .to_string()
+                                                }
+                                            } else if tok_focused {
+                                                format!("{}▏", st.auth_reset_token_input)
+                                            } else {
+                                                st.auth_reset_token_input.clone()
+                                            })
+                                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                                if let Ok(mut g) = this.state.lock() {
+                                                    g.input_target =
+                                                        ActiveInputTarget::AuthResetToken;
+                                                    g.input_selected_all = false;
+                                                }
+                                                cx.notify();
+                                            })),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("settings-input-reset-new-pw")
+                                            .occlude()
+                                            .w(px(176.0))
+                                            .px(px(8.0))
+                                            .py(px(5.0))
+                                            .rounded(px(4.0))
+                                            .bg(rgb(palette::CANVAS_BG))
+                                            .border_1()
+                                            .border_color(rgb(if rpw_focused {
+                                                accent
+                                            } else {
+                                                palette::BORDER
+                                            }))
+                                            .cursor_pointer()
+                                            .text_size(px(11.0))
+                                            .text_color(rgb(
+                                                if st.auth_reset_new_pw_input.is_empty()
+                                                    && !rpw_focused
+                                                {
+                                                    palette::TEXT_DIM
+                                                } else {
+                                                    palette::TEXT_PRIMARY
+                                                },
+                                            ))
+                                            .truncate()
+                                            .child(if st.auth_reset_new_pw_input.is_empty() {
+                                                if rpw_focused {
+                                                    "▏".to_string()
+                                                } else {
+                                                    tr(
+                                                        loc,
+                                                        "New password (8+ chars)",
+                                                        "新密码（至少 8 位）",
+                                                    )
+                                                    .to_string()
+                                                }
+                                            } else if rpw_focused {
+                                                format!("{pw_dots}▏")
+                                            } else {
+                                                pw_dots
+                                            })
+                                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                                if let Ok(mut g) = this.state.lock() {
+                                                    g.input_target =
+                                                        ActiveInputTarget::AuthResetNewPassword;
+                                                    g.input_selected_all = false;
+                                                }
+                                                cx.notify();
+                                            })),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("settings-btn-submit-reset-pw")
+                                            .occlude()
+                                            .flex_shrink_0()
+                                            .px(px(11.0))
+                                            .py(px(5.0))
+                                            .rounded(px(4.0))
+                                            .bg(rgb(accent))
+                                            .hover(|h| h.opacity(0.9))
+                                            .cursor_pointer()
+                                            .text_size(px(11.0))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(rgb(palette::CANVAS_BG))
+                                            .child(if st.auth_loading {
+                                                tr(loc, "Resetting…", "重置中…")
+                                            } else {
+                                                tr(loc, "Reset Password", "确认重置")
+                                            })
+                                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                                this.submit_password_reset_token();
+                                                cx.notify();
+                                            })),
+                                    ),
+                            )
+                        })
                         .when_some(st.auth_error.clone(), |el, err| {
                             el.child(
                                 div()
@@ -1566,6 +1766,9 @@ impl CodaGpuWorkspaceView {
                         })
                     }),
             )
+            .when(st.is_logged_in && st.account_is_admin, |el| {
+                el.child(self.render_settings_admin_friends_card(st, cx))
+            })
             .child({
                 let wh = &st.webhook_settings;
                 let bark_focus = st.input_target == ActiveInputTarget::WebhookBarkUrl;
@@ -2592,6 +2795,787 @@ impl CodaGpuWorkspaceView {
                     .child("+")
                     .on_click(on_inc),
             )
+    }
+
+    fn render_settings_app_update_card(
+        &self,
+        st: &CodaDesktopState,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let loc = st.locale;
+        let accent = st.layout.accent_color_u32();
+        let upd = &st.self_update;
+        let cur_ver = &upd.current_version;
+        let has_update = upd.update_available;
+        let latest_label = upd.latest_version.as_deref().unwrap_or(cur_ver);
+        let subtitle = if let Some(ref prog) = upd.progress_message {
+            prog.clone()
+        } else if has_update {
+            format!(
+                "{} {latest_label} · {}",
+                tr(loc, "New release", "发现新版本"),
+                tr(
+                    loc,
+                    "SHA-256 verified in-place bundle upgrade",
+                    "SHA-256 严格校验 · 一键覆盖并重启"
+                )
+            )
+        } else if upd.latest_version.is_some() {
+            format!(
+                "{} (v{cur_ver})",
+                tr(
+                    loc,
+                    "You are running the latest version",
+                    "当前已是最新版本"
+                )
+            )
+        } else {
+            tr(
+                loc,
+                "Check /api/v1/site-info & GitHub Releases for Coda.app updates",
+                "自动检查服务端与 GitHub Releases 最新版本",
+            )
+            .to_string()
+        };
+
+        div()
+            .p(px(11.0))
+            .rounded(px(7.0))
+            .bg(rgb(palette::SURFACE_BG))
+            .border_1()
+            .border_color(rgb(if has_update {
+                palette::DONE_GREEN
+            } else {
+                palette::BORDER
+            }))
+            .flex()
+            .flex_col()
+            .gap(px(6.0))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(10.0))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.0))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(6.0))
+                                    .child(
+                                        div()
+                                            .text_size(px(12.0))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(rgb(palette::TEXT_PRIMARY))
+                                            .child(format!(
+                                                "{} · v{cur_ver}",
+                                                tr(loc, "App Update", "客户端版本更新")
+                                            )),
+                                    )
+                                    .when(has_update, |el| {
+                                        el.child(
+                                            div()
+                                                .px(px(6.0))
+                                                .py(px(1.0))
+                                                .rounded(px(99.0))
+                                                .bg(rgba(0x22c55e24))
+                                                .text_size(px(10.0))
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .text_color(rgb(palette::DONE_GREEN))
+                                                .child(format!("✨ {latest_label}")),
+                                        )
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(10.5))
+                                    .text_color(rgb(if upd.updating {
+                                        palette::WORKING_SKY
+                                    } else if has_update {
+                                        palette::DONE_GREEN
+                                    } else {
+                                        palette::TEXT_DIM
+                                    }))
+                                    .truncate()
+                                    .child(subtitle),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .child(self.render_setting_pill(
+                                "settings-btn-check-update",
+                                if upd.checking {
+                                    tr(loc, "Checking…", "检查中…")
+                                } else {
+                                    tr(loc, "Check for Updates", "检查更新")
+                                },
+                                false,
+                                accent,
+                                cx.listener(|this, _: &ClickEvent, _, cx| {
+                                    this.mesh_hub.check_desktop_self_update(true);
+                                    cx.notify();
+                                }),
+                            ))
+                            .when(has_update, |el| {
+                                let is_updating = upd.updating;
+                                el.child(
+                                    div()
+                                        .id("settings-btn-update-restart")
+                                        .occlude()
+                                        .px(px(10.0))
+                                        .py(px(4.5))
+                                        .rounded(px(5.0))
+                                        .bg(rgb(palette::DONE_GREEN))
+                                        .hover(|h| h.opacity(0.92))
+                                        .cursor_pointer()
+                                        .text_size(px(11.0))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(rgb(0x09090b))
+                                        .child(if is_updating {
+                                            tr(loc, "Updating…", "正在下载安装…")
+                                        } else {
+                                            tr(loc, "Update & Restart", "一键更新并重启")
+                                        })
+                                        .on_click(cx.listener(
+                                            move |this, _: &ClickEvent, _, cx| {
+                                                if !is_updating {
+                                                    this.mesh_hub
+                                                        .trigger_desktop_self_update_and_restart();
+                                                }
+                                                cx.notify();
+                                            },
+                                        )),
+                                )
+                            }),
+                    ),
+            )
+            .when_some(upd.error_message.clone(), |el, err| {
+                el.child(
+                    div()
+                        .px(px(8.0))
+                        .py(px(4.0))
+                        .rounded(px(4.0))
+                        .bg(rgb(palette::CANVAS_BG))
+                        .border_1()
+                        .border_color(rgb(palette::ERROR_RED))
+                        .text_size(px(10.5))
+                        .text_color(rgb(palette::ERROR_RED))
+                        .child(err),
+                )
+            })
+    }
+
+    fn render_settings_snippets_card(
+        &self,
+        st: &CodaDesktopState,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let loc = st.locale;
+        let accent = st.layout.accent_color_u32();
+        let title_focus = st.input_target == ActiveInputTarget::SnippetTitleInput;
+        let prompt_focus = st.input_target == ActiveInputTarget::SnippetPromptInput;
+
+        div()
+            .p(px(11.0))
+            .rounded(px(7.0))
+            .bg(rgb(palette::SURFACE_BG))
+            .border_1()
+            .border_color(rgb(palette::BORDER))
+            .flex()
+            .flex_col()
+            .gap(px(6.0))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.0))
+                            .child(
+                                div()
+                                    .text_size(px(12.0))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(rgb(palette::TEXT_PRIMARY))
+                                    .child(format!(
+                                        "{} ({}/{MAX_PROMPT_SNIPPETS})",
+                                        tr(
+                                            loc,
+                                            "Saved Prompt Snippets (⚡ ⌘K)",
+                                            "跨设备常用提示词 (⚡ ⌘K)"
+                                        ),
+                                        st.prompt_snippets.len()
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(10.5))
+                                    .text_color(rgb(palette::TEXT_DIM))
+                                    .child(tr(
+                                        loc,
+                                        "Synced via /api/v1/me/snippets + cached in ~/.config/coda/snippets.json",
+                                        "通过 /api/v1/me/snippets 多端同步，离线自动回退本地缓存",
+                                    )),
+                            ),
+                    )
+                    .child(self.render_setting_pill(
+                        "settings-btn-sync-snippets",
+                        if st.snippets_loading {
+                            tr(loc, "Syncing…", "同步中…")
+                        } else {
+                            tr(loc, "Sync", "刷新同步")
+                        },
+                        false,
+                        accent,
+                        cx.listener(|this, _: &ClickEvent, _, cx| {
+                            this.mesh_hub.fetch_prompt_snippets();
+                            cx.notify();
+                        }),
+                    )),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .child(
+                        div()
+                            .id("settings-input-snippet-title")
+                            .occlude()
+                            .w(px(148.0))
+                            .px(px(8.0))
+                            .py(px(5.0))
+                            .rounded(px(5.0))
+                            .bg(rgb(palette::CHROME_BG))
+                            .border_1()
+                            .border_color(rgb(if title_focus {
+                                accent
+                            } else {
+                                palette::BORDER
+                            }))
+                            .cursor_pointer()
+                            .text_size(px(11.0))
+                            .text_color(rgb(
+                                if st.snippet_title_input.is_empty() && !title_focus {
+                                    palette::TEXT_DIM
+                                } else {
+                                    palette::TEXT_PRIMARY
+                                },
+                            ))
+                            .truncate()
+                            .child(if st.snippet_title_input.is_empty() {
+                                if title_focus {
+                                    "▏".to_string()
+                                } else {
+                                    tr(loc, "Snippet title", "标题（如：跑测试）").to_string()
+                                }
+                            } else {
+                                format!(
+                                    "{}{}",
+                                    st.snippet_title_input,
+                                    if title_focus { "▏" } else { "" }
+                                )
+                            })
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                if let Ok(mut g) = this.state.lock() {
+                                    g.input_selected_all = false;
+                                    g.input_target = ActiveInputTarget::SnippetTitleInput;
+                                }
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id("settings-input-snippet-prompt")
+                            .occlude()
+                            .flex_1()
+                            .min_w_0()
+                            .px(px(8.0))
+                            .py(px(5.0))
+                            .rounded(px(5.0))
+                            .bg(rgb(palette::CHROME_BG))
+                            .border_1()
+                            .border_color(rgb(if prompt_focus {
+                                accent
+                            } else {
+                                palette::BORDER
+                            }))
+                            .cursor_pointer()
+                            .text_size(px(11.0))
+                            .text_color(rgb(
+                                if st.snippet_prompt_input.is_empty() && !prompt_focus {
+                                    palette::TEXT_DIM
+                                } else {
+                                    palette::TEXT_PRIMARY
+                                },
+                            ))
+                            .truncate()
+                            .child(if st.snippet_prompt_input.is_empty() {
+                                if prompt_focus {
+                                    "▏".to_string()
+                                } else {
+                                    tr(loc, "Prompt text to send…", "输入要一键发送的提示词内容…")
+                                        .to_string()
+                                }
+                            } else {
+                                let flat = st.snippet_prompt_input.replace('\n', " ↵ ");
+                                format!("{flat}{}", if prompt_focus { "▏" } else { "" })
+                            })
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                if let Ok(mut g) = this.state.lock() {
+                                    g.input_selected_all = false;
+                                    g.input_target = ActiveInputTarget::SnippetPromptInput;
+                                }
+                                cx.notify();
+                            })),
+                    )
+                    .child(self.render_setting_pill(
+                        "settings-btn-add-snippet",
+                        tr(loc, "+ Add", "+ 添加"),
+                        true,
+                        accent,
+                        cx.listener(|this, _: &ClickEvent, _, cx| {
+                            this.submit_add_custom_snippet();
+                            cx.notify();
+                        }),
+                    )),
+            )
+            .children(st.prompt_snippets.iter().enumerate().map(|(idx, snip)| {
+                let del_id = snip.id.clone();
+                let send_title = snip.title.clone();
+                let send_prompt = snip.prompt.clone();
+                let preview = snip.prompt.replace('\n', " ↵ ");
+                div()
+                    .px(px(8.0))
+                    .py(px(5.0))
+                    .rounded(px(5.0))
+                    .bg(rgb(palette::CHROME_BG))
+                    .border_1()
+                    .border_color(rgb(palette::BORDER))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .text_size(px(11.0))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(palette::TEXT_PRIMARY))
+                                    .child(format!("⚡ {}", snip.title)),
+                            )
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .flex_1()
+                                    .truncate()
+                                    .text_size(px(10.5))
+                                    .text_color(rgb(palette::TEXT_DIM))
+                                    .child(preview),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .flex()
+                            .items_center()
+                            .gap(px(4.0))
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!(
+                                        "settings-snip-send-{idx}"
+                                    )))
+                                    .occlude()
+                                    .px(px(6.0))
+                                    .py(px(2.0))
+                                    .rounded(px(4.0))
+                                    .hover(|h| h.bg(rgb(palette::HOVER_BG)))
+                                    .cursor_pointer()
+                                    .text_size(px(10.0))
+                                    .text_color(rgb(accent))
+                                    .child(tr(loc, "Send", "发送"))
+                                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                        if let Ok(mut g) = this.state.lock() {
+                                            g.settings_open = false;
+                                            g.input_target = ActiveInputTarget::TerminalDirect;
+                                        }
+                                        this.send_prompt_snippet_to_session(
+                                            None,
+                                            &send_title,
+                                            &send_prompt,
+                                        );
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!(
+                                        "settings-snip-del-{idx}"
+                                    )))
+                                    .occlude()
+                                    .px(px(6.0))
+                                    .py(px(2.0))
+                                    .rounded(px(4.0))
+                                    .hover(|h| h.bg(rgb(palette::HOVER_BG)))
+                                    .cursor_pointer()
+                                    .text_size(px(10.5))
+                                    .text_color(rgb(palette::ERROR_RED))
+                                    .child("×")
+                                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                        this.delete_custom_snippet(&del_id);
+                                        cx.notify();
+                                    })),
+                            ),
+                    )
+            }))
+    }
+
+    fn render_settings_admin_friends_card(
+        &self,
+        st: &CodaDesktopState,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let loc = st.locale;
+        let accent = st.layout.accent_color_u32();
+        let note_focus = st.input_target == ActiveInputTarget::AdminInviteNote;
+        let srv_base = st.server_url.clone();
+
+        div()
+            .p(px(10.0))
+            .rounded(px(7.0))
+            .bg(rgb(palette::SURFACE_BG))
+            .border_1()
+            .border_color(rgb(palette::BORDER))
+            .flex()
+            .flex_col()
+            .gap(px(7.0))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.0))
+                            .child(
+                                div()
+                                    .text_size(px(11.5))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(palette::TEXT_PRIMARY))
+                                    .child(tr(
+                                        loc,
+                                        "Admin · Friend Invites & Password Reset",
+                                        "管理员 · 好友邀请注册与密码重置",
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(10.0))
+                                    .text_color(rgb(palette::TEXT_DIM))
+                                    .child(tr(
+                                        loc,
+                                        "Share 1-click registration links or mint 24h password reset links for friends",
+                                        "一键复制好友注册专属链接，或为忘记密码的好友生成 24h 重置链接",
+                                    )),
+                            ),
+                    )
+                    .child(self.render_setting_pill(
+                        "settings-admin-refresh",
+                        if st.admin_loading {
+                            "…"
+                        } else {
+                            tr(loc, "Refresh", "刷新")
+                        },
+                        false,
+                        accent,
+                        cx.listener(|this, _: &ClickEvent, _, cx| {
+                            this.mesh_hub.refresh_account_profile_and_admin_data();
+                            cx.notify();
+                        }),
+                    )),
+            )
+            // Invite creation row
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .child(
+                        div()
+                            .id("settings-input-admin-invite-note")
+                            .occlude()
+                            .flex_1()
+                            .min_w_0()
+                            .px(px(8.0))
+                            .py(px(5.0))
+                            .rounded(px(4.0))
+                            .bg(rgb(palette::CANVAS_BG))
+                            .border_1()
+                            .border_color(rgb(if note_focus {
+                                accent
+                            } else {
+                                palette::BORDER
+                            }))
+                            .cursor_pointer()
+                            .text_size(px(11.0))
+                            .text_color(rgb(
+                                if st.admin_invite_note_input.is_empty() && !note_focus {
+                                    palette::TEXT_DIM
+                                } else {
+                                    palette::TEXT_PRIMARY
+                                },
+                            ))
+                            .truncate()
+                            .child(if st.admin_invite_note_input.is_empty() {
+                                if note_focus {
+                                    "▏".to_string()
+                                } else {
+                                    tr(
+                                        loc,
+                                        "Optional friend note (e.g. Alice's MacBook)",
+                                        "选填备注（如：好友小王）",
+                                    )
+                                    .to_string()
+                                }
+                            } else {
+                                format!(
+                                    "{}{}",
+                                    st.admin_invite_note_input,
+                                    if note_focus { "▏" } else { "" }
+                                )
+                            })
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                if let Ok(mut g) = this.state.lock() {
+                                    g.input_selected_all = false;
+                                    g.input_target = ActiveInputTarget::AdminInviteNote;
+                                }
+                                cx.notify();
+                            })),
+                    )
+                    .child(self.render_setting_pill(
+                        "settings-admin-create-invite",
+                        tr(loc, "+ New Invite Link", "+ 生成邀请链接"),
+                        true,
+                        accent,
+                        cx.listener(|this, _: &ClickEvent, _, cx| {
+                            this.submit_create_admin_invite();
+                            cx.notify();
+                        }),
+                    )),
+            )
+            // Active Invite Codes list
+            .children(st.admin_invites.iter().map(|inv| {
+                let code_copy = inv.code.clone();
+                let code_del = inv.code.clone();
+                let full_link = build_invite_registration_url(&srv_base, &inv.code);
+                let meta = if inv.note.trim().is_empty() {
+                    format!("{}/{}", inv.used_count, inv.max_uses)
+                } else {
+                    format!("{}/{} · {}", inv.used_count, inv.max_uses, inv.note)
+                };
+                div()
+                    .px(px(8.0))
+                    .py(px(5.0))
+                    .rounded(px(5.0))
+                    .bg(rgb(palette::CHROME_BG))
+                    .border_1()
+                    .border_color(rgb(palette::BORDER))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.0))
+                            .child(
+                                div()
+                                    .font_family("Menlo")
+                                    .text_size(px(11.0))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(accent))
+                                    .child(inv.code.clone()),
+                            )
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(px(10.5))
+                                    .text_color(rgb(palette::TEXT_DIM))
+                                    .child(meta),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .flex()
+                            .items_center()
+                            .gap(px(5.0))
+                            .child(self.render_setting_pill(
+                                SharedString::from(format!("settings-copy-invite-{}", inv.code)),
+                                tr(loc, "Copy Invite Link", "复制邀请链接"),
+                                false,
+                                accent,
+                                cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(
+                                        full_link.clone(),
+                                    ));
+                                    if let Ok(mut g) = this.state.lock() {
+                                        g.status_notice = Some(format!(
+                                            "{}: {code_copy}",
+                                            tr(
+                                                g.locale,
+                                                "Copied invite link",
+                                                "已复制邀请注册链接"
+                                            )
+                                        ));
+                                    }
+                                    cx.notify();
+                                }),
+                            ))
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!(
+                                        "settings-revoke-invite-{}",
+                                        inv.code
+                                    )))
+                                    .occlude()
+                                    .px(px(6.0))
+                                    .py(px(3.0))
+                                    .rounded(px(4.0))
+                                    .hover(|h| h.bg(rgb(palette::HOVER_BG)))
+                                    .cursor_pointer()
+                                    .text_size(px(10.5))
+                                    .text_color(rgb(palette::ERROR_RED))
+                                    .child("×")
+                                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                        this.mesh_hub.delete_admin_invite_code(code_del.clone());
+                                        cx.notify();
+                                    })),
+                            ),
+                    )
+            }))
+            // Registered Friends list (`GET /api/v1/admin/users`)
+            .when(!st.admin_users.is_empty(), |el| {
+                el.child(
+                    div()
+                        .pt(px(2.0))
+                        .text_size(px(10.0))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(palette::TEXT_DIM))
+                        .child(format!(
+                            "{} ({})",
+                            tr(loc, "REGISTERED FRIENDS", "已注册成员"),
+                            st.admin_users.len()
+                        )),
+                )
+                .children(st.admin_users.iter().map(|u| {
+                    let uid = u.id;
+                    let u_handle = u.handle.clone();
+                    let dev_badge = format!(
+                        "{}/{} {}",
+                        u.online_devices,
+                        u.total_devices,
+                        tr(loc, "online", "在线设备")
+                    );
+                    div()
+                        .px(px(8.0))
+                        .py(px(5.0))
+                        .rounded(px(5.0))
+                        .bg(rgb(palette::CHROME_BG))
+                        .border_1()
+                        .border_color(rgb(palette::BORDER))
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(8.0))
+                        .child(
+                            div()
+                                .min_w_0()
+                                .flex_1()
+                                .flex()
+                                .items_center()
+                                .gap(px(6.0))
+                                .child(
+                                    div()
+                                        .w(px(6.0))
+                                        .h(px(6.0))
+                                        .flex_shrink_0()
+                                        .rounded(px(99.0))
+                                        .bg(rgb(if u.online_devices > 0 {
+                                            palette::DONE_GREEN
+                                        } else {
+                                            palette::TEXT_DIM
+                                        })),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(11.0))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(rgb(palette::TEXT_PRIMARY))
+                                        .child(format!("@{}", u.handle)),
+                                )
+                                .when(u.is_admin, |b| {
+                                    b.child(
+                                        div()
+                                            .px(px(4.0))
+                                            .py(px(0.5))
+                                            .rounded(px(3.0))
+                                            .bg(rgb(palette::SURFACE_BG))
+                                            .text_size(px(9.5))
+                                            .text_color(rgb(accent))
+                                            .child("admin"),
+                                    )
+                                })
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_size(px(10.5))
+                                        .text_color(rgb(palette::TEXT_DIM))
+                                        .child(dev_badge),
+                                ),
+                        )
+                        .child(self.render_setting_pill(
+                            SharedString::from(format!("settings-copy-reset-link-{uid}")),
+                            tr(loc, "Copy Reset Link", "复制重置密码链接"),
+                            false,
+                            accent,
+                            cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                this.mesh_hub
+                                    .create_and_copy_friend_reset_link(uid, u_handle.clone());
+                                cx.notify();
+                            }),
+                        ))
+                }))
+            })
     }
 }
 
