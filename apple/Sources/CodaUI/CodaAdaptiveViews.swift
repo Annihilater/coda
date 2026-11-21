@@ -586,70 +586,98 @@ public struct CodaAdaptiveRootView: View {
 
             Spacer()
 
-            VStack(spacing: 14) {
-                Image(systemName: "terminal.fill")
-                    .font(.system(size: 30))
-                    .foregroundStyle(CodaHerdrTheme.textSecondary)
+            if store.isSignedIn && store.remoteMachines.isEmpty {
+                ScrollView {
+                    CodaFriendOnboardingCard(store: store)
+                        .frame(maxWidth: 500)
+                        .padding(24)
+                }
+            } else {
+                VStack(spacing: 14) {
+                    Image(systemName: "terminal.fill")
+                        .font(.system(size: 30))
+                        .foregroundStyle(CodaHerdrTheme.textSecondary)
 
-                Text(store.isSignedIn
-                    ? tr("Select or launch a terminal", "选择或新建终端会话", locale: store.locale)
-                    : tr("Connect Coda Agent Mesh", "连接 Coda Agent 加密工作网", locale: store.locale))
-                    .font(.system(size: 18, weight: .semibold))
-                    .foregroundStyle(CodaHerdrTheme.textPrimary)
+                    Text(store.isSignedIn
+                        ? tr("Select or launch a terminal", "选择或新建终端会话", locale: store.locale)
+                        : tr("Connect Coda Agent Mesh", "连接 Coda Agent 加密工作网", locale: store.locale))
+                        .font(.system(size: 18, weight: .semibold))
+                        .foregroundStyle(CodaHerdrTheme.textPrimary)
 
-                Text(store.isSignedIn
-                    ? tr("Pick any session from Inbox or Spaces on the left to stream live ANSI output.", "从左侧栏选择一个工作区会话，实时查看加密终端并下发指令。", locale: store.locale)
-                    : tr("Sign in and pair a host machine to control agents across iPhone, iPad, Mac, and Linux.", "登录并配对工作站后，即可在 iPhone、iPad 与 Mac 间同步接管 AI Coding Agent。", locale: store.locale))
-                    .font(.system(size: 13))
-                    .foregroundStyle(CodaHerdrTheme.textSecondary)
-                    .multilineTextAlignment(.center)
-                    .frame(maxWidth: 400)
+                    Text(store.isSignedIn
+                        ? tr("Pick any session from Inbox or Spaces on the left to stream live ANSI output.", "从左侧栏选择一个工作区会话，实时查看加密终端并下发指令。", locale: store.locale)
+                        : tr("Sign in and pair a host machine to control agents across iPhone, iPad, Mac, and Linux.", "登录并配对工作站后，即可在 iPhone、iPad 与 Mac 间同步接管 AI Coding Agent。", locale: store.locale))
+                        .font(.system(size: 13))
+                        .foregroundStyle(CodaHerdrTheme.textSecondary)
+                        .multilineTextAlignment(.center)
+                        .frame(maxWidth: 400)
 
-                HStack(spacing: 10) {
-                    if store.isSignedIn, let onlineHost = store.remoteMachines.first(where: { $0.isOnline }) {
-                        Menu {
-                            let defaultCwd = store.workspacesByDevice[onlineHost.id]?.first?.rootPath
-                            Button("Claude Code") { store.launchAgent(agent: "claude", on: onlineHost, cwd: defaultCwd) }
-                            Button("Codex") { store.launchAgent(agent: "codex", on: onlineHost, cwd: defaultCwd) }
-                            Button("Grok") { store.launchAgent(agent: "grok", on: onlineHost, cwd: defaultCwd) }
-                            Button("Antigravity (AGY)") { store.launchAgent(agent: "agy", on: onlineHost, cwd: defaultCwd) }
-                            Button("Gemini CLI") { store.launchAgent(agent: "gemini", on: onlineHost, cwd: defaultCwd) }
-                            Divider()
-                            Button("Shell") { store.launchAgent(agent: "shell", on: onlineHost, cwd: defaultCwd) }
-                            Divider()
-                            Button {
-                                store.openBootstrapWorkspaceSheet(for: onlineHost)
+                    HStack(spacing: 10) {
+                        if store.isSignedIn, let onlineHost = store.remoteMachines.first(where: { $0.isOnline }) {
+                            Menu {
+                                let defaultCwd = store.workspacesByDevice[onlineHost.id]?.first?.rootPath
+                                Button("Claude Code") { store.launchAgent(agent: "claude", on: onlineHost, cwd: defaultCwd) }
+                                Button("Codex") { store.launchAgent(agent: "codex", on: onlineHost, cwd: defaultCwd) }
+                                Button("Grok") { store.launchAgent(agent: "grok", on: onlineHost, cwd: defaultCwd) }
+                                Button("Antigravity (AGY)") { store.launchAgent(agent: "agy", on: onlineHost, cwd: defaultCwd) }
+                                Button("Gemini CLI") { store.launchAgent(agent: "gemini", on: onlineHost, cwd: defaultCwd) }
+                                Divider()
+                                Button("Shell") { store.launchAgent(agent: "shell", on: onlineHost, cwd: defaultCwd) }
+                                Divider()
+                                Button {
+                                    store.openBootstrapWorkspaceSheet(for: onlineHost)
+                                } label: {
+                                    Label(tr("New Workspace / Git Clone…", "新建目录 / Git Clone…", locale: store.locale), systemImage: "folder.badge.plus")
+                                }
                             } label: {
-                                Label(tr("New Workspace / Git Clone…", "新建目录 / Git Clone…", locale: store.locale), systemImage: "folder.badge.plus")
+                                Label(tr("New Terminal", "新建终端", locale: store.locale), systemImage: "terminal")
+                                    .font(.system(size: 13, weight: .semibold))
+                                    .foregroundStyle(.black)
+                                    .padding(.horizontal, 16)
+                                    .padding(.vertical, 9)
+                                    .background(Capsule().fill(CodaHerdrTheme.cyanWorking))
                             }
+                        }
+
+                        Button {
+                            store.settingsInitialFocusPairing = store.isSignedIn
+                            store.settingsInitialAuthMode = nil
+                            store.showSettingsSheet = true
                         } label: {
-                            Label(tr("New Terminal", "新建终端", locale: store.locale), systemImage: "terminal")
+                            Label(
+                                store.isSignedIn ? tr("Add machine", "添加主机", locale: store.locale) : tr("Sign in", "立即登录", locale: store.locale),
+                                systemImage: store.isSignedIn ? "plus" : "person.badge.key.fill"
+                            )
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(.black)
+                            .padding(.horizontal, 16)
+                            .padding(.vertical, 9)
+                            .background(Capsule().fill(CodaHerdrTheme.textPrimary))
+                        }
+                        .buttonStyle(.plain)
+
+                        if !store.isSignedIn {
+                            Button {
+                                store.settingsInitialFocusPairing = false
+                                store.settingsInitialAuthMode = 3
+                                store.showSettingsSheet = true
+                            } label: {
+                                Label(
+                                    tr("Reset Forgotten Password", "重置密码", locale: store.locale),
+                                    systemImage: "key.horizontal.fill"
+                                )
                                 .font(.system(size: 13, weight: .semibold))
-                                .foregroundStyle(.black)
-                                .padding(.horizontal, 16)
+                                .foregroundStyle(CodaHerdrTheme.cyanWorking)
+                                .padding(.horizontal, 14)
                                 .padding(.vertical, 9)
-                                .background(Capsule().fill(CodaHerdrTheme.cyanWorking))
+                                .background(Capsule().fill(CodaHerdrTheme.cyanWorking.opacity(0.14)))
+                            }
+                            .buttonStyle(.plain)
                         }
                     }
-
-                    Button {
-                        store.settingsInitialFocusPairing = store.isSignedIn
-                        store.showSettingsSheet = true
-                    } label: {
-                        Label(
-                            store.isSignedIn ? tr("Add machine", "添加主机", locale: store.locale) : tr("Sign in", "立即登录", locale: store.locale),
-                            systemImage: store.isSignedIn ? "plus" : "person.badge.key.fill"
-                        )
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(.black)
-                        .padding(.horizontal, 16)
-                        .padding(.vertical, 9)
-                        .background(Capsule().fill(CodaHerdrTheme.textPrimary))
-                    }
-                    .buttonStyle(.plain)
                 }
+                .padding(24)
             }
-            .padding(24)
 
             Spacer()
         }

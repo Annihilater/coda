@@ -64,6 +64,7 @@ public final class CodaWorkspaceStore: ObservableObject {
     @Published public var showSidebar: Bool = true
     @Published public var showSettingsSheet: Bool = false
     @Published public var settingsInitialFocusPairing: Bool = false
+    @Published public var settingsInitialAuthMode: Int? = nil
     @Published public var showComposeSheet: Bool = false
     @Published public var showPaneMinimapSheet: Bool = false
     @Published public var showGitDiffSheet: Bool = false
@@ -147,6 +148,15 @@ public final class CodaWorkspaceStore: ObservableObject {
     @Published public private(set) var voicePartialTranscript: String = ""
     @Published public var voiceError: String? = nil
     @Published public var accountStatusMessage: String? = nil
+    @Published public var currentUser: CodaAuthUserProfile? = nil
+    @Published public var promptSnippets: [CodaPromptSnippet] = CodaPromptSnippet.defaultStarterSnippets
+    @Published public var isSavingSnippets: Bool = false
+    @Published public var adminInvites: [CodaInviteCodeItem] = []
+    @Published public var adminUsers: [CodaAdminUserSummary] = []
+    @Published public var isLoadingAdminData: Bool = false
+    @Published public var isResettingPassword: Bool = false
+    @Published public var adminStatusMessage: String? = nil
+    @Published public var adminErrorMessage: String? = nil
 
     private var networkClient: CodaNetworkClient?
     private var networkClientURL: URL?
@@ -166,6 +176,8 @@ public final class CodaWorkspaceStore: ObservableObject {
     private var gitDiffGeneration: UInt64 = 0
     private var remoteFileRequestGeneration: UInt64 = 0
     private var portPreviewGeneration: UInt64 = 0
+    private var snippetsMutationGeneration: UInt64 = 0
+    private var lastAccountMetaSyncAt: Date? = nil
     private var pendingSelectSessionID: String? = nil
     private var readCompletedIDs: Set<String> = []
     private var attachedSessionIDs: Set<String> = []
@@ -209,6 +221,17 @@ public final class CodaWorkspaceStore: ObservableObject {
             loadedIdentity.deviceId = savedDevUUID
         }
         self.localIdentity = loadedIdentity
+
+        if !loadedSettings.sessionToken.isEmpty {
+            self.promptSnippets = Self.loadCachedSnippets(
+                serverBaseURL: loadedSettings.serverBaseURLString,
+                ownerHandle: loadedSettings.ownerHandle
+            )
+            self.currentUser = Self.loadCachedUserProfile(
+                serverBaseURL: loadedSettings.serverBaseURLString,
+                ownerHandle: loadedSettings.ownerHandle
+            )
+        }
 
         CodaLocalNotifier.shared.registerSessionTapHandler { [weak self] sid in
             self?.selectSessionByID(sid)
@@ -391,6 +414,16 @@ public final class CodaWorkspaceStore: ObservableObject {
         self.activeToast = nil
         self.uploadStatusBanner = nil
         self.voiceConfigSyncMessage = nil
+        self.lastAccountMetaSyncAt = nil
+        self.snippetsMutationGeneration &+= 1
+        self.adminStatusMessage = nil
+        self.adminErrorMessage = nil
+        if originChanged {
+            self.currentUser = nil
+            self.adminInvites = []
+            self.adminUsers = []
+            self.promptSnippets = CodaPromptSnippet.defaultStarterSnippets
+        }
         cancelVoiceDictation()
         syncIdentityDeviceIdForCurrentRegistration()
         _ = ensureClient()
@@ -1057,11 +1090,22 @@ public final class CodaWorkspaceStore: ObservableObject {
                 clientLabel: localIdentity.name
             )
             settings.sessionToken = tok
-            if let me = try? await client.fetchAuthMe() {
-                settings.ownerHandle = me.handle
+            if let profile = try? await client.fetchCurrentUserProfile() {
+                currentUser = profile
+                settings.ownerHandle = profile.handle
+                Self.saveCachedUserProfile(
+                    profile,
+                    serverBaseURL: settings.serverBaseURLString,
+                    ownerHandle: profile.handle
+                )
             } else {
                 settings.ownerHandle = emailOrHandle
             }
+            promptSnippets = Self.loadCachedSnippets(
+                serverBaseURL: settings.serverBaseURLString,
+                ownerHandle: settings.ownerHandle
+            )
+            lastAccountMetaSyncAt = nil
             syncIdentityDeviceIdForCurrentRegistration()
             settings.save()
             await ensureClientDeviceRegistered(using: client)
@@ -1075,11 +1119,16 @@ public final class CodaWorkspaceStore: ObservableObject {
     public func registerAccount(email: String, handle: String, password: String, inviteCode: String? = nil) async {
         authError = nil
         accountStatusMessage = nil
+        if let rawInvite = inviteCode,
+           let origin = extractServerOriginFromAuthLink(rawInvite),
+           origin.lowercased() != normalizedServerURLString().lowercased() {
+            updateServerURL(origin)
+        }
         guard let client = await preparedClient() else { return }
         do {
             let cleanEmail = email.trimmingCharacters(in: .whitespacesAndNewlines)
             let cleanHandle = handle.trimmingCharacters(in: .whitespacesAndNewlines)
-            let cleanInvite = inviteCode?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let cleanInvite = inviteCode.map(extractInviteCodeFromInput)
             let tok = try await client.register(
                 email: cleanEmail,
                 handle: cleanHandle,
@@ -1088,7 +1137,22 @@ public final class CodaWorkspaceStore: ObservableObject {
                 inviteCode: (cleanInvite?.isEmpty == false) ? cleanInvite : nil
             )
             settings.sessionToken = tok
-            settings.ownerHandle = cleanHandle
+            if let profile = try? await client.fetchCurrentUserProfile() {
+                currentUser = profile
+                settings.ownerHandle = profile.handle
+                Self.saveCachedUserProfile(
+                    profile,
+                    serverBaseURL: settings.serverBaseURLString,
+                    ownerHandle: profile.handle
+                )
+            } else {
+                settings.ownerHandle = cleanHandle
+            }
+            promptSnippets = Self.loadCachedSnippets(
+                serverBaseURL: settings.serverBaseURLString,
+                ownerHandle: settings.ownerHandle
+            )
+            lastAccountMetaSyncAt = nil
             syncIdentityDeviceIdForCurrentRegistration()
             settings.save()
             await ensureClientDeviceRegistered(using: client)
@@ -1376,6 +1440,14 @@ public final class CodaWorkspaceStore: ObservableObject {
         activeToast = nil
         voiceConfigSyncMessage = nil
         uploadStatusBanner = nil
+        currentUser = nil
+        adminInvites = []
+        adminUsers = []
+        adminStatusMessage = nil
+        adminErrorMessage = nil
+        lastAccountMetaSyncAt = nil
+        snippetsMutationGeneration &+= 1
+        promptSnippets = CodaPromptSnippet.defaultStarterSnippets
         selectedSessionID = nil
         networkClient = nil
         networkClientURL = nil
@@ -1416,6 +1488,13 @@ public final class CodaWorkspaceStore: ObservableObject {
         }
 
         do {
+            let needAccountMeta = forceWorkspaces
+                || currentUser == nil
+                || (lastAccountMetaSyncAt.map { Date().timeIntervalSince($0) >= 45 } ?? true)
+            if needAccountMeta {
+                await syncAccountProfileAndSnippets(using: client, epoch: epoch)
+                guard self.workspaceEpoch == epoch, isSignedIn else { return }
+            }
             await ensureClientDeviceRegistered(using: client)
             guard self.workspaceEpoch == epoch, isSignedIn else { return }
             let allDevices = try await client.listDevices()
@@ -3249,6 +3328,388 @@ public final class CodaWorkspaceStore: ObservableObject {
                     self.portPreviewError = error.localizedDescription
                 }
             }
+        }
+    }
+
+    // MARK: - v1.1.0 Synced Prompt Snippets, Password Reset Token & Admin Friend Circle
+
+    private static func snippetsCacheKey(serverBaseURL: String, ownerHandle: String) -> String {
+        let regKey = CodaPersistedSettings.registrationKey(serverBaseURL: serverBaseURL, ownerHandle: ownerHandle)
+        return "dev.codahub.client.prompt_snippets.v1.\(regKey)"
+    }
+
+    private static func userProfileCacheKey(serverBaseURL: String, ownerHandle: String) -> String {
+        let regKey = CodaPersistedSettings.registrationKey(serverBaseURL: serverBaseURL, ownerHandle: ownerHandle)
+        return "dev.codahub.client.user_profile.v1.\(regKey)"
+    }
+
+    private static func loadCachedSnippets(serverBaseURL: String, ownerHandle: String) -> [CodaPromptSnippet] {
+        let key = snippetsCacheKey(serverBaseURL: serverBaseURL, ownerHandle: ownerHandle)
+        guard let data = UserDefaults.standard.data(forKey: key),
+              let decoded = try? JSONDecoder().decode([CodaPromptSnippet].self, from: data) else {
+            return CodaPromptSnippet.defaultStarterSnippets
+        }
+        return CodaPromptSnippet.sanitizeList(decoded)
+    }
+
+    private static func saveCachedSnippets(
+        _ snippets: [CodaPromptSnippet],
+        serverBaseURL: String,
+        ownerHandle: String
+    ) {
+        let key = snippetsCacheKey(serverBaseURL: serverBaseURL, ownerHandle: ownerHandle)
+        let clean = CodaPromptSnippet.sanitizeList(snippets)
+        if let data = try? JSONEncoder().encode(clean) {
+            UserDefaults.standard.set(data, forKey: key)
+        }
+    }
+
+    private static func loadCachedUserProfile(serverBaseURL: String, ownerHandle: String) -> CodaAuthUserProfile? {
+        let key = userProfileCacheKey(serverBaseURL: serverBaseURL, ownerHandle: ownerHandle)
+        guard let data = UserDefaults.standard.data(forKey: key) else { return nil }
+        return try? JSONDecoder().decode(CodaAuthUserProfile.self, from: data)
+    }
+
+    private static func saveCachedUserProfile(
+        _ profile: CodaAuthUserProfile,
+        serverBaseURL: String,
+        ownerHandle: String
+    ) {
+        let key = userProfileCacheKey(serverBaseURL: serverBaseURL, ownerHandle: ownerHandle)
+        if let data = try? JSONEncoder().encode(profile) {
+            UserDefaults.standard.set(data, forKey: key)
+        }
+    }
+
+    private func syncAccountProfileAndSnippets(using client: CodaNetworkClient, epoch: UInt64) async {
+        let snipGenBefore = snippetsMutationGeneration
+        if let profile = try? await client.fetchCurrentUserProfile() {
+            guard self.workspaceEpoch == epoch, isSignedIn else { return }
+            self.currentUser = profile
+            if settings.ownerHandle != profile.handle {
+                settings.ownerHandle = profile.handle
+                settings.save()
+            }
+            Self.saveCachedUserProfile(
+                profile,
+                serverBaseURL: settings.serverBaseURLString,
+                ownerHandle: profile.handle
+            )
+        }
+        if let fetchedSnippets = try? await client.fetchPromptSnippets() {
+            guard self.workspaceEpoch == epoch, isSignedIn else { return }
+            if self.snippetsMutationGeneration == snipGenBefore {
+                self.promptSnippets = fetchedSnippets
+                Self.saveCachedSnippets(
+                    fetchedSnippets,
+                    serverBaseURL: settings.serverBaseURLString,
+                    ownerHandle: settings.ownerHandle
+                )
+            }
+        }
+        lastAccountMetaSyncAt = Date()
+        if currentUser?.isAdmin == true {
+            await loadAdminDashboardData()
+        }
+    }
+
+    public func loadPromptSnippets() async {
+        guard isSignedIn, let client = await preparedClient() else { return }
+        let epoch = workspaceEpoch
+        let genBefore = snippetsMutationGeneration
+        if let fetched = try? await client.fetchPromptSnippets() {
+            guard self.workspaceEpoch == epoch, isSignedIn, self.snippetsMutationGeneration == genBefore else { return }
+            self.promptSnippets = fetched
+            Self.saveCachedSnippets(
+                fetched,
+                serverBaseURL: settings.serverBaseURLString,
+                ownerHandle: settings.ownerHandle
+            )
+        }
+    }
+
+    public func insertSnippetPrompt(_ prompt: String, for sessionID: String) {
+        let clean = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clean.isEmpty else { return }
+        var cur = composeDraft(for: sessionID)
+        if cur.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            cur = clean
+        } else if cur.hasSuffix("\n") {
+            cur += clean
+        } else {
+            cur += "\n" + clean
+        }
+        setComposeDraft(cur, for: sessionID)
+        CodaHaptics.lightTap()
+    }
+
+    @discardableResult
+    public func saveDraftAsSnippet(_ rawDraft: String, customTitle: String? = nil) async -> Bool {
+        let cleanPrompt = rawDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanPrompt.isEmpty else {
+            uploadStatusBanner = tr(
+                "Type a prompt draft first before saving as a snippet.",
+                "请先输入指令内容再保存为快捷片段。",
+                locale: locale
+            )
+            return false
+        }
+        let resolvedTitle = customTitle?.nilIfEmpty ?? CodaPromptSnippet.derivedTitle(fromPrompt: cleanPrompt)
+        guard let candidate = CodaPromptSnippet(title: resolvedTitle, prompt: cleanPrompt).sanitized() else {
+            return false
+        }
+
+        var updated = promptSnippets
+        if let dupIdx = updated.firstIndex(where: {
+            $0.prompt.trimmingCharacters(in: .whitespacesAndNewlines) == candidate.prompt
+        }) {
+            updated[dupIdx].title = candidate.title
+        } else {
+            if updated.count >= CodaPromptSnippet.maxSnippetsCount {
+                uploadStatusBanner = tr(
+                    "Maximum of 24 snippets reached — delete one first.",
+                    "最多可保存 24 条快捷片段，请先删除旧片段。",
+                    locale: locale
+                )
+                return false
+            }
+            updated.append(candidate)
+        }
+
+        let cleanList = CodaPromptSnippet.sanitizeList(updated)
+        snippetsMutationGeneration &+= 1
+        let mutGen = snippetsMutationGeneration
+        let epoch = workspaceEpoch
+        promptSnippets = cleanList
+        if isSignedIn {
+            Self.saveCachedSnippets(
+                cleanList,
+                serverBaseURL: settings.serverBaseURLString,
+                ownerHandle: settings.ownerHandle
+            )
+        }
+        CodaHaptics.success()
+        uploadStatusBanner = tr(
+            "Saved snippet “\(candidate.title)”.",
+            "已保存快捷片段「\(candidate.title)」。",
+            locale: locale
+        )
+
+        guard isSignedIn, let client = await preparedClient() else { return true }
+        isSavingSnippets = true
+        defer {
+            if self.workspaceEpoch == epoch {
+                self.isSavingSnippets = false
+            }
+        }
+        do {
+            let remoteSaved = try await client.savePromptSnippets(cleanList)
+            if self.workspaceEpoch == epoch && self.snippetsMutationGeneration == mutGen {
+                self.promptSnippets = remoteSaved
+                Self.saveCachedSnippets(
+                    remoteSaved,
+                    serverBaseURL: settings.serverBaseURLString,
+                    ownerHandle: settings.ownerHandle
+                )
+            }
+            return true
+        } catch {
+            if self.workspaceEpoch == epoch {
+                self.uploadStatusBanner = error.localizedDescription
+            }
+            return false
+        }
+    }
+
+    public func deletePromptSnippet(id: String) async {
+        let nextList = promptSnippets.filter { $0.id != id }
+        guard nextList.count != promptSnippets.count else { return }
+        snippetsMutationGeneration &+= 1
+        let mutGen = snippetsMutationGeneration
+        let epoch = workspaceEpoch
+        promptSnippets = nextList
+        if isSignedIn {
+            Self.saveCachedSnippets(
+                nextList,
+                serverBaseURL: settings.serverBaseURLString,
+                ownerHandle: settings.ownerHandle
+            )
+        }
+        CodaHaptics.lightTap()
+
+        guard isSignedIn, let client = await preparedClient() else { return }
+        isSavingSnippets = true
+        defer {
+            if self.workspaceEpoch == epoch {
+                self.isSavingSnippets = false
+            }
+        }
+        do {
+            let remoteSaved = try await client.savePromptSnippets(nextList)
+            if self.workspaceEpoch == epoch && self.snippetsMutationGeneration == mutGen {
+                self.promptSnippets = remoteSaved
+                Self.saveCachedSnippets(
+                    remoteSaved,
+                    serverBaseURL: settings.serverBaseURLString,
+                    ownerHandle: settings.ownerHandle
+                )
+            }
+        } catch {
+            if self.workspaceEpoch == epoch {
+                self.uploadStatusBanner = error.localizedDescription
+            }
+        }
+    }
+
+    public func resetPasswordWithToken(
+        rawTokenOrURL: String,
+        newPassword: String
+    ) async -> CodaPasswordResetConfirmResult? {
+        authError = nil
+        accountStatusMessage = nil
+        if let origin = extractServerOriginFromAuthLink(rawTokenOrURL),
+           origin.lowercased() != normalizedServerURLString().lowercased() {
+            updateServerURL(origin)
+        }
+        guard extractResetTokenFromInput(rawTokenOrURL) != nil else {
+            authError = tr(
+                "Please paste a valid reset link or rst_... token.",
+                "请粘贴有效的密码重置链接或 rst_... 令牌。",
+                locale: locale
+            )
+            return nil
+        }
+        guard newPassword.utf8.count >= 8 else {
+            authError = tr(
+                "New password must be at least 8 characters.",
+                "新密码长度至少为 8 位字符。",
+                locale: locale
+            )
+            return nil
+        }
+        guard let client = await preparedClient() else { return nil }
+        let epoch = workspaceEpoch
+        isResettingPassword = true
+        defer {
+            if self.workspaceEpoch == epoch {
+                self.isResettingPassword = false
+            }
+        }
+        do {
+            let res = try await client.resetPasswordWithToken(token: rawTokenOrURL, newPassword: newPassword)
+            guard self.workspaceEpoch == epoch else { return nil }
+            let handleDisplay = res.handle.isEmpty ? "" : " (@\(res.handle))"
+            accountStatusMessage = tr(
+                "Password reset successful\(handleDisplay)! Sign in with your new password.",
+                "密码重置成功\(handleDisplay)！请使用新密码登录。",
+                locale: locale
+            )
+            CodaHaptics.success()
+            return res
+        } catch {
+            if self.workspaceEpoch == epoch {
+                authError = error.localizedDescription
+            }
+            return nil
+        }
+    }
+
+    public func loadAdminDashboardData() async {
+        guard isSignedIn, currentUser?.isAdmin == true, let client = await preparedClient() else { return }
+        let epoch = workspaceEpoch
+        isLoadingAdminData = true
+        defer {
+            if self.workspaceEpoch == epoch {
+                self.isLoadingAdminData = false
+            }
+        }
+        async let invitesResult = client.fetchAdminInvites()
+        async let usersResult = client.fetchAdminUsers()
+        if let invites = try? await invitesResult, self.workspaceEpoch == epoch {
+            self.adminInvites = invites
+        }
+        if let users = try? await usersResult, self.workspaceEpoch == epoch {
+            self.adminUsers = users
+        }
+    }
+
+    @discardableResult
+    public func createAdminInvite(
+        note: String,
+        maxUses: Int = 5,
+        validDays: Int = 30
+    ) async -> CodaInviteCodeItem? {
+        guard isSignedIn, currentUser?.isAdmin == true, let client = await preparedClient() else { return nil }
+        let epoch = workspaceEpoch
+        adminErrorMessage = nil
+        adminStatusMessage = nil
+        do {
+            let created = try await client.createAdminInvite(note: note, maxUses: maxUses, validDays: validDays)
+            guard self.workspaceEpoch == epoch else { return nil }
+            adminInvites.insert(created, at: 0)
+            if let url = buildInviteRegistrationURL(serverURL: settings.serverBaseURLString, code: created.code) {
+                copyTextToClipboard(url)
+                adminStatusMessage = tr(
+                    "Created \(created.code) & copied invite link.",
+                    "已创建 \(created.code) 并复制注册邀请链接。",
+                    locale: locale
+                )
+            } else {
+                adminStatusMessage = tr(
+                    "Created invite code \(created.code).",
+                    "已创建邀请码 \(created.code)。",
+                    locale: locale
+                )
+            }
+            CodaHaptics.success()
+            return created
+        } catch {
+            if self.workspaceEpoch == epoch {
+                adminErrorMessage = error.localizedDescription
+            }
+            return nil
+        }
+    }
+
+    public func deleteAdminInvite(code: String) async {
+        guard isSignedIn, currentUser?.isAdmin == true, let client = await preparedClient() else { return }
+        let epoch = workspaceEpoch
+        adminErrorMessage = nil
+        do {
+            try await client.deleteAdminInvite(code: code)
+            guard self.workspaceEpoch == epoch else { return }
+            adminInvites.removeAll { $0.code == code }
+            adminStatusMessage = tr("Revoked invite \(code).", "已撤销邀请码 \(code)。", locale: locale)
+        } catch {
+            if self.workspaceEpoch == epoch {
+                adminErrorMessage = error.localizedDescription
+            }
+        }
+    }
+
+    public func generateAdminPasswordResetLink(
+        for member: CodaAdminUserSummary
+    ) async -> CodaPasswordResetLinkResult? {
+        guard isSignedIn, currentUser?.isAdmin == true, let client = await preparedClient() else { return nil }
+        let epoch = workspaceEpoch
+        adminErrorMessage = nil
+        adminStatusMessage = nil
+        do {
+            let res = try await client.createAdminPasswordResetLink(userId: member.id)
+            guard self.workspaceEpoch == epoch else { return nil }
+            copyTextToClipboard(res.resetUrl)
+            CodaHaptics.success()
+            adminStatusMessage = tr(
+                "Copied 24h reset link for @\(member.handle) — paste on WeChat.",
+                "已复制 @\(member.handle) 的 24 小时密码重置链接，可直接发送至微信。",
+                locale: locale
+            )
+            return res
+        } catch {
+            if self.workspaceEpoch == epoch {
+                adminErrorMessage = error.localizedDescription
+            }
+            return nil
         }
     }
 }

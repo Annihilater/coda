@@ -2173,6 +2173,525 @@ public struct CodaPruneStaleDevicesResult: Codable, Sendable, Equatable {
     }
 }
 
+// MARK: - Cross-Device Prompt Snippets, Friend Onboarding & Admin Member Models (v1.1.0)
+
+public struct CodaPromptSnippet: Codable, Identifiable, Equatable, Sendable {
+    public static let maxSnippetsCount = 24
+    public static let maxTitleLength = 60
+    public static let maxPromptLength = 4000
+
+    public var id: String
+    public var title: String
+    public var prompt: String
+
+    public init(
+        id: String = "snip-\(UUID().uuidString.lowercased().prefix(8))",
+        title: String,
+        prompt: String
+    ) {
+        self.id = id
+        self.title = title
+        self.prompt = prompt
+    }
+
+    public static let defaultStarterSnippets: [CodaPromptSnippet] = [
+        CodaPromptSnippet(
+            id: "s1",
+            title: "Run Tests & Fix",
+            prompt: "Run the full test suite, fix any failures or compiler warnings, and summarize what changed."
+        ),
+        CodaPromptSnippet(
+            id: "s2",
+            title: "Review Git Diff",
+            prompt: "Review the current git diff carefully for bugs, edge cases, or regressions before committing."
+        ),
+        CodaPromptSnippet(
+            id: "s3",
+            title: "Continue",
+            prompt: "Continue with the next steps until everything is complete and verified."
+        ),
+        CodaPromptSnippet(
+            id: "s4",
+            title: "Clean Commit",
+            prompt: "Stage and commit the current changes with a concise conventional commit message."
+        ),
+    ]
+
+    public static func derivedTitle(fromPrompt rawPrompt: String) -> String {
+        let firstNonEmpty = rawPrompt
+            .components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .first(where: { !$0.isEmpty }) ?? ""
+        guard !firstNonEmpty.isEmpty else { return "Snippet" }
+        let collapsed = firstNonEmpty
+            .components(separatedBy: .whitespaces)
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+        if collapsed.count <= 34 {
+            return collapsed
+        }
+        return String(collapsed.prefix(33)) + "…"
+    }
+
+    private static func truncateScalars(_ text: String, maxScalars: Int) -> String {
+        guard text.unicodeScalars.count > maxScalars else { return text }
+        return String(String.UnicodeScalarView(text.unicodeScalars.prefix(maxScalars)))
+    }
+
+    private static func stripControlScalars(_ text: String, replaceWhitespaceWithSpace: Bool) -> String {
+        var out = String.UnicodeScalarView()
+        out.reserveCapacity(text.unicodeScalars.count)
+        for sc in text.unicodeScalars {
+            let v = sc.value
+            let isCtrl = v < 0x20 || (v >= 0x7F && v <= 0x9F)
+            if isCtrl {
+                if replaceWhitespaceWithSpace && (v == 0x09 || v == 0x0A || v == 0x0D) {
+                    out.append(" ")
+                }
+            } else {
+                out.append(sc)
+            }
+        }
+        return String(out)
+    }
+
+    public func sanitized() -> CodaPromptSnippet? {
+        let cleanPrompt = prompt
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+            .replacingOccurrences(of: "\0", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanPrompt.isEmpty else { return nil }
+
+        let rawId = Self.stripControlScalars(id, replaceWhitespaceWithSpace: false)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanId = rawId.isEmpty
+            ? "snip-\(UUID().uuidString.lowercased().prefix(8))"
+            : Self.truncateScalars(rawId, maxScalars: 64)
+
+        let rawTitle = Self.stripControlScalars(title, replaceWhitespaceWithSpace: true)
+            .components(separatedBy: .whitespaces)
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let resolvedTitle = rawTitle.isEmpty ? Self.derivedTitle(fromPrompt: cleanPrompt) : rawTitle
+        let boundedTitle = Self.truncateScalars(resolvedTitle, maxScalars: Self.maxTitleLength)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let boundedPrompt = Self.truncateScalars(cleanPrompt, maxScalars: Self.maxPromptLength)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !boundedTitle.isEmpty, !boundedPrompt.isEmpty else { return nil }
+        return CodaPromptSnippet(id: cleanId, title: boundedTitle, prompt: boundedPrompt)
+    }
+
+    public static func sanitizeList(_ snippets: [CodaPromptSnippet]) -> [CodaPromptSnippet] {
+        var out: [CodaPromptSnippet] = []
+        var seenIds = Set<String>()
+        for item in snippets {
+            guard let clean = item.sanitized() else { continue }
+            var finalItem = clean
+            if !seenIds.insert(finalItem.id).inserted {
+                finalItem.id = "snip-\(UUID().uuidString.lowercased().prefix(8))"
+                seenIds.insert(finalItem.id)
+            }
+            out.append(finalItem)
+            if out.count >= maxSnippetsCount {
+                break
+            }
+        }
+        return out
+    }
+}
+
+public struct CodaPromptSnippetsEnvelope: Codable, Equatable, Sendable {
+    public let snippets: [CodaPromptSnippet]
+
+    public init(snippets: [CodaPromptSnippet]) {
+        self.snippets = snippets
+    }
+}
+
+public struct CodaAuthUserProfile: Codable, Identifiable, Equatable, Sendable {
+    public let id: UUID
+    public let email: String
+    public let handle: String
+    public let displayName: String
+    public let isAdmin: Bool
+    public let bandwidthQuotaMbps: Int
+    public let createdAt: String?
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case email
+        case handle
+        case displayName = "display_name"
+        case isAdmin = "is_admin"
+        case bandwidthQuotaMbps = "bandwidth_quota_mbps"
+        case createdAt = "created_at"
+    }
+
+    public init(
+        id: UUID,
+        email: String,
+        handle: String,
+        displayName: String = "",
+        isAdmin: Bool = false,
+        bandwidthQuotaMbps: Int = 25,
+        createdAt: String? = nil
+    ) {
+        self.id = id
+        self.email = email
+        self.handle = handle
+        self.displayName = displayName
+        self.isAdmin = isAdmin
+        self.bandwidthQuotaMbps = bandwidthQuotaMbps
+        self.createdAt = createdAt
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(UUID.self, forKey: .id)
+        email = (try? c.decodeIfPresent(String.self, forKey: .email)) ?? ""
+        handle = try c.decode(String.self, forKey: .handle)
+        displayName = (try? c.decodeIfPresent(String.self, forKey: .displayName)) ?? ""
+        isAdmin = (try? c.decodeIfPresent(Bool.self, forKey: .isAdmin)) ?? false
+        bandwidthQuotaMbps = (try? c.decodeIfPresent(Int.self, forKey: .bandwidthQuotaMbps)) ?? 25
+        createdAt = try? c.decodeIfPresent(String.self, forKey: .createdAt)
+    }
+}
+
+public struct CodaInviteCodeItem: Codable, Identifiable, Equatable, Sendable {
+    public var id: String { code }
+    public let code: String
+    public let note: String
+    public let maxUses: Int
+    public let usedCount: Int
+    public let expiresAt: String?
+    public let createdAt: String?
+
+    enum CodingKeys: String, CodingKey {
+        case code
+        case note
+        case maxUses = "max_uses"
+        case usedCount = "used_count"
+        case expiresAt = "expires_at"
+        case createdAt = "created_at"
+    }
+
+    public init(
+        code: String,
+        note: String = "",
+        maxUses: Int = 5,
+        usedCount: Int = 0,
+        expiresAt: String? = nil,
+        createdAt: String? = nil
+    ) {
+        self.code = code
+        self.note = note
+        self.maxUses = maxUses
+        self.usedCount = usedCount
+        self.expiresAt = expiresAt
+        self.createdAt = createdAt
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        code = try c.decode(String.self, forKey: .code)
+        note = (try? c.decodeIfPresent(String.self, forKey: .note)) ?? ""
+        maxUses = (try? c.decodeIfPresent(Int.self, forKey: .maxUses)) ?? 1
+        usedCount = (try? c.decodeIfPresent(Int.self, forKey: .usedCount)) ?? 0
+        expiresAt = try? c.decodeIfPresent(String.self, forKey: .expiresAt)
+        createdAt = try? c.decodeIfPresent(String.self, forKey: .createdAt)
+    }
+}
+
+public struct CodaAdminUserSummary: Codable, Identifiable, Equatable, Sendable {
+    public let id: UUID
+    public let handle: String
+    public let email: String
+    public let displayName: String
+    public let isAdmin: Bool
+    public let onlineDevices: Int
+    public let totalDevices: Int
+    public let lastLoginAt: String?
+    public let createdAt: String?
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case handle
+        case email
+        case displayName = "display_name"
+        case isAdmin = "is_admin"
+        case onlineDevices = "online_devices"
+        case totalDevices = "total_devices"
+        case lastLoginAt = "last_login_at"
+        case createdAt = "created_at"
+    }
+
+    public init(
+        id: UUID,
+        handle: String,
+        email: String = "",
+        displayName: String = "",
+        isAdmin: Bool = false,
+        onlineDevices: Int = 0,
+        totalDevices: Int = 0,
+        lastLoginAt: String? = nil,
+        createdAt: String? = nil
+    ) {
+        self.id = id
+        self.handle = handle
+        self.email = email
+        self.displayName = displayName
+        self.isAdmin = isAdmin
+        self.onlineDevices = onlineDevices
+        self.totalDevices = totalDevices
+        self.lastLoginAt = lastLoginAt
+        self.createdAt = createdAt
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(UUID.self, forKey: .id)
+        handle = try c.decode(String.self, forKey: .handle)
+        email = (try? c.decodeIfPresent(String.self, forKey: .email)) ?? ""
+        displayName = (try? c.decodeIfPresent(String.self, forKey: .displayName)) ?? ""
+        isAdmin = (try? c.decodeIfPresent(Bool.self, forKey: .isAdmin)) ?? false
+        onlineDevices = (try? c.decodeIfPresent(Int.self, forKey: .onlineDevices)) ?? 0
+        totalDevices = (try? c.decodeIfPresent(Int.self, forKey: .totalDevices)) ?? 0
+        lastLoginAt = try? c.decodeIfPresent(String.self, forKey: .lastLoginAt)
+        createdAt = try? c.decodeIfPresent(String.self, forKey: .createdAt)
+    }
+}
+
+public struct CodaAdminUsersEnvelope: Codable, Equatable, Sendable {
+    public let users: [CodaAdminUserSummary]
+
+    public init(users: [CodaAdminUserSummary]) {
+        self.users = users
+    }
+}
+
+public struct CodaPasswordResetLinkResult: Codable, Equatable, Sendable {
+    public let ok: Bool
+    public let userId: UUID
+    public let handle: String
+    public let resetToken: String
+    public let resetUrl: String
+    public let expiresInSecs: Int
+
+    public var resetURL: String { resetUrl }
+
+    enum CodingKeys: String, CodingKey {
+        case ok
+        case userId = "user_id"
+        case handle
+        case resetToken = "reset_token"
+        case resetUrl = "reset_url"
+        case expiresInSecs = "expires_in_secs"
+    }
+
+    public init(
+        ok: Bool = true,
+        userId: UUID,
+        handle: String,
+        resetToken: String,
+        resetUrl: String,
+        expiresInSecs: Int = 86400
+    ) {
+        self.ok = ok
+        self.userId = userId
+        self.handle = handle
+        self.resetToken = resetToken
+        self.resetUrl = resetUrl
+        self.expiresInSecs = expiresInSecs
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        ok = (try? c.decodeIfPresent(Bool.self, forKey: .ok)) ?? true
+        userId = try c.decode(UUID.self, forKey: .userId)
+        handle = (try? c.decodeIfPresent(String.self, forKey: .handle)) ?? ""
+        resetToken = try c.decode(String.self, forKey: .resetToken)
+        resetUrl = try c.decode(String.self, forKey: .resetUrl)
+        expiresInSecs = (try? c.decodeIfPresent(Int.self, forKey: .expiresInSecs)) ?? 86400
+    }
+}
+
+public struct CodaPasswordResetConfirmResult: Codable, Equatable, Sendable {
+    public let ok: Bool
+    public let handle: String
+
+    public init(ok: Bool = true, handle: String = "") {
+        self.ok = ok
+        self.handle = handle
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case ok
+        case handle
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        ok = (try? c.decodeIfPresent(Bool.self, forKey: .ok)) ?? true
+        handle = (try? c.decodeIfPresent(String.self, forKey: .handle)) ?? ""
+    }
+}
+
+private func isURLSafeResetTokenChar(_ scalar: Unicode.Scalar) -> Bool {
+    let v = scalar.value
+    return (v >= 0x30 && v <= 0x39) // 0-9
+        || (v >= 0x41 && v <= 0x5A) // A-Z
+        || (v >= 0x61 && v <= 0x7A) // a-z
+        || v == 0x5F || v == 0x2D   // _ -
+}
+
+private func isValidBareResetToken(_ raw: String) -> Bool {
+    guard raw.hasPrefix("rst_"), raw.count <= 256 else { return false }
+    let suffix = raw.dropFirst(4)
+    guard !suffix.isEmpty else { return false }
+    return suffix.unicodeScalars.allSatisfy(isURLSafeResetTokenChar)
+}
+
+/// Extracts a clean `rst_...` password reset token from either a full
+/// `https://.../reset-password?token=rst_...` URL (including WeChat message text around a URL)
+/// or a raw `rst_...` token string. Returns `nil` when no valid `rst_...` token is present.
+public func extractResetTokenFromInput(_ raw: String) -> String? {
+    let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return nil }
+
+    if isValidBareResetToken(trimmed) {
+        return trimmed
+    }
+
+    if let comps = URLComponents(string: trimmed) {
+        if let items = comps.queryItems,
+           let tokenItem = items.first(where: { $0.name.lowercased() == "token" }),
+           let val = tokenItem.value?.trimmingCharacters(in: .whitespacesAndNewlines),
+           isValidBareResetToken(val) {
+            return val
+        }
+        if let frag = comps.fragment, frag.contains("?"),
+           let fragComps = URLComponents(string: "https://codahub.local/" + frag),
+           let items = fragComps.queryItems,
+           let tokenItem = items.first(where: { $0.name.lowercased() == "token" }),
+           let val = tokenItem.value?.trimmingCharacters(in: .whitespacesAndNewlines),
+           isValidBareResetToken(val) {
+            return val
+        }
+    }
+
+    let decoded = trimmed.removingPercentEncoding ?? trimmed
+    var searchStart = decoded.startIndex
+    while let range = decoded.range(of: "rst_", range: searchStart..<decoded.endIndex) {
+        let precededByWordChar: Bool
+        if range.lowerBound > decoded.startIndex {
+            let prevIdx = decoded.index(before: range.lowerBound)
+            let prevScalar = decoded[prevIdx].unicodeScalars.first
+            precededByWordChar = prevScalar.map(isURLSafeResetTokenChar) ?? false
+        } else {
+            precededByWordChar = false
+        }
+
+        var cursor = range.upperBound
+        while cursor < decoded.endIndex,
+              let sc = decoded[cursor].unicodeScalars.first,
+              decoded[cursor].unicodeScalars.count == 1,
+              isURLSafeResetTokenChar(sc) {
+            cursor = decoded.index(after: cursor)
+        }
+        let candidate = String(decoded[range.lowerBound..<cursor])
+        if !precededByWordChar && isValidBareResetToken(candidate) {
+            return candidate
+        }
+        searchStart = cursor > range.lowerBound ? cursor : decoded.index(after: range.lowerBound)
+    }
+    return nil
+}
+
+/// Builds a shareable friend registration link (`https://<server>/register?invite=CODA-XXXXXX`)
+/// from a base server URL and invite code. Returns `nil` if `serverURL` or `code` is invalid.
+public func buildInviteRegistrationURL(serverURL: String, code: String) -> String? {
+    let cleanServer = serverURL.trimmingCharacters(in: .whitespacesAndNewlines)
+    let cleanCode = code.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !cleanServer.isEmpty,
+          !cleanCode.isEmpty,
+          var comps = URLComponents(string: cleanServer),
+          let scheme = comps.scheme?.lowercased(),
+          (scheme == "https" || scheme == "http"),
+          let host = comps.host,
+          !host.isEmpty,
+          comps.user == nil,
+          comps.password == nil
+    else {
+        return nil
+    }
+    var basePath = comps.path
+    while basePath.hasSuffix("/") {
+        basePath.removeLast()
+    }
+    comps.path = basePath + "/register"
+    comps.queryItems = [URLQueryItem(name: "invite", value: cleanCode)]
+    comps.fragment = nil
+    return comps.url?.absoluteString
+}
+
+/// Extracts an invite code from either a pasted `https://.../register?invite=CODA-XXXXXX` URL or raw code.
+public func extractInviteCodeFromInput(_ raw: String) -> String {
+    let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return "" }
+    if let comps = URLComponents(string: trimmed),
+       let items = comps.queryItems,
+       let inv = items.first(where: { $0.name.lowercased() == "invite" })?.value?.trimmingCharacters(in: .whitespacesAndNewlines),
+       !inv.isEmpty {
+        return inv
+    }
+    return trimmed
+}
+
+/// Extracts a safe `https://host[:port]` (or loopback `http://localhost[:port]`) server origin from a pasted reset/invite URL.
+public func extractServerOriginFromAuthLink(_ raw: String) -> String? {
+    let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard let comps = URLComponents(string: trimmed),
+          let scheme = comps.scheme?.lowercased(),
+          let host = comps.host?.lowercased(),
+          !host.isEmpty,
+          comps.user == nil,
+          comps.password == nil
+    else {
+        return nil
+    }
+    let isLoopback = host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "[::1]"
+    guard scheme == "https" || (scheme == "http" && isLoopback) else {
+        return nil
+    }
+    var origin = URLComponents()
+    origin.scheme = scheme
+    origin.host = comps.host
+    origin.port = comps.port
+    return origin.url?.absoluteString
+}
+
+/// Builds a shell-safe 1-line host enrollment command (`curl -fsSL <serverURL>/install.sh | sh`).
+public func buildOneLineInstallCommand(serverURL: String) -> String {
+    var trimmed = serverURL.trimmingCharacters(in: .whitespacesAndNewlines)
+    while trimmed.hasSuffix("/") && trimmed.count > "https://".count {
+        trimmed.removeLast()
+    }
+    let unsafeChars = CharacterSet(charactersIn: " \t\r\n'\"`$;&|<>\\")
+    if let comps = URLComponents(string: trimmed),
+       let scheme = comps.scheme?.lowercased(),
+       (scheme == "https" || scheme == "http"),
+       let host = comps.host,
+       !host.isEmpty,
+       comps.user == nil,
+       comps.password == nil,
+       trimmed.rangeOfCharacter(from: unsafeChars) == nil {
+        return "curl -fsSL \(trimmed)/install.sh | sh"
+    }
+    return "curl -fsSL https://codahub.dev/install.sh | sh"
+}
+
 // MARK: - Responsive Apple Device Form Factors, Fold Postures & Safe Area Specs
 
 public enum CodaFoldPosture: String, Codable, Sendable, CaseIterable, Equatable {

@@ -1433,6 +1433,148 @@ struct CodaSelfTest {
             ) == .iphoneDuoCoverPortrait,
             "Duo Cover 466x678 with keyboard open must stay .iphoneDuoCoverPortrait instead of flipping to .iphoneLandscape"
         )
+
+        // 8n. v1.1.0 Friend-Circle Upgrades: CodaPromptSnippet Roundtrip, Reset Token Parser, Invite URLs & Admin Wire Models
+        precondition(CodaPromptSnippet.defaultStarterSnippets.count == 4)
+        precondition(CodaPromptSnippet.defaultStarterSnippets.map(\.id) == ["s1", "s2", "s3", "s4"])
+
+        let customSnippet = CodaPromptSnippet(
+            id: "snip-audit-1",
+            title: "Audit Security",
+            prompt: "Inspect all endpoints for authz and SSRF\nand run cargo test."
+        )
+        let encodedEnvelope = try JSONEncoder().encode(
+            CodaPromptSnippetsEnvelope(snippets: [customSnippet] + CodaPromptSnippet.defaultStarterSnippets)
+        )
+        let rawSnippetsObj = try JSONSerialization.jsonObject(with: encodedEnvelope) as? [String: Any]
+        precondition((rawSnippetsObj?["snippets"] as? [[String: Any]])?.count == 5)
+        let decodedEnvelope = try JSONDecoder().decode(CodaPromptSnippetsEnvelope.self, from: encodedEnvelope)
+        precondition(decodedEnvelope.snippets.first == customSnippet)
+        precondition(decodedEnvelope.snippets.count == 5)
+
+        // Sanitization limits: max 24 items, title <= 60, prompt <= 4000, empty prompt rejected, duplicate IDs disambiguated
+        precondition(CodaPromptSnippet(id: "empty", title: "Empty", prompt: "   \n  ").sanitized() == nil)
+        let longTitlePrompt = CodaPromptSnippet(
+            id: "long\u{07}-1",
+            title: "Line1\nLine2\u{1B} " + String(repeating: "👨‍👩‍👧‍👦", count: 20),
+            prompt: String(repeating: "P", count: 4500)
+        ).sanitized()
+        precondition(
+            longTitlePrompt != nil
+                && longTitlePrompt!.id == "long-1"
+                && longTitlePrompt!.title.unicodeScalars.count <= 60
+                && !longTitlePrompt!.title.unicodeScalars.contains(where: { $0.value < 0x20 || ($0.value >= 0x7F && $0.value <= 0x9F) })
+                && longTitlePrompt!.prompt.unicodeScalars.count == 4000
+        )
+        let oversizedList = (0..<30).map { idx in
+            CodaPromptSnippet(id: idx < 2 ? "dup-id" : "id-\(idx)", title: "", prompt: "Prompt line \(idx)\ndetail")
+        }
+        let sanitizedList = CodaPromptSnippet.sanitizeList(oversizedList)
+        precondition(sanitizedList.count == 24, "Expected max 24 snippets, got \(sanitizedList.count)")
+        precondition(Set(sanitizedList.map(\.id)).count == 24, "Duplicate snippet IDs must be disambiguated")
+        precondition(sanitizedList[0].title == "Prompt line 0")
+
+        // extractResetTokenFromInput: raw token vs full URL vs query params vs WeChat message vs invalid inputs
+        let sampleResetToken = "rst_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789_-"
+        precondition(extractResetTokenFromInput("  \(sampleResetToken)\n") == sampleResetToken)
+        precondition(
+            extractResetTokenFromInput("https://codahub.dev/reset-password?token=\(sampleResetToken)") == sampleResetToken
+        )
+        precondition(
+            extractResetTokenFromInput("https://coda.example.com:8443/reset-password?utm=wechat&token=\(sampleResetToken)#form")
+                == sampleResetToken
+        )
+        precondition(
+            extractResetTokenFromInput("https://codahub.dev/#/reset-password?token=\(sampleResetToken)") == sampleResetToken
+        )
+        precondition(
+            extractResetTokenFromInput("Hi! Reset your Coda password here: https://codahub.dev/reset-password?token=\(sampleResetToken) (24h)")
+                == sampleResetToken
+        )
+        precondition(extractResetTokenFromInput("") == nil)
+        precondition(extractResetTokenFromInput("   ") == nil)
+        precondition(extractResetTokenFromInput("rst_") == nil)
+        precondition(extractResetTokenFromInput("https://codahub.dev/reset-password?token=") == nil)
+        precondition(extractResetTokenFromInput("https://codahub.dev/login") == nil)
+        precondition(extractResetTokenFromInput("first_name_should_not_match") == nil)
+
+        // buildInviteRegistrationURL & extractInviteCodeFromInput & buildOneLineInstallCommand
+        precondition(
+            buildInviteRegistrationURL(serverURL: "https://codahub.dev", code: "CODA-8F3K9A")
+                == "https://codahub.dev/register?invite=CODA-8F3K9A"
+        )
+        precondition(
+            buildInviteRegistrationURL(serverURL: "https://codahub.dev///", code: "CODA-8F3K9A")
+                == "https://codahub.dev/register?invite=CODA-8F3K9A"
+        )
+        precondition(
+            buildInviteRegistrationURL(serverURL: "http://127.0.0.1:8080", code: "CODA-LOCAL1")
+                == "http://127.0.0.1:8080/register?invite=CODA-LOCAL1"
+        )
+        precondition(buildInviteRegistrationURL(serverURL: "https://codahub.dev", code: "   ") == nil)
+        precondition(buildInviteRegistrationURL(serverURL: "javascript:alert(1)", code: "CODA-123") == nil)
+        precondition(
+            extractInviteCodeFromInput("https://codahub.dev/register?invite=CODA-FRIEND9") == "CODA-FRIEND9"
+        )
+        precondition(extractInviteCodeFromInput("  CODA-RAW77 ") == "CODA-RAW77")
+        precondition(
+            extractServerOriginFromAuthLink("https://mesh.example.org:8443/reset-password?token=rst_abc12345")
+                == "https://mesh.example.org:8443"
+        )
+        precondition(
+            extractServerOriginFromAuthLink("http://evil.example.org/reset-password?token=rst_abc12345") == nil
+        )
+        precondition(
+            buildOneLineInstallCommand(serverURL: "https://codahub.dev/") == "curl -fsSL https://codahub.dev/install.sh | sh"
+        )
+        precondition(
+            buildOneLineInstallCommand(serverURL: "https://evil.com; rm -rf /") == "curl -fsSL https://codahub.dev/install.sh | sh"
+        )
+
+        // Admin users, reset-link & auth profile snake_case wire compatibility
+        let adminUsersJSON = Data("""
+        {
+          "users": [
+            {
+              "id": "11111111-2222-3333-4444-555555555555",
+              "handle": "alice",
+              "email": "alice@example.com",
+              "display_name": "Alice",
+              "is_admin": true,
+              "online_devices": 2,
+              "total_devices": 3,
+              "last_login_at": "2026-11-21T05:50:50.123456Z",
+              "created_at": "2026-11-01T00:00:00Z"
+            }
+          ]
+        }
+        """.utf8)
+        let decodedAdminUsers = try JSONDecoder().decode(CodaAdminUsersEnvelope.self, from: adminUsersJSON)
+        precondition(decodedAdminUsers.users.count == 1)
+        precondition(decodedAdminUsers.users[0].handle == "alice")
+        precondition(decodedAdminUsers.users[0].isAdmin == true)
+        precondition(decodedAdminUsers.users[0].onlineDevices == 2 && decodedAdminUsers.users[0].totalDevices == 3)
+
+        let resetLinkJSON = Data("""
+        {
+          "ok": true,
+          "user_id": "11111111-2222-3333-4444-555555555555",
+          "handle": "alice",
+          "reset_token": "rst_1234567890abcdef1234567890abcdef",
+          "reset_url": "https://codahub.dev/reset-password?token=rst_1234567890abcdef1234567890abcdef",
+          "expires_in_secs": 86400
+        }
+        """.utf8)
+        let decodedResetLink = try JSONDecoder().decode(CodaPasswordResetLinkResult.self, from: resetLinkJSON)
+        precondition(decodedResetLink.ok && decodedResetLink.handle == "alice")
+        precondition(
+            decodedResetLink.resetUrl == "https://codahub.dev/reset-password?token=rst_1234567890abcdef1234567890abcdef"
+        )
+        precondition(extractResetTokenFromInput(decodedResetLink.resetUrl) == decodedResetLink.resetToken)
+
+        let resetConfirmJSON = Data(#"{"ok":true,"handle":"alice"}"#.utf8)
+        let decodedResetConfirm = try JSONDecoder().decode(CodaPasswordResetConfirmResult.self, from: resetConfirmJSON)
+        precondition(decodedResetConfirm.ok && decodedResetConfirm.handle == "alice")
     }
 
     private static func readFramed(conn: NWConnection, completion: @escaping @Sendable ([String: Any]?) -> Void) {

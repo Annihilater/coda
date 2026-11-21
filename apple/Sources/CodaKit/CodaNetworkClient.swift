@@ -585,6 +585,11 @@ public actor CodaNetworkClient {
     }
 
     public func fetchAuthMe() async throws -> (handle: String, email: String) {
+        let profile = try await fetchCurrentUserProfile()
+        return (profile.handle, profile.email)
+    }
+
+    public func fetchCurrentUserProfile() async throws -> CodaAuthUserProfile {
         let url = serverBaseURL.appendingPathComponent("api/v1/auth/me")
         var req = URLRequest(url: url)
         req.httpMethod = "GET"
@@ -593,12 +598,181 @@ public actor CodaNetworkClient {
         }
         let (data, resp) = try await URLSession.shared.data(for: req)
         guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
-            throw URLError(.userAuthenticationRequired)
+            throw CodaAPIError.fromResponse(data: data, response: resp, fallback: "Fetch account profile failed")
         }
-        let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
-        let handle = (json?["handle"] as? String) ?? ""
-        let email = (json?["email"] as? String) ?? ""
-        return (handle, email)
+        return try JSONDecoder().decode(CodaAuthUserProfile.self, from: data)
+    }
+
+    public func fetchPromptSnippets() async throws -> [CodaPromptSnippet] {
+        let url = serverBaseURL.appendingPathComponent("api/v1/me/snippets")
+        var req = URLRequest(url: url)
+        req.httpMethod = "GET"
+        if let token = bearerToken {
+            req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            throw CodaAPIError.fromResponse(data: data, response: resp, fallback: "Fetch prompt snippets failed")
+        }
+        if let envelope = try? JSONDecoder().decode(CodaPromptSnippetsEnvelope.self, from: data) {
+            return CodaPromptSnippet.sanitizeList(envelope.snippets)
+        }
+        let direct = try JSONDecoder().decode([CodaPromptSnippet].self, from: data)
+        return CodaPromptSnippet.sanitizeList(direct)
+    }
+
+    @discardableResult
+    public func savePromptSnippets(_ snippets: [CodaPromptSnippet]) async throws -> [CodaPromptSnippet] {
+        let clean = CodaPromptSnippet.sanitizeList(snippets)
+        let url = serverBaseURL.appendingPathComponent("api/v1/me/snippets")
+        var req = URLRequest(url: url)
+        req.httpMethod = "PUT"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if let token = bearerToken {
+            req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
+        req.httpBody = try JSONEncoder().encode(CodaPromptSnippetsEnvelope(snippets: clean))
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            throw CodaAPIError.fromResponse(data: data, response: resp, fallback: "Save prompt snippets failed")
+        }
+        if let envelope = try? JSONDecoder().decode(CodaPromptSnippetsEnvelope.self, from: data) {
+            return CodaPromptSnippet.sanitizeList(envelope.snippets)
+        }
+        if let direct = try? JSONDecoder().decode([CodaPromptSnippet].self, from: data) {
+            return CodaPromptSnippet.sanitizeList(direct)
+        }
+        return clean
+    }
+
+    public func fetchAdminInvites() async throws -> [CodaInviteCodeItem] {
+        let url = serverBaseURL.appendingPathComponent("api/v1/invites")
+        var req = URLRequest(url: url)
+        req.httpMethod = "GET"
+        if let token = bearerToken {
+            req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            throw CodaAPIError.fromResponse(data: data, response: resp, fallback: "Fetch invite codes failed")
+        }
+        if let direct = try? JSONDecoder().decode([CodaInviteCodeItem].self, from: data) {
+            return direct
+        }
+        struct InvitesEnvelope: Codable { let invites: [CodaInviteCodeItem] }
+        return try JSONDecoder().decode(InvitesEnvelope.self, from: data).invites
+    }
+
+    public func createAdminInvite(
+        note: String = "",
+        maxUses: Int = 5,
+        validDays: Int = 30
+    ) async throws -> CodaInviteCodeItem {
+        let url = serverBaseURL.appendingPathComponent("api/v1/invites")
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if let token = bearerToken {
+            req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
+        let body: [String: Any] = [
+            "note": note.trimmingCharacters(in: .whitespacesAndNewlines),
+            "max_uses": max(1, maxUses),
+            "valid_days": max(1, validDays),
+        ]
+        req.httpBody = try JSONSerialization.data(withJSONObject: body)
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            throw CodaAPIError.fromResponse(data: data, response: resp, fallback: "Create invite code failed")
+        }
+        return try JSONDecoder().decode(CodaInviteCodeItem.self, from: data)
+    }
+
+    public func deleteAdminInvite(code: String) async throws {
+        let cleanCode = code.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanCode.isEmpty else { return }
+        let url = serverBaseURL
+            .appendingPathComponent("api/v1/invites")
+            .appendingPathComponent(cleanCode)
+        var req = URLRequest(url: url)
+        req.httpMethod = "DELETE"
+        if let token = bearerToken {
+            req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            throw CodaAPIError.fromResponse(data: data, response: resp, fallback: "Revoke invite code failed")
+        }
+    }
+
+    public func fetchAdminUsers() async throws -> [CodaAdminUserSummary] {
+        let url = serverBaseURL.appendingPathComponent("api/v1/admin/users")
+        var req = URLRequest(url: url)
+        req.httpMethod = "GET"
+        if let token = bearerToken {
+            req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            throw CodaAPIError.fromResponse(data: data, response: resp, fallback: "Fetch admin members failed")
+        }
+        if let envelope = try? JSONDecoder().decode(CodaAdminUsersEnvelope.self, from: data) {
+            return envelope.users
+        }
+        return try JSONDecoder().decode([CodaAdminUserSummary].self, from: data)
+    }
+
+    public func createAdminPasswordResetLink(userId: UUID) async throws -> CodaPasswordResetLinkResult {
+        let url = serverBaseURL.appendingPathComponent("api/v1/admin/users/\(userId.uuidString.lowercased())/reset-link")
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if let token = bearerToken {
+            req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
+        req.httpBody = Data("{}".utf8)
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            throw CodaAPIError.fromResponse(data: data, response: resp, fallback: "Create password reset link failed")
+        }
+        return try JSONDecoder().decode(CodaPasswordResetLinkResult.self, from: data)
+    }
+
+    @discardableResult
+    public func resetPasswordWithToken(
+        token: String,
+        newPassword: String
+    ) async throws -> CodaPasswordResetConfirmResult {
+        guard let cleanToken = extractResetTokenFromInput(token) else {
+            throw CodaAPIError.httpError(
+                statusCode: 400,
+                message: "Paste a valid reset link or rst_... token."
+            )
+        }
+        let pwdBytes = newPassword.utf8.count
+        guard pwdBytes >= 8 && pwdBytes <= 256 else {
+            throw CodaAPIError.httpError(
+                statusCode: 400,
+                message: "New password must be between 8 and 256 characters."
+            )
+        }
+        let url = serverBaseURL.appendingPathComponent("api/v1/auth/reset-password")
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let body: [String: String] = [
+            "token": cleanToken,
+            "new_password": newPassword,
+        ]
+        req.httpBody = try JSONSerialization.data(withJSONObject: body)
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            throw CodaAPIError.fromResponse(data: data, response: resp, fallback: "Password reset failed")
+        }
+        if let decoded = try? JSONDecoder().decode(CodaPasswordResetConfirmResult.self, from: data) {
+            return decoded
+        }
+        return CodaPasswordResetConfirmResult(ok: true, handle: "")
     }
 
     public func registerClientDevice(

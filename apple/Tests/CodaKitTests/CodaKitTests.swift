@@ -155,4 +155,27 @@ final class CodaKitTests: XCTestCase {
         let ordered = [idle, working, doneUnread, needsYou].sorted(by: CodaAgentSession.inboxOrder)
         XCTAssertEqual(ordered.map(\.id), ["s-needs", "s-done", "s-work", "s-idle"])
     }
+
+    func testV11PromptSnippetsResetTokenAndInviteURLHelpers() throws {
+        XCTAssertEqual(CodaPromptSnippet.defaultStarterSnippets.count, 4)
+        let snip = CodaPromptSnippet(id: "s-custom", title: "Ship It", prompt: "Run cargo test && swift build")
+        let data = try JSONEncoder().encode(CodaPromptSnippetsEnvelope(snippets: [snip]))
+        let decoded = try JSONDecoder().decode(CodaPromptSnippetsEnvelope.self, from: data)
+        XCTAssertEqual(decoded.snippets, [snip])
+
+        let tok = "rst_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789_-"
+        XCTAssertEqual(extractResetTokenFromInput(tok), tok)
+        XCTAssertEqual(extractResetTokenFromInput("https://codahub.dev/reset-password?token=\(tok)"), tok)
+        XCTAssertNil(extractResetTokenFromInput("https://codahub.dev/login"))
+        XCTAssertNil(extractResetTokenFromInput("rst_"))
+
+        XCTAssertEqual(
+            buildInviteRegistrationURL(serverURL: "https://codahub.dev/", code: "CODA-ABCDEF"),
+            "https://codahub.dev/register?invite=CODA-ABCDEF"
+        )
+        XCTAssertEqual(
+            buildOneLineInstallCommand(serverURL: "https://codahub.dev/"),
+            "curl -fsSL https://codahub.dev/install.sh | sh"
+        )
+    }
 }

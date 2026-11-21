@@ -230,6 +230,7 @@ public struct CodaMobileInboxTabView: View {
 
             Button {
                 store.settingsInitialFocusPairing = false
+                store.settingsInitialAuthMode = nil
                 store.showSettingsSheet = true
             } label: {
                 HStack {
@@ -243,6 +244,36 @@ public struct CodaMobileInboxTabView: View {
                 .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(CodaHerdrTheme.textPrimary))
             }
             .buttonStyle(.plain)
+
+            HStack(spacing: 10) {
+                Button {
+                    store.settingsInitialFocusPairing = false
+                    store.settingsInitialAuthMode = 2
+                    store.showSettingsSheet = true
+                } label: {
+                    Label(tr("Use Invite Code", "邀请码注册", locale: store.locale), systemImage: "ticket.fill")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(CodaHerdrTheme.textPrimary)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 8.5)
+                        .background(RoundedRectangle(cornerRadius: 9, style: .continuous).fill(CodaHerdrTheme.elevatedBG))
+                }
+                .buttonStyle(.plain)
+
+                Button {
+                    store.settingsInitialFocusPairing = false
+                    store.settingsInitialAuthMode = 3
+                    store.showSettingsSheet = true
+                } label: {
+                    Label(tr("Reset Forgotten Password", "重置忘记密码", locale: store.locale), systemImage: "key.horizontal.fill")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(CodaHerdrTheme.cyanWorking)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 8.5)
+                        .background(RoundedRectangle(cornerRadius: 9, style: .continuous).fill(CodaHerdrTheme.cyanWorking.opacity(0.14)))
+                }
+                .buttonStyle(.plain)
+            }
         }
         .padding(18)
         .background(
@@ -252,33 +283,12 @@ public struct CodaMobileInboxTabView: View {
         )
     }
 
+    @ViewBuilder
     private var emptyInboxCard: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            if store.remoteMachines.isEmpty {
-                Text(tr("No machines paired yet", "尚未配对任何主机", locale: store.locale))
-                    .font(.system(size: 16, weight: .semibold))
-                    .foregroundStyle(CodaHerdrTheme.textPrimary)
-                Text(tr(
-                    "Generate a 6-digit pairing command to enroll a Mac or Linux host into your workspace mesh.",
-                    "生成 6 位配对指令，将你的 Mac 或 Linux 主机加入加密工作网。",
-                    locale: store.locale
-                ))
-                .font(.system(size: 13))
-                .foregroundStyle(CodaHerdrTheme.textSecondary)
-
-                Button {
-                    store.settingsInitialFocusPairing = true
-                    store.showSettingsSheet = true
-                } label: {
-                    Label(tr("Add Machine", "添加主机", locale: store.locale), systemImage: "plus")
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(.black)
-                        .padding(.horizontal, 14)
-                        .padding(.vertical, 8)
-                        .background(Capsule().fill(CodaHerdrTheme.textPrimary))
-                }
-                .buttonStyle(.plain)
-            } else {
+        if store.remoteMachines.isEmpty {
+            CodaFriendOnboardingCard(store: store)
+        } else {
+            VStack(alignment: .leading, spacing: 12) {
                 Text(tr("Inbox is clear", "暂无待处理终端", locale: store.locale))
                     .font(.system(size: 16, weight: .semibold))
                     .foregroundStyle(CodaHerdrTheme.textPrimary)
@@ -306,6 +316,154 @@ public struct CodaMobileInboxTabView: View {
                 }
                 .buttonStyle(.plain)
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(18)
+            .background(
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .fill(CodaHerdrTheme.cardBG)
+                    .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).strokeBorder(CodaHerdrTheme.borderHairline, lineWidth: 1))
+            )
+        }
+    }
+}
+
+// MARK: - 3-Step Friend Onboarding Quickstart Card
+
+private final class FriendOnboardingLocalState: ObservableObject {
+    @Published var copiedInstallCommand: Bool = false
+}
+
+public struct CodaFriendOnboardingCard: View {
+    @ObservedObject public var store: CodaWorkspaceStore
+    @StateObject private var local = FriendOnboardingLocalState()
+
+    public init(store: CodaWorkspaceStore) {
+        self.store = store
+    }
+
+    public var body: some View {
+        let installCmd = buildOneLineInstallCommand(serverURL: store.settings.serverBaseURLString)
+        return VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 10) {
+                Image(systemName: "sparkles.rectangle.stack.fill")
+                    .font(.system(size: 19, weight: .semibold))
+                    .foregroundStyle(CodaHerdrTheme.cyanWorking)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(tr("3-Step Host Quickstart", "三步快速接入你的主机", locale: store.locale))
+                        .font(.system(size: 16, weight: .bold))
+                        .foregroundStyle(CodaHerdrTheme.textPrimary)
+                    Text(
+                        tr(
+                            "Enroll any Mac or Linux machine into your zero-knowledge E2EE mesh.",
+                            "将任意 Mac 或 Linux 工作站加入你的零知识端到端加密工作网。",
+                            locale: store.locale
+                        )
+                    )
+                    .font(.system(size: 12))
+                    .foregroundStyle(CodaHerdrTheme.textSecondary)
+                }
+            }
+
+            // Step 1
+            VStack(alignment: .leading, spacing: 7) {
+                stepHeader(
+                    number: "1",
+                    title: tr("Copy 1-line install command", "复制一行安装指令并在电脑终端运行", locale: store.locale)
+                )
+
+                Text(installCmd)
+                    .font(.system(size: 11.5, design: .monospaced))
+                    .foregroundStyle(CodaHerdrTheme.textPrimary)
+                    .textSelection(.enabled)
+                    .padding(10)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(RoundedRectangle(cornerRadius: 9, style: .continuous).fill(CodaHerdrTheme.canvasBG))
+
+                Button {
+                    copyTextToClipboard(installCmd)
+                    local.copiedInstallCommand = true
+                    CodaHaptics.success()
+                } label: {
+                    Label(
+                        local.copiedInstallCommand
+                            ? tr("Copied Install Command", "已复制安装命令", locale: store.locale)
+                            : tr("Copy Install Command", "一键复制安装命令", locale: store.locale),
+                        systemImage: local.copiedInstallCommand ? "checkmark.circle.fill" : "doc.on.doc"
+                    )
+                    .font(.system(size: 12.5, weight: .semibold))
+                    .foregroundStyle(.black)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 8)
+                    .background(
+                        Capsule()
+                            .fill(local.copiedInstallCommand ? CodaHerdrTheme.greenDiff : CodaHerdrTheme.cyanWorking)
+                    )
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(12)
+            .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(CodaHerdrTheme.elevatedBG.opacity(0.65)))
+
+            // Step 2
+            VStack(alignment: .leading, spacing: 7) {
+                stepHeader(
+                    number: "2",
+                    title: tr("Approve device code in Settings", "在设置中批准设备授权码（或生成配对码）", locale: store.locale)
+                )
+                Text(
+                    tr(
+                        "Enter the ABCD-2345 code printed by coda-daemon, or generate a 6-digit pairing command.",
+                        "输入终端输出的 ABCD-2345 授权码，或直接生成 6 位一键配对命令。",
+                        locale: store.locale
+                    )
+                )
+                .font(.system(size: 12))
+                .foregroundStyle(CodaHerdrTheme.textSecondary)
+
+                Button {
+                    store.settingsInitialFocusPairing = true
+                    store.showSettingsSheet = true
+                } label: {
+                    Label(
+                        tr("Open Settings / Device Approval", "打开设置 · 批准设备入网", locale: store.locale),
+                        systemImage: "checkmark.shield.fill"
+                    )
+                    .font(.system(size: 12.5, weight: .semibold))
+                    .foregroundStyle(.black)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 8)
+                    .background(Capsule().fill(CodaHerdrTheme.textPrimary))
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(12)
+            .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(CodaHerdrTheme.elevatedBG.opacity(0.65)))
+
+            // Step 3
+            VStack(alignment: .leading, spacing: 7) {
+                stepHeader(
+                    number: "3",
+                    title: tr("Launch Claude Code / Codex / Grok / AGY", "一键启动 Claude Code / Codex / Grok / AGY", locale: store.locale)
+                )
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 6) {
+                        ForEach(["Claude Code", "Codex", "Grok", "Antigravity (AGY)", "Gemini CLI"], id: \.self) { agent in
+                            Text(agent)
+                                .font(.system(size: 11, weight: .medium, design: .monospaced))
+                                .foregroundStyle(CodaHerdrTheme.textPrimary)
+                                .padding(.horizontal, 9)
+                                .padding(.vertical, 4.5)
+                                .background(
+                                    Capsule()
+                                        .fill(CodaHerdrTheme.canvasBG)
+                                        .overlay(Capsule().strokeBorder(CodaHerdrTheme.borderHairline, lineWidth: 1))
+                                )
+                        }
+                    }
+                }
+            }
+            .padding(12)
+            .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(CodaHerdrTheme.elevatedBG.opacity(0.65)))
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(18)
@@ -314,6 +472,19 @@ public struct CodaMobileInboxTabView: View {
                 .fill(CodaHerdrTheme.cardBG)
                 .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).strokeBorder(CodaHerdrTheme.borderHairline, lineWidth: 1))
         )
+    }
+
+    private func stepHeader(number: String, title: String) -> some View {
+        HStack(spacing: 8) {
+            Text(number)
+                .font(.system(size: 11, weight: .bold, design: .monospaced))
+                .foregroundStyle(.black)
+                .frame(width: 20, height: 20)
+                .background(Circle().fill(CodaHerdrTheme.cyanWorking))
+            Text(title)
+                .font(.system(size: 13.5, weight: .semibold))
+                .foregroundStyle(CodaHerdrTheme.textPrimary)
+        }
     }
 }
 
@@ -458,7 +629,9 @@ public struct CodaMobileSpacesTabView: View {
 
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 18) {
-                        if !store.isSignedIn || store.spacesByMachine.isEmpty {
+                        if store.isSignedIn && store.remoteMachines.isEmpty {
+                            CodaFriendOnboardingCard(store: store)
+                        } else if !store.isSignedIn || store.spacesByMachine.isEmpty {
                             VStack(alignment: .leading, spacing: 10) {
                                 Text(tr("No connected workstations", "暂无已连接主机", locale: store.locale))
                                     .font(.system(size: 16, weight: .semibold))

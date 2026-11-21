@@ -1071,6 +1071,21 @@ public struct CodaTerminalSessionView: View {
                     .foregroundStyle(CodaHerdrTheme.redDiff)
             }
 
+            if local.useMultiLineComposer {
+                CodaPromptSnippetsBarView(
+                    store: store,
+                    draftText: local.directInputBuffer,
+                    compact: true,
+                    onInsertSnippet: { snippetPrompt in
+                        insertSnippetIntoDirectInput(snippetPrompt)
+                    },
+                    onSaveDraft: {
+                        let draft = local.directInputBuffer
+                        Task { _ = await store.saveDraftAsSnippet(draft) }
+                    }
+                )
+            }
+
             HStack(alignment: .bottom, spacing: 8) {
                 if local.useMultiLineComposer {
                     TextField(
@@ -1155,6 +1170,19 @@ public struct CodaTerminalSessionView: View {
         } else {
             local.directInputBuffer += " " + token + (trailingSpace ? " " : "")
         }
+    }
+
+    private func insertSnippetIntoDirectInput(_ prompt: String) {
+        let clean = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clean.isEmpty else { return }
+        if local.directInputBuffer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            local.directInputBuffer = clean
+        } else if local.directInputBuffer.hasSuffix("\n") {
+            local.directInputBuffer += clean
+        } else {
+            local.directInputBuffer += "\n" + clean
+        }
+        CodaHaptics.lightTap()
     }
 
     private func pasteClipboardIntoDirectBar() {
@@ -1491,10 +1519,140 @@ public struct CodaMiniPaneMapGlyph: View {
     }
 }
 
-// MARK: - Compose & File Attachment Sheet
+// MARK: - Cross-Device Saved Prompt Snippets Capsule Bar & Compose Sheet
+
+public struct CodaPromptSnippetsBarView: View {
+    @ObservedObject public var store: CodaWorkspaceStore
+    public let draftText: String
+    public let compact: Bool
+    public let onInsertSnippet: (String) -> Void
+    public let onSaveDraft: () -> Void
+    public var onToggleManageList: (() -> Void)? = nil
+    public var isManagingList: Bool = false
+
+    public init(
+        store: CodaWorkspaceStore,
+        draftText: String,
+        compact: Bool = false,
+        onInsertSnippet: @escaping (String) -> Void,
+        onSaveDraft: @escaping () -> Void,
+        onToggleManageList: (() -> Void)? = nil,
+        isManagingList: Bool = false
+    ) {
+        self.store = store
+        self.draftText = draftText
+        self.compact = compact
+        self.onInsertSnippet = onInsertSnippet
+        self.onSaveDraft = onSaveDraft
+        self.onToggleManageList = onToggleManageList
+        self.isManagingList = isManagingList
+    }
+
+    public var body: some View {
+        let canSaveDraft = !draftText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !store.isSavingSnippets
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 6) {
+                ForEach(store.promptSnippets) { snippet in
+                    HStack(spacing: 4) {
+                        Button {
+                            onInsertSnippet(snippet.prompt)
+                        } label: {
+                            HStack(spacing: 4) {
+                                Image(systemName: "sparkles")
+                                    .font(.system(size: compact ? 9.5 : 10.5, weight: .semibold))
+                                    .foregroundStyle(CodaHerdrTheme.cyanWorking)
+                                Text(snippet.title)
+                                    .font(.system(size: compact ? 11 : 12, weight: .medium))
+                                    .foregroundStyle(CodaHerdrTheme.textPrimary)
+                                    .lineLimit(1)
+                            }
+                        }
+                        .buttonStyle(.plain)
+
+                        Button {
+                            Task { await store.deletePromptSnippet(id: snippet.id) }
+                        } label: {
+                            Image(systemName: "xmark")
+                                .font(.system(size: compact ? 8.5 : 9.5, weight: .bold))
+                                .foregroundStyle(CodaHerdrTheme.textDim)
+                                .padding(2)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    .padding(.leading, compact ? 9 : 10)
+                    .padding(.trailing, compact ? 6 : 7)
+                    .padding(.vertical, compact ? 4.5 : 6)
+                    .background(
+                        Capsule()
+                            .fill(CodaHerdrTheme.cardBG)
+                            .overlay(Capsule().strokeBorder(CodaHerdrTheme.borderHairline, lineWidth: 1))
+                    )
+                    .contextMenu {
+                        Button {
+                            onInsertSnippet(snippet.prompt)
+                        } label: {
+                            Label(tr("Insert into Composer", "插入到输入框", locale: store.locale), systemImage: "text.insert")
+                        }
+                        Button(role: .destructive) {
+                            Task { await store.deletePromptSnippet(id: snippet.id) }
+                        } label: {
+                            Label(tr("Delete Snippet", "删除快捷片段", locale: store.locale), systemImage: "trash")
+                        }
+                    }
+                }
+
+                Button {
+                    onSaveDraft()
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "plus")
+                            .font(.system(size: compact ? 9.5 : 10.5, weight: .bold))
+                        Text(tr("Save Draft as Snippet", "存为快捷片段", locale: store.locale))
+                            .font(.system(size: compact ? 11 : 11.5, weight: .semibold))
+                            .lineLimit(1)
+                    }
+                    .foregroundStyle(canSaveDraft ? CodaHerdrTheme.cyanWorking : CodaHerdrTheme.textDim)
+                    .padding(.horizontal, compact ? 9 : 11)
+                    .padding(.vertical, compact ? 4.5 : 6)
+                    .background(
+                        Capsule()
+                            .fill(canSaveDraft ? CodaHerdrTheme.cyanWorking.opacity(0.14) : CodaHerdrTheme.canvasBG)
+                            .overlay(
+                                Capsule().strokeBorder(
+                                    canSaveDraft ? CodaHerdrTheme.cyanWorking.opacity(0.45) : CodaHerdrTheme.borderHairline,
+                                    lineWidth: 1
+                                )
+                            )
+                    )
+                }
+                .buttonStyle(.plain)
+                .disabled(!canSaveDraft)
+
+                if let onToggleManageList, !store.promptSnippets.isEmpty {
+                    Button {
+                        onToggleManageList()
+                    } label: {
+                        Image(systemName: isManagingList ? "chevron.up.circle.fill" : "slider.horizontal.below.rectangle")
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundStyle(isManagingList ? CodaHerdrTheme.cyanWorking : CodaHerdrTheme.textSecondary)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 6)
+                            .background(
+                                Capsule()
+                                    .fill(CodaHerdrTheme.elevatedBG)
+                                    .overlay(Capsule().strokeBorder(CodaHerdrTheme.borderHairline, lineWidth: 1))
+                            )
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+    }
+}
 
 private final class ComposeSheetLocalState: ObservableObject {
     @Published var showFileImporter: Bool = false
+    @Published var showManageSnippetsList: Bool = false
     #if canImport(PhotosUI)
     @Published var selectedPhotoItem: PhotosPickerItem? = nil
     #endif
@@ -1533,6 +1691,60 @@ public struct CodaComposePromptSheet: View {
                     dismiss()
                 }
                 .foregroundStyle(CodaHerdrTheme.textSecondary)
+            }
+
+            CodaPromptSnippetsBarView(
+                store: store,
+                draftText: draftText,
+                compact: false,
+                onInsertSnippet: { snippetPrompt in
+                    store.insertSnippetPrompt(snippetPrompt, for: session.id)
+                },
+                onSaveDraft: {
+                    let current = store.composeDraft(for: session.id)
+                    Task { _ = await store.saveDraftAsSnippet(current) }
+                },
+                onToggleManageList: {
+                    withAnimation(.snappy(duration: 0.16)) {
+                        local.showManageSnippetsList.toggle()
+                    }
+                },
+                isManagingList: local.showManageSnippetsList
+            )
+
+            if local.showManageSnippetsList && !store.promptSnippets.isEmpty {
+                List {
+                    ForEach(store.promptSnippets) { snippet in
+                        Button {
+                            store.insertSnippetPrompt(snippet.prompt, for: session.id)
+                        } label: {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(snippet.title)
+                                    .font(.system(size: 12.5, weight: .semibold))
+                                    .foregroundStyle(CodaHerdrTheme.textPrimary)
+                                Text(snippet.prompt)
+                                    .font(.system(size: 11, design: .monospaced))
+                                    .foregroundStyle(CodaHerdrTheme.textSecondary)
+                                    .lineLimit(2)
+                            }
+                            .padding(.vertical, 2)
+                        }
+                        .buttonStyle(.plain)
+                        .listRowBackground(CodaHerdrTheme.canvasBG)
+                        .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                            Button(role: .destructive) {
+                                Task { await store.deletePromptSnippet(id: snippet.id) }
+                            } label: {
+                                Label(tr("Delete", "删除", locale: store.locale), systemImage: "trash")
+                            }
+                        }
+                    }
+                }
+                .listStyle(.plain)
+                .scrollContentBackground(.hidden)
+                .frame(maxHeight: 132)
+                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(CodaHerdrTheme.borderHairline, lineWidth: 1))
             }
 
             TextEditor(text: sessionDraftBinding)
@@ -1718,6 +1930,9 @@ public struct CodaComposePromptSheet: View {
         .padding(18)
         .background(CodaHerdrTheme.cardBG)
         .presentationDetents([.medium, .large])
+        .onAppear {
+            Task { await store.loadPromptSnippets() }
+        }
         .onDisappear {
             store.cancelVoiceDictation()
         }

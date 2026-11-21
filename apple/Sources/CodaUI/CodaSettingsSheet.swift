@@ -6,11 +6,14 @@ import SwiftUI
 
 private final class SettingsFormModel: ObservableObject {
     @Published var serverURLInput: String = ""
-    @Published var authMode: Int = 0 // 0: Browser Device Auth, 1: Password, 2: Register
+    @Published var authMode: Int = 0 // 0: Browser Device Auth, 1: Password, 2: Register, 3: Reset Password
     @Published var emailInput: String = ""
     @Published var handleInput: String = ""
     @Published var passwordInput: String = ""
     @Published var inviteCodeInput: String = ""
+    @Published var resetTokenOrURLInput: String = ""
+    @Published var resetNewPasswordInput: String = ""
+    @Published var resetConfirmPasswordInput: String = ""
     @Published var suggestedHostName: String = ""
     @Published var approveUserCodeInput: String = ""
     @Published var renamingDeviceId: UUID? = nil
@@ -21,6 +24,10 @@ private final class SettingsFormModel: ObservableObject {
     @Published var showDeleteAccount: Bool = false
     @Published var deletePasswordInput: String = ""
     @Published var copiedFlag: Bool = false
+    @Published var newInviteNoteInput: String = ""
+    @Published var copiedInviteCode: String? = nil
+    @Published var copiedResetUserId: UUID? = nil
+    @Published var mintingResetUserId: UUID? = nil
 }
 
 public struct CodaSettingsAndPairingSheet: View {
@@ -43,6 +50,9 @@ public struct CodaSettingsAndPairingSheet: View {
                         if store.isSignedIn {
                             machinePairingSection
                                 .id("machine_pairing_section")
+                            if store.currentUser?.isAdmin == true {
+                                adminFriendsAndInvitesSection
+                            }
                             offlineWebhooksSection
                         }
                         voiceModelSection
@@ -51,8 +61,32 @@ public struct CodaSettingsAndPairingSheet: View {
                 }
                 .onAppear {
                     form.serverURLInput = store.settings.serverBaseURLString
+                    if let initialMode = store.settingsInitialAuthMode, !store.isSignedIn {
+                        form.authMode = initialMode
+                        store.settingsInitialAuthMode = nil
+                        if initialMode == 3,
+                           form.resetTokenOrURLInput.isEmpty,
+                           let clip = readTextFromClipboard(),
+                           extractResetTokenFromInput(clip) != nil {
+                            form.resetTokenOrURLInput = clip
+                            if let origin = extractServerOriginFromAuthLink(clip) {
+                                form.serverURLInput = origin
+                            }
+                        } else if initialMode == 2,
+                                  form.inviteCodeInput.isEmpty,
+                                  let clip = readTextFromClipboard(),
+                                  clip.contains("invite=") {
+                            form.inviteCodeInput = extractInviteCodeFromInput(clip)
+                            if let origin = extractServerOriginFromAuthLink(clip) {
+                                form.serverURLInput = origin
+                            }
+                        }
+                    }
                     if store.isSignedIn {
-                        Task { await store.loadNotificationWebhookSettings() }
+                        Task {
+                            await store.loadNotificationWebhookSettings()
+                            await store.loadAdminDashboardData()
+                        }
                     }
                     if store.settingsInitialFocusPairing && store.isSignedIn {
                         store.settingsInitialFocusPairing = false
@@ -67,7 +101,15 @@ public struct CodaSettingsAndPairingSheet: View {
                     if signedIn {
                         form.passwordInput = ""
                         form.inviteCodeInput = ""
-                        Task { await store.loadNotificationWebhookSettings() }
+                        Task {
+                            await store.loadNotificationWebhookSettings()
+                            await store.loadAdminDashboardData()
+                        }
+                    }
+                }
+                .onChange(of: store.currentUser?.isAdmin) { _, isAdmin in
+                    if isAdmin == true {
+                        Task { await store.loadAdminDashboardData() }
                     }
                 }
             }
@@ -190,9 +232,19 @@ public struct CodaSettingsAndPairingSheet: View {
                         Image(systemName: "checkmark.shield.fill")
                             .foregroundStyle(CodaHerdrTheme.greenDiff)
                         VStack(alignment: .leading, spacing: 2) {
-                            Text(store.settings.ownerHandle.isEmpty ? tr("Signed In", "已登录", locale: store.locale) : "@\(store.settings.ownerHandle)")
-                                .font(.system(size: 14, weight: .semibold))
-                                .foregroundStyle(CodaHerdrTheme.textPrimary)
+                            HStack(spacing: 6) {
+                                Text(store.settings.ownerHandle.isEmpty ? tr("Signed In", "已登录", locale: store.locale) : "@\(store.settings.ownerHandle)")
+                                    .font(.system(size: 14, weight: .semibold))
+                                    .foregroundStyle(CodaHerdrTheme.textPrimary)
+                                if store.currentUser?.isAdmin == true {
+                                    Text("ADMIN")
+                                        .font(.system(size: 9.5, weight: .bold, design: .monospaced))
+                                        .foregroundStyle(CodaHerdrTheme.cyanWorking)
+                                        .padding(.horizontal, 6)
+                                        .padding(.vertical, 2)
+                                        .background(Capsule().fill(CodaHerdrTheme.cyanWorking.opacity(0.16)))
+                                }
+                            }
                             Text(store.settings.serverBaseURLString)
                                 .font(.system(size: 11, design: .monospaced))
                                 .foregroundStyle(CodaHerdrTheme.textSecondary)
@@ -347,9 +399,10 @@ public struct CodaSettingsAndPairingSheet: View {
             } else {
                 VStack(alignment: .leading, spacing: 12) {
                     Picker("", selection: $form.authMode) {
-                        Text(tr("Browser", "浏览器授权", locale: store.locale)).tag(0)
-                        Text(tr("Sign In", "密码登录", locale: store.locale)).tag(1)
+                        Text(tr("Browser", "浏览器", locale: store.locale)).tag(0)
+                        Text(tr("Sign In", "登录", locale: store.locale)).tag(1)
                         Text(tr("Register", "注册", locale: store.locale)).tag(2)
+                        Text(tr("Reset", "重置密码", locale: store.locale)).tag(3)
                     }
                     .pickerStyle(.segmented)
 
@@ -417,6 +470,102 @@ public struct CodaSettingsAndPairingSheet: View {
                             }
                             .buttonStyle(.plain)
                         }
+                    } else if form.authMode == 3 {
+                        VStack(alignment: .leading, spacing: 10) {
+                            Text(tr(
+                                "Reset Forgotten Password — paste the reset link or rst_... token sent by your admin on WeChat, then set a new password.",
+                                "重置忘记的密码 — 粘贴管理员通过微信发给你的重置链接或 rst_... 令牌，并设置新密码。",
+                                locale: store.locale
+                            ))
+                            .font(.system(size: 11.5))
+                            .foregroundStyle(CodaHerdrTheme.textSecondary)
+
+                            HStack(spacing: 8) {
+                                TextField(
+                                    tr("Reset link or rst_... token", "粘贴重置链接或 rst_... 令牌", locale: store.locale),
+                                    text: $form.resetTokenOrURLInput
+                                )
+                                .font(.system(size: 12.5, design: .monospaced))
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 8)
+                                .background(RoundedRectangle(cornerRadius: 8).fill(CodaHerdrTheme.canvasBG))
+                                .codaNoAutocapAndSpelling()
+
+                                Button {
+                                    if let clip = readTextFromClipboard(), !clip.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                        form.resetTokenOrURLInput = clip
+                                        if let origin = extractServerOriginFromAuthLink(clip) {
+                                            form.serverURLInput = origin
+                                        }
+                                    }
+                                } label: {
+                                    Label(tr("Paste", "粘贴", locale: store.locale), systemImage: "doc.on.clipboard")
+                                        .font(.system(size: 11.5, weight: .semibold))
+                                        .foregroundStyle(CodaHerdrTheme.cyanWorking)
+                                        .padding(.horizontal, 10)
+                                        .padding(.vertical, 8)
+                                        .background(RoundedRectangle(cornerRadius: 8).fill(CodaHerdrTheme.pillActiveBG))
+                                }
+                                .buttonStyle(.plain)
+                            }
+
+                            SecureField(tr("New password (min 8 chars)", "新密码（至少 8 位）", locale: store.locale), text: $form.resetNewPasswordInput)
+                                .font(.system(size: 13))
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 8)
+                                .background(RoundedRectangle(cornerRadius: 8).fill(CodaHerdrTheme.canvasBG))
+
+                            SecureField(tr("Confirm new password", "确认新密码", locale: store.locale), text: $form.resetConfirmPasswordInput)
+                                .font(.system(size: 13))
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 8)
+                                .background(RoundedRectangle(cornerRadius: 8).fill(CodaHerdrTheme.canvasBG))
+
+                            Button {
+                                guard form.resetNewPasswordInput == form.resetConfirmPasswordInput else {
+                                    store.authError = tr("New passwords do not match.", "两次输入的新密码不一致。", locale: store.locale)
+                                    return
+                                }
+                                Task {
+                                    if let res = await store.resetPasswordWithToken(
+                                        rawTokenOrURL: form.resetTokenOrURLInput,
+                                        newPassword: form.resetNewPasswordInput
+                                    ) {
+                                        form.serverURLInput = store.settings.serverBaseURLString
+                                        if !res.handle.isEmpty {
+                                            form.emailInput = res.handle
+                                        }
+                                        form.resetTokenOrURLInput = ""
+                                        form.resetNewPasswordInput = ""
+                                        form.resetConfirmPasswordInput = ""
+                                        form.passwordInput = ""
+                                        form.authMode = 1
+                                    }
+                                }
+                            } label: {
+                                HStack(spacing: 6) {
+                                    if store.isResettingPassword {
+                                        ProgressView().controlSize(.small).tint(.black)
+                                    }
+                                    Text(
+                                        store.isResettingPassword
+                                            ? tr("Resetting Password…", "正在重置密码…", locale: store.locale)
+                                            : tr("Reset Forgotten Password", "确认重置密码", locale: store.locale)
+                                    )
+                                    .font(.system(size: 13, weight: .semibold))
+                                }
+                                .foregroundStyle(.black)
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 10)
+                                .background(RoundedRectangle(cornerRadius: 8).fill(CodaHerdrTheme.cyanWorking))
+                            }
+                            .buttonStyle(.plain)
+                            .disabled(
+                                store.isResettingPassword
+                                    || form.resetTokenOrURLInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                                    || form.resetNewPasswordInput.isEmpty
+                            )
+                        }
                     } else {
                         VStack(spacing: 10) {
                             TextField(tr("Email or Handle", "邮箱或用户名", locale: store.locale), text: $form.emailInput)
@@ -434,12 +583,31 @@ public struct CodaSettingsAndPairingSheet: View {
                                     .background(RoundedRectangle(cornerRadius: 8).fill(CodaHerdrTheme.canvasBG))
                                     .codaNoAutocapAndSpelling()
 
-                                TextField(tr("Invite Code (optional)", "邀请码（如服务器要求）", locale: store.locale), text: $form.inviteCodeInput)
-                                    .font(.system(size: 13, design: .monospaced))
-                                    .padding(.horizontal, 10)
-                                    .padding(.vertical, 8)
-                                    .background(RoundedRectangle(cornerRadius: 8).fill(CodaHerdrTheme.canvasBG))
-                                    .codaNoAutocapAndSpelling()
+                                HStack(spacing: 8) {
+                                    TextField(tr("Invite Code or Link (optional)", "邀请码或邀请链接（如服务器要求）", locale: store.locale), text: $form.inviteCodeInput)
+                                        .font(.system(size: 13, design: .monospaced))
+                                        .padding(.horizontal, 10)
+                                        .padding(.vertical, 8)
+                                        .background(RoundedRectangle(cornerRadius: 8).fill(CodaHerdrTheme.canvasBG))
+                                        .codaNoAutocapAndSpelling()
+
+                                    Button {
+                                        if let clip = readTextFromClipboard(), !clip.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                            form.inviteCodeInput = extractInviteCodeFromInput(clip)
+                                            if let origin = extractServerOriginFromAuthLink(clip) {
+                                                form.serverURLInput = origin
+                                            }
+                                        }
+                                    } label: {
+                                        Image(systemName: "doc.on.clipboard")
+                                            .font(.system(size: 12, weight: .semibold))
+                                            .foregroundStyle(CodaHerdrTheme.cyanWorking)
+                                            .padding(.horizontal, 10)
+                                            .padding(.vertical, 8)
+                                            .background(RoundedRectangle(cornerRadius: 8).fill(CodaHerdrTheme.pillActiveBG))
+                                    }
+                                    .buttonStyle(.plain)
+                                }
                             }
 
                             SecureField(tr("Password", "密码", locale: store.locale), text: $form.passwordInput)
@@ -457,6 +625,7 @@ public struct CodaSettingsAndPairingSheet: View {
                                             password: form.passwordInput,
                                             inviteCode: form.inviteCodeInput
                                         )
+                                        form.serverURLInput = store.settings.serverBaseURLString
                                     } else {
                                         await store.signInWithPassword(emailOrHandle: form.emailInput, password: form.passwordInput)
                                     }
@@ -470,7 +639,40 @@ public struct CodaSettingsAndPairingSheet: View {
                                     .background(RoundedRectangle(cornerRadius: 8).fill(CodaHerdrTheme.textPrimary))
                             }
                             .buttonStyle(.plain)
+
+                            if form.authMode == 1 {
+                                Button {
+                                    store.authError = nil
+                                    if form.resetTokenOrURLInput.isEmpty,
+                                       let clip = readTextFromClipboard(),
+                                       extractResetTokenFromInput(clip) != nil {
+                                        form.resetTokenOrURLInput = clip
+                                    }
+                                    form.authMode = 3
+                                } label: {
+                                    HStack(spacing: 4) {
+                                        Image(systemName: "key.horizontal.fill")
+                                            .font(.system(size: 11))
+                                        Text(tr("Reset Forgotten Password (paste WeChat reset link)", "忘记密码？粘贴管理员重置链接", locale: store.locale))
+                                            .font(.system(size: 12, weight: .medium))
+                                    }
+                                    .foregroundStyle(CodaHerdrTheme.cyanWorking)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .padding(.top, 2)
+                                }
+                                .buttonStyle(.plain)
+                            }
                         }
+                    }
+
+                    if let status = store.accountStatusMessage {
+                        HStack(spacing: 6) {
+                            Image(systemName: "checkmark.circle.fill")
+                                .font(.system(size: 12))
+                            Text(status)
+                                .font(.system(size: 12, weight: .medium))
+                        }
+                        .foregroundStyle(CodaHerdrTheme.greenDiff)
                     }
 
                     if let err = store.authError {
@@ -715,6 +917,251 @@ public struct CodaSettingsAndPairingSheet: View {
                     }
                     .buttonStyle(.plain)
                     .disabled(store.isPruningStaleDevices)
+                }
+            }
+        }
+    }
+
+    // MARK: - Admin Friend Circle · Invite Links & Passwordless Member Reset
+
+    private var adminFriendsAndInvitesSection: some View {
+        sectionCard(title: tr("Admin · Friends & Invites", "管理员 · 好友与邀请链接", locale: store.locale)) {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack {
+                    Text(tr("Friend Invite Codes", "好友注册邀请码", locale: store.locale))
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(CodaHerdrTheme.textPrimary)
+                    Spacer()
+                    Button {
+                        Task { await store.loadAdminDashboardData() }
+                    } label: {
+                        HStack(spacing: 4) {
+                            if store.isLoadingAdminData {
+                                ProgressView().controlSize(.mini).tint(CodaHerdrTheme.textSecondary)
+                            } else {
+                                Image(systemName: "arrow.clockwise")
+                                    .font(.system(size: 11, weight: .semibold))
+                            }
+                            Text(tr("Refresh", "刷新", locale: store.locale))
+                                .font(.system(size: 11, weight: .medium))
+                        }
+                        .foregroundStyle(CodaHerdrTheme.textSecondary)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(RoundedRectangle(cornerRadius: 6).fill(CodaHerdrTheme.canvasBG))
+                    }
+                    .buttonStyle(.plain)
+                }
+
+                HStack(spacing: 8) {
+                    TextField(
+                        tr("Optional note (e.g. for WeChat friend)", "备注（如：给好友小王）", locale: store.locale),
+                        text: $form.newInviteNoteInput
+                    )
+                    .font(.system(size: 12.5))
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 7)
+                    .background(RoundedRectangle(cornerRadius: 8).fill(CodaHerdrTheme.canvasBG))
+
+                    Button {
+                        let note = form.newInviteNoteInput
+                        form.newInviteNoteInput = ""
+                        Task {
+                            if let created = await store.createAdminInvite(note: note) {
+                                form.copiedInviteCode = created.code
+                            }
+                        }
+                    } label: {
+                        Label(tr("New Invite", "新建邀请码", locale: store.locale), systemImage: "plus")
+                            .font(.system(size: 11.5, weight: .semibold))
+                            .foregroundStyle(.black)
+                            .padding(.horizontal, 11)
+                            .padding(.vertical, 7.5)
+                            .background(RoundedRectangle(cornerRadius: 8).fill(CodaHerdrTheme.textPrimary))
+                    }
+                    .buttonStyle(.plain)
+                }
+
+                if store.adminInvites.isEmpty {
+                    Text(tr("No invite codes yet. Create one to share a registration link.", "暂无邀请码，点击上方按钮即可生成专属注册链接。", locale: store.locale))
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(CodaHerdrTheme.textSecondary)
+                } else {
+                    ForEach(store.adminInvites) { invite in
+                        let isCopied = (form.copiedInviteCode == invite.code)
+                        HStack(spacing: 8) {
+                            VStack(alignment: .leading, spacing: 2) {
+                                HStack(spacing: 6) {
+                                    Text(invite.code)
+                                        .font(.system(size: 12.5, weight: .semibold, design: .monospaced))
+                                        .foregroundStyle(CodaHerdrTheme.textPrimary)
+                                    Text("\(invite.usedCount)/\(invite.maxUses)")
+                                        .font(.system(size: 10.5, design: .monospaced))
+                                        .foregroundStyle(CodaHerdrTheme.textSecondary)
+                                }
+                                if !invite.note.isEmpty {
+                                    Text(invite.note)
+                                        .font(.system(size: 11))
+                                        .foregroundStyle(CodaHerdrTheme.textSecondary)
+                                        .lineLimit(1)
+                                }
+                            }
+                            Spacer()
+
+                            Button {
+                                if let url = buildInviteRegistrationURL(
+                                    serverURL: store.settings.serverBaseURLString,
+                                    code: invite.code
+                                ) {
+                                    copyTextToClipboard(url)
+                                    form.copiedInviteCode = invite.code
+                                    CodaHaptics.success()
+                                    store.adminStatusMessage = tr(
+                                        "Copied invite link: \(url)",
+                                        "已复制注册邀请链接：\(url)",
+                                        locale: store.locale
+                                    )
+                                }
+                            } label: {
+                                Label(
+                                    isCopied
+                                        ? tr("Copied Link", "已复制链接", locale: store.locale)
+                                        : tr("Copy Invite Link", "复制邀请链接", locale: store.locale),
+                                    systemImage: isCopied ? "checkmark" : "link"
+                                )
+                                .font(.system(size: 11, weight: .semibold))
+                                .foregroundStyle(isCopied ? CodaHerdrTheme.greenDiff : CodaHerdrTheme.cyanWorking)
+                                .padding(.horizontal, 9)
+                                .padding(.vertical, 5.5)
+                                .background(
+                                    RoundedRectangle(cornerRadius: 7)
+                                        .fill((isCopied ? CodaHerdrTheme.greenDiff : CodaHerdrTheme.cyanWorking).opacity(0.14))
+                                )
+                            }
+                            .buttonStyle(.plain)
+
+                            Button(role: .destructive) {
+                                Task { await store.deleteAdminInvite(code: invite.code) }
+                            } label: {
+                                Image(systemName: "trash")
+                                    .font(.system(size: 11))
+                                    .foregroundStyle(CodaHerdrTheme.redDiff)
+                                    .padding(5.5)
+                                    .background(RoundedRectangle(cornerRadius: 6).fill(CodaHerdrTheme.redDiff.opacity(0.12)))
+                            }
+                            .buttonStyle(.plain)
+                        }
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 7)
+                        .background(RoundedRectangle(cornerRadius: 8).fill(CodaHerdrTheme.canvasBG))
+                    }
+                }
+
+                Divider().background(CodaHerdrTheme.borderHairline)
+
+                HStack {
+                    Text(
+                        tr(
+                            "Friends / Members (\(store.adminUsers.count))",
+                            "好友 / 成员列表 (\(store.adminUsers.count))",
+                            locale: store.locale
+                        )
+                    )
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(CodaHerdrTheme.textPrimary)
+                    Spacer()
+                }
+
+                if store.adminUsers.isEmpty {
+                    Text(tr("No registered members loaded yet.", "暂无已注册成员数据。", locale: store.locale))
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(CodaHerdrTheme.textSecondary)
+                } else {
+                    ForEach(store.adminUsers) { member in
+                        let isCopiedReset = (form.copiedResetUserId == member.id)
+                        let isMinting = (form.mintingResetUserId == member.id)
+                        HStack(spacing: 8) {
+                            Circle()
+                                .fill(member.onlineDevices > 0 ? CodaHerdrTheme.greenDiff : CodaHerdrTheme.textDim)
+                                .frame(width: 8, height: 8)
+
+                            VStack(alignment: .leading, spacing: 2) {
+                                HStack(spacing: 6) {
+                                    Text("@\(member.handle)")
+                                        .font(.system(size: 13, weight: .semibold, design: .monospaced))
+                                        .foregroundStyle(CodaHerdrTheme.textPrimary)
+                                    if member.isAdmin {
+                                        Text("ADMIN")
+                                            .font(.system(size: 9, weight: .bold, design: .monospaced))
+                                            .foregroundStyle(CodaHerdrTheme.amberNeedsYou)
+                                            .padding(.horizontal, 5)
+                                            .padding(.vertical, 1.5)
+                                            .background(Capsule().fill(CodaHerdrTheme.amberNeedsYou.opacity(0.16)))
+                                    }
+                                }
+                                Text(
+                                    tr(
+                                        "\(member.onlineDevices)/\(member.totalDevices) devices online",
+                                        "\(member.onlineDevices)/\(member.totalDevices) 台设备在线",
+                                        locale: store.locale
+                                    )
+                                )
+                                .font(.system(size: 11, design: .monospaced))
+                                .foregroundStyle(CodaHerdrTheme.textSecondary)
+                            }
+
+                            Spacer()
+
+                            Button {
+                                form.mintingResetUserId = member.id
+                                Task {
+                                    let res = await store.generateAdminPasswordResetLink(for: member)
+                                    form.mintingResetUserId = nil
+                                    if res != nil {
+                                        form.copiedResetUserId = member.id
+                                    }
+                                }
+                            } label: {
+                                HStack(spacing: 4) {
+                                    if isMinting {
+                                        ProgressView().controlSize(.mini).tint(CodaHerdrTheme.amberNeedsYou)
+                                    } else {
+                                        Image(systemName: isCopiedReset ? "checkmark" : "key.fill")
+                                            .font(.system(size: 10.5, weight: .semibold))
+                                    }
+                                    Text(
+                                        isCopiedReset
+                                            ? tr("Copied Reset Link", "已复制重置链接", locale: store.locale)
+                                            : tr("Copy Reset Link", "复制重置链接", locale: store.locale)
+                                    )
+                                    .font(.system(size: 11, weight: .semibold))
+                                }
+                                .foregroundStyle(isCopiedReset ? CodaHerdrTheme.greenDiff : CodaHerdrTheme.amberNeedsYou)
+                                .padding(.horizontal, 9)
+                                .padding(.vertical, 5.5)
+                                .background(
+                                    RoundedRectangle(cornerRadius: 7)
+                                        .fill((isCopiedReset ? CodaHerdrTheme.greenDiff : CodaHerdrTheme.amberNeedsYou).opacity(0.14))
+                                )
+                            }
+                            .buttonStyle(.plain)
+                            .disabled(isMinting)
+                        }
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 7)
+                        .background(RoundedRectangle(cornerRadius: 8).fill(CodaHerdrTheme.canvasBG))
+                    }
+                }
+
+                if let okMsg = store.adminStatusMessage {
+                    Text(okMsg)
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(CodaHerdrTheme.greenDiff)
+                }
+                if let errMsg = store.adminErrorMessage {
+                    Text(errMsg)
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(CodaHerdrTheme.redDiff)
                 }
             }
         }

@@ -739,62 +739,68 @@ public struct CodaDuoDirectoryPane: View {
         )
     }
 
+    @ViewBuilder
     private var emptyCard: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text(store.isSignedIn
-                ? tr("No active agent sessions", "暂无活跃 Agent 会话", locale: store.locale)
-                : tr("Sign in & pair a workstation", "登录并配对远端工作站", locale: store.locale))
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(CodaHerdrTheme.textPrimary)
+        if store.isSignedIn && store.remoteMachines.isEmpty {
+            CodaFriendOnboardingCard(store: store)
+        } else {
+            VStack(alignment: .leading, spacing: 8) {
+                Text(store.isSignedIn
+                    ? tr("No active agent sessions", "暂无活跃 Agent 会话", locale: store.locale)
+                    : tr("Sign in & pair a workstation", "登录并配对远端工作站", locale: store.locale))
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(CodaHerdrTheme.textPrimary)
 
-            HStack(spacing: 8) {
-                if store.isSignedIn, let onlineHost = store.remoteMachines.first(where: { $0.isOnline }) {
-                    Menu {
-                        let defaultCwd = store.workspacesByDevice[onlineHost.id]?.first?.rootPath
-                        Button("Claude Code") { store.launchAgent(agent: "claude", on: onlineHost, cwd: defaultCwd) }
-                        Button("Codex") { store.launchAgent(agent: "codex", on: onlineHost, cwd: defaultCwd) }
-                        Button("Grok") { store.launchAgent(agent: "grok", on: onlineHost, cwd: defaultCwd) }
-                        Button("Antigravity (AGY)") { store.launchAgent(agent: "agy", on: onlineHost, cwd: defaultCwd) }
-                        Button("Gemini CLI") { store.launchAgent(agent: "gemini", on: onlineHost, cwd: defaultCwd) }
-                        Divider()
-                        Button("Shell") { store.launchAgent(agent: "shell", on: onlineHost, cwd: defaultCwd) }
-                        Divider()
-                        Button {
-                            store.openBootstrapWorkspaceSheet(for: onlineHost)
+                HStack(spacing: 8) {
+                    if store.isSignedIn, let onlineHost = store.remoteMachines.first(where: { $0.isOnline }) {
+                        Menu {
+                            let defaultCwd = store.workspacesByDevice[onlineHost.id]?.first?.rootPath
+                            Button("Claude Code") { store.launchAgent(agent: "claude", on: onlineHost, cwd: defaultCwd) }
+                            Button("Codex") { store.launchAgent(agent: "codex", on: onlineHost, cwd: defaultCwd) }
+                            Button("Grok") { store.launchAgent(agent: "grok", on: onlineHost, cwd: defaultCwd) }
+                            Button("Antigravity (AGY)") { store.launchAgent(agent: "agy", on: onlineHost, cwd: defaultCwd) }
+                            Button("Gemini CLI") { store.launchAgent(agent: "gemini", on: onlineHost, cwd: defaultCwd) }
+                            Divider()
+                            Button("Shell") { store.launchAgent(agent: "shell", on: onlineHost, cwd: defaultCwd) }
+                            Divider()
+                            Button {
+                                store.openBootstrapWorkspaceSheet(for: onlineHost)
+                            } label: {
+                                Label(tr("New Workspace / Git Clone…", "新建目录 / Git Clone…", locale: store.locale), systemImage: "folder.badge.plus")
+                            }
                         } label: {
-                            Label(tr("New Workspace / Git Clone…", "新建目录 / Git Clone…", locale: store.locale), systemImage: "folder.badge.plus")
+                            Text(tr("New Terminal", "新建终端", locale: store.locale))
+                                .font(.system(size: 12, weight: .semibold))
+                                .foregroundStyle(.black)
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 6)
+                                .background(Capsule().fill(CodaHerdrTheme.cyanWorking))
                         }
+                    }
+
+                    Button {
+                        store.settingsInitialFocusPairing = store.isSignedIn
+                        store.settingsInitialAuthMode = nil
+                        store.showSettingsSheet = true
                     } label: {
-                        Text(tr("New Terminal", "新建终端", locale: store.locale))
+                        Text(store.isSignedIn ? tr("Add machine", "添加主机", locale: store.locale) : tr("Open Settings", "打开设置", locale: store.locale))
                             .font(.system(size: 12, weight: .semibold))
                             .foregroundStyle(.black)
                             .padding(.horizontal, 12)
                             .padding(.vertical, 6)
-                            .background(Capsule().fill(CodaHerdrTheme.cyanWorking))
+                            .background(Capsule().fill(CodaHerdrTheme.textPrimary))
                     }
+                    .buttonStyle(.plain)
                 }
-
-                Button {
-                    store.settingsInitialFocusPairing = store.isSignedIn
-                    store.showSettingsSheet = true
-                } label: {
-                    Text(store.isSignedIn ? tr("Add machine", "添加主机", locale: store.locale) : tr("Open Settings", "打开设置", locale: store.locale))
-                        .font(.system(size: 12, weight: .semibold))
-                        .foregroundStyle(.black)
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 6)
-                        .background(Capsule().fill(CodaHerdrTheme.textPrimary))
-                }
-                .buttonStyle(.plain)
             }
+            .padding(12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(CodaHerdrTheme.canvasBG)
+                    .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(CodaHerdrTheme.borderHairline, lineWidth: 1))
+            )
         }
-        .padding(12)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(CodaHerdrTheme.canvasBG)
-                .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(CodaHerdrTheme.borderHairline, lineWidth: 1))
-        )
     }
 }
 
@@ -1244,17 +1250,27 @@ public struct CodaDuoInnerPortraitWorkbenchView: View {
         .buttonStyle(.plain)
     }
 
+    @ViewBuilder
     private var emptyPortraitTerminal: some View {
-        VStack(spacing: 8) {
-            Image(systemName: "terminal")
-                .font(.system(size: 26))
-                .foregroundStyle(CodaHerdrTheme.textSecondary)
-            Text(tr("Open sidebar or select a session", "请从侧边栏选择一个会话", locale: store.locale))
-                .font(.system(size: 13))
-                .foregroundStyle(CodaHerdrTheme.textSecondary)
+        if store.isSignedIn && store.remoteMachines.isEmpty {
+            ScrollView {
+                CodaFriendOnboardingCard(store: store)
+                    .padding(16)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(CodaHerdrTheme.canvasBG)
+        } else {
+            VStack(spacing: 8) {
+                Image(systemName: "terminal")
+                    .font(.system(size: 26))
+                    .foregroundStyle(CodaHerdrTheme.textSecondary)
+                Text(tr("Open sidebar or select a session", "请从侧边栏选择一个会话", locale: store.locale))
+                    .font(.system(size: 13))
+                    .foregroundStyle(CodaHerdrTheme.textSecondary)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(CodaHerdrTheme.canvasBG)
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(CodaHerdrTheme.canvasBG)
     }
 }
 
