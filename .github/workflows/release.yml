@@ -142,19 +142,53 @@ jobs:
       - name: Test, Verify & Build Apple Swift 6 Desktop Companion
         run: |
           export CODA_FFI_DYLIB_PATH="${GITHUB_WORKSPACE}/target/release/libcoda_apple_ffi.dylib"
+          SHORT_VER="${RELEASE_TAG#v}"
+          COMPANION_PLIST="${RUNNER_TEMP}/CodaMacCompanion-Info.plist"
+          cat > "${COMPANION_PLIST}" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleDevelopmentRegion</key><string>en</string>
+            <key>CFBundleExecutable</key><string>CodaMacApp</string>
+            <key>CFBundleIconFile</key><string>AppIcon</string>
+            <key>CFBundleIdentifier</key><string>dev.codahub.mac-companion</string>
+            <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+            <key>CFBundleName</key><string>CodaMacCompanion</string>
+            <key>CFBundleDisplayName</key><string>Coda Companion</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>${SHORT_VER}</string>
+            <key>CFBundleVersion</key><string>${SHORT_VER}</string>
+            <key>LSMinimumSystemVersion</key><string>14.0</string>
+            <key>NSHighResolutionCapable</key><true/>
+            <key>NSLocalNetworkUsageDescription</key><string>Coda discovers and connects directly to your paired Macs and Linux workstations on your local network over end-to-end encrypted P2P.</string>
+            <key>NSMicrophoneUsageDescription</key><string>Coda records voice prompts locally only when you click the microphone button to transcribe commands for your coding agents.</string>
+            <key>NSSpeechRecognitionUsageDescription</key><string>Coda transcribes your voice commands locally on-device when dictating prompts to your coding agents.</string>
+          </dict>
+          </plist>
+          EOF
           cd apple
           swift test
           swift build -c release
           ./.build/release/CodaSelfTest
-          swift build -c release --product CodaMacApp
+          swift build -c release --product CodaMacApp -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist -Xlinker "${COMPANION_PLIST}"
       - name: Package macOS Apple Silicon Suite
         run: |
+          SHORT_VER="${RELEASE_TAG#v}"
+          COMPANION_PLIST="${RUNNER_TEMP}/CodaMacCompanion-Info.plist"
           mkdir -p dist/coda-macos-aarch64 dist/coda-daemon-macos-aarch64
           cp target/release/coda-desktop dist/coda-macos-aarch64/
           cp target/release/coda-daemon dist/coda-macos-aarch64/
           cp target/release/coda-server dist/coda-macos-aarch64/
           cp target/release/libcoda_apple_ffi.dylib dist/coda-macos-aarch64/
           cp apple/.build/release/CodaMacApp dist/coda-macos-aarch64/
+          COMPANION_APP="dist/coda-macos-aarch64/CodaMacCompanion.app"
+          mkdir -p "${COMPANION_APP}/Contents/MacOS" "${COMPANION_APP}/Contents/Resources"
+          cp apple/.build/release/CodaMacApp "${COMPANION_APP}/Contents/MacOS/CodaMacApp"
+          chmod +x "${COMPANION_APP}/Contents/MacOS/CodaMacApp"
+          cp "${COMPANION_PLIST}" "${COMPANION_APP}/Contents/Info.plist"
+          swift assets/render_icon.swift --icns "${COMPANION_APP}/Contents/Resources/AppIcon.icns"
+          codesign --force --deep --sign - "${COMPANION_APP}"
           cp -r web/dist dist/coda-macos-aarch64/web-dist
           cp -r deploy dist/coda-macos-aarch64/deploy
           cp README.md dist/coda-macos-aarch64/
@@ -172,8 +206,7 @@ jobs:
           mkdir -p "${APP_DIR}/Contents/MacOS" "${APP_DIR}/Contents/Resources"
           cp target/release/coda-desktop "${APP_DIR}/Contents/MacOS/coda-desktop"
           chmod +x "${APP_DIR}/Contents/MacOS/coda-desktop"
-          swift assets/render_icon.swift --icns "${APP_DIR}/Contents/Resources/AppIcon.icns"
-          SHORT_VER="${RELEASE_TAG#v}"
+          cp "${COMPANION_APP}/Contents/Resources/AppIcon.icns" "${APP_DIR}/Contents/Resources/AppIcon.icns"
           cat > "${APP_DIR}/Contents/Info.plist" <<EOF
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -193,6 +226,7 @@ jobs:
             <key>NSHighResolutionCapable</key><true/>
             <key>NSLocalNetworkUsageDescription</key><string>Coda discovers and connects directly to your paired Macs and Linux workstations on your local network over end-to-end encrypted P2P.</string>
             <key>NSMicrophoneUsageDescription</key><string>Coda records voice prompts locally only when you click the microphone button to transcribe commands for your coding agents.</string>
+            <key>NSSpeechRecognitionUsageDescription</key><string>Coda transcribes your voice commands locally on-device when dictating prompts to your coding agents.</string>
           </dict>
           </plist>
           EOF

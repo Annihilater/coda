@@ -38,11 +38,13 @@ INSTALL_DIR="${CODA_INSTALL_DIR:-${HOME}/.local/bin}"
 
 # Guard against `sudo sh` polluting a non-root user's $HOME with root-owned files.
 SUDO_FIXUP_USER=""
+TARGET_HOME="${HOME:-/root}"
 if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ] && [ "${SUDO_USER}" != "root" ]; then
   SUDO_USER_HOME="$(eval printf '%s' "~${SUDO_USER}" 2>/dev/null || true)"
   if [ -n "${SUDO_USER_HOME}" ] && [ "${HOME}" = "${SUDO_USER_HOME}" ]; then
-    echo "[WARN] Detected sudo preserving ${SUDO_USER}'s HOME (${HOME}); will restore ownership to ${SUDO_USER}." >&2
+    echo "[WARN] Detected sudo preserving ${SUDO_USER}'s HOME (${HOME}); will restore ownership and run service as ${SUDO_USER}." >&2
     SUDO_FIXUP_USER="${SUDO_USER}"
+    TARGET_HOME="${SUDO_USER_HOME}"
   fi
 fi
 
@@ -487,9 +489,14 @@ EOF
   fi
 elif [ "${OS_NAME}" = "Linux" ]; then
   SERVICE_STARTED=0
-  SAFE_WORK_DIR="${HOME:-/}"
+  SAFE_WORK_DIR="${TARGET_HOME:-/}"
   if [ ! -d "${SAFE_WORK_DIR}" ]; then
     SAFE_WORK_DIR="/"
+  fi
+
+  if [ -n "${SUDO_FIXUP_USER}" ]; then
+    SUDO_FIXUP_GROUP="$(id -gn "${SUDO_FIXUP_USER}" 2>/dev/null || printf '%s' "${SUDO_FIXUP_USER}")"
+    chown -R "${SUDO_FIXUP_USER}:${SUDO_FIXUP_GROUP}" "${INSTALL_DIR}" "${STATE_DIR}" 2>/dev/null || true
   fi
 
   EXEC_CMD="$(systemd_quote "${INSTALL_DIR}/coda-daemon") --config $(systemd_quote "${CFG_PATH}") run"
@@ -499,6 +506,12 @@ elif [ "${OS_NAME}" = "Linux" ]; then
 
   if [ "$(id -u)" -eq 0 ] && [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
     SYS_UNIT="/etc/systemd/system/coda-daemon.service"
+    SYS_USER_DIRECTIVES=""
+    if [ -n "${SUDO_FIXUP_USER}" ]; then
+      SUDO_FIXUP_GROUP="$(id -gn "${SUDO_FIXUP_USER}" 2>/dev/null || printf '%s' "${SUDO_FIXUP_USER}")"
+      SYS_USER_DIRECTIVES="User=${SUDO_FIXUP_USER}
+Group=${SUDO_FIXUP_GROUP}"
+    fi
     cat > "${SYS_UNIT}" <<EOF
 [Unit]
 Description=Coda Zero-Knowledge Host Daemon (herdr-core bridge)
@@ -507,8 +520,9 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+${SYS_USER_DIRECTIVES}
 WorkingDirectory=$(systemd_quote "${SAFE_WORK_DIR}")
-Environment=$(systemd_quote "HOME=${HOME}")
+Environment="HOME=${TARGET_HOME}"
 Environment=$(systemd_quote "PATH=${INSTALL_DIR}:/usr/local/bin:/usr/bin:/bin")
 Environment=$(systemd_quote "CODA_DAEMON_CONFIG=${CFG_PATH}")
 ExecStart=${EXEC_CMD}
