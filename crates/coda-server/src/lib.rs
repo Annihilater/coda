@@ -40,9 +40,14 @@ use uuid::Uuid;
 
 const RATE_LIMITER_MAX_BUCKETS: usize = 8192;
 
+struct RateBucket {
+    count: u32,
+    expires_at: Instant,
+}
+
 #[derive(Default)]
 pub struct RateLimiter {
-    buckets: Mutex<HashMap<String, (u32, Instant)>>,
+    buckets: Mutex<HashMap<String, RateBucket>>,
 }
 
 impl RateLimiter {
@@ -50,30 +55,36 @@ impl RateLimiter {
         let now = Instant::now();
         let mut map = self.buckets.lock().await;
         if map.len() > RATE_LIMITER_MAX_BUCKETS / 2 {
-            map.retain(|_, (_, started)| now.duration_since(*started) < window * 2);
+            map.retain(|_, bucket| bucket.expires_at > now);
         }
         if map.len() >= RATE_LIMITER_MAX_BUCKETS && !map.contains_key(key) {
-            // Hard memory cap against IPv6 rotation flood: evict oldest 25% entries.
-            let mut entries: Vec<(String, Instant)> =
-                map.iter().map(|(k, (_, ts))| (k.clone(), *ts)).collect();
-            entries.sort_by_key(|(_, ts)| *ts);
+            // Hard memory cap against IPv6 rotation flood: evict soonest-expiring 25% entries.
+            let mut entries: Vec<(String, Instant)> = map
+                .iter()
+                .map(|(k, b)| (k.clone(), b.expires_at))
+                .collect();
+            entries.sort_by_key(|(_, exp)| *exp);
             let evict_count = (RATE_LIMITER_MAX_BUCKETS / 4).max(1);
             for (old_k, _) in entries.into_iter().take(evict_count) {
                 map.remove(&old_k);
             }
         }
-        let entry = map.entry(key.to_string()).or_insert((0, now));
-        if now.duration_since(entry.1) >= window {
-            *entry = (1, now);
+        let entry = map.entry(key.to_string()).or_insert(RateBucket {
+            count: 0,
+            expires_at: now + window,
+        });
+        if entry.expires_at <= now {
+            entry.count = 1;
+            entry.expires_at = now + window;
             return Ok(());
         }
-        if entry.0 >= max_requests {
+        if entry.count >= max_requests {
             return Err(ApiError {
                 status: StatusCode::TOO_MANY_REQUESTS,
                 message: "rate limit exceeded; please retry shortly".into(),
             });
         }
-        entry.0 += 1;
+        entry.count += 1;
         Ok(())
     }
 }
@@ -1820,7 +1831,8 @@ async fn register_client_device_handler(
     headers: HeaderMap,
     Json(req): Json<RegisterClientDeviceRequest>,
 ) -> Result<Json<DeviceRecord>, ApiError> {
-    let user = require_auth(&st, &headers).await?;
+    let session = require_auth_session(&st, &headers).await?;
+    let user = session.user;
     let endpoints = sanitize_endpoints_value(&req.endpoints);
     let dev = st
         .db
@@ -1837,6 +1849,10 @@ async fn register_client_device_handler(
         )
         .await
         .map_err(ApiError::bad_request)?;
+    st.db
+        .bind_session_device(&session.token_sha256, dev.id)
+        .await
+        .map_err(ApiError::internal)?;
     st.relay_hub
         .notify_device_enrolled(user.id, dev.id, &dev.name, &dev.role, Some(dev.is_online))
         .await;
@@ -2118,6 +2134,8 @@ pub struct DaemonAlertRequest {
 pub struct PruneStaleDevicesRequest {
     #[serde(default)]
     pub max_idle_days: i32,
+    #[serde(default)]
+    pub exclude_device_id: Option<Uuid>,
 }
 
 fn env_allows_local_webhook_test() -> bool {
@@ -2377,25 +2395,50 @@ fn build_webhook_tasks(
 }
 
 async fn execute_webhook_task(
-    client: &reqwest::Client,
+    fallback_client: &reqwest::Client,
     task: &OutboundWebhookTask,
     allow_local_test: bool,
 ) -> std::result::Result<(), String> {
     let parsed = reqwest::Url::parse(&task.url)
         .map_err(|e| format!("{}: invalid URL ({e})", task.channel))?;
-    if !allow_local_test {
-        let host = parsed
-            .host_str()
-            .ok_or_else(|| format!("{}: missing host", task.channel))?
-            .trim_start_matches('[')
-            .trim_end_matches(']');
-        let port = parsed.port_or_known_default().unwrap_or(443);
-        let resolved = tokio::net::lookup_host((host, port))
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| format!("{}: missing host", task.channel))?
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_string();
+    let port = parsed
+        .port_or_known_default()
+        .unwrap_or_else(|| if parsed.scheme() == "http" { 80 } else { 443 });
+    let is_local_test_loopback = allow_local_test
+        && matches!(parsed.scheme(), "http" | "https")
+        && matches!(host.to_ascii_lowercase().as_str(), "127.0.0.1" | "localhost");
+
+    let dispatch_client = if is_local_test_loopback {
+        fallback_client.clone()
+    } else if let Ok(ip) = host.parse::<IpAddr>() {
+        if is_blocked_ssrf_ip(ip) {
+            return Err(format!(
+                "{}: literal IP {ip} blocked by SSRF guard",
+                task.channel
+            ));
+        }
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(6))
+            .no_proxy()
+            .user_agent("coda-server-webhook")
+            .build()
+            .map_err(|e| format!("{}: client build failed ({e})", task.channel))?
+    } else {
+        let resolved: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), port))
             .await
-            .map_err(|e| format!("{}: DNS lookup failed ({e})", task.channel))?;
-        let mut count = 0usize;
-        for sa in resolved {
-            count += 1;
+            .map_err(|e| format!("{}: DNS lookup failed ({e})", task.channel))?
+            .collect();
+        if resolved.is_empty() {
+            return Err(format!("{}: DNS returned no addresses", task.channel));
+        }
+        for sa in &resolved {
             if is_blocked_ssrf_ip(sa.ip()) {
                 return Err(format!(
                     "{}: resolved IP {} blocked by SSRF guard",
@@ -2404,12 +2447,18 @@ async fn execute_webhook_task(
                 ));
             }
         }
-        if count == 0 {
-            return Err(format!("{}: DNS returned no addresses", task.channel));
-        }
-    }
+        // Pin validated SocketAddr(s) on a per-dispatch client to eliminate DNS-rebinding TOCTOU.
+        reqwest::Client::builder()
+            .resolve_to_addrs(&host, &resolved)
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(6))
+            .no_proxy()
+            .user_agent("coda-server-webhook")
+            .build()
+            .map_err(|e| format!("{}: client build failed ({e})", task.channel))?
+    };
 
-    let resp = client
+    let resp = dispatch_client
         .post(&task.url)
         .json(&task.body)
         .send()
@@ -2711,20 +2760,29 @@ async fn daemon_alert_handler(
     });
 
     let allow_local = effective_allow_local_webhook(&st);
-    let (tasks, _errs) =
+    let (tasks, mut errors) =
         build_webhook_tasks(&settings, &title, &body, &generic_payload, allow_local);
-    let dispatched = tasks.len();
-
-    for task in tasks {
-        let http = st.webhook_http.clone();
-        tokio::spawn(async move {
-            let _ = execute_webhook_task(&http, &task, allow_local).await;
-        });
+    let results = futures_util::future::join_all(
+        tasks
+            .iter()
+            .map(|task| execute_webhook_task(&st.webhook_http, task, allow_local)),
+    )
+    .await;
+    let mut dispatched = 0usize;
+    for res in results {
+        match res {
+            Ok(()) => dispatched += 1,
+            Err(err_msg) => {
+                tracing::warn!("daemon alert webhook delivery failed: {err_msg}");
+                errors.push(err_msg);
+            }
+        }
     }
 
     Ok(Json(json!({
         "ok": true,
         "dispatched": dispatched,
+        "errors": errors,
     })))
 }
 
@@ -2736,7 +2794,7 @@ async fn prune_stale_devices_handler(
     let session = require_auth_session(&st, &headers).await?;
     let trimmed_body = std::str::from_utf8(&body).unwrap_or("").trim();
     let req: PruneStaleDevicesRequest = if trimmed_body.is_empty() {
-        PruneStaleDevicesRequest { max_idle_days: 0 }
+        PruneStaleDevicesRequest::default()
     } else {
         serde_json::from_slice(&body)
             .map_err(|e| ApiError::bad_request(anyhow::anyhow!("invalid JSON body: {e}")))?
@@ -2744,12 +2802,18 @@ async fn prune_stale_devices_handler(
 
     let pruned_ids = st
         .db
-        .prune_stale_web_devices(session.user.id, session.device_id, req.max_idle_days.max(0))
+        .prune_stale_web_devices_excluding(
+            session.user.id,
+            session.device_id,
+            req.exclude_device_id,
+            req.max_idle_days.max(0),
+        )
         .await
         .map_err(ApiError::internal)?;
     let pruned_count = pruned_ids.len();
 
     for dev_id in pruned_ids {
+        st.relay_hub.disconnect_device(session.user.id, dev_id).await;
         st.relay_hub
             .notify_device_enrolled(session.user.id, dev_id, "", "client", Some(false))
             .await;
@@ -2761,6 +2825,7 @@ async fn prune_stale_devices_handler(
     })))
 }
 
+#[derive(Debug)]
 pub struct ApiError {
     status: StatusCode,
     message: String,
@@ -2916,5 +2981,47 @@ mod tests {
             sanitize_metadata_basename("/Users/vampire/secret/coda"),
             "coda"
         );
+        // IPv4-mapped IPv6 SSRF block
+        assert!(is_blocked_ssrf_ip(
+            "::ffff:127.0.0.1".parse::<IpAddr>().unwrap()
+        ));
+        assert!(is_blocked_ssrf_ip(
+            "::ffff:169.254.169.254".parse::<IpAddr>().unwrap()
+        ));
+        assert!(is_blocked_ssrf_ip(
+            "::ffff:100.100.100.200".parse::<IpAddr>().unwrap()
+        ));
+    }
+
+    #[tokio::test]
+    async fn rate_limiter_preserves_long_window_buckets_across_short_window_sweeps() {
+        let limiter = RateLimiter::default();
+        // Exhaust a 60s bucket (max_requests = 1)
+        limiter
+            .check("daemon_alert:u1:d1:s1:needs_you", 1, Duration::from_secs(60))
+            .await
+            .unwrap();
+        assert!(limiter
+            .check("daemon_alert:u1:d1:s1:needs_you", 1, Duration::from_secs(60))
+            .await
+            .is_err());
+
+        // Populate > 4096 short-window (1ms) buckets and trigger sweep with a 10ms caller window
+        for i in 0..4200 {
+            let _ = limiter
+                .check(&format!("short:{i}"), 5, Duration::from_millis(1))
+                .await;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        limiter
+            .check("trigger_sweep", 5, Duration::from_millis(10))
+            .await
+            .unwrap();
+
+        // The 60s bucket MUST still be active (not prematurely evicted by the 10ms caller)
+        assert!(limiter
+            .check("daemon_alert:u1:d1:s1:needs_you", 1, Duration::from_secs(60))
+            .await
+            .is_err());
     }
 }

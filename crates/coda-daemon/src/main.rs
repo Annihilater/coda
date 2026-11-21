@@ -677,6 +677,7 @@ async fn main() -> Result<()> {
             let _ = peers_store.refresh_from_server(true).await;
 
             let runtime = SharedHostRuntime::new().await;
+            runtime.update_config(cfg.clone()).await;
             let (bound_p2p, p2p_abort) = match spawn_direct_p2p_listener_with_runtime(
                 cfg.clone(),
                 p2p_bind,
@@ -728,8 +729,9 @@ async fn main() -> Result<()> {
             let mut backoff_secs = 1u64;
 
             loop {
-                let _ = maybe_renew_daemon_config(&mut cfg, Some(&cfg_path), &peers_store, false)
-                    .await;
+                if maybe_renew_daemon_config(&mut cfg, Some(&cfg_path), &peers_store, false).await {
+                    runtime.update_config(cfg.clone()).await;
+                }
                 let started = tokio::time::Instant::now();
                 let run_fut = run_daemon_once_with_runtime(
                     &cfg,
@@ -767,6 +769,7 @@ async fn main() -> Result<()> {
                         info!("coda-daemon received SIGHUP; reloading {}", cfg_path.display());
                         if let Ok(reloaded) = DaemonConfig::load(&cfg_path) {
                             cfg = reloaded;
+                            runtime.update_config(cfg.clone()).await;
                             peers_store.update_relay_ticket(cfg.daemon_relay_ticket.clone()).await;
                             let _ = peers_store.refresh_from_server(true).await;
                         }
@@ -784,7 +787,9 @@ async fn main() -> Result<()> {
                             Err(e) => {
                                 let msg = e.to_string().to_ascii_lowercase();
                                 if msg.contains("expired") || msg.contains("ticket") || msg.contains("unauthorized") {
-                                    let _ = maybe_renew_daemon_config(&mut cfg, Some(&cfg_path), &peers_store, true).await;
+                                    if maybe_renew_daemon_config(&mut cfg, Some(&cfg_path), &peers_store, true).await {
+                                        runtime.update_config(cfg.clone()).await;
+                                    }
                                 }
                                 if started.elapsed() >= Duration::from_secs(10) {
                                     backoff_secs = 1;
@@ -818,7 +823,9 @@ async fn main() -> Result<()> {
                     _ = sighup.recv() => {
                                 if let Ok(reloaded) = DaemonConfig::load(&cfg_path) {
                                     cfg = reloaded;
+                                    runtime.update_config(cfg.clone()).await;
                                     peers_store.update_relay_ticket(cfg.daemon_relay_ticket.clone()).await;
+                                    let _ = peers_store.refresh_from_server(true).await;
                                 }
                                 backoff_secs = 1;
                                 continue;

@@ -2526,6 +2526,60 @@ async fn test_v090_webhook_notifications_daemon_alerts_prune_stale_and_bootstrap
     assert!(devs_after_prune.iter().any(|d| d.id == ios_offline.id));
     assert!(devs_after_prune.iter().any(|d| d.id == daemon_cfg.device_id));
 
+    // Verify self-revocation guard (#20 Bug #3): an offline/idle Web Console session (`_relogin`)
+    // calling `prune-stale` MUST preserve both its own `auth_sessions.device_id` AND `exclude_device_id`!
+    let extra_tab = reg_client("Second Idle Tab", "web").await;
+    let stale_tab = reg_client("Stale Orphan Tab", "web").await;
+    let caller_id = StoredDeviceIdentity::generate("Active Caller Tab");
+    let caller_web: DeviceRecord = http
+        .post(format!("{base}/api/v1/devices/register-client"))
+        .bearer_auth(&_relogin.token)
+        .json(&json!({
+            "name": "Active Caller Tab",
+            "platform": "web",
+            "ed25519_pubkey": caller_id.ed25519_public_b64,
+            "x25519_pubkey": caller_id.x25519_public_b64,
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let safe_prune: serde_json::Value = http
+        .post(format!("{base}/api/v1/devices/prune-stale"))
+        .bearer_auth(&_relogin.token)
+        .json(&json!({
+            "max_idle_days": 0,
+            "exclude_device_id": extra_tab.id,
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(safe_prune["ok"], true);
+    assert_eq!(safe_prune["pruned_count"], 1);
+    let devs_after_safe_prune: Vec<DeviceRecord> = http
+        .get(format!("{base}/api/v1/devices"))
+        .bearer_auth(&_relogin.token)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(devs_after_safe_prune.iter().any(|d| d.id == caller_web.id));
+    assert!(devs_after_safe_prune.iter().any(|d| d.id == extra_tab.id));
+    assert!(!devs_after_safe_prune.iter().any(|d| d.id == stale_tab.id));
+
     // 6. Verify live E2EE BootstrapWorkspace over Raw TCP Relay
     let cfg_bg = daemon_cfg.clone();
     let daemon_task = tokio::spawn(async move {
@@ -2615,6 +2669,53 @@ async fn test_v090_webhook_notifications_daemon_alerts_prune_stale_and_bootstrap
         other => panic!("unexpected reply: {other:?}"),
     }
     let _ = std::fs::remove_dir_all(&tmp_parent);
+
+    // 7. Verify SetVoiceConfig masks non-empty API key (`••••••••`) & TranscribeAudio SSRF guard over E2EE
+    let vc_ack = smart
+        .request(
+            &PeerMessage::SetVoiceConfig {
+                req_id: "e2e-vc-ssrf".into(),
+                config: VoiceModelConfig {
+                    provider: "openai".into(),
+                    base_url: "https://[::ffff:169.254.169.254]/v1".into(),
+                    api_key: "sk-secret-e2e-v1".into(),
+                    model: "whisper-1".into(),
+                },
+            },
+            TrafficLane::ControlP0,
+        )
+        .await
+        .unwrap();
+    match vc_ack {
+        PeerMessage::VoiceConfigAck { ok, config, .. } => {
+            assert!(ok);
+            assert_eq!(config.api_key, "••••••••");
+        }
+        other => panic!("unexpected VoiceConfigAck: {other:?}"),
+    }
+    let ta_reply = smart
+        .request(
+            &PeerMessage::TranscribeAudio {
+                req_id: "e2e-ta-ssrf".into(),
+                audio_b64: base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    b"RIFF....WAVEfmt ",
+                ),
+                mime_type: "audio/wav".into(),
+                filename: "voice.wav".into(),
+                language: Some("en".into()),
+            },
+            TrafficLane::ControlP0,
+        )
+        .await
+        .unwrap();
+    match ta_reply {
+        PeerMessage::TranscribeAudioResult { ok, error, .. } => {
+            assert!(!ok);
+            assert!(error.as_deref().is_some_and(|e| e.contains("SSRF")));
+        }
+        other => panic!("unexpected TranscribeAudioResult: {other:?}"),
+    }
 
     daemon_task.abort();
     mock_server_task.abort();

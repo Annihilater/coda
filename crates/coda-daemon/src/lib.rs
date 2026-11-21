@@ -10,8 +10,8 @@ pub mod fs_sandbox;
 pub mod telemetry_ota;
 
 pub use fs_sandbox::{
-    expand_tilde_path, handle_bootstrap_workspace_rpc, is_sensitive_path, validate_git_clone_url,
-    validate_workspace_folder_name,
+    expand_tilde_path, handle_bootstrap_workspace_rpc, is_blocked_ssrf_ip, is_sensitive_path,
+    validate_git_clone_url, validate_workspace_folder_name,
 };
 use fs_sandbox::{
     handle_list_directory_rpc, handle_read_file_preview_rpc, lossy_utf8_prefix,
@@ -77,6 +77,7 @@ const MAX_CONCURRENT_PEER_RPCS: usize = 32;
 const MAX_DIRECT_P2P_CONNS: usize = 64;
 const MAX_SESSIONS_PER_PEER: usize = 8;
 const MAX_HTTP_PREVIEW_BYTES: usize = 4 * 1024 * 1024;
+const MAX_HTTP_PREVIEW_REQ_BODY_BYTES: usize = 2 * 1024 * 1024;
 const MAX_UPLOAD_FILE_BYTES: usize = 8 * 1024 * 1024;
 const WS_KEEPALIVE_SECS: u64 = 25;
 const HANDSHAKE_REPLAY_MAX_ENTRIES: usize = 4096;
@@ -1500,8 +1501,17 @@ struct NativeFallbackShells {
 }
 
 impl NativeFallbackShells {
-    fn list(&self, include_finished: bool) -> Vec<HerdrTerminalSummary> {
+    fn prune_dead(&mut self) {
         self.terminals
+            .retain(|_, entry| entry.alive.load(Ordering::Relaxed));
+    }
+
+    fn list(&mut self, include_finished: bool) -> Vec<HerdrTerminalSummary> {
+        if !include_finished {
+            self.prune_dead();
+        }
+        let summaries: Vec<HerdrTerminalSummary> = self
+            .terminals
             .values()
             .filter_map(|e| {
                 let is_alive = e.alive.load(Ordering::Relaxed);
@@ -1512,11 +1522,19 @@ impl NativeFallbackShells {
                 s.alive = is_alive;
                 Some(s)
             })
-            .collect()
+            .collect();
+        self.prune_dead();
+        summaries
     }
 
+    fn terminal_cwd(&self, terminal: &str) -> Option<String> {
+        self.terminals.get(terminal).map(|e| e.summary.cwd.clone())
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn launch(
         &mut self,
+        owner_weak: Option<std::sync::Weak<Mutex<NativeFallbackShells>>>,
         agent: &str,
         name: Option<&str>,
         cwd: Option<&str>,
@@ -1524,6 +1542,7 @@ impl NativeFallbackShells {
         cols: u16,
         rows: u16,
     ) -> Result<HerdrTerminalSummary> {
+        self.prune_dead();
         self.seq = self.seq.saturating_add(1);
         let clean_name = name
             .and_then(coda_herdr::sanitize_hc_terminal_name)
@@ -1551,13 +1570,18 @@ impl NativeFallbackShells {
         let out_tx_c = output_tx.clone();
         let tail_c = Arc::clone(&screen_tail);
         let alive_c = Arc::clone(&alive);
+        let addr_reap = address.clone();
         tokio::spawn(async move {
             while let Some(ev) = pty_rx.recv().await {
                 if let Ok(raw) = B64.decode(&ev.data_b64) {
                     if let Ok(mut buf) = tail_c.lock() {
                         buf.extend_from_slice(&raw);
                         if buf.len() > 32_768 {
-                            let drop_n = buf.len() - 32_768;
+                            let mut drop_n = buf.len() - 32_768;
+                            while drop_n < buf.len() && (buf[drop_n] & 0b1100_0000) == 0b1000_0000
+                            {
+                                drop_n += 1;
+                            }
                             buf.drain(..drop_n);
                         }
                     }
@@ -1565,6 +1589,16 @@ impl NativeFallbackShells {
                 let _ = out_tx_c.send(ev);
             }
             alive_c.store(false, Ordering::Relaxed);
+            if let Some(owner) = owner_weak.and_then(|w| w.upgrade()) {
+                let mut guard = owner.lock().await;
+                if guard
+                    .terminals
+                    .get(&addr_reap)
+                    .is_some_and(|e| !e.alive.load(Ordering::Relaxed))
+                {
+                    guard.terminals.remove(&addr_reap);
+                }
+            }
         });
 
         let summary = HerdrTerminalSummary {
@@ -1599,6 +1633,7 @@ impl NativeFallbackShells {
     }
 
     fn resize(&mut self, terminal: &str, cols: u16, rows: u16) -> Result<()> {
+        self.prune_dead();
         let entry = self
             .terminals
             .get_mut(terminal)
@@ -1615,6 +1650,7 @@ impl NativeFallbackShells {
         cols: u16,
         rows: u16,
     ) -> Result<(Vec<u8>, broadcast::Receiver<PtyOutputEvent>)> {
+        self.prune_dead();
         let entry = self
             .terminals
             .get_mut(terminal)
@@ -1644,7 +1680,9 @@ impl NativeFallbackShells {
     }
 
     fn kill(&mut self, terminal: &str) -> bool {
-        self.terminals.remove(terminal).is_some()
+        let removed = self.terminals.remove(terminal).is_some();
+        self.prune_dead();
+        removed
     }
 }
 
@@ -1712,6 +1750,7 @@ pub enum DaemonTermAlertPhase {
     NeedsYou,
     Working,
     Done,
+    Error,
     Idle,
 }
 
@@ -1720,7 +1759,18 @@ impl DaemonTermAlertPhase {
         let raw = status.state.trim().to_ascii_lowercase();
         match raw.as_str() {
             "needs_you" | "needsyou" | "needs-you" | "blocked" | "waiting" | "attention"
-            | "prompt" | "permission" | "error" => Self::NeedsYou,
+            | "prompt" | "permission" => Self::NeedsYou,
+            "error" => {
+                if status
+                    .kind
+                    .as_deref()
+                    .is_some_and(|k| matches!(k, "permission" | "question" | "auth"))
+                {
+                    Self::NeedsYou
+                } else {
+                    Self::Error
+                }
+            }
             "working" | "running" | "busy" | "active" | "thinking" | "streaming" => Self::Working,
             "done" | "completed" | "finished" | "success" => Self::Done,
             _ => {
@@ -1786,12 +1836,72 @@ fn extract_safe_terminal_session_name(term: &HerdrTerminalSummary) -> String {
 
 #[derive(Default)]
 pub struct DaemonAlertTracker {
-    last_phase: HashMap<String, DaemonTermAlertPhase>,
-    known_meta: HashMap<String, (String, String)>,
+    last_phase: HashMap<String, (DaemonTermAlertPhase, u64)>,
+    known_meta: HashMap<String, (String, String, u64)>,
     cooldowns: HashMap<(String, String), std::time::Instant>,
+    seq: u64,
 }
 
 impl DaemonAlertTracker {
+    fn next_seq(&mut self) -> u64 {
+        self.seq = self.seq.saturating_add(1);
+        self.seq
+    }
+
+    fn insert_phase(&mut self, addr: &str, phase: DaemonTermAlertPhase) -> Option<DaemonTermAlertPhase> {
+        if self.last_phase.len() >= 512 && !self.last_phase.contains_key(addr) {
+            let mut ordered: Vec<(String, u64)> = self
+                .last_phase
+                .iter()
+                .map(|(k, (_, ord))| (k.clone(), *ord))
+                .collect();
+            ordered.sort_by_key(|(_, ord)| *ord);
+            for (old_k, _) in ordered.into_iter().take(128) {
+                self.last_phase.remove(&old_k);
+            }
+        }
+        let ord = self.next_seq();
+        self.last_phase
+            .insert(addr.to_string(), (phase, ord))
+            .map(|(prev, _)| prev)
+    }
+
+    /// Seeds initial terminal phases from `hc.list_terminals` on startup/reconnect without firing false alerts.
+    pub fn seed_from_terminals(&mut self, terminals: &[HerdrTerminalSummary]) {
+        for term in terminals {
+            let addr = term.address.trim();
+            if addr.is_empty() {
+                continue;
+            }
+            self.cache_terminal_meta(term);
+            if !self.last_phase.contains_key(addr) {
+                let phase = term
+                    .status
+                    .as_ref()
+                    .map(DaemonTermAlertPhase::from_herdr_status)
+                    .unwrap_or(DaemonTermAlertPhase::Idle);
+                let _ = self.insert_phase(addr, phase);
+            }
+        }
+    }
+
+    /// Seeds a newly launched terminal as `Idle` so an immediate transition to `NeedsYou` still fires.
+    pub fn seed_new_terminal(&mut self, term: &HerdrTerminalSummary) {
+        let addr = term.address.trim();
+        if addr.is_empty() {
+            return;
+        }
+        self.cache_terminal_meta(term);
+        if !self.last_phase.contains_key(addr) {
+            let phase = term
+                .status
+                .as_ref()
+                .map(DaemonTermAlertPhase::from_herdr_status)
+                .unwrap_or(DaemonTermAlertPhase::Idle);
+            let _ = self.insert_phase(addr, phase);
+        }
+    }
+
     pub fn observe_live_event(
         &mut self,
         device_id: Uuid,
@@ -1801,18 +1911,7 @@ impl DaemonAlertTracker {
         now: std::time::Instant,
     ) -> Option<(String, DaemonAlertPayload)> {
         if let Some(t) = terminal {
-            if !t.address.trim().is_empty() {
-                if self.known_meta.len() >= 512 && !self.known_meta.contains_key(&t.address) {
-                    self.known_meta.clear();
-                }
-                self.known_meta.insert(
-                    t.address.clone(),
-                    (
-                        extract_safe_terminal_session_name(t),
-                        extract_safe_cwd_basename(&t.cwd),
-                    ),
-                );
-            }
+            self.cache_terminal_meta(t);
         }
 
         let addr = terminal
@@ -1841,20 +1940,34 @@ impl DaemonAlertTracker {
                     .and_then(|v| serde_json::from_value::<coda_protocol::HerdrAgentStatus>(v.clone()).ok())
             })?;
 
+        let raw_kind = raw_event
+            .get("kind")
+            .or_else(|| raw_event.get("type"))
+            .or_else(|| raw_event.get("event"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let is_creation_event = matches!(
+            raw_kind,
+            "created" | "spawned" | "terminal.created" | "terminal_created"
+        );
+
         let new_phase = DaemonTermAlertPhase::from_herdr_status(&status_obj);
-        if self.last_phase.len() >= 512 && !self.last_phase.contains_key(addr) {
-            self.last_phase.clear();
-        }
-        let prev_phase = self.last_phase.insert(addr.to_string(), new_phase);
+        let prev_phase = self.insert_phase(addr, new_phase);
+        let prev = match prev_phase {
+            Some(p) => p,
+            None if is_creation_event => DaemonTermAlertPhase::Idle,
+            // First observation of an unseeded pre-existing terminal establishes baseline without false alerts.
+            None => return None,
+        };
 
         let alert_status = if new_phase == DaemonTermAlertPhase::NeedsYou
-            && prev_phase != Some(DaemonTermAlertPhase::NeedsYou)
+            && prev != DaemonTermAlertPhase::NeedsYou
         {
             Some("needs_you")
         } else if matches!(
             new_phase,
             DaemonTermAlertPhase::Idle | DaemonTermAlertPhase::Done
-        ) && prev_phase == Some(DaemonTermAlertPhase::Working)
+        ) && prev == DaemonTermAlertPhase::Working
         {
             Some("finished")
         } else {
@@ -1875,7 +1988,7 @@ impl DaemonAlertTracker {
         let (session_name, cwd_basename) = self
             .known_meta
             .get(addr)
-            .cloned()
+            .map(|(n, c, _)| (n.clone(), c.clone()))
             .unwrap_or_else(|| (sanitize_alert_meta_field(addr, 64), String::new()));
 
         Some((
@@ -1891,15 +2004,26 @@ impl DaemonAlertTracker {
     }
 
     pub fn cache_terminal_meta(&mut self, term: &HerdrTerminalSummary) {
-        if !term.address.trim().is_empty() {
-            if self.known_meta.len() >= 512 && !self.known_meta.contains_key(&term.address) {
-                self.known_meta.clear();
+        let addr = term.address.trim();
+        if !addr.is_empty() {
+            if self.known_meta.len() >= 512 && !self.known_meta.contains_key(addr) {
+                let mut ordered: Vec<(String, u64)> = self
+                    .known_meta
+                    .iter()
+                    .map(|(k, (_, _, ord))| (k.clone(), *ord))
+                    .collect();
+                ordered.sort_by_key(|(_, ord)| *ord);
+                for (old_k, _) in ordered.into_iter().take(128) {
+                    self.known_meta.remove(&old_k);
+                }
             }
+            let ord = self.next_seq();
             self.known_meta.insert(
-                term.address.clone(),
+                addr.to_string(),
                 (
                     extract_safe_terminal_session_name(term),
                     extract_safe_cwd_basename(&term.cwd),
+                    ord,
                 ),
             );
         }
@@ -1973,108 +2097,38 @@ async fn post_daemon_alert_metadata(auth: &DaemonAlertPushAuth, payload: &Daemon
 }
 
 fn spawn_herdr_event_forwarder(
-    herdr: SharedHerdr,
+    mut events_rx: broadcast::Receiver<PeerMessage>,
     sessions: Arc<Mutex<HashMap<PeerSessionKey, PeerCryptoSession>>>,
-    alert_auth: DaemonAlertPushAuth,
-    alert_tracker: Arc<StdMutex<DaemonAlertTracker>>,
+    my_device_id: Uuid,
     stop_flag: Arc<std::sync::atomic::AtomicBool>,
 ) -> tokio::task::JoinHandle<()> {
-    let my_device_id = alert_auth.device_id;
     tokio::spawn(async move {
-        let mut seq: u64 = 0;
-        let mut backoff_secs = 1u64;
         loop {
             if stop_flag.load(Ordering::Relaxed) {
                 break;
             }
-            let Some(hc) = resolve_herdr_lazy(&herdr).await else {
-                tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
-                backoff_secs = (backoff_secs * 2).min(15);
-                continue;
+            let msg = match events_rx.recv().await {
+                Ok(m) => m,
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => break,
             };
-            let Ok(mut ev_rx) = hc.subscribe_live_events().await else {
-                tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
-                backoff_secs = (backoff_secs * 2).min(15);
-                continue;
-            };
-            backoff_secs = 1;
-            while let Some(raw_event) = ev_rx.recv().await {
-                if stop_flag.load(Ordering::Relaxed) {
-                    return;
-                }
-                seq += 1;
-                let event_kind = raw_event
-                    .get("kind")
-                    .or_else(|| raw_event.get("type"))
-                    .or_else(|| raw_event.get("event"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("update")
-                    .to_string();
-                let terminal = raw_event
-                    .get("terminal")
-                    .and_then(|v| serde_json::from_value::<HerdrTerminalSummary>(v.clone()).ok())
-                    .or_else(|| serde_json::from_value::<HerdrTerminalSummary>(raw_event.clone()).ok());
-
-                // Zero-Knowledge Offline Alert Push trigger (fires even when 0 E2EE client peers are online!).
-                let maybe_alert = alert_tracker
-                    .lock()
-                    .ok()
-                    .and_then(|mut tr| {
-                        tr.observe_live_event(
-                            alert_auth.device_id,
-                            &alert_auth.device_name,
-                            terminal.as_ref(),
-                            &raw_event,
-                            std::time::Instant::now(),
-                        )
-                    });
-                if let Some((term_addr, mut alert_payload)) = maybe_alert {
-                    let auth_c = alert_auth.clone();
-                    let hc_c = Arc::clone(&hc);
-                    let tracker_c = Arc::clone(&alert_tracker);
-                    tokio::spawn(async move {
-                        if alert_payload.cwd_basename.is_empty() {
-                            if let Ok(list) = hc_c.list_terminals(false).await {
-                                if let Some(found) = list.iter().find(|t| t.address == term_addr) {
-                                    alert_payload.session_name = extract_safe_terminal_session_name(found);
-                                    alert_payload.cwd_basename = extract_safe_cwd_basename(&found.cwd);
-                                    if let Ok(mut tr) = tracker_c.lock() {
-                                        tr.cache_terminal_meta(found);
-                                    }
-                                }
-                            }
-                        }
-                        post_daemon_alert_metadata(&auth_c, &alert_payload).await;
-                    });
-                }
-
-                let peer_keys: Vec<PeerSessionKey> = {
-                    let map = sessions.lock().await;
-                    map.keys().cloned().collect()
-                };
-                if peer_keys.is_empty() {
-                    continue;
-                }
-                let msg = PeerMessage::HerdrLiveEvent {
-                    seq,
-                    event_kind,
-                    terminal,
-                    raw_event,
-                };
-                for key in peer_keys {
-                    let _ = send_e2ee_peer_message(
-                        &sessions,
-                        my_device_id,
-                        &key,
-                        &msg,
-                        TrafficLane::ControlP0,
-                    )
-                    .await;
-                }
+            if stop_flag.load(Ordering::Relaxed) {
+                break;
             }
-            // #25: `hc connect` event subscriber exited; reconnect with backoff instead of permanently stopping.
-            tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
-            backoff_secs = (backoff_secs * 2).min(15);
+            let peer_keys: Vec<PeerSessionKey> = {
+                let map = sessions.lock().await;
+                map.keys().cloned().collect()
+            };
+            for key in peer_keys {
+                let _ = send_e2ee_peer_message(
+                    &sessions,
+                    my_device_id,
+                    &key,
+                    &msg,
+                    TrafficLane::ControlP0,
+                )
+                .await;
+            }
         }
     })
 }
@@ -2428,13 +2482,17 @@ fn is_loopback_host(host: &str) -> bool {
 
 /// Shared host execution state across Relay and Direct P2P listeners so fallback shells,
 /// `herdr-core` handles, active PTY subscriptions (for cross-transport single-owner eviction),
-/// and immediate shutdown signals stay consistent across reconnects and transport hot-switches.
+/// single shared `herdr` event broadcast, live `DaemonConfig`, and immediate shutdown signals
+/// stay consistent across reconnects, ticket renewals, `SIGHUP`, and transport hot-switches.
 #[derive(Clone)]
 pub struct SharedHostRuntime {
     herdr: SharedHerdr,
     fallback_shells: Arc<Mutex<NativeFallbackShells>>,
     active_ptys: Arc<Mutex<HashMap<(PeerSessionKey, String), ActivePtySubscription>>>,
     alert_tracker: Arc<StdMutex<DaemonAlertTracker>>,
+    live_config: Arc<RwLock<Option<DaemonConfig>>>,
+    herdr_events_tx: broadcast::Sender<PeerMessage>,
+    herdr_supervisor_started: Arc<std::sync::atomic::AtomicBool>,
     shutdown_tx: watch::Sender<bool>,
     reexec_tx: watch::Sender<bool>,
     started_at: std::time::Instant,
@@ -2443,19 +2501,184 @@ pub struct SharedHostRuntime {
 
 impl SharedHostRuntime {
     pub async fn new() -> Self {
-        let herdr: SharedHerdr = Arc::new(RwLock::new(connect_herdr_with_install().await));
+        let initial_hc = connect_herdr_with_install().await;
+        let alert_tracker = Arc::new(StdMutex::new(DaemonAlertTracker::default()));
+        if let Some(ref hc) = initial_hc {
+            if let Ok(initial_terms) = hc.list_terminals(false).await {
+                if let Ok(mut tr) = alert_tracker.lock() {
+                    tr.seed_from_terminals(&initial_terms);
+                }
+            }
+        }
+        let herdr: SharedHerdr = Arc::new(RwLock::new(initial_hc));
+        let (herdr_events_tx, _) = broadcast::channel(512);
         let (shutdown_tx, _) = watch::channel(false);
         let (reexec_tx, _) = watch::channel(false);
         Self {
             herdr,
             fallback_shells: Arc::new(Mutex::new(NativeFallbackShells::default())),
             active_ptys: Arc::new(Mutex::new(HashMap::new())),
-            alert_tracker: Arc::new(StdMutex::new(DaemonAlertTracker::default())),
+            alert_tracker,
+            live_config: Arc::new(RwLock::new(None)),
+            herdr_events_tx,
+            herdr_supervisor_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             shutdown_tx,
             reexec_tx,
             started_at: std::time::Instant::now(),
             ota_lock: Arc::new(Mutex::new(())),
         }
+    }
+
+    /// Updates the shared live `DaemonConfig` (e.g. on startup, ticket renewal, or `SIGHUP`)
+    /// and ensures the single shared `herdr` event supervisor is running.
+    pub async fn update_config(&self, cfg: DaemonConfig) {
+        *self.live_config.write().await = Some(cfg);
+        self.ensure_herdr_event_supervisor();
+    }
+
+    pub async fn current_config_or(&self, fallback: &DaemonConfig) -> DaemonConfig {
+        self.live_config
+            .read()
+            .await
+            .clone()
+            .unwrap_or_else(|| fallback.clone())
+    }
+
+    pub fn subscribe_herdr_events(&self) -> broadcast::Receiver<PeerMessage> {
+        self.ensure_herdr_event_supervisor();
+        self.herdr_events_tx.subscribe()
+    }
+
+    fn ensure_herdr_event_supervisor(&self) {
+        if self
+            .herdr_supervisor_started
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+        let herdr = Arc::clone(&self.herdr);
+        let alert_tracker = Arc::clone(&self.alert_tracker);
+        let live_config = Arc::clone(&self.live_config);
+        let events_tx = self.herdr_events_tx.clone();
+        let mut shutdown_rx = self.shutdown_rx();
+
+        tokio::spawn(async move {
+            let mut seq: u64 = 0;
+            let mut backoff_secs = 1u64;
+            loop {
+                if *shutdown_rx.borrow() {
+                    break;
+                }
+                let Some(hc) = resolve_herdr_lazy(&herdr).await else {
+                    tokio::select! {
+                        res = shutdown_rx.changed() => {
+                            if res.is_err() || *shutdown_rx.borrow() { break; }
+                        }
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)) => {}
+                    }
+                    backoff_secs = (backoff_secs * 2).min(15);
+                    continue;
+                };
+                if let Ok(initial_terms) = hc.list_terminals(false).await {
+                    if let Ok(mut tr) = alert_tracker.lock() {
+                        tr.seed_from_terminals(&initial_terms);
+                    }
+                }
+                let Ok(mut ev_rx) = hc.subscribe_live_events().await else {
+                    tokio::select! {
+                        res = shutdown_rx.changed() => {
+                            if res.is_err() || *shutdown_rx.borrow() { break; }
+                        }
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)) => {}
+                    }
+                    backoff_secs = (backoff_secs * 2).min(15);
+                    continue;
+                };
+                backoff_secs = 1;
+                loop {
+                    let raw_event = tokio::select! {
+                        res = shutdown_rx.changed() => {
+                            if res.is_err() || *shutdown_rx.borrow() {
+                                return;
+                            }
+                            continue;
+                        }
+                        maybe_ev = ev_rx.recv() => {
+                            match maybe_ev {
+                                Some(ev) => ev,
+                                None => break,
+                            }
+                        }
+                    };
+                    seq = seq.saturating_add(1);
+                    let event_kind = raw_event
+                        .get("kind")
+                        .or_else(|| raw_event.get("type"))
+                        .or_else(|| raw_event.get("event"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("update")
+                        .to_string();
+                    let terminal = raw_event
+                        .get("terminal")
+                        .and_then(|v| serde_json::from_value::<HerdrTerminalSummary>(v.clone()).ok())
+                        .or_else(|| {
+                            serde_json::from_value::<HerdrTerminalSummary>(raw_event.clone()).ok()
+                        });
+
+                    if let Some(cfg_now) = live_config.read().await.clone() {
+                        let alert_auth = DaemonAlertPushAuth::from_config(&cfg_now);
+                        let maybe_alert = alert_tracker.lock().ok().and_then(|mut tr| {
+                            tr.observe_live_event(
+                                alert_auth.device_id,
+                                &alert_auth.device_name,
+                                terminal.as_ref(),
+                                &raw_event,
+                                std::time::Instant::now(),
+                            )
+                        });
+                        if let Some((term_addr, mut alert_payload)) = maybe_alert {
+                            let hc_c = Arc::clone(&hc);
+                            let tracker_c = Arc::clone(&alert_tracker);
+                            tokio::spawn(async move {
+                                if alert_payload.cwd_basename.is_empty() {
+                                    if let Ok(list) = hc_c.list_terminals(false).await {
+                                        if let Some(found) =
+                                            list.iter().find(|t| t.address == term_addr)
+                                        {
+                                            alert_payload.session_name =
+                                                extract_safe_terminal_session_name(found);
+                                            alert_payload.cwd_basename =
+                                                extract_safe_cwd_basename(&found.cwd);
+                                            if let Ok(mut tr) = tracker_c.lock() {
+                                                tr.cache_terminal_meta(found);
+                                            }
+                                        }
+                                    }
+                                }
+                                post_daemon_alert_metadata(&alert_auth, &alert_payload).await;
+                            });
+                        }
+                    }
+
+                    let msg = PeerMessage::HerdrLiveEvent {
+                        seq,
+                        event_kind,
+                        terminal,
+                        raw_event,
+                    };
+                    let _ = events_tx.send(msg);
+                }
+
+                tokio::select! {
+                    res = shutdown_rx.changed() => {
+                        if res.is_err() || *shutdown_rx.borrow() { break; }
+                    }
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)) => {}
+                }
+                backoff_secs = (backoff_secs * 2).min(15);
+            }
+        });
     }
 
     pub fn shutdown_rx(&self) -> watch::Receiver<bool> {
@@ -2707,6 +2930,7 @@ pub async fn run_daemon_once_with_runtime(
     peers_store: Arc<TrustedPeersStore>,
     runtime: SharedHostRuntime,
 ) -> Result<()> {
+    runtime.update_config(cfg.clone()).await;
     // Reap any leftover non-P2P PTY subscriptions if a prior relay session was cancelled (e.g. SIGHUP).
     runtime
         .active_ptys
@@ -2859,10 +3083,9 @@ pub async fn run_daemon_once_with_runtime(
 
     let stop_events = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let event_forwarder = spawn_herdr_event_forwarder(
-        Arc::clone(&herdr),
+        runtime.subscribe_herdr_events(),
         Arc::clone(&sessions),
-        DaemonAlertPushAuth::from_config(cfg),
-        Arc::clone(&runtime.alert_tracker),
+        my_device_id,
         Arc::clone(&stop_events),
     );
     _task_guard.0.push(event_forwarder.abort_handle());
@@ -3004,6 +3227,7 @@ pub async fn spawn_direct_p2p_listener_with_runtime(
     peers_store: Arc<TrustedPeersStore>,
     runtime: SharedHostRuntime,
 ) -> Result<(SocketAddr, tokio::task::AbortHandle)> {
+    runtime.update_config(cfg.clone()).await;
     // #20: Dual-stack `[::]:24444` (`IPV6_V6ONLY = false`) with automatic `0.0.0.0:24444` fallback.
     let listener = bind_dual_stack_tcp_listener(bind_addr).await?;
     let local_addr = listener.local_addr()?;
@@ -3044,6 +3268,7 @@ pub async fn spawn_direct_p2p_listener_with_runtime(
             let conn_shutdown_rx = runtime.shutdown_rx();
             tokio::spawn(async move {
                 let _conn_permit = permit;
+                let active_cfg = runtime_clone.current_config_or(&cfg_clone).await;
                 let _ = stream.set_nodelay(true);
                 let mut peek4 = [0u8; 4];
                 let is_ws = matches!(
@@ -3058,7 +3283,7 @@ pub async fn spawn_direct_p2p_listener_with_runtime(
                     handle_direct_p2p_ws_socket(
                         stream,
                         peer_addr,
-                        cfg_clone,
+                        active_cfg,
                         runtime_clone,
                         peers_clone,
                         replay_clone,
@@ -3069,7 +3294,7 @@ pub async fn spawn_direct_p2p_listener_with_runtime(
                     handle_direct_p2p_socket(
                         stream,
                         peer_addr,
-                        cfg_clone,
+                        active_cfg,
                         runtime_clone,
                         peers_clone,
                         replay_clone,
@@ -3350,7 +3575,6 @@ async fn handle_direct_p2p_socket(
     replay_cache: Arc<Mutex<TimedReplayCache>>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
-    let herdr = Arc::clone(&runtime.herdr);
     let active_ptys = Arc::clone(&runtime.active_ptys);
     if *shutdown_rx.borrow() {
         return Ok(());
@@ -3427,10 +3651,9 @@ async fn handle_direct_p2p_socket(
     let rpc_semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_PEER_RPCS));
     let stop_events = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let event_forwarder = spawn_herdr_event_forwarder(
-        Arc::clone(&herdr),
+        runtime.subscribe_herdr_events(),
         Arc::clone(&sessions),
-        DaemonAlertPushAuth::from_config(&cfg),
-        Arc::clone(&runtime.alert_tracker),
+        cfg.device_id,
         Arc::clone(&stop_events),
     );
     // #3: Subscribe to live TrustedPeersStore updates so revoked devices disconnect immediately.
@@ -3507,7 +3730,6 @@ async fn handle_direct_p2p_ws_socket(
     replay_cache: Arc<Mutex<TimedReplayCache>>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
-    let herdr = Arc::clone(&runtime.herdr);
     let active_ptys = Arc::clone(&runtime.active_ptys);
     if *shutdown_rx.borrow() {
         return Ok(());
@@ -3619,10 +3841,9 @@ async fn handle_direct_p2p_ws_socket(
     let rpc_semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_PEER_RPCS));
     let stop_events = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let event_forwarder = spawn_herdr_event_forwarder(
-        Arc::clone(&herdr),
+        runtime.subscribe_herdr_events(),
         Arc::clone(&sessions),
-        DaemonAlertPushAuth::from_config(&cfg),
-        Arc::clone(&runtime.alert_tracker),
+        cfg.device_id,
         Arc::clone(&stop_events),
     );
     let mut peer_updates = peers_store.subscribe_updates();
@@ -3894,42 +4115,48 @@ pub async fn start_embedded_host_with_handle(cfg_path: &Path) -> Option<Embedded
             if *shutdown_rx.borrow() {
                 break;
             }
-            let _ = maybe_renew_daemon_config(&mut cfg, Some(&cfg_path_buf), &peers_store, false)
-                .await;
-            let started = tokio::time::Instant::now();
-            match run_daemon_once_with_runtime(
-                &cfg,
-                None,
-                Some(port),
-                Arc::clone(&peers_store),
-                relay_runtime.clone(),
-            )
-            .await
-            {
-                Ok(()) => {
-                    if *shutdown_rx.borrow() {
-                        break;
-                    }
-                    if started.elapsed() >= std::time::Duration::from_secs(10) {
-                        backoff_secs = 1;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
-                    backoff_secs = (backoff_secs * 2).min(30);
+                if maybe_renew_daemon_config(&mut cfg, Some(&cfg_path_buf), &peers_store, false)
+                    .await
+                {
+                    relay_runtime.update_config(cfg.clone()).await;
                 }
-                Err(e) => {
-                    if *shutdown_rx.borrow() {
-                        break;
+                let started = tokio::time::Instant::now();
+                match run_daemon_once_with_runtime(
+                    &cfg,
+                    None,
+                    Some(port),
+                    Arc::clone(&peers_store),
+                    relay_runtime.clone(),
+                )
+                .await
+                {
+                    Ok(()) => {
+                        if *shutdown_rx.borrow() {
+                            break;
+                        }
+                        if started.elapsed() >= std::time::Duration::from_secs(10) {
+                            backoff_secs = 1;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+                        backoff_secs = (backoff_secs * 2).min(30);
                     }
-                    let msg = e.to_string().to_ascii_lowercase();
-                    if msg.contains("expired") || msg.contains("ticket") || msg.contains("unauthorized") {
-                        let _ = maybe_renew_daemon_config(
-                            &mut cfg,
-                            Some(&cfg_path_buf),
-                            &peers_store,
-                            true,
-                        )
-                        .await;
-                    }
+                    Err(e) => {
+                        if *shutdown_rx.borrow() {
+                            break;
+                        }
+                        let msg = e.to_string().to_ascii_lowercase();
+                        if msg.contains("expired") || msg.contains("ticket") || msg.contains("unauthorized") {
+                            if maybe_renew_daemon_config(
+                                &mut cfg,
+                                Some(&cfg_path_buf),
+                                &peers_store,
+                                true,
+                            )
+                            .await
+                            {
+                                relay_runtime.update_config(cfg.clone()).await;
+                            }
+                        }
                     if started.elapsed() >= std::time::Duration::from_secs(10) {
                         backoff_secs = 1;
                     }
@@ -3952,12 +4179,367 @@ pub async fn start_embedded_host_with_handle(cfg_path: &Path) -> Option<Embedded
 }
 
 fn redact_voice_config(cfg: VoiceModelConfig) -> VoiceModelConfig {
+    let masked_key = if cfg.api_key.trim().is_empty() {
+        String::new()
+    } else {
+        "••••••••".to_string()
+    };
     VoiceModelConfig {
         provider: cfg.provider,
         base_url: cfg.base_url,
-        // #10: Never broadcast plaintext API key in WorkspacesSnapshot.
-        api_key: String::new(),
+        // #10: Never broadcast plaintext API key in WorkspacesSnapshot; expose masked indicator when set.
+        api_key: masked_key,
         model: cfg.model,
+    }
+}
+
+fn is_masked_or_empty_voice_key(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    trimmed.is_empty() || trimmed.chars().all(|c| c == '•' || c == '*')
+}
+
+fn local_voice_config_path() -> Option<PathBuf> {
+    if let Ok(env_cfg) = std::env::var("CODA_DAEMON_CONFIG") {
+        let trimmed = env_cfg.trim();
+        if !trimmed.is_empty() {
+            let p = PathBuf::from(trimmed);
+            let dir = p.parent().unwrap_or_else(|| Path::new("."));
+            return Some(dir.join("voice_config.json"));
+        }
+    }
+    let home = std::env::var("HOME")
+        .ok()
+        .filter(|s| !s.trim().is_empty())?;
+    Some(PathBuf::from(home).join(".config/coda/voice_config.json"))
+}
+
+fn load_local_voice_config() -> Option<VoiceModelConfig> {
+    let path = local_voice_config_path()?;
+    let bytes = std::fs::read(path).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn save_local_voice_config(cfg: &VoiceModelConfig) -> Result<()> {
+    let path = local_voice_config_path()
+        .ok_or_else(|| anyhow!("unable to resolve local voice_config.json path"))?;
+    let bytes = serde_json::to_vec_pretty(cfg)?;
+    atomic_write_private_file(&path, &bytes)
+}
+
+async fn get_effective_voice_config(herdr: Option<&HerdrClient>) -> Option<VoiceModelConfig> {
+    let local_cfg = load_local_voice_config();
+    if let Some(hc) = herdr {
+        if let Ok(Some(mut hc_cfg)) = hc.get_voice_config().await {
+            if hc_cfg.api_key.trim().is_empty() {
+                if let Some(ref loc) = local_cfg {
+                    if !loc.api_key.trim().is_empty() {
+                        hc_cfg.api_key = loc.api_key.clone();
+                    }
+                }
+            }
+            return Some(hc_cfg);
+        }
+    }
+    local_cfg
+}
+
+fn write_fallback_uploaded_file(
+    clean_name: &str,
+    bytes: &[u8],
+    cwd_hint: Option<&str>,
+) -> Result<String> {
+    let short_id = &Uuid::new_v4().simple().to_string()[..12];
+    if let Some(raw_cwd) = cwd_hint.map(str::trim).filter(|s| !s.is_empty()) {
+        if let Ok(expanded) = expand_tilde_path(raw_cwd) {
+            if !is_sensitive_path(&expanded) {
+                if let Ok(canon) = std::fs::canonicalize(&expanded) {
+                    if canon.is_dir() && !is_sensitive_path(&canon) {
+                        let uploads_dir = canon.join(".coda-uploads");
+                        if std::fs::create_dir_all(&uploads_dir).is_ok() {
+                            #[cfg(unix)]
+                            {
+                                use std::os::unix::fs::PermissionsExt;
+                                let _ = std::fs::set_permissions(
+                                    &uploads_dir,
+                                    std::fs::Permissions::from_mode(0o700),
+                                );
+                            }
+                            let dest = uploads_dir.join(format!("{short_id}-{clean_name}"));
+                            if atomic_write_private_file(&dest, bytes).is_ok() {
+                                return Ok(dest.to_string_lossy().to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let tmp_dest = std::env::temp_dir().join(format!("coda-upload-{short_id}-{clean_name}"));
+    atomic_write_private_file(&tmp_dest, bytes)?;
+    Ok(tmp_dest.to_string_lossy().to_string())
+}
+
+fn build_daemon_whisper_multipart(
+    boundary: &str,
+    filename: &str,
+    mime_type: &str,
+    audio_bytes: &[u8],
+    model: &str,
+    language: Option<&str>,
+) -> Vec<u8> {
+    let safe_fname: String = filename
+        .chars()
+        .filter(|c| !c.is_control() && *c != '"' && *c != '\\' && *c != '/')
+        .take(96)
+        .collect();
+    let final_fname = if safe_fname.trim().is_empty() {
+        "voice.webm"
+    } else {
+        safe_fname.trim()
+    };
+    let safe_mime: String = mime_type
+        .chars()
+        .filter(|c| !c.is_control() && *c != '"')
+        .take(64)
+        .collect();
+    let final_mime = if safe_mime.trim().is_empty() {
+        "audio/webm"
+    } else {
+        safe_mime.trim()
+    };
+    let safe_model: String = model.chars().filter(|c| !c.is_control()).take(96).collect();
+    let final_model = if safe_model.trim().is_empty() {
+        "gpt-4o-mini-transcribe"
+    } else {
+        safe_model.trim()
+    };
+
+    let mut body = Vec::with_capacity(audio_bytes.len() + 768);
+    body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+    body.extend_from_slice(
+        format!(
+            "Content-Disposition: form-data; name=\"file\"; filename=\"{final_fname}\"\r\nContent-Type: {final_mime}\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(audio_bytes);
+    body.extend_from_slice(b"\r\n");
+
+    body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+    body.extend_from_slice(
+        format!("Content-Disposition: form-data; name=\"model\"\r\n\r\n{final_model}\r\n")
+            .as_bytes(),
+    );
+
+    if let Some(lang) = language.map(str::trim).filter(|s| !s.is_empty()) {
+        let clean_lang: String = lang
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+            .take(16)
+            .collect();
+        if !clean_lang.is_empty() {
+            body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+            body.extend_from_slice(
+                format!(
+                    "Content-Disposition: form-data; name=\"language\"\r\n\r\n{clean_lang}\r\n"
+                )
+                .as_bytes(),
+            );
+        }
+    }
+
+    body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+    body.extend_from_slice(
+        b"Content-Disposition: form-data; name=\"response_format\"\r\n\r\njson\r\n",
+    );
+    body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+    body
+}
+
+async fn handle_transcribe_audio_rpc(
+    req_id: String,
+    audio_b64: String,
+    mime_type: String,
+    filename: String,
+    language: Option<String>,
+    herdr: Option<&HerdrClient>,
+) -> (PeerMessage, TrafficLane) {
+    let fail = |req_id: String, msg: String| {
+        (
+            PeerMessage::TranscribeAudioResult {
+                req_id,
+                ok: false,
+                text: String::new(),
+                error: Some(msg),
+            },
+            TrafficLane::ControlP0,
+        )
+    };
+
+    if audio_b64.len() > (MAX_UPLOAD_FILE_BYTES * 4) / 3 + 256 {
+        return fail(req_id, "audio payload exceeds 8 MiB limit".into());
+    }
+    let audio_bytes = match B64.decode(audio_b64.trim()) {
+        Ok(b) if !b.is_empty() && b.len() <= MAX_UPLOAD_FILE_BYTES => b,
+        Ok(_) => return fail(req_id, "audio payload is empty or exceeds 8 MiB limit".into()),
+        Err(e) => return fail(req_id, format!("invalid audio base64: {e}")),
+    };
+
+    let Some(vcfg) = get_effective_voice_config(herdr).await else {
+        return fail(
+            req_id,
+            "No Whisper voice model configured on host.".into(),
+        );
+    };
+    let raw_base = vcfg.base_url.trim();
+    if raw_base.is_empty() {
+        return fail(req_id, "Voice model base_url is empty on host.".into());
+    }
+    let mut parsed = match reqwest::Url::parse(raw_base) {
+        Ok(u) => u,
+        Err(e) => return fail(req_id, format!("invalid voice base_url: {e}")),
+    };
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return fail(
+            req_id,
+            "voice base_url must not contain embedded credentials".into(),
+        );
+    }
+    let Some(host_raw) = parsed.host_str() else {
+        return fail(req_id, "voice base_url missing host".into());
+    };
+    let host = host_raw
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_string();
+    let host_lower = host.to_ascii_lowercase();
+    let allow_local_test = std::env::var("CODA_ALLOW_LOCAL_VOICE_TEST")
+        .ok()
+        .is_some_and(|v| v.trim() == "1" || v.trim().eq_ignore_ascii_case("true"));
+    let is_local_test_loopback = allow_local_test
+        && matches!(parsed.scheme(), "http" | "https")
+        && matches!(host_lower.as_str(), "127.0.0.1" | "localhost");
+
+    let client = if is_local_test_loopback {
+        match reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(35))
+            .no_proxy()
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => return fail(req_id, format!("HTTP client error: {e}")),
+        }
+    } else {
+        if parsed.scheme() != "https" {
+            return fail(req_id, "voice base_url must use https://".into());
+        }
+        if host_lower == "localhost"
+            || host_lower.ends_with(".localhost")
+            || host_lower.ends_with(".local")
+            || host_lower.ends_with(".internal")
+            || host_lower == "metadata"
+            || host_lower == "instance-data"
+            || host_lower == "metadata.google.internal"
+        {
+            return fail(req_id, "voice base_url host is blocked by SSRF policy".into());
+        }
+        let port = parsed.port_or_known_default().unwrap_or(443);
+        if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+            if is_blocked_ssrf_ip(ip) {
+                return fail(req_id, format!("voice base_url IP {ip} blocked by SSRF policy"));
+            }
+            match reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(std::time::Duration::from_secs(35))
+                .no_proxy()
+                .build()
+            {
+                Ok(c) => c,
+                Err(e) => return fail(req_id, format!("HTTP client error: {e}")),
+            }
+        } else {
+            let resolved: Vec<SocketAddr> =
+                match tokio::net::lookup_host((host.as_str(), port)).await {
+                    Ok(iter) => iter.collect(),
+                    Err(e) => return fail(req_id, format!("voice host DNS lookup failed: {e}")),
+                };
+            if resolved.is_empty() {
+                return fail(req_id, "voice host DNS returned no addresses".into());
+            }
+            for sa in &resolved {
+                if is_blocked_ssrf_ip(sa.ip()) {
+                    return fail(
+                        req_id,
+                        format!("voice host resolved IP {} blocked by SSRF policy", sa.ip()),
+                    );
+                }
+            }
+            match reqwest::Client::builder()
+                .resolve_to_addrs(&host, &resolved)
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(std::time::Duration::from_secs(35))
+                .no_proxy()
+                .build()
+            {
+                Ok(c) => c,
+                Err(e) => return fail(req_id, format!("HTTP client error: {e}")),
+            }
+        }
+    };
+
+    if vcfg.api_key.trim().is_empty() && !is_local_test_loopback {
+        return fail(req_id, "Whisper API key is empty on host.".into());
+    }
+
+    let cur_path = parsed.path().trim_end_matches('/').to_string();
+    if !cur_path.ends_with("/audio/transcriptions") {
+        parsed.set_path(&format!("{cur_path}/audio/transcriptions"));
+    }
+
+    let boundary = format!("----CodaDaemonVoice{}", Uuid::new_v4().simple());
+    let body = build_daemon_whisper_multipart(
+        &boundary,
+        &filename,
+        &mime_type,
+        &audio_bytes,
+        &vcfg.model,
+        language.as_deref(),
+    );
+
+    let mut req = client.post(parsed).header(
+        reqwest::header::CONTENT_TYPE,
+        format!("multipart/form-data; boundary={boundary}"),
+    );
+    if !vcfg.api_key.trim().is_empty() {
+        req = req.bearer_auth(vcfg.api_key.trim());
+    }
+    match req.body(body).send().await {
+        Ok(resp) => {
+            let status = resp.status();
+            let raw_txt = resp.text().await.unwrap_or_default();
+            if !status.is_success() {
+                let snippet: String = raw_txt.chars().take(180).collect();
+                return fail(
+                    req_id,
+                    format!("Whisper HTTP {}: {}", status.as_u16(), snippet),
+                );
+            }
+            let transcript = serde_json::from_str::<serde_json::Value>(&raw_txt)
+                .ok()
+                .and_then(|v| v.get("text").and_then(|x| x.as_str()).map(str::to_string))
+                .unwrap_or(raw_txt);
+            (
+                PeerMessage::TranscribeAudioResult {
+                    req_id,
+                    ok: true,
+                    text: transcript.trim().to_string(),
+                    error: None,
+                },
+                TrafficLane::ControlP0,
+            )
+        }
+        Err(e) => fail(req_id, format!("Whisper transcription request failed: {e}")),
     }
 }
 
@@ -4036,15 +4618,22 @@ async fn handle_peer_request_full(
                         tokio::time::sleep(std::time::Duration::from_millis(450)).await;
                         rt_reexec.request_reexec();
                     });
+                    let ota_msg = if resolved_herdr.is_some() {
+                        format!(
+                            "Upgraded coda-daemon {prev} -> {next_ver}; hot-restarting daemon (active terminals remain live)."
+                        )
+                    } else {
+                        format!(
+                            "Upgraded coda-daemon {prev} -> {next_ver}; restarting daemon (fallback PTY shells will reset; install herdr-core for persistent sessions)."
+                        )
+                    };
                     return Some((
                         PeerMessage::UpgradeDaemonResult {
                             req_id,
                             ok: true,
                             previous_version: prev.clone(),
                             target_version: Some(next_ver.clone()),
-                            message: format!(
-                                "Upgraded coda-daemon {prev} -> {next_ver}; hot-restarting daemon (active terminals remain live)."
-                            ),
+                            message: ota_msg,
                         },
                         TrafficLane::ControlP0,
                     ));
@@ -4105,15 +4694,9 @@ async fn handle_peer_request_full(
                     }],
                 });
             }
-            let voice_config = match resolved_herdr.as_deref() {
-                Some(hc) => hc
-                    .get_voice_config()
-                    .await
-                    .ok()
-                    .flatten()
-                    .map(redact_voice_config),
-                None => None,
-            };
+            let voice_config = get_effective_voice_config(resolved_herdr.as_deref())
+                .await
+                .map(redact_voice_config);
             let host_health = Some(telemetry_ota::collect_host_health_snapshot(
                 runtime.started_at,
                 herdr_ver,
@@ -4424,21 +5007,35 @@ async fn handle_peer_request_full(
                     ));
                 }
             };
-            let _ = decoded_bytes;
-
-            let Some(hc) = resolved_herdr.as_deref() else {
+            let fb_cwd = fallback_shells.lock().await.terminal_cwd(&terminal);
+            if fb_cwd.is_some() || resolved_herdr.is_none() {
                 return Some((
-                    PeerMessage::UploadTerminalFileResult {
-                        req_id,
-                        terminal,
-                        ok: false,
-                        remote_path: None,
-                        bytes: 0,
-                        error: Some("herdr-core unavailable".into()),
+                    match write_fallback_uploaded_file(
+                        &clean_name,
+                        &decoded_bytes,
+                        fb_cwd.as_deref(),
+                    ) {
+                        Ok(remote_path) => PeerMessage::UploadTerminalFileResult {
+                            req_id,
+                            terminal,
+                            ok: true,
+                            remote_path: Some(remote_path),
+                            bytes: decoded_bytes.len(),
+                            error: None,
+                        },
+                        Err(e) => PeerMessage::UploadTerminalFileResult {
+                            req_id,
+                            terminal,
+                            ok: false,
+                            remote_path: None,
+                            bytes: 0,
+                            error: Some(format!("fallback upload failed: {e}")),
+                        },
                     },
                     TrafficLane::ControlP0,
                 ));
-            };
+            }
+            let hc = resolved_herdr.as_deref().unwrap();
             match hc.put_file(&terminal, &clean_name, &data_b64).await {
                 Ok((remote_path, bytes)) => {
                     return Some((
@@ -4469,17 +5066,21 @@ async fn handle_peer_request_full(
             }
         }
         PeerMessage::SetVoiceConfig { req_id, mut config } => {
-            let ok = match resolved_herdr.as_deref() {
-                Some(hc) => {
-                    if config.api_key.trim().is_empty() {
-                        if let Ok(Some(prev)) = hc.get_voice_config().await {
-                            config.api_key = prev.api_key;
-                        }
+            if is_masked_or_empty_voice_key(&config.api_key) {
+                if let Some(prev) = get_effective_voice_config(resolved_herdr.as_deref()).await {
+                    if config.api_key.trim().is_empty() || config.api_key != prev.api_key {
+                        config.api_key = prev.api_key;
                     }
-                    hc.set_voice_config(&config).await.is_ok()
+                } else if config.api_key.chars().all(|c| c == '•' || c == '*') {
+                    config.api_key.clear();
                 }
+            }
+            let saved_local = save_local_voice_config(&config).is_ok();
+            let saved_hc = match resolved_herdr.as_deref() {
+                Some(hc) => hc.set_voice_config(&config).await.is_ok(),
                 None => false,
             };
+            let ok = saved_hc || saved_local;
             return Some((
                 PeerMessage::VoiceConfigAck {
                     req_id,
@@ -4488,6 +5089,25 @@ async fn handle_peer_request_full(
                 },
                 TrafficLane::ControlP0,
             ));
+        }
+        PeerMessage::TranscribeAudio {
+            req_id,
+            audio_b64,
+            mime_type,
+            filename,
+            language,
+        } => {
+            return Some(
+                handle_transcribe_audio_rpc(
+                    req_id,
+                    audio_b64,
+                    mime_type,
+                    filename,
+                    language,
+                    resolved_herdr.as_deref(),
+                )
+                .await,
+            );
         }
         PeerMessage::KillTerminal { req_id, terminal } => {
             {
@@ -4516,7 +5136,16 @@ async fn handle_peer_request_full(
                 TrafficLane::ControlP0,
             ));
         }
-        other => Some(handle_peer_request(other, resolved_herdr.as_deref(), fallback_shells, hostname).await),
+        other => Some(
+            handle_peer_request(
+                other,
+                resolved_herdr.as_deref(),
+                fallback_shells,
+                &runtime.alert_tracker,
+                hostname,
+            )
+            .await,
+        ),
     }
 }
 
@@ -4524,6 +5153,7 @@ async fn handle_peer_request(
     msg: PeerMessage,
     herdr: Option<&HerdrClient>,
     fallback_shells: &Arc<Mutex<NativeFallbackShells>>,
+    alert_tracker: &Arc<StdMutex<DaemonAlertTracker>>,
     hostname: &str,
 ) -> (PeerMessage, TrafficLane) {
     match msg {
@@ -4600,6 +5230,9 @@ async fn handle_peer_request(
                     .await
                 {
                     Ok(term) => {
+                        if let Ok(mut tr) = alert_tracker.lock() {
+                            tr.seed_new_terminal(&term);
+                        }
                         return (
                             PeerMessage::LaunchAgentResult {
                                 req_id,
@@ -4608,7 +5241,7 @@ async fn handle_peer_request(
                                 error: None,
                             },
                             TrafficLane::ControlP0,
-                        )
+                        );
                     }
                     Err(e) => {
                         return (
@@ -4619,12 +5252,14 @@ async fn handle_peer_request(
                                 error: Some(e.to_string()),
                             },
                             TrafficLane::ControlP0,
-                        )
+                        );
                     }
                 }
             }
             // #22: Built-in native Unix openpty fallback when `herdr-core` is not installed.
+            let weak_fb = Arc::downgrade(fallback_shells);
             let res = fallback_shells.lock().await.launch(
+                Some(weak_fb),
                 &agent,
                 name.as_deref(),
                 cwd.as_deref(),
@@ -4813,79 +5448,15 @@ async fn handle_peer_request(
             )
         }
         PeerMessage::GitDiffRequest { req_id, cwd } => handle_git_diff_rpc(req_id, cwd).await,
-        PeerMessage::HttpLocalPreviewRequest { req_id, port, path } => {
-            let target_url = match validate_local_preview_target(port, &path) {
-                Ok(u) => u,
-                Err(msg) => {
-                    return (
-                        PeerMessage::HttpLocalPreviewResponse {
-                            req_id,
-                            status_code: 403,
-                            content_type: "text/plain".into(),
-                            body_b64: B64.encode(msg),
-                        },
-                        TrafficLane::BulkP1,
-                    );
-                }
-            };
-            match preview_http_client().get(target_url).send().await {
-                Ok(mut resp) => {
-                    let status_code = resp.status().as_u16();
-                    let content_type = resp
-                        .headers()
-                        .get(reqwest::header::CONTENT_TYPE)
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or("text/html; charset=utf-8")
-                        .to_string();
-                    if resp
-                        .content_length()
-                        .is_some_and(|n| n > MAX_HTTP_PREVIEW_BYTES as u64)
-                    {
-                        return (
-                            PeerMessage::HttpLocalPreviewResponse {
-                                req_id,
-                                status_code: 413,
-                                content_type: "text/plain".into(),
-                                body_b64: B64.encode("Local preview response exceeds 4 MiB limit"),
-                            },
-                            TrafficLane::BulkP1,
-                        );
-                    }
-                    let mut body = Vec::new();
-                    while let Ok(Some(chunk)) = resp.chunk().await {
-                        if body.len().saturating_add(chunk.len()) > MAX_HTTP_PREVIEW_BYTES {
-                            return (
-                                PeerMessage::HttpLocalPreviewResponse {
-                                    req_id,
-                                    status_code: 413,
-                                    content_type: "text/plain".into(),
-                                    body_b64: B64.encode("Local preview body exceeded 4 MiB limit"),
-                                },
-                                TrafficLane::BulkP1,
-                            );
-                        }
-                        body.extend_from_slice(&chunk);
-                    }
-                    (
-                        PeerMessage::HttpLocalPreviewResponse {
-                            req_id,
-                            status_code,
-                            content_type,
-                            body_b64: B64.encode(&body),
-                        },
-                        TrafficLane::BulkP1,
-                    )
-                }
-                Err(e) => (
-                    PeerMessage::HttpLocalPreviewResponse {
-                        req_id,
-                        status_code: 502,
-                        content_type: "text/plain".into(),
-                        body_b64: B64.encode(format!("Local port {port} unreachable: {e}")),
-                    },
-                    TrafficLane::BulkP1,
-                ),
-            }
+        PeerMessage::HttpLocalPreviewRequest {
+            req_id,
+            port,
+            path,
+            method,
+            headers,
+            req_body_b64,
+        } => {
+            handle_http_local_preview_rpc(req_id, port, path, method, headers, req_body_b64).await
         }
         PeerMessage::ListDirectory {
             req_id,
@@ -4914,42 +5485,366 @@ async fn handle_peer_request(
     }
 }
 
+fn is_safe_forwarded_request_header(lower_name: &str) -> bool {
+    !matches!(
+        lower_name,
+        "host"
+            | "connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+            | "content-length"
+            | "accept-encoding"
+    )
+}
+
+fn is_safe_forwarded_response_header(lower_name: &str) -> bool {
+    matches!(
+        lower_name,
+        "location"
+            | "set-cookie"
+            | "cache-control"
+            | "expires"
+            | "pragma"
+            | "etag"
+            | "last-modified"
+            | "accept-ranges"
+            | "content-range"
+            | "content-disposition"
+            | "content-language"
+            | "access-control-allow-origin"
+            | "access-control-allow-credentials"
+            | "access-control-allow-methods"
+            | "access-control-allow-headers"
+            | "access-control-expose-headers"
+            | "access-control-max-age"
+            | "vary"
+            | "www-authenticate"
+            | "allow"
+            | "x-content-type-options"
+    )
+}
+
+fn strip_header_crlf(raw: &str) -> String {
+    raw.chars()
+        .filter(|c| *c != '\r' && *c != '\n' && *c != '\0')
+        .collect()
+}
+
+pub async fn handle_http_local_preview_rpc(
+    req_id: String,
+    port: u16,
+    path: String,
+    method: Option<String>,
+    req_headers: Vec<(String, String)>,
+    req_body_b64: Option<String>,
+) -> (PeerMessage, TrafficLane) {
+    let err_resp = |req_id: String, status_code: u16, msg: String, headers: Vec<(String, String)>| {
+        (
+            PeerMessage::HttpLocalPreviewResponse {
+                req_id,
+                status_code,
+                content_type: "text/plain; charset=utf-8".into(),
+                body_b64: B64.encode(msg),
+                headers,
+                truncated: false,
+            },
+            TrafficLane::BulkP1,
+        )
+    };
+
+    let target_url = match validate_local_preview_target(port, &path) {
+        Ok(u) => u,
+        Err(msg) => return err_resp(req_id, 403, msg, Vec::new()),
+    };
+
+    let method_upper = method
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("GET")
+        .to_ascii_uppercase();
+    let http_method = match method_upper.as_str() {
+        "GET" => reqwest::Method::GET,
+        "HEAD" => reqwest::Method::HEAD,
+        "POST" => reqwest::Method::POST,
+        "PUT" => reqwest::Method::PUT,
+        "PATCH" => reqwest::Method::PATCH,
+        "DELETE" => reqwest::Method::DELETE,
+        "OPTIONS" => reqwest::Method::OPTIONS,
+        _ => {
+            return err_resp(
+                req_id,
+                405,
+                format!("Unsupported HTTP method `{method_upper}`"),
+                vec![(
+                    "Allow".into(),
+                    "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS".into(),
+                )],
+            );
+        }
+    };
+
+    let decoded_body = match req_body_b64
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(b64) => {
+            if b64.len() > (MAX_HTTP_PREVIEW_REQ_BODY_BYTES * 4) / 3 + 256 {
+                return err_resp(
+                    req_id,
+                    413,
+                    "Local preview request body exceeds 2 MiB limit".into(),
+                    Vec::new(),
+                );
+            }
+            match B64.decode(b64) {
+                Ok(b) if b.len() <= MAX_HTTP_PREVIEW_REQ_BODY_BYTES => Some(b),
+                Ok(_) => {
+                    return err_resp(
+                        req_id,
+                        413,
+                        "Local preview request body exceeds 2 MiB limit".into(),
+                        Vec::new(),
+                    );
+                }
+                Err(e) => {
+                    return err_resp(
+                        req_id,
+                        400,
+                        format!("Invalid base64 request body: {e}"),
+                        Vec::new(),
+                    );
+                }
+            }
+        }
+        None => None,
+    };
+
+    let mut req_builder = preview_http_client().request(http_method.clone(), target_url);
+    let mut total_hdr_bytes = 0usize;
+    for (raw_k, raw_v) in req_headers.into_iter().take(64) {
+        let clean_k = strip_header_crlf(raw_k.trim());
+        let clean_v = strip_header_crlf(&raw_v);
+        if clean_k.is_empty() {
+            continue;
+        }
+        let lower_k = clean_k.to_ascii_lowercase();
+        if !is_safe_forwarded_request_header(&lower_k) {
+            continue;
+        }
+        total_hdr_bytes = total_hdr_bytes.saturating_add(clean_k.len() + clean_v.len());
+        if total_hdr_bytes > 32 * 1024 {
+            break;
+        }
+        if let (Ok(hn), Ok(hv)) = (
+            reqwest::header::HeaderName::from_bytes(clean_k.as_bytes()),
+            reqwest::header::HeaderValue::from_str(&clean_v),
+        ) {
+            req_builder = req_builder.header(hn, hv);
+        }
+    }
+    if let Some(body_bytes) = decoded_body {
+        if http_method != reqwest::Method::GET && http_method != reqwest::Method::HEAD {
+            req_builder = req_builder.body(body_bytes);
+        }
+    }
+
+    match req_builder.send().await {
+        Ok(mut resp) => {
+            let status_code = resp.status().as_u16();
+            let content_type = resp
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .map(strip_header_crlf)
+                .unwrap_or_else(|| "text/html; charset=utf-8".into());
+
+            let mut out_headers = Vec::new();
+            for (hname, hval) in resp.headers().iter() {
+                let lower = hname.as_str().to_ascii_lowercase();
+                if !is_safe_forwarded_response_header(&lower) {
+                    continue;
+                }
+                if let Ok(val_str) = hval.to_str() {
+                    let clean_v = strip_header_crlf(val_str);
+                    out_headers.push((hname.as_str().to_string(), clean_v));
+                    if out_headers.len() >= 64 {
+                        break;
+                    }
+                }
+            }
+
+            if http_method == reqwest::Method::HEAD {
+                return (
+                    PeerMessage::HttpLocalPreviewResponse {
+                        req_id,
+                        status_code,
+                        content_type,
+                        body_b64: String::new(),
+                        headers: out_headers,
+                        truncated: false,
+                    },
+                    TrafficLane::BulkP1,
+                );
+            }
+
+            let is_sse = content_type
+                .split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .eq_ignore_ascii_case("text/event-stream");
+            if is_sse {
+                let mut sse_buf = Vec::new();
+                if let Ok(Ok(Some(chunk))) = tokio::time::timeout(
+                    std::time::Duration::from_millis(150),
+                    resp.chunk(),
+                )
+                .await
+                {
+                    let take_n = chunk.len().min(65_536);
+                    sse_buf.extend_from_slice(&chunk[..take_n]);
+                }
+                return (
+                    PeerMessage::HttpLocalPreviewResponse {
+                        req_id,
+                        status_code,
+                        content_type,
+                        body_b64: B64.encode(&sse_buf),
+                        headers: out_headers,
+                        truncated: true,
+                    },
+                    TrafficLane::BulkP1,
+                );
+            }
+
+            if resp
+                .content_length()
+                .is_some_and(|n| n > MAX_HTTP_PREVIEW_BYTES as u64)
+            {
+                return err_resp(
+                    req_id,
+                    413,
+                    "Local preview response exceeds 4 MiB limit".into(),
+                    Vec::new(),
+                );
+            }
+            let mut body = Vec::new();
+            while let Ok(Some(chunk)) = resp.chunk().await {
+                if body.len().saturating_add(chunk.len()) > MAX_HTTP_PREVIEW_BYTES {
+                    return err_resp(
+                        req_id,
+                        413,
+                        "Local preview body exceeded 4 MiB limit".into(),
+                        Vec::new(),
+                    );
+                }
+                body.extend_from_slice(&chunk);
+            }
+            (
+                PeerMessage::HttpLocalPreviewResponse {
+                    req_id,
+                    status_code,
+                    content_type,
+                    body_b64: B64.encode(&body),
+                    headers: out_headers,
+                    truncated: false,
+                },
+                TrafficLane::BulkP1,
+            )
+        }
+        Err(e) => err_resp(
+            req_id,
+            502,
+            format!("Local port {port} unreachable: {e}"),
+            Vec::new(),
+        ),
+    }
+}
+
 pub async fn handle_git_diff_rpc(req_id: String, cwd: String) -> (PeerMessage, TrafficLane) {
-    let empty_resp = |req_id: String| {
+    let err_resp = |req_id: String, msg: String| {
         (
             PeerMessage::GitDiffResponse {
                 req_id,
                 branch: String::new(),
                 status_short: String::new(),
                 diff_unified: String::new(),
+                is_git_repo: false,
+                repo_root: None,
+                error: Some(msg),
             },
             TrafficLane::BulkP1,
         )
     };
 
-    let Ok(expanded) = expand_tilde_path(&cwd) else {
-        return empty_resp(req_id);
+    let expanded = match expand_tilde_path(&cwd) {
+        Ok(p) => p,
+        Err(e) => return err_resp(req_id, format!("invalid workspace path: {e}")),
     };
     if is_sensitive_path(&expanded) {
-        return empty_resp(req_id);
+        return err_resp(req_id, "access denied: restricted path".into());
     }
-    let Ok(canon_cwd) = tokio::fs::canonicalize(&expanded).await else {
-        return empty_resp(req_id);
+    let canon_cwd = match tokio::fs::canonicalize(&expanded).await {
+        Ok(p) => p,
+        Err(e) => {
+            return err_resp(
+                req_id,
+                format!("workspace directory not found ({cwd}): {e}"),
+            );
+        }
     };
     let is_dir = tokio::fs::metadata(&canon_cwd)
         .await
         .map(|m| m.is_dir())
         .unwrap_or(false);
-    if !is_dir || is_sensitive_path(&canon_cwd) {
-        return empty_resp(req_id);
+    if !is_dir {
+        return err_resp(req_id, "workspace path is not a directory".into());
+    }
+    if is_sensitive_path(&canon_cwd) {
+        return err_resp(req_id, "access denied: restricted path".into());
     }
 
     let cwd_str = canon_cwd.to_string_lossy().to_string();
-    let branch = match run_cmd_capture(
+    let Some(top_raw) = run_cmd_capture(
         "git",
         &[
             "-C",
             &cwd_str,
+            "-c",
+            "core.quotePath=false",
+            "-c",
+            "core.fsmonitor=false",
+            "rev-parse",
+            "--show-toplevel",
+        ],
+    )
+    .await
+    .map(|s| s.trim().to_string())
+    .filter(|s| !s.is_empty())
+    else {
+        return err_resp(req_id, "Not a Git repository".into());
+    };
+
+    let repo_root_path = tokio::fs::canonicalize(&top_raw)
+        .await
+        .unwrap_or_else(|_| PathBuf::from(&top_raw));
+    if is_sensitive_path(&repo_root_path) {
+        return err_resp(req_id, "access denied: restricted repository root".into());
+    }
+    let repo_root_str = repo_root_path.to_string_lossy().to_string();
+
+    let branch = match run_cmd_capture(
+        "git",
+        &[
+            "-C",
+            &repo_root_str,
             "-c",
             "core.quotePath=false",
             "-c",
@@ -4966,7 +5861,7 @@ pub async fn handle_git_diff_rpc(req_id: String, cwd: String) -> (PeerMessage, T
             "git",
             &[
                 "-C",
-                &cwd_str,
+                &repo_root_str,
                 "-c",
                 "core.quotePath=false",
                 "-c",
@@ -4984,25 +5879,48 @@ pub async fn handle_git_diff_rpc(req_id: String, cwd: String) -> (PeerMessage, T
         "git",
         &[
             "-C",
-            &cwd_str,
+            &repo_root_str,
             "-c",
             "core.quotePath=false",
             "-c",
             "core.fsmonitor=false",
             "status",
-            "--short",
+            "--porcelain",
+            "-uall",
         ],
     )
     .await
     .unwrap_or_default();
-    let status_short = lossy_utf8_prefix(status_raw.as_bytes(), MAX_GIT_DIFF_BYTES);
+
+    let mut clean_status_lines = Vec::new();
+    let mut untracked_rels = Vec::new();
+    for line in status_raw.lines() {
+        if line.len() < 4 {
+            continue;
+        }
+        if let Some(rel) = line.strip_prefix("?? ") {
+            let trimmed_rel = rel.trim_end_matches('\r');
+            let cand = repo_root_path.join(trimmed_rel);
+            if is_sensitive_path(&cand) {
+                continue;
+            }
+            if untracked_rels.len() < 24 {
+                untracked_rels.push(trimmed_rel.to_string());
+            }
+        }
+        if clean_status_lines.len() < 600 {
+            clean_status_lines.push(line);
+        }
+    }
+    let joined_status = clean_status_lines.join("\n");
+    let status_short = lossy_utf8_prefix(joined_status.as_bytes(), MAX_GIT_DIFF_BYTES);
 
     // #41: Diff against HEAD (falls back to working tree / staged diff on unborn repos) and truncate UTF-8 safely to 256 KiB.
     let diff_raw = match run_cmd_capture(
         "git",
         &[
             "-C",
-            &cwd_str,
+            &repo_root_str,
             "-c",
             "core.quotePath=false",
             "-c",
@@ -5022,7 +5940,7 @@ pub async fn handle_git_diff_rpc(req_id: String, cwd: String) -> (PeerMessage, T
                 "git",
                 &[
                     "-C",
-                    &cwd_str,
+                    &repo_root_str,
                     "-c",
                     "core.quotePath=false",
                     "-c",
@@ -5041,7 +5959,7 @@ pub async fn handle_git_diff_rpc(req_id: String, cwd: String) -> (PeerMessage, T
                     "git",
                     &[
                         "-C",
-                        &cwd_str,
+                        &repo_root_str,
                         "-c",
                         "core.quotePath=false",
                         "-c",
@@ -5057,7 +5975,83 @@ pub async fn handle_git_diff_rpc(req_id: String, cwd: String) -> (PeerMessage, T
             }
         }
     };
-    let diff_unified = lossy_utf8_prefix(diff_raw.as_bytes(), MAX_GIT_DIFF_BYTES);
+    let mut diff_unified = lossy_utf8_prefix(diff_raw.as_bytes(), MAX_GIT_DIFF_BYTES);
+
+    // Append synthetic `+` unified diff hunks for untracked (`??`) UTF-8 files (<= 64 KiB, up to 24 files within 256 KiB cap).
+    for rel in untracked_rels {
+        if diff_unified.len().saturating_add(128) >= MAX_GIT_DIFF_BYTES {
+            break;
+        }
+        if rel.is_empty()
+            || rel.starts_with('/')
+            || rel.contains('\0')
+            || rel.contains('\n')
+            || Path::new(&rel).components().any(|c| {
+                matches!(
+                    c,
+                    std::path::Component::ParentDir
+                        | std::path::Component::RootDir
+                        | std::path::Component::Prefix(_)
+                )
+            })
+        {
+            continue;
+        }
+        let cand = repo_root_path.join(&rel);
+        if is_sensitive_path(&cand) {
+            continue;
+        }
+        let Ok(sym_meta) = tokio::fs::symlink_metadata(&cand).await else {
+            continue;
+        };
+        if !sym_meta.file_type().is_file() || sym_meta.len() > 64 * 1024 {
+            continue;
+        }
+        let Ok(canon_file) = tokio::fs::canonicalize(&cand).await else {
+            continue;
+        };
+        if !canon_file.starts_with(&repo_root_path) || is_sensitive_path(&canon_file) {
+            continue;
+        }
+        let Ok(raw_bytes) = tokio::fs::read(&canon_file).await else {
+            continue;
+        };
+        if raw_bytes.len() > 64 * 1024 || raw_bytes.contains(&0u8) {
+            continue;
+        }
+        let Ok(utf8_text) = std::str::from_utf8(&raw_bytes) else {
+            continue;
+        };
+        let normalized = utf8_text.replace("\r\n", "\n");
+        let synthetic = if normalized.is_empty() {
+            format!("diff --git a/{rel} b/{rel}\nnew file mode 100644\n")
+        } else {
+            let trimmed_nl = normalized.strip_suffix('\n').unwrap_or(&normalized);
+            let lines: Vec<&str> = trimmed_nl.split('\n').collect();
+            let line_count = lines.len();
+            let mut hunk = format!(
+                "diff --git a/{rel} b/{rel}\nnew file mode 100644\n--- /dev/null\n+++ b/{rel}\n@@ -0,0 +1,{line_count} @@\n"
+            );
+            for ln in lines {
+                hunk.push('+');
+                hunk.push_str(ln);
+                hunk.push('\n');
+            }
+            hunk
+        };
+        let needs_sep = !diff_unified.is_empty() && !diff_unified.ends_with('\n');
+        let projected_len = diff_unified
+            .len()
+            .saturating_add(usize::from(needs_sep))
+            .saturating_add(synthetic.len());
+        if projected_len > MAX_GIT_DIFF_BYTES {
+            continue;
+        }
+        if needs_sep {
+            diff_unified.push('\n');
+        }
+        diff_unified.push_str(&synthetic);
+    }
 
     (
         PeerMessage::GitDiffResponse {
@@ -5065,6 +6059,9 @@ pub async fn handle_git_diff_rpc(req_id: String, cwd: String) -> (PeerMessage, T
             branch: branch.trim().to_string(),
             status_short,
             diff_unified,
+            is_git_repo: true,
+            repo_root: Some(repo_root_str),
+            error: None,
         },
         TrafficLane::BulkP1,
     )
@@ -6402,6 +7399,38 @@ mod tests {
             .output()
             .await;
 
+        // Create an untracked (`??`) UTF-8 file + sensitive `.env` file to verify synthetic `+` diffs
+        std::fs::create_dir_all(Path::new(&ws_path).join("src")).unwrap();
+        std::fs::write(
+            Path::new(&ws_path).join("src/agent_new.rs"),
+            "pub fn hello() -> &'static str {\n    \"v1\"\n}\n",
+        )
+        .unwrap();
+        std::fs::write(Path::new(&ws_path).join(".env"), "SECRET_TOKEN=123\n").unwrap();
+
+        let (untracked_msg, _) =
+            handle_git_diff_rpc("gd-untracked".into(), Path::new(&ws_path).join("src").to_string_lossy().to_string()).await;
+        match untracked_msg {
+            PeerMessage::GitDiffResponse {
+                is_git_repo,
+                repo_root,
+                status_short,
+                diff_unified,
+                error,
+                ..
+            } => {
+                assert!(is_git_repo);
+                assert!(repo_root.as_deref().is_some_and(|r| r.ends_with("alpha-service")));
+                assert!(error.is_none());
+                assert!(status_short.contains("?? src/agent_new.rs"));
+                assert!(!status_short.contains(".env"));
+                assert!(diff_unified.contains("diff --git a/src/agent_new.rs b/src/agent_new.rs"));
+                assert!(diff_unified.contains("+pub fn hello() -> &'static str {"));
+                assert!(!diff_unified.contains("SECRET_TOKEN"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
         // Write > 300 KiB of multi-byte UTF-8 content so unified diff exceeds 256 KiB
         let big_cjk = "零知识加密代码审查行🚀\n".repeat(12_000);
         std::fs::write(&file_path, big_cjk).unwrap();
@@ -6414,13 +7443,39 @@ mod tests {
                 branch,
                 status_short,
                 diff_unified,
+                is_git_repo,
+                repo_root,
+                error,
             } => {
                 assert_eq!(req_id, "gd-1");
+                assert!(is_git_repo);
+                assert!(repo_root.is_some());
+                assert!(error.is_none());
                 assert!(!branch.is_empty());
                 assert!(status_short.contains("notes.txt"));
                 assert!(!diff_unified.is_empty());
                 assert!(diff_unified.len() <= MAX_GIT_DIFF_BYTES);
                 assert!(!diff_unified.contains('\u{FFFD}'));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        // Non-git directory returns is_git_repo=false with clear error
+        let non_git_dir = root.join("plain-folder");
+        std::fs::create_dir_all(&non_git_dir).unwrap();
+        let (non_git_diff, _) =
+            handle_git_diff_rpc("gd-nongit".into(), non_git_dir.to_string_lossy().to_string())
+                .await;
+        match non_git_diff {
+            PeerMessage::GitDiffResponse {
+                is_git_repo,
+                repo_root,
+                error,
+                ..
+            } => {
+                assert!(!is_git_repo);
+                assert!(repo_root.is_none());
+                assert!(error.as_deref().is_some_and(|e| e.contains("Git")));
             }
             other => panic!("unexpected: {other:?}"),
         }
@@ -6434,8 +7489,12 @@ mod tests {
                 branch,
                 status_short,
                 diff_unified,
+                is_git_repo,
+                error,
                 ..
             } => {
+                assert!(!is_git_repo);
+                assert!(error.is_some());
                 assert!(branch.is_empty());
                 assert!(status_short.is_empty());
                 assert!(diff_unified.is_empty());
@@ -6554,5 +7613,236 @@ mod tests {
             )
             .expect("expected needs_you after 60s cooldown");
         assert_eq!(alert_after_cooldown.status, "needs_you");
+
+        // Pre-existing blocked or error terminal observed for the first time (e.g. startup/re-exec) MUST NOT fire false-positive alert!
+        let mut startup_tracker = DaemonAlertTracker::default();
+        let pre_blocked = HerdrTerminalSummary {
+            address: "existing-blocked".into(),
+            name: Some("pre-existing".into()),
+            argv: vec!["claude".into()],
+            cwd: "/tmp/coda".into(),
+            cols: 120,
+            rows: 40,
+            alive: true,
+            status: Some(coda_protocol::HerdrAgentStatus {
+                state: "blocked".into(),
+                kind: Some("permission".into()),
+                app: Some("claude".into()),
+                title: None,
+                msg: None,
+                progress: None,
+            }),
+        };
+        startup_tracker.seed_from_terminals(&[pre_blocked.clone()]);
+        assert!(startup_tracker
+            .observe_live_event(dev_id, "Studio Mac", Some(&pre_blocked), &json!({}), t0)
+            .is_none());
+
+        // Unseeded first observation of blocked or error status also establishes baseline without firing
+        let mut unseeded = DaemonAlertTracker::default();
+        assert!(unseeded
+            .observe_live_event(dev_id, "Studio Mac", Some(&pre_blocked), &json!({}), t0)
+            .is_none());
+        let mut err_term = pre_blocked.clone();
+        err_term.address = "err-1".into();
+        err_term.status.as_mut().unwrap().state = "error".into();
+        err_term.status.as_mut().unwrap().kind = None;
+        unseeded.seed_new_terminal(&HerdrTerminalSummary {
+            status: None,
+            ..err_term.clone()
+        });
+        assert!(unseeded
+            .observe_live_event(dev_id, "Studio Mac", Some(&err_term), &json!({}), t0)
+            .is_none());
+
+        // FIFO eviction past 512 terminals preserves recent terminals instead of wiping map via clear()
+        for i in 0..560 {
+            let mut t = pre_blocked.clone();
+            t.address = format!("bulk-{i}");
+            startup_tracker.seed_from_terminals(&[t]);
+        }
+        let mut recent_blocked = pre_blocked.clone();
+        recent_blocked.address = "bulk-559".into();
+        assert!(startup_tracker
+            .observe_live_event(dev_id, "Studio Mac", Some(&recent_blocked), &json!({}), t0)
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn test_v1_preview_query_urls_full_methods_sse_and_ssrf_guards() {
+        // 1. Query strings containing `://` are permitted while authority injection is rejected
+        let next_img = validate_local_preview_target(
+            3000,
+            "/_next/image?url=http://127.0.0.1:3000/logo.png&w=256",
+        )
+        .expect("valid query URL");
+        assert_eq!(next_img.host_str(), Some("127.0.0.1"));
+        assert!(validate_local_preview_target(3000, "http://evil.example/steal?a=1").is_err());
+
+        // 2. IPv4-mapped IPv6, RFC1918, and CGNAT metadata URLs blocked in git_clone_url
+        assert!(validate_git_clone_url("https://[::ffff:127.0.0.1]/org/repo.git").is_err());
+        assert!(validate_git_clone_url("https://[::ffff:169.254.169.254]/org/repo.git").is_err());
+        assert!(validate_git_clone_url("https://100.100.100.200/org/repo.git").is_err());
+        assert!(validate_git_clone_url("https://192.168.1.10/org/repo.git").is_err());
+        assert!(validate_git_clone_url("https://10.0.0.5/org/repo.git").is_err());
+        assert!(validate_git_clone_url("https://[fd00::1]/org/repo.git").is_err());
+
+        // 3. Spin up a real local HTTP server to test POST + headers, 302 Location, HEAD, and SSE short-circuit
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let srv = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let req_txt = String::from_utf8_lossy(&buf[..n]);
+                    let first_line = req_txt.lines().next().unwrap_or("");
+                    if first_line.starts_with("POST /api/echo") {
+                        let has_cookie = req_txt.to_ascii_lowercase().contains("cookie: sid=abc");
+                        let body = req_txt.split("\r\n\r\n").nth(1).unwrap_or("");
+                        let resp_body = format!("cookie={has_cookie};body={body}");
+                        let resp = format!(
+                            "HTTP/1.1 201 Created\r\nContent-Type: text/plain\r\nSet-Cookie: sid=renewed; Path=/\r\nContent-Length: {}\r\n\r\n{}",
+                            resp_body.len(),
+                            resp_body
+                        );
+                        let _ = sock.write_all(resp.as_bytes()).await;
+                    } else if first_line.starts_with("GET /login") {
+                        let resp = "HTTP/1.1 302 Found\r\nLocation: /dashboard\r\nContent-Length: 0\r\n\r\n";
+                        let _ = sock.write_all(resp.as_bytes()).await;
+                    } else if first_line.starts_with("HEAD /asset") {
+                        let resp = "HTTP/1.1 200 OK\r\nContent-Type: application/javascript\r\nETag: \"v1\"\r\nContent-Length: 999999\r\n\r\n";
+                        let _ = sock.write_all(resp.as_bytes()).await;
+                    } else if first_line.starts_with("GET /events") {
+                        let _ = sock
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\ndata: ping\n\n")
+                            .await;
+                        // Hold SSE connection open for 15s to verify daemon short-circuits cleanly
+                        tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                    }
+                });
+            }
+        });
+
+        // POST with Cookie header + JSON body
+        let (post_res, _) = handle_http_local_preview_rpc(
+            "hp-post".into(),
+            port,
+            "/api/echo?redirect=http://127.0.0.1/ok".into(),
+            Some("POST".into()),
+            vec![("Cookie".into(), "sid=abc".into())],
+            Some(B64.encode(b"hello-v1")),
+        )
+        .await;
+        match post_res {
+            PeerMessage::HttpLocalPreviewResponse {
+                status_code,
+                body_b64,
+                headers,
+                ..
+            } => {
+                assert_eq!(status_code, 201);
+                let txt = String::from_utf8(B64.decode(body_b64).unwrap()).unwrap();
+                assert_eq!(txt, "cookie=true;body=hello-v1");
+                assert!(headers
+                    .iter()
+                    .any(|(k, v)| k.eq_ignore_ascii_case("set-cookie") && v.contains("sid=renewed")));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        // 302 Redirect preserves Location header
+        let (redir_res, _) = handle_http_local_preview_rpc(
+            "hp-302".into(),
+            port,
+            "/login".into(),
+            Some("GET".into()),
+            Vec::new(),
+            None,
+        )
+        .await;
+        match redir_res {
+            PeerMessage::HttpLocalPreviewResponse {
+                status_code,
+                headers,
+                ..
+            } => {
+                assert_eq!(status_code, 302);
+                assert!(headers
+                    .iter()
+                    .any(|(k, v)| k.eq_ignore_ascii_case("location") && v == "/dashboard"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        // HEAD returns headers immediately with empty body
+        let (head_res, _) = handle_http_local_preview_rpc(
+            "hp-head".into(),
+            port,
+            "/asset".into(),
+            Some("HEAD".into()),
+            Vec::new(),
+            None,
+        )
+        .await;
+        match head_res {
+            PeerMessage::HttpLocalPreviewResponse {
+                status_code,
+                body_b64,
+                headers,
+                ..
+            } => {
+                assert_eq!(status_code, 200);
+                assert!(body_b64.is_empty());
+                assert!(headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("etag")));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        // SSE short-circuits in < 1s with truncated=true instead of hanging 10-15s
+        let t_sse = std::time::Instant::now();
+        let (sse_res, _) = handle_http_local_preview_rpc(
+            "hp-sse".into(),
+            port,
+            "/events".into(),
+            Some("GET".into()),
+            Vec::new(),
+            None,
+        )
+        .await;
+        assert!(t_sse.elapsed() < std::time::Duration::from_secs(2));
+        match sse_res {
+            PeerMessage::HttpLocalPreviewResponse {
+                status_code,
+                truncated,
+                ..
+            } => {
+                assert_eq!(status_code, 200);
+                assert!(truncated);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        // Fallback file upload without herdr-core writes 0o600 file cleanly
+        let up_dir = std::env::temp_dir().join(format!("coda-fb-up-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&up_dir).unwrap();
+        let up_path = write_fallback_uploaded_file(
+            "shot.png",
+            b"\x89PNG\r\n\x1a\n",
+            Some(up_dir.to_str().unwrap()),
+        )
+        .unwrap();
+        assert!(Path::new(&up_path).is_file());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&up_path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        let _ = std::fs::remove_dir_all(&up_dir);
+        srv.abort();
     }
 }

@@ -1336,6 +1336,12 @@ pub enum PeerMessage {
         branch: String,
         status_short: String,
         diff_unified: String,
+        #[serde(default = "default_true")]
+        is_git_repo: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repo_root: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
     },
     /// Cleanly terminates and removes a remote `herdr` terminal session.
     KillTerminal {
@@ -1366,18 +1372,30 @@ pub enum PeerMessage {
         path: String,
         content: String,
         error: Option<String>,
+        #[serde(default)]
+        truncated: bool,
     },
     /// Zero-config remote localhost web port preview (`127.0.0.1:PORT` -> Mobile/Web preview sheet)
     HttpLocalPreviewRequest {
         req_id: String,
         port: u16,
         path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        method: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        headers: Vec<(String, String)>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        req_body_b64: Option<String>,
     },
     HttpLocalPreviewResponse {
         req_id: String,
         status_code: u16,
         content_type: String,
         body_b64: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        headers: Vec<(String, String)>,
+        #[serde(default)]
+        truncated: bool,
     },
     /// Queries live host CPU/memory/uptime/version telemetry over E2EE.
     GetHostHealth {
@@ -1415,6 +1433,22 @@ pub enum PeerMessage {
         workspace_path: String,
         detail: String,
     },
+    /// Proxies audio transcription over E2EE using the host's configured Whisper/OpenAI-compatible endpoint.
+    TranscribeAudio {
+        req_id: String,
+        audio_b64: String,
+        mime_type: String,
+        filename: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        language: Option<String>,
+    },
+    TranscribeAudioResult {
+        req_id: String,
+        ok: bool,
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
 }
 
 impl PeerMessage {
@@ -1440,7 +1474,8 @@ impl PeerMessage {
             | Self::HttpLocalPreviewRequest { req_id, .. }
             | Self::GetHostHealth { req_id, .. }
             | Self::UpgradeDaemon { req_id, .. }
-            | Self::BootstrapWorkspace { req_id, .. } => Some(req_id.as_str()),
+            | Self::BootstrapWorkspace { req_id, .. }
+            | Self::TranscribeAudio { req_id, .. } => Some(req_id.as_str()),
             _ => None,
         }
     }
@@ -1463,7 +1498,8 @@ impl PeerMessage {
             | Self::HttpLocalPreviewResponse { req_id, .. }
             | Self::HostHealthResult { req_id, .. }
             | Self::UpgradeDaemonResult { req_id, .. }
-            | Self::BootstrapWorkspaceResult { req_id, .. } => Some(req_id.as_str()),
+            | Self::BootstrapWorkspaceResult { req_id, .. }
+            | Self::TranscribeAudioResult { req_id, .. } => Some(req_id.as_str()),
             _ => None,
         }
     }
@@ -1899,5 +1935,97 @@ mod tests {
         assert_eq!(res.response_req_id(), Some("bw-1"));
         let res_json = serde_json::to_string(&res).unwrap();
         assert!(res_json.contains(r#""op":"bootstrap_workspace_result""#));
+    }
+
+    #[test]
+    fn test_v1_protocol_extensions_backward_compat_and_whisper_roundtrip() {
+        // Legacy v0.9 GitDiffResponse without new fields defaults is_git_repo=true
+        let legacy_diff: PeerMessage = serde_json::from_str(
+            r#"{"op":"git_diff_response","req_id":"gd-1","branch":"main","status_short":"","diff_unified":""}"#,
+        )
+        .unwrap();
+        match legacy_diff {
+            PeerMessage::GitDiffResponse {
+                is_git_repo,
+                repo_root,
+                error,
+                ..
+            } => {
+                assert!(is_git_repo);
+                assert!(repo_root.is_none());
+                assert!(error.is_none());
+            }
+            _ => panic!("expected GitDiffResponse"),
+        }
+
+        // Legacy FilePreviewResponse defaults truncated=false
+        let legacy_fp: PeerMessage = serde_json::from_str(
+            r#"{"op":"file_preview_response","req_id":"fp-1","path":"/tmp/a.rs","content":"fn main(){}","error":null}"#,
+        )
+        .unwrap();
+        match legacy_fp {
+            PeerMessage::FilePreviewResponse { truncated, .. } => assert!(!truncated),
+            _ => panic!("expected FilePreviewResponse"),
+        }
+
+        // Legacy HttpLocalPreviewRequest / Response defaults
+        let legacy_hp_req: PeerMessage = serde_json::from_str(
+            r#"{"op":"http_local_preview_request","req_id":"hp-1","port":3000,"path":"/api?url=https://x"}"#,
+        )
+        .unwrap();
+        match legacy_hp_req {
+            PeerMessage::HttpLocalPreviewRequest {
+                method,
+                headers,
+                req_body_b64,
+                ..
+            } => {
+                assert!(method.is_none());
+                assert!(headers.is_empty());
+                assert!(req_body_b64.is_none());
+            }
+            _ => panic!("expected HttpLocalPreviewRequest"),
+        }
+
+        let legacy_hp_res: PeerMessage = serde_json::from_str(
+            r#"{"op":"http_local_preview_response","req_id":"hp-1","status_code":200,"content_type":"text/html","body_b64":""}"#,
+        )
+        .unwrap();
+        match legacy_hp_res {
+            PeerMessage::HttpLocalPreviewResponse {
+                headers, truncated, ..
+            } => {
+                assert!(headers.is_empty());
+                assert!(!truncated);
+            }
+            _ => panic!("expected HttpLocalPreviewResponse"),
+        }
+
+        // TranscribeAudio / TranscribeAudioResult wire roundtrip + req_id correlation
+        let ta = PeerMessage::TranscribeAudio {
+            req_id: "ta-1".into(),
+            audio_b64: "AAAA".into(),
+            mime_type: "audio/webm".into(),
+            filename: "voice.webm".into(),
+            language: Some("en".into()),
+        };
+        assert_eq!(ta.request_id(), Some("ta-1"));
+        assert_eq!(ta.response_req_id(), None);
+        let ta_json = serde_json::to_string(&ta).unwrap();
+        assert!(ta_json.contains(r#""op":"transcribe_audio""#));
+        let ta_dec: PeerMessage = serde_json::from_str(&ta_json).unwrap();
+        assert_eq!(ta_dec.request_id(), Some("ta-1"));
+
+        let tr = PeerMessage::TranscribeAudioResult {
+            req_id: "ta-1".into(),
+            ok: true,
+            text: "hello world".into(),
+            error: None,
+        };
+        assert_eq!(tr.request_id(), None);
+        assert_eq!(tr.response_req_id(), Some("ta-1"));
+        let tr_json = serde_json::to_string(&tr).unwrap();
+        assert!(tr_json.contains(r#""op":"transcribe_audio_result""#));
+        assert!(!tr_json.contains("error"));
     }
 }

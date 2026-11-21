@@ -168,7 +168,8 @@ pub fn validate_local_preview_target(port: u16, path: &str) -> Result<reqwest::U
             "Local preview port {port} blocked (internal infrastructure/control port)"
         ));
     }
-    if path.starts_with('@') || path.contains("://") {
+    let path_before_query = path.split('?').next().unwrap_or(path);
+    if path.starts_with('@') || path_before_query.contains("://") {
         return Err("Invalid local preview path".into());
     }
     let clean_path = if path.starts_with('/') {
@@ -176,8 +177,9 @@ pub fn validate_local_preview_target(port: u16, path: &str) -> Result<reqwest::U
     } else {
         format!("/{path}")
     };
+    let clean_before_query = clean_path.split('?').next().unwrap_or(&clean_path);
     if clean_path.chars().any(|c| c.is_control())
-        || clean_path.contains('\\')
+        || clean_before_query.contains('\\')
         || clean_path.starts_with("//")
     {
         return Err("Invalid local preview path".into());
@@ -265,6 +267,34 @@ pub fn validate_workspace_folder_name(raw: &str) -> Result<String> {
     Ok(trimmed.to_string())
 }
 
+pub fn is_blocked_ssrf_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            let o = v4.octets();
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_multicast()
+                || o[0] == 0
+                || (o[0] == 100 && (o[1] & 0xc0) == 64)
+                || (o[0] == 198 && (o[1] == 18 || o[1] == 19))
+                || o[0] >= 240
+        }
+        std::net::IpAddr::V6(v6) => {
+            if let Some(mapped_v4) = v6.to_ipv4_mapped() {
+                return is_blocked_ssrf_ip(std::net::IpAddr::V4(mapped_v4));
+            }
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || (v6.segments()[0] & 0xfe00) == 0xfc00
+                || (v6.segments()[0] & 0xffc0) == 0xfe80
+        }
+    }
+}
+
 fn is_blocked_git_clone_host(host: &str) -> bool {
     let h = host
         .trim()
@@ -277,27 +307,17 @@ fn is_blocked_git_clone_host(host: &str) -> bool {
         || h.ends_with('.')
         || h == "localhost"
         || h.ends_with(".localhost")
+        || h.ends_with(".local")
+        || h.ends_with(".internal")
+        || h == "metadata"
+        || h == "instance-data"
         || h == "metadata.google.internal"
         || h == "169.254.169.254"
     {
         return true;
     }
     if let Ok(ip) = h.parse::<std::net::IpAddr>() {
-        return match ip {
-            std::net::IpAddr::V4(v4) => {
-                v4.is_loopback()
-                    || v4.is_link_local()
-                    || v4.is_unspecified()
-                    || v4.is_broadcast()
-                    || v4.is_multicast()
-            }
-            std::net::IpAddr::V6(v6) => {
-                v6.is_loopback()
-                    || v6.is_unspecified()
-                    || v6.is_multicast()
-                    || (v6.segments()[0] & 0xffc0) == 0xfe80
-            }
-        };
+        return is_blocked_ssrf_ip(ip);
     }
     false
 }
@@ -441,6 +461,7 @@ pub async fn handle_bootstrap_workspace_rpc(
         None => None,
     };
 
+    let parent_existed = tokio::fs::metadata(&expanded_parent).await.is_ok();
     if let Err(e) = tokio::fs::create_dir_all(&expanded_parent).await {
         return fail(req_id, format!("failed creating parent_dir: {e}"));
     }
@@ -449,6 +470,9 @@ pub async fn handle_bootstrap_workspace_rpc(
         Err(e) => return fail(req_id, format!("failed resolving parent_dir: {e}")),
     };
     if is_sensitive_path(&canon_parent) {
+        if !parent_existed {
+            let _ = tokio::fs::remove_dir(&canon_parent).await;
+        }
         return fail(
             req_id,
             "access denied: parent_dir resolves to restricted path".into(),
@@ -457,6 +481,9 @@ pub async fn handle_bootstrap_workspace_rpc(
 
     let target_path = canon_parent.join(&clean_folder);
     if is_sensitive_path(&target_path) {
+        if !parent_existed {
+            let _ = tokio::fs::remove_dir(&canon_parent).await;
+        }
         return fail(req_id, "access denied: target path is restricted".into());
     }
 
@@ -467,6 +494,12 @@ pub async fn handle_bootstrap_workspace_rpc(
                 format!("target directory already exists: {}", target_path.display()),
             );
         }
+        let cleanup_failed_clone = |target: PathBuf, parent: PathBuf, existed: bool| async move {
+            let _ = tokio::fs::remove_dir_all(&target).await;
+            if !existed {
+                let _ = tokio::fs::remove_dir(&parent).await;
+            }
+        };
         let target_str = target_path.to_string_lossy().to_string();
         let mut cmd = Command::new("git");
         cmd.kill_on_drop(true)
@@ -490,8 +523,9 @@ pub async fn handle_bootstrap_workspace_rpc(
             Ok(Ok(out)) if out.status.success() => {
                 let final_path = tokio::fs::canonicalize(&target_path)
                     .await
-                    .unwrap_or(target_path);
+                    .unwrap_or_else(|_| target_path.clone());
                 if is_sensitive_path(&final_path) || !final_path.starts_with(&canon_parent) {
+                    cleanup_failed_clone(target_path, canon_parent, parent_existed).await;
                     return fail(
                         req_id,
                         "access denied: cloned workspace resolved outside parent_dir".into(),
@@ -508,6 +542,7 @@ pub async fn handle_bootstrap_workspace_rpc(
                 )
             }
             Ok(Ok(out)) => {
+                cleanup_failed_clone(target_path, canon_parent, parent_existed).await;
                 let stderr = lossy_utf8_prefix(&out.stderr, 2048);
                 let msg = stderr.trim();
                 fail(
@@ -519,9 +554,12 @@ pub async fn handle_bootstrap_workspace_rpc(
                     },
                 )
             }
-            Ok(Err(e)) => fail(req_id, format!("failed spawning git: {e}")),
+            Ok(Err(e)) => {
+                cleanup_failed_clone(target_path, canon_parent, parent_existed).await;
+                fail(req_id, format!("failed spawning git: {e}"))
+            }
             Err(_) => {
-                let _ = tokio::fs::remove_dir_all(&target_path).await;
+                cleanup_failed_clone(target_path, canon_parent, parent_existed).await;
                 fail(req_id, "git clone timed out after 60s".into())
             }
         }
@@ -743,6 +781,7 @@ pub async fn handle_read_file_preview_rpc(
                     path,
                     content: String::new(),
                     error: Some(e.to_string()),
+                    truncated: false,
                 },
                 TrafficLane::BulkP1,
             );
@@ -757,6 +796,7 @@ pub async fn handle_read_file_preview_rpc(
                     path,
                     content: String::new(),
                     error: Some(e.to_string()),
+                    truncated: false,
                 },
                 TrafficLane::BulkP1,
             );
@@ -769,6 +809,7 @@ pub async fn handle_read_file_preview_rpc(
                 path,
                 content: String::new(),
                 error: Some("access denied: sensitive file path blocked".into()),
+                truncated: false,
             },
             TrafficLane::BulkP1,
         );
@@ -784,6 +825,7 @@ pub async fn handle_read_file_preview_rpc(
                             path,
                             content: String::new(),
                             error: Some(e.to_string()),
+                            truncated: false,
                         },
                         TrafficLane::BulkP1,
                     );
@@ -796,6 +838,7 @@ pub async fn handle_read_file_preview_rpc(
                         path,
                         content: String::new(),
                         error: Some("not a regular file".into()),
+                        truncated: false,
                     },
                     TrafficLane::BulkP1,
                 );
@@ -809,6 +852,7 @@ pub async fn handle_read_file_preview_rpc(
                         path,
                         content: String::new(),
                         error: Some(e.to_string()),
+                        truncated: false,
                     },
                     TrafficLane::BulkP1,
                 );
@@ -825,6 +869,7 @@ pub async fn handle_read_file_preview_rpc(
                             total_bytes
                         ),
                         error: None,
+                        truncated: false,
                     },
                     TrafficLane::BulkP1,
                 )
@@ -839,6 +884,7 @@ pub async fn handle_read_file_preview_rpc(
                         path,
                         content: text,
                         error: None,
+                        truncated: was_truncated,
                     },
                     TrafficLane::BulkP1,
                 )
@@ -850,6 +896,7 @@ pub async fn handle_read_file_preview_rpc(
                 path,
                 content: String::new(),
                 error: Some(e.to_string()),
+                truncated: false,
             },
             TrafficLane::BulkP1,
         ),

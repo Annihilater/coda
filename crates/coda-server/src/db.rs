@@ -1391,6 +1391,17 @@ impl Db {
         Ok(deleted > 0)
     }
 
+    pub async fn bind_session_device(&self, token_sha256: &str, device_id: Uuid) -> Result<()> {
+        let client = self.client().await?;
+        client
+            .execute(
+                "UPDATE auth_sessions SET device_id = $1 WHERE token_sha256 = $2",
+                &[&device_id, &token_sha256],
+            )
+            .await?;
+        Ok(())
+    }
+
     /// Deletes offline `web` client devices belonging to `user_id` (excluding `exclude_device_id` if present).
     /// When `max_idle_days > 0`, restricts deletion to rows with `COALESCE(last_seen_at, created_at) < NOW() - make_interval(days => max_idle_days)`.
     pub async fn prune_stale_web_devices(
@@ -1399,41 +1410,91 @@ impl Db {
         exclude_device_id: Option<Uuid>,
         max_idle_days: i32,
     ) -> Result<Vec<Uuid>> {
-        let client = self.client().await?;
-        let rows = if max_idle_days > 0 {
+        self.prune_stale_web_devices_excluding(user_id, exclude_device_id, None, max_idle_days)
+            .await
+    }
+
+    /// Deletes offline `web` client devices belonging to `user_id`, excluding both `session_device_id`
+    /// and optional caller-provided `extra_exclude_device_id`, while detaching `scope = 'full'`
+    /// account sessions from pruned ephemeral tab keys so `ON DELETE CASCADE` never logs out active sessions.
+    pub async fn prune_stale_web_devices_excluding(
+        &self,
+        user_id: Uuid,
+        session_device_id: Option<Uuid>,
+        extra_exclude_device_id: Option<Uuid>,
+        max_idle_days: i32,
+    ) -> Result<Vec<Uuid>> {
+        let mut tx_guard = self.acquire_tx_client().await?;
+        let tx = tx_guard.as_mut().transaction().await?;
+        let target_rows = if max_idle_days > 0 {
             let days = max_idle_days.clamp(1, 3650);
-            client
-                .query(
-                    r#"
-                    DELETE FROM devices
-                    WHERE user_id = $1
-                      AND platform = 'web'
-                      AND role = 'client'
-                      AND is_online = FALSE
-                      AND ($2::uuid IS NULL OR id <> $2)
-                      AND COALESCE(last_seen_at, created_at) < NOW() - make_interval(days => $3)
-                    RETURNING id
-                    "#,
-                    &[&user_id, &exclude_device_id, &days],
-                )
-                .await?
+            tx.query(
+                r#"
+                SELECT id
+                FROM devices
+                WHERE user_id = $1
+                  AND platform = 'web'
+                  AND role = 'client'
+                  AND is_online = FALSE
+                  AND ($2::uuid IS NULL OR id <> $2)
+                  AND ($3::uuid IS NULL OR id <> $3)
+                  AND COALESCE(last_seen_at, created_at) < NOW() - make_interval(days => $4)
+                FOR UPDATE
+                "#,
+                &[
+                    &user_id,
+                    &session_device_id,
+                    &extra_exclude_device_id,
+                    &days,
+                ],
+            )
+            .await?
         } else {
-            client
-                .query(
-                    r#"
-                    DELETE FROM devices
-                    WHERE user_id = $1
-                      AND platform = 'web'
-                      AND role = 'client'
-                      AND is_online = FALSE
-                      AND ($2::uuid IS NULL OR id <> $2)
-                    RETURNING id
-                    "#,
-                    &[&user_id, &exclude_device_id],
-                )
-                .await?
+            tx.query(
+                r#"
+                SELECT id
+                FROM devices
+                WHERE user_id = $1
+                  AND platform = 'web'
+                  AND role = 'client'
+                  AND is_online = FALSE
+                  AND ($2::uuid IS NULL OR id <> $2)
+                  AND ($3::uuid IS NULL OR id <> $3)
+                FOR UPDATE
+                "#,
+                &[&user_id, &session_device_id, &extra_exclude_device_id],
+            )
+            .await?
         };
-        Ok(rows.into_iter().map(|r| r.get(0)).collect())
+        let target_ids: Vec<Uuid> = target_rows.into_iter().map(|r| r.get(0)).collect();
+        if target_ids.is_empty() {
+            tx.commit().await?;
+            return Ok(Vec::new());
+        }
+        tx.execute(
+            r#"
+            UPDATE auth_sessions
+            SET device_id = NULL
+            WHERE user_id = $1
+              AND scope = 'full'
+              AND device_id = ANY($2)
+            "#,
+            &[&user_id, &target_ids],
+        )
+        .await?;
+        let deleted_rows = tx
+            .query(
+                r#"
+                DELETE FROM devices
+                WHERE user_id = $1
+                  AND id = ANY($2)
+                RETURNING id
+                "#,
+                &[&user_id, &target_ids],
+            )
+            .await?;
+        tx.commit().await?;
+        Ok(deleted_rows.into_iter().map(|r| r.get(0)).collect())
     }
 
     pub async fn get_notification_settings(
