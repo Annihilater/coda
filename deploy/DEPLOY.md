@@ -6,7 +6,7 @@ Coda 每次发布 Tag (`v*`) 时，GitHub Actions 流水线会自动构建并发
 > - **产物命名**：所有发布压缩包文件名均携带版本号（例如 `-v0.2.3.tar.gz`），而 **解压后顶层目录名称均不带版本号**（例如 `coda-deploy-bundle/`、`coda-macos-aarch64/`），方便脚本与升级复用。
 > - **预构建镜像（部署包无需 Dockerfile）**：`coda-deploy-bundle/` 直接引用公网镜像仓库 `ghcr.io/annihilater/coda:<version>`；同时 `start.sh` / `update.sh` 内置自动回落逻辑——若服务器无法访问 GHCR，会自动从 GitHub Releases 下载离线镜像包 `coda-image-linux-{amd64,arm64}-<version>.tar.gz` 并 `docker load` 导入。
 > - **统一 `.env` 密钥管理**：`./start.sh`、`docker-compose.yml`、`coda-server.service`、`coda-relay-cn.service` 与直接运行 `coda-server` 二进制均**统一从 `.env`（或 `/etc/coda/.env`，`0600` 权限）读取 `CODA_RELAY_SECRET` 等环境变量**，`.service` 单元文件中不存放任何明文密钥。
-> - **完整变量与安全规范**：有关 `.env` 全部配置项、必填密钥校验、`SHA256SUMS` 完整性校验、E2EE v2 前向安全及滚动升级说明，请查阅同目录下的 `CONFIG_AND_SECURITY.md`。
+> - **完整变量与安全规范**：有关 `.env` 全部配置项、必填密钥校验、`SHA256SUMS` 完整性校验、W3C VAPID Web Push、好友免密重置令牌、E2EE v2 前向安全及滚动升级说明，请查阅同目录下的 `CONFIG_AND_SECURITY.md`；六端 UI/交互设计规范请参阅仓库内的 [`../docs/PRODUCT_PROTOTYPE.md`](../docs/PRODUCT_PROTOTYPE.md)。
 
 | 制品 / 镜像名称 | 解压后目录 / 平台 | 说明 |
 | :--- | :--- | :--- |
@@ -114,9 +114,10 @@ curl -fsSL https://raw.githubusercontent.com/Annihilater/coda/main/deploy/instal
 
 ## 三、只登录一次，全端浏览器授权接入开发机 (Server / Mac / iOS)
 
-1. **注册账号**：打开浏览器访问 **`https://codahub.dev`**（或 `http://你的服务器IP:8080`）：
+1. **注册账号与好友管理**：打开浏览器访问 **`https://codahub.dev`**（或 `http://你的服务器IP:8080`）：
    - 当 `.env` 设置了 `CODA_OPEN_REGISTRATION=true` 时，任何人都可**免邀请码自由注册**并直接进入控制台（第一个注册的用户同时拥有管理员权限）；
-   - 如需封闭内测，设 `CODA_OPEN_REGISTRATION=false`，则除首位管理员外需使用管理员签发的 `CODA-XXXXXX` 邀请码。
+   - 如需封闭好友圈共享，设 `CODA_OPEN_REGISTRATION=false`，管理员可在「设置 → Admin」一键生成并复制**好友邀请深链（`https://codahub.dev/register?invite=CODA-XXXXXX`）**发给朋友直接打开注册；
+   - 若好友忘记密码，无需搭建任何邮件服务器——管理员在好友列表中点击 **`Copy Reset Link`** 即可生成 24 小时单次有效的重置链接（`https://codahub.dev/reset-password?token=rst_...`），好友打开链接（或在 `Coda.app` / iOS 端直接粘贴该链接）即可自助设新密码（自动吊销旧登录会话，同时保留已配对的受控开发机不断线）。
 2. **Linux / macOS 服务器一键接入（推荐浏览器设备码授权）**：
    直接在目标开发机或云服务器上执行官网首页的一键命令（脚本与 `coda-daemon login` 均已默认指向 `https://codahub.dev`，无需额外传 `--server`）：
 
@@ -146,18 +147,19 @@ curl -fsSL https://codahub.dev/install.sh | sh
 
 ## 四、使用各端客户端连接开发（Windows/Mac/iOS 互控）
 
-1. **Web 终端 & iOS Safari PWA（零上架零安装）**：
-   用电脑浏览器或 iPhone Safari 访问 `https://codahub.dev`（支持终端原始键盘输入、多标签与双栏分屏会话、`Needs-You` 置顶提醒与一键审批胶囊栏、智能 `?2004h` 多行 `Prompt Composer`、富文本安全的剪贴板截图粘贴自动上传、E2EE 远端文件树 / `Git Diff` 代码审查（含未跟踪 `??` 新建文件 `+` 补丁与一键跳文件） / 全方法沙箱化 `localhost` 端口预览、远端目录选择与 `git clone` 工作区引导、浏览器原生语音识别免 Key 回落 + E2EE 远端守护进程代理 Whisper 转写、离线告警 Webhook 推送配置及防自删陈旧离线浏览器设备一键清理）；在 iPhone Safari 点击「分享 → 添加到主屏幕」即可全屏当原生 App 使用；如有 **TestFlight** 链接，可在 `.env` 中配置 `CODA_IOS_BETA_URL`。
-2. **macOS 桌面端（`.dmg` 双击安装，`Hybrid` 双向互控 + 显式被控开关）**：
+1. **Web 终端 & iOS Safari PWA（零上架零安装 + 1-Click 锁屏推送）**：
+   用电脑浏览器或 iPhone Safari 访问 `https://codahub.dev`（支持终端原始键盘输入、多标签与双栏分屏会话、`Needs-You` 置顶提醒与一键审批胶囊栏、智能 `?2004h` 多行 `Prompt Composer` + **跨端云同步常用 Prompt Snippets 胶囊**、三步新手引导卡片、富文本安全的剪贴板截图粘贴自动上传、E2EE 远端文件树 / `Git Diff` 代码审查（含未跟踪 `??` 新建文件 `+` 补丁与一键跳文件） / 全方法沙箱化 `localhost` 端口预览、远端目录选择与 `git clone` 工作区引导、浏览器原生语音识别免 Key 回落 + E2EE 远端守护进程代理 Whisper 转写、**`/sw.js` 标准 W3C VAPID 浏览器与 iOS 主屏幕 PWA 一键锁屏推送**及离线 Webhook 配置、防自删陈旧离线浏览器设备一键清理）；在 iPhone Safari 点击「分享 → 添加到主屏幕」后打开即可一键开启 iOS 原生锁屏通知；如有 **TestFlight** 链接，可在 `.env` 中配置 `CODA_IOS_BETA_URL`。
+2. **macOS 桌面端（`.dmg` 双击安装，应用内一键自更新 + `Hybrid` 双向互控）**：
    在官网下载中心直接点击下载 **`Coda-Desktop-macos-aarch64-<version>.dmg`** 并拖入 `Applications`；首次打开若提示未公证开发者，在终端执行一次：
    ```bash
    xattr -cr /Applications/Coda.app
    ```
-   打开 `Coda.app` 点击左侧「🔑 浏览器登录」即可绑定同一账号——支持在侧边抽屉与设置页一键开关 **「允许远端控制本机（Allow Remote Control）」**，配备置顶 `NEEDS ATTENTION` 收件箱（`⌘J` 环形速跳）与 Dock 待审批角标、远端新建目录与 `git clone` 引导弹窗、剪贴板截图粘贴 (`⌘V`) 自动加密上传、E2EE 远端文件树 / `Git Diff` 审查 / 全方法多端口 `127.0.0.1` 本地回环 HTTP 代理隧道、macOS 原生听写回落 + Whisper 语音输入、全五类离线 Webhook 配置及一键清理离线 Web 设备，并与独立安装的 `coda-daemon` 自动共存互不冲突。
+   打开 `Coda.app` 点击左侧「🔑 浏览器登录」即可绑定同一账号——顶栏内置 **`✨ Update vX.Y.Z` 应用内一键自更新**（自动校验 `SHA256SUMS` 摘要并原子替换重启，后续升级无需重拖 `.dmg`），支持在侧边抽屉与设置页一键开关 **「允许远端控制本机（Allow Remote Control）」**，配备置顶 `NEEDS ATTENTION` 收件箱（`⌘J` 环形速跳）与 Dock 待审批角标、跨端同步常用 Prompt Snippets 胶囊与 `⌘K` 速发、管理员好友重置链接复制、远端新建目录与 `git clone` 引导弹窗、剪贴板截图粘贴 (`⌘V`) 自动加密上传、E2EE 远端文件树 / `Git Diff` 审查 / 全方法多端口 `127.0.0.1` 本地回环 HTTP 代理隧道、macOS 原生听写回落 + Whisper 语音输入、全五类离线 Webhook 配置及一键清理离线 Web 设备，并与独立安装的 `coda-daemon` 自动共存互不冲突。
 3. **iPhone / iPhone Duo / iPad 原生 SwiftUI 客户端 (`apple/`)**：
-   使用 Xcode 打开 `apple/Package.swift`（或 `apple/project.yml`）编译到真机运行测试版，支持浏览器设备码授权、多主机并发中继路由、低延迟 PTY 实时输入、`Needs-You` 悬浮审批栏与多行 `Prompt Composer`（支持系统相册 `PhotosPicker` 与剪贴板图片直传）、E2EE `Files | Changes (Git Diff) | Port Preview (含沙箱 Web 预览)` 检视器、远端工作区 `git clone` 引导、Apple 原生 `SFSpeechRecognizer` 免配置语音听写回落 + E2EE 远端守护进程 Whisper 转写、离线 Webhook 配置与远程主机健康/OTA 管理。
-4. **零知识离线告警推送（Bark / Telegram / 飞书 / Discord / 自定义 Webhook）**：
-   在任一客户端「设置」中填入 HTTPS Webhook（如 Bark URL、Telegram Bot Token + Chat ID、飞书机器人、Discord 或自定义 Generic Webhook）并点击「测试推送」即可生效。当远端 `coda-daemon` 检测到终端从运行态进入 `Needs-You` 待审批或完成运行状态时，仅上报设备名、会话名与目录末级名（**绝不包含任何终端屏幕明文或命令内容**），由服务端遵循 DNS 钉扎防重绑定 SSRF 防护与 60 秒冷却策略并发投递离线通知。
+   使用 Xcode 打开 `apple/Package.swift`（或 `apple/project.yml`）编译到真机运行测试版，支持浏览器设备码授权、多主机并发中继路由、低延迟 PTY 实时输入、`Needs-You` 悬浮审批栏与多行 `Prompt Composer`（支持**跨端同步常用 Prompt Snippets 胶囊**、系统相册 `PhotosPicker` 与剪贴板图片直传）、粘贴一键重置链接找回密码与管理员好友邀请/重置链接复制、E2EE `Files | Changes (Git Diff) | Port Preview (含沙箱 Web 预览)` 检视器、远端工作区 `git clone` 引导、Apple 原生 `SFSpeechRecognizer` 免配置语音听写回落 + E2EE 远端守护进程 Whisper 转写、离线 Webhook 配置与远程主机健康/OTA 管理。
+4. **零知识离线告警推送（零配置 W3C VAPID Web Push + Bark / Telegram / 飞书 / Discord / 自定义 Webhook）**：
+   - **一键锁屏 Web Push（无需配置任何外部密钥）**：`coda-server` 启动连接 PostgreSQL 时自动在 `server_kv` 生成并持久化 P-256 VAPID 密钥对，并为 `/sw.js` 自动下发 `Service-Worker-Allowed: /` 与 `Cache-Control: no-cache`；用户在桌面浏览器或添加到主屏幕的 iOS Safari PWA 中点击 **「🔔 Enable Lock-Screen Push」** 即可完成 `RFC 8292 VAPID` + `RFC 8291 aes128gcm` 加密推送订阅（服务端自动清理返回 `404`/`410` 的失效订阅）。
+   - **多通道自定义 Webhook**：亦可在任一客户端「设置」中填入 HTTPS Webhook（如 Bark URL、Telegram Bot Token + Chat ID、飞书机器人、Discord 或自定义 Generic Webhook）并点击「测试推送」。当远端 `coda-daemon` 检测到终端从运行态进入 `Needs-You` 待审批或完成运行状态时，仅上报设备名、会话名与目录末级名（**绝不包含任何终端屏幕明文或命令内容**），由服务端遵循 DNS 钉扎防重绑定 SSRF 防护与 60 秒冷却策略并发投递离线通知。
 
 ---
 

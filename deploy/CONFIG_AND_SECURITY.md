@@ -1,6 +1,6 @@
 # Coda 生产环境配置参考、安全基线与运维手册
 
-本文档随 `coda-deploy-bundle` 一并打包分发，补充说明 `.env` 环境变量、密钥与校验规则、E2EE v2 安全基线以及日常升级回滚流程；主安装步骤请同步参阅同目录的 `DEPLOY.md`。
+本文档随 `coda-deploy-bundle` 一并打包分发，补充说明 `.env` 环境变量、密钥与校验规则、E2EE v2 安全基线、W3C VAPID Web Push 与好友免密重置机制以及日常升级回滚流程；主安装步骤请同步参阅同目录的 `DEPLOY.md`，全端产品交互规范请参阅 [`../docs/PRODUCT_PROTOTYPE.md`](../docs/PRODUCT_PROTOTYPE.md)。
 
 ---
 
@@ -47,12 +47,17 @@
 - **角色最小权限与设备吊销**：`role = "daemon"` 受控机无法反向控制同账号其他设备；删除设备时级联吊销关联会话并立即踢出活跃中继与 Direct P2P 连接；`coda-daemon` 支持 30 天中继票据提前 7 天 Ed25519 签名自动续签。
 - **凭据最小暴露**：macOS `Coda.app` 会话 Token 优先存入 macOS Keychain（CLI/测试回落 `0600` 文件）；`install-daemon.sh` 防止 `sudo` 污染普通用户 `$HOME` 权限，且日志强制 `0600` 与 10 MiB 截断。
 
-### 3. 全制品 SHA-256 完整性校验
-- 每次发版均会生成 `SHA256SUMS-<version>.txt` 与 `SHA256SUMS.txt`；`coda.sh` 离线镜像包回落、`install-server.sh`、`install-relay-cn.sh` 与 `install-daemon.sh` 均已内置自动 SHA-256 摘要校验，摘要不匹配或缺少校验清单时拒绝导入或安装。
+### 3. 全制品 SHA-256 完整性校验与客户端应用内自更新
+- 每次发版均会生成 `SHA256SUMS-<version>.txt` 与 `SHA256SUMS.txt`；`coda.sh` 离线镜像包回落、`install-server.sh`、`install-relay-cn.sh`、`install-daemon.sh`、`coda-daemon upgrade` 以及 **`Coda.app` 应用内一键自更新**均内置强制 SHA-256 摘要比对，摘要不匹配或缺少校验清单时立即中止替换。
 - 如需手工校验已下载到本地的发布制品：
   ```bash
   sha256sum -c SHA256SUMS-<version>.txt --ignore-missing
   ```
+
+### 4. 管理员好友免密重置令牌与 W3C VAPID Web Push 安全基线
+- **单次哈希重置令牌 (`password_reset_tokens`)**：管理员接口 `/api/v1/admin/users` 与 `/api/v1/admin/users/{id}/reset-link` 严格校验 `scope = 'full'` 且 `is_admin = true`；签发的 `rst_<32+ urlsafe chars>` 令牌仅以 `SHA-256` 摘要落库（24 小时 TTL），`/api/v1/auth/reset-password` 按客户端 IP 限流并通过 `UPDATE ... WHERE consumed_at IS NULL AND expires_at > NOW()` 单次原子核销，成功后仅清理该用户 `scope = 'full'` 会话并实时通知事件连接断开，不中断已绑定的 `coda-daemon` 节点。
+- **零配置 W3C VAPID Web Push (`server_kv` & `web_push_subscriptions`)**：主控启动时在 PostgreSQL `server_kv` 原子初始化 P-256 PKCS#8 VAPID 密钥对（`--relay-only` 无数据库模式自动关闭）；推送载荷使用 `RFC 8292 ES256` 鉴权与 `RFC 8291 aes128gcm` 加密（仅含零知识元数据），所有订阅 `endpoint` 强制 `https://`、单用户上限 16 条、投递时通过 DNS 解析校验加 `resolve_to_addrs` IP 钉扎阻断 SSRF 重绑定，并在收到 `404`/`410` 时自动清理失效订阅；静态服务对 `/sw.js` 固定返回 `Service-Worker-Allowed: /` 与 `Cache-Control: no-cache`。
+- **跨端提示词片段边界 (`user_prompt_snippets`)**：`/api/v1/me/snippets` 强制校验单用户最多 24 条、标题 `<= 60` 字符、内容 `<= 4000` 字符且全端账号严格租户隔离。
 
 ### 4. 非交互式受控机接入（避免密码暴露在进程列表）
 - 在 CI 或自动化脚本中登录绑定受控机时，请通过标准输入传递密码而非命令行明文参数：
