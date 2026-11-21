@@ -958,10 +958,16 @@ impl RemoteMeshHub {
         let weak_hub = Arc::downgrade(self);
         let mut shutdown_rx = self.shutdown_tx.subscribe();
         self.spawn_bg(async move {
-            if let Some(hub) = weak_hub.upgrade() {
-                hub.sync_all_hosts_and_sessions().await;
-            } else {
+            if *shutdown_rx.borrow() || weak_hub.strong_count() == 0 {
                 return;
+            }
+            tokio::select! {
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() {
+                        return;
+                    }
+                }
+                _ = Self::sync_all_hosts_and_sessions_weak(&weak_hub) => {}
             }
 
             loop {
@@ -997,12 +1003,6 @@ impl RemoteMeshHub {
                         let Some(ev) = ev_opt else {
                             break;
                         };
-                        let Some(hub) = weak_hub.upgrade() else {
-                            return;
-                        };
-                        if hub.watcher_gen.load(Ordering::Acquire) != my_gen {
-                            return;
-                        }
                         if ev.role.as_deref() == Some("client") {
                             continue;
                         }
@@ -1010,8 +1010,23 @@ impl RemoteMeshHub {
                             ev.kind.as_str(),
                             "connected" | "devices_changed" | "peer_presence"
                         ) {
-                            hub.smart_path.lock().await.reset_all();
-                            hub.sync_all_hosts_and_sessions().await;
+                            {
+                                let Some(hub) = weak_hub.upgrade() else {
+                                    return;
+                                };
+                                if hub.watcher_gen.load(Ordering::Acquire) != my_gen {
+                                    return;
+                                }
+                                hub.smart_path.lock().await.reset_all();
+                            }
+                            tokio::select! {
+                                changed = shutdown_rx.changed() => {
+                                    if changed.is_err() || *shutdown_rx.borrow() {
+                                        return;
+                                    }
+                                }
+                                _ = Self::sync_all_hosts_and_sessions_weak(&weak_hub) => {}
+                            }
                         }
                     },
                     Err(e) => {
@@ -1031,6 +1046,14 @@ impl RemoteMeshHub {
     }
 
     async fn sync_all_hosts_and_sessions(self: &Arc<Self>) {
+        let weak = Arc::downgrade(self);
+        Self::sync_all_hosts_and_sessions_weak(&weak).await;
+    }
+
+    async fn sync_all_hosts_and_sessions_weak(weak_hub: &std::sync::Weak<Self>) {
+        if weak_hub.strong_count() == 0 {
+            return;
+        }
         let Ok(cfg) = load_desktop_daemon_config(&DaemonConfig::default_path()) else {
             return;
         };
@@ -1040,7 +1063,10 @@ impl RemoteMeshHub {
         let Ok(list) = list_account_hosts(&cfg.server_url, tok).await else {
             return;
         };
-        let local_host_id = self
+        let Some(hub_arc) = weak_hub.upgrade() else {
+            return;
+        };
+        let local_host_id = hub_arc
             .state
             .lock()
             .ok()
@@ -1055,7 +1081,7 @@ impl RemoteMeshHub {
         let mut stale_host_ids: Vec<Uuid> = Vec::new();
         let mut pruned_sids: Vec<String> = Vec::new();
         {
-            let Ok(mut g) = self.state.lock() else {
+            let Ok(mut g) = hub_arc.state.lock() else {
                 return;
             };
             for prev_h in &g.remote_hosts {
@@ -1146,23 +1172,27 @@ impl RemoteMeshHub {
             g.remote_hosts = merged_hosts;
         }
         if !pruned_sids.is_empty() {
-            if let Ok(mut mgr) = self.pty_mgr.lock() {
+            if let Ok(mut mgr) = hub_arc.pty_mgr.lock() {
                 for sid in pruned_sids {
                     mgr.remove_remote_buffer(&sid);
                 }
             }
         }
         for stale_id in stale_host_ids {
-            self.drop_peer(stale_id).await;
+            hub_arc.drop_peer(stale_id).await;
         }
-        self.ui_dirty.store(true, Ordering::Release);
+        hub_arc.ui_dirty.store(true, Ordering::Release);
+        drop(hub_arc);
 
         for host in &hosts {
+            let Some(hub) = weak_hub.upgrade() else {
+                return;
+            };
             if !host.is_online {
-                self.drop_peer(host.id).await;
+                hub.drop_peer(host.id).await;
                 continue;
             }
-            self.sync_single_remote_host(&cfg, host).await;
+            hub.sync_single_remote_host(&cfg, host).await;
         }
     }
 

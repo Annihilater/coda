@@ -1017,6 +1017,22 @@ async fn read_full_http_proxy_request(
 /// Spawns a strictly loopback (`127.0.0.1:0`) full-method HTTP/1.1 proxy listener forwarding
 /// `ProxyHttpRequest`s via `fetcher`, rewriting loopback redirect `Location` headers, and
 /// acquiring concurrency permits outside `accept()` so `stop_tx` cancels instantaneously (`Bug #6` / `Gap #1`).
+async fn send_early_error_and_drain(mut stream: tokio::net::TcpStream, resp: &[u8]) {
+    let _ = stream.write_all(resp).await;
+    let _ = stream.shutdown().await;
+    let _ = tokio::time::timeout(Duration::from_millis(500), async {
+        let mut sink = [0u8; 16_384];
+        let mut drained = 0usize;
+        while drained < 8 * 1024 * 1024 {
+            match stream.read(&mut sink).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => drained = drained.saturating_add(n),
+            }
+        }
+    })
+    .await;
+}
+
 pub async fn spawn_loopback_http_proxy_with_full_fetcher<F, Fut>(
     remote_port: u16,
     fetcher: F,
@@ -1093,8 +1109,7 @@ where
                             msg.as_bytes(),
                             false,
                         );
-                        let _ = stream.write_all(&resp).await;
-                        let _ = stream.shutdown().await;
+                        send_early_error_and_drain(stream, &resp).await;
                         return;
                     }
                 };
@@ -1109,8 +1124,7 @@ where
                         msg.as_bytes(),
                         is_head,
                     );
-                    let _ = stream.write_all(&resp).await;
-                    let _ = stream.shutdown().await;
+                    send_early_error_and_drain(stream, &resp).await;
                     return;
                 }
 
