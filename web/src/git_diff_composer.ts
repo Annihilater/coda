@@ -2,12 +2,13 @@ import { escapeHtml } from "./vt";
 import { svgIcon } from "./icons";
 import type { Device, HerdrTerminal } from "./types";
 import { isNeedsYouState } from "./notify";
+import { sanitizeBracketedPasteText } from "./terminal_keys";
 
 // ============================================================================
 // 1. Remote E2EE Interactive Git Diff Parser, Filter & Modal Renderer
 // ============================================================================
 
-export type GitChangeBadge = "M" | "A" | "D" | "R" | "C" | "U" | "??";
+export type GitChangeBadge = "M" | "A" | "D" | "R" | "C" | "T" | "U" | "??";
 
 export interface GitChangedFile {
   status: GitChangeBadge;
@@ -31,6 +32,8 @@ export interface GitDiffModalState {
   diffUnified: string;
   files: GitChangedFile[];
   selectedFile: string | null;
+  isGitRepo: boolean;
+  repoRoot: string | null;
   loading: boolean;
   error: string | null;
   reqId: string | null;
@@ -45,10 +48,22 @@ export function createInitialGitDiffState(): GitDiffModalState {
     diffUnified: "",
     files: [],
     selectedFile: null,
+    isGitRepo: true,
+    repoRoot: null,
     loading: false,
     error: null,
     reqId: null,
   };
+}
+
+export function resolveGitDiffFileRoot(
+  repoRoot: string | null | undefined,
+  fallbackCwd: string
+): string {
+  const cleanRepo = String(repoRoot || "").trim();
+  if (cleanRepo) return cleanRepo;
+  const cleanCwd = String(fallbackCwd || "").trim();
+  return cleanCwd || ".";
 }
 
 function unquoteGitPath(raw: string): string {
@@ -70,12 +85,14 @@ function classifyStatusBadge(rawCode: string): GitChangeBadge {
   if (clean.includes("C")) return "C";
   if (clean.includes("A")) return "A";
   if (clean.includes("D")) return "D";
+  if (clean.includes("T")) return "T";
   return "M";
 }
 
 /**
- * Parses `git status --short` lines (e.g. ` M src/app.ts`, `A  new.ts`, `?? untracked.png`,
- * `R  old.ts -> new.ts`) into structured file descriptors for interactive filter pills.
+ * Parses `git status --short` / `--porcelain` lines (e.g. ` M src/app.ts`, `A  new.ts`,
+ * ` T symlink`, `?? untracked.png`, `R  old.ts -> new.ts`) into structured file descriptors.
+ * Only splits `" -> "` on `R`/`C` statuses so regular filenames containing `" -> "` stay intact.
  */
 export function parseGitStatusShort(statusShort: string): GitChangedFile[] {
   if (!statusShort) return [];
@@ -89,11 +106,11 @@ export function parseGitStatusShort(statusShort: string): GitChangedFile[] {
 
     let rawCode = "";
     let restPath = "";
-    if (line.length > 3 && /^[ MADRCU?!]{2}$/.test(line.slice(0, 2)) && line[2] === " ") {
+    if (line.length > 3 && /^[ MADRCTU?!]{2}$/.test(line.slice(0, 2)) && line[2] === " ") {
       rawCode = line.slice(0, 2);
       restPath = line.slice(3);
     } else {
-      const m = line.match(/^\s*([MADRCU?!]{1,2})\s+(.+)$/);
+      const m = line.match(/^\s*([MADRCTU?!]{1,2})\s+(.+)$/);
       if (!m) continue;
       rawCode = m[1];
       restPath = m[2];
@@ -101,7 +118,8 @@ export function parseGitStatusShort(statusShort: string): GitChangedFile[] {
 
     let origPath: string | null = null;
     let finalPath = "";
-    const arrowIdx = restPath.indexOf(" -> ");
+    const isRenameOrCopy = /[RC]/i.test(rawCode);
+    const arrowIdx = isRenameOrCopy ? restPath.indexOf(" -> ") : -1;
     if (arrowIdx >= 0) {
       origPath = unquoteGitPath(restPath.slice(0, arrowIdx));
       finalPath = unquoteGitPath(restPath.slice(arrowIdx + 4));
@@ -279,10 +297,17 @@ function badgeClassForGitStatus(st: GitChangeBadge): string {
     case "C":
       return "blue";
     case "M":
+    case "T":
       return "amber";
     case "??":
       return "";
   }
+}
+
+function extractDiffHeaderTargetPath(headerLine: string): string | null {
+  if (!headerLine.startsWith("diff --git ")) return null;
+  const m = headerLine.match(/^diff --git "?a\/(.+?)"? "?b\/(.+?)"?$/);
+  return m?.[2] ? unquoteGitPath(m[2]) : null;
 }
 
 export function renderGitDiffModal(
@@ -296,6 +321,14 @@ export function renderGitDiffModal(
   const selectedEntry = st.selectedFile
     ? st.files.find((f) => f.path === st.selectedFile)
     : undefined;
+  const canOpenSelectedFile = Boolean(
+    selectedEntry &&
+      selectedEntry.status !== "D" &&
+      !selectedEntry.path.endsWith("/")
+  );
+  const deletedPaths = new Set(
+    st.files.filter((f) => f.status === "D").map((f) => f.path)
+  );
   const filteredDiff = filterUnifiedDiffByFile(
     st.diffUnified,
     st.selectedFile,
@@ -303,7 +336,10 @@ export function renderGitDiffModal(
   );
   const fullStats = parseUnifiedDiffLines(st.diffUnified);
   const activeParsed = st.selectedFile ? parseUnifiedDiffLines(filteredDiff) : fullStats;
-  const branchLabel = st.branch.trim() || "HEAD";
+  const branchLabel = !st.isGitRepo
+    ? tr("Not a Git Repo", "非 Git 仓库")
+    : st.branch.trim() || "HEAD";
+  const branchBadgeCls = !st.isGitRepo ? "red" : "blue";
 
   return `
     <div class="modal-mask" id="git-diff-mask">
@@ -312,10 +348,17 @@ export function renderGitDiffModal(
           <div style="display:flex;align-items:center;gap:8px;min-width:0;flex-wrap:wrap;">
             ${svgIcon("gitBranch", 15)}
             <strong style="font-size:15px;">${tr("Remote Git Changes / Diff (E2EE)", "远端 Git 变更与 Diff 审查 (端到端加密)")}</strong>
-            <span class="pm-badge blue coda-mono">${escapeHtml(branchLabel)}</span>
+            <span class="pm-badge ${branchBadgeCls} coda-mono">${escapeHtml(branchLabel)}</span>
             <span class="pm-badge coda-mono"><span style="color:var(--emerald);">+${fullStats.added}</span>&nbsp;<span style="color:var(--rose);">-${fullStats.deleted}</span></span>
           </div>
           <div style="display:flex;align-items:center;gap:6px;">
+            ${
+              canOpenSelectedFile && selectedEntry
+                ? `<button id="btn-gd-open-selected" type="button" class="pm-btn pm-btn-secondary pm-btn-sm" data-gd-open-file="${escapeHtml(selectedEntry.path)}">
+                    ${tr("Open File", "打开文件")} &rarr;
+                  </button>`
+                : ""
+            }
             <button id="btn-refresh-git-diff" type="button" class="pm-btn pm-btn-secondary pm-btn-sm">
               ${st.loading ? tr("Refreshing…", "刷新中…") : tr("Refresh", "刷新")}
             </button>
@@ -323,20 +366,27 @@ export function renderGitDiffModal(
           </div>
         </div>
 
-        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:10px;">
-          <span style="font-size:11.5px;color:var(--text-tertiary);">${tr("Workspace:", "工作区：")}</span>
-          ${
-            uniqueRoots.length > 1
-              ? `<select id="gd-cwd-select" class="pm-input coda-mono" style="margin:0;width:auto;max-width:420px;height:30px;padding:0 8px;font-size:11.5px;">
-                  ${uniqueRoots
-                    .map(
-                      (r) =>
-                        `<option value="${escapeHtml(r)}" ${r === st.cwd ? "selected" : ""}>${escapeHtml(r)}</option>`
-                    )
-                    .join("")}
-                </select>`
-              : `<code class="coda-mono" style="font-size:11.5px;">${escapeHtml(st.cwd || "~")}</code>`
-          }
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;margin-bottom:10px;">
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+            <span style="font-size:11.5px;color:var(--text-tertiary);">${tr("Workspace:", "工作区：")}</span>
+            ${
+              uniqueRoots.length > 1
+                ? `<select id="gd-cwd-select" class="pm-input coda-mono" style="margin:0;width:auto;max-width:420px;height:30px;padding:0 8px;font-size:11.5px;">
+                    ${uniqueRoots
+                      .map(
+                        (r) =>
+                          `<option value="${escapeHtml(r)}" ${r === st.cwd ? "selected" : ""}>${escapeHtml(r)}</option>`
+                      )
+                      .join("")}
+                  </select>`
+                : `<code class="coda-mono" style="font-size:11.5px;">${escapeHtml(st.cwd || "~")}</code>`
+            }
+            ${
+              st.repoRoot && st.repoRoot !== st.cwd
+                ? `<span class="coda-mono" style="font-size:11px;color:var(--text-tertiary);">(${tr("root:", "仓库根：")} ${escapeHtml(st.repoRoot)})</span>`
+                : ""
+            }
+          </div>
         </div>
 
         ${
@@ -370,27 +420,53 @@ export function renderGitDiffModal(
             st.loading && activeParsed.lines.length === 0 && st.files.length === 0
               ? `<div style="padding:24px;text-align:center;font-size:12px;color:var(--text-tertiary);">${tr("Fetching encrypted Git status & unified diff…", "正在通过端到端加密通道拉取 Git 状态与统一 Diff…")}</div>`
               : activeParsed.lines.length === 0
-                ? `<div style="padding:24px;text-align:center;font-size:12px;color:var(--text-tertiary);">
-                    ${
-                      selectedEntry?.status === "??"
-                        ? tr(
-                            `Untracked file "${escapeHtml(selectedEntry.path)}" has no tracked diff hunks yet — open Remote Files to preview full content.`,
-                            `未跟踪新文件「${escapeHtml(selectedEntry.path)}」尚无 Git 索引对比块，可在「文件」面板直接预览完整源码。`
+                ? `<div style="padding:24px;text-align:center;font-size:12px;color:var(--text-tertiary);display:flex;flex-direction:column;align-items:center;gap:10px;">
+                    <div>${
+                      st.error || !st.isGitRepo
+                        ? escapeHtml(
+                            st.error ||
+                              tr(
+                                "Selected directory is not a Git repository or could not be inspected.",
+                                "所选目录不是 Git 仓库或无法读取 Git 状态。"
+                              )
                           )
-                        : st.files.length === 0
-                          ? tr("Working tree clean — no uncommitted Git changes.", "工作区干净，当前无未提交的 Git 变更。")
-                          : tr("No unified diff lines for the current selection.", "当前筛选条件下无统一 Diff 内容。")
+                        : selectedEntry?.status === "??"
+                          ? tr(
+                              `Untracked file "${escapeHtml(selectedEntry.path)}" has no text diff hunks — click Open File to inspect full source.`,
+                              `未跟踪文件「${escapeHtml(selectedEntry.path)}」无文本对比块，点击下方按钮即可直接预览完整源码。`
+                            )
+                          : st.files.length === 0
+                            ? tr("Working tree clean — no uncommitted Git changes.", "工作区干净，当前无未提交的 Git 变更。")
+                            : tr(
+                                "Changed entries have no text diff hunks (e.g. binary, mode-only, or directory) — select a file above to open it.",
+                                "当前变更项无文本 Diff 行（如二进制文件、权限变更或目录），可点击上方文件直接打开预览。"
+                              )
+                    }</div>
+                    ${
+                      canOpenSelectedFile && selectedEntry
+                        ? `<button type="button" class="pm-btn pm-btn-secondary pm-btn-sm" data-gd-open-file="${escapeHtml(selectedEntry.path)}">${tr("Open File", "打开文件")} &rarr;</button>`
+                        : ""
                     }
                   </div>`
                 : activeParsed.lines
-                    .map(
-                      (ln) => `
+                    .map((ln) => {
+                      const headerPath =
+                        ln.kind === "meta" ? extractDiffHeaderTargetPath(ln.text) : null;
+                      const showJump =
+                        Boolean(headerPath) &&
+                        !deletedPaths.has(headerPath!) &&
+                        !headerPath!.endsWith("/");
+                      return `
                 <div class="gd-row gd-${ln.kind}">
                   <span class="gd-ln">${ln.oldLine !== null ? ln.oldLine : ""}</span>
                   <span class="gd-ln">${ln.newLine !== null ? ln.newLine : ""}</span>
-                  <span class="gd-code">${escapeHtml(ln.text)}</span>
-                </div>`
-                    )
+                  <span class="gd-code" style="display:flex;align-items:center;justify-content:space-between;gap:10px;"><span>${escapeHtml(ln.text)}</span>${
+                        showJump
+                          ? `<button type="button" class="pm-btn pm-btn-ghost pm-btn-sm" data-gd-open-file="${escapeHtml(headerPath!)}" style="height:20px;padding:0 7px;font-size:10.5px;">${tr("Open File", "打开文件")} &rarr;</button>`
+                          : ""
+                      }</span>
+                </div>`;
+                    })
                     .join("")
           }
         </div>
@@ -423,11 +499,120 @@ export function formatUploadedPathForPty(remotePath: string): string {
   return `${shellEscapePath(remotePath)} `;
 }
 
+export function resolveClipboardImageExtension(
+  mimeType?: string | null,
+  originalName?: string | null
+): string {
+  const cleanMime = String(mimeType || "")
+    .split(";")[0]
+    .trim()
+    .toLowerCase();
+  switch (cleanMime) {
+    case "image/jpeg":
+    case "image/jpg":
+      return "jpg";
+    case "image/webp":
+      return "webp";
+    case "image/gif":
+      return "gif";
+    case "image/png":
+      return "png";
+    case "image/svg+xml":
+      return "svg";
+    case "image/bmp":
+      return "bmp";
+    case "image/avif":
+      return "avif";
+    case "image/heic":
+      return "heic";
+    case "image/heif":
+      return "heif";
+  }
+
+  const nameMatch = String(originalName || "")
+    .trim()
+    .match(/\.([A-Za-z0-9]+)$/);
+  if (nameMatch) {
+    const ext = nameMatch[1].toLowerCase();
+    if (ext === "jpeg" || ext === "jpg") return "jpg";
+    if (
+      ext === "webp" ||
+      ext === "gif" ||
+      ext === "png" ||
+      ext === "svg" ||
+      ext === "bmp" ||
+      ext === "avif" ||
+      ext === "heic" ||
+      ext === "heif"
+    ) {
+      return ext;
+    }
+  }
+  return "png";
+}
+
 /**
- * Generates deterministic `clipboard-<timestamp>.png` filenames for pasted screenshot blobs.
+ * Generates deterministic `clipboard-<timestamp>.<ext>` filenames matching actual image MIME bytes.
  */
-export function buildClipboardImageFilename(nowMs = Date.now(), seq = 0): string {
-  return seq > 0 ? `clipboard-${nowMs}-${seq}.png` : `clipboard-${nowMs}.png`;
+export function buildClipboardImageFilename(
+  nowMs = Date.now(),
+  seq = 0,
+  mimeType?: string | null,
+  originalName?: string | null
+): string {
+  const ext = resolveClipboardImageExtension(mimeType, originalName);
+  return seq > 0 ? `clipboard-${nowMs}-${seq}.${ext}` : `clipboard-${nowMs}.${ext}`;
+}
+
+export interface ClipboardDataLike {
+  getData?: (format: string) => string;
+  items?: ArrayLike<{
+    kind?: string;
+    type?: string;
+    getAsFile?: () => File | Blob | null;
+  }> | null;
+  files?: ArrayLike<File | Blob> | null;
+}
+
+/**
+ * Extracts pasted image blobs ONLY when `text/plain` is empty, preventing rich-text apps
+ * (Excel, Numbers, Word, Keynote, macOS Notes) that place BOTH `text/plain` and `image/png`
+ * on the clipboard from losing copied text.
+ */
+export function extractPureClipboardImages(
+  clipboardData: ClipboardDataLike | null | undefined
+): Array<File | Blob> {
+  if (!clipboardData) return [];
+  const plainText =
+    String(clipboardData.getData?.("text/plain") || "") ||
+    String(clipboardData.getData?.("text") || "");
+  if (plainText.length > 0) {
+    return [];
+  }
+
+  const out: Array<File | Blob> = [];
+  const items = clipboardData.items;
+  if (items && items.length > 0) {
+    for (let i = 0; i < items.length; i += 1) {
+      const item = items[i];
+      if (item && item.kind === "file" && String(item.type || "").toLowerCase().startsWith("image/")) {
+        const blob = item.getAsFile?.();
+        if (blob) out.push(blob);
+      }
+    }
+    if (out.length > 0) return out;
+  }
+
+  const files = clipboardData.files;
+  if (files && files.length > 0) {
+    for (let i = 0; i < files.length; i += 1) {
+      const f = files[i];
+      if (f && String(f.type || "").toLowerCase().startsWith("image/")) {
+        out.push(f);
+      }
+    }
+  }
+  return out;
 }
 
 // ============================================================================
@@ -502,15 +687,72 @@ export function renderNeedsYouCapsuleBar(
   `;
 }
 
+const KNOWN_TUI_AGENT_NAMES = new Set([
+  "claude",
+  "claude-code",
+  "codex",
+  "grok",
+  "agy",
+  "antigravity",
+  "gemini",
+  "aider",
+  "opencode",
+  "goose",
+]);
+
+export function isKnownTuiAgentTerminal(term?: HerdrTerminal | null): boolean {
+  if (!term) return false;
+  const app = String(term.status?.app || "")
+    .trim()
+    .toLowerCase();
+  if (app && KNOWN_TUI_AGENT_NAMES.has(app)) return true;
+
+  const argv0 = String(term.argv?.[0] || "")
+    .trim()
+    .split(/[\\/]/)
+    .pop()
+    ?.toLowerCase();
+  if (argv0 && KNOWN_TUI_AGENT_NAMES.has(argv0)) return true;
+
+  const rawName = String(term.name || "")
+    .trim()
+    .toLowerCase();
+  if (rawName && KNOWN_TUI_AGENT_NAMES.has(rawName)) return true;
+  return false;
+}
+
+export function resolveEffectiveBracketedPaste(opts: {
+  bracketedPaste?: boolean;
+  bracketedPasteExplicit?: boolean | null;
+  term?: HerdrTerminal | null;
+}): boolean {
+  // If `\x1b[?2004l` was explicitly emitted, strictly honor disabled bracketed paste.
+  if (opts.bracketedPasteExplicit === false) return false;
+  if (opts.bracketedPaste) return true;
+  if (isKnownTuiAgentTerminal(opts.term)) return true;
+  return false;
+}
+
 /**
  * Encodes multi-line Prompt Composer text into a sanitized Bracketed Paste sequence + trailing CR (`\r`).
- * Strips any literal `\x1b[201~` inside `text` so pasted content cannot break out of bracketed paste early.
+ * Iteratively strips any `\x1b[200~` / `\x1b[201~` markers so nested `\x1b[\x1b[201~201~` cannot break out.
  */
 export function encodeComposerBracketedPasteSubmit(text: string): string {
+  return `\x1b[200~${sanitizeBracketedPasteText(text)}\x1b[201~\r`;
+}
+
+/**
+ * Encodes Prompt Composer submission: wraps in `?2004h` bracketed paste when enabled,
+ * or falls back to clean normalized `\n` + trailing `\r` for plain shells/REPLs (`/bin/sh`, `python`, `psql`).
+ */
+export function encodeComposerSubmit(text: string, useBracketedPaste: boolean): string {
+  if (useBracketedPaste) {
+    return encodeComposerBracketedPasteSubmit(text);
+  }
   const normalized = String(text || "")
     .replace(/\r\n/g, "\n")
-    .replace(/\x1b\[201~/g, "");
-  return `\x1b[200~${normalized}\x1b[201~\r`;
+    .replace(/[\r\n]+$/, "");
+  return `${normalized}\r`;
 }
 
 export function renderPromptComposerPanel(opts: {
@@ -520,11 +762,16 @@ export function renderPromptComposerPanel(opts: {
   isTranscribingVoice: boolean;
   hasSpeechFallback: boolean;
   hasWhisperKey: boolean;
+  useBracketedPaste?: boolean;
   tr: (en: string, zh: string) => string;
 }): string {
   if (!opts.open) return "";
   const { tr } = opts;
   const micBtnClass = opts.isRecordingVoice ? "is-recording" : "";
+  const modeBadge =
+    opts.useBracketedPaste === false
+      ? tr("Direct Stdin", "标准输入")
+      : "Bracketed Paste";
   const voiceHint = opts.isTranscribingVoice
     ? tr("Transcribing…", "转写中…")
     : opts.isRecordingVoice
@@ -540,7 +787,7 @@ export function renderPromptComposerPanel(opts: {
       <div class="composer-head">
         <div style="display:flex;align-items:center;gap:8px;min-width:0;">
           <strong style="font-size:12.5px;">${tr("Prompt Composer", "多行 Prompt 编排器")}</strong>
-          <span class="pm-badge coda-mono" style="height:19px;font-size:10px;">Bracketed Paste</span>
+          <span class="pm-badge coda-mono" style="height:19px;font-size:10px;">${escapeHtml(modeBadge)}</span>
         </div>
         <div style="display:flex;align-items:center;gap:6px;">
           <span class="coda-mono" style="font-size:10.5px;color:var(--text-tertiary);">${tr("⌘/Ctrl+Enter to send", "⌘/Ctrl+Enter 发送")}</span>
@@ -654,7 +901,7 @@ export function renderNeedsAttentionSidebarSection(
           <span>${tr("Needs Attention", "Needs Attention · 待审批")}</span>
           <span class="pm-badge amber coda-mono" style="height:18px;padding:0 6px;font-size:10.5px;">${items.length}</span>
         </span>
-        <span class="pm-kbd" title="${tr("Jump to next Needs-You terminal (⌘J / Alt+J)", "跳转至下一个待审批终端 (⌘J / Alt+J)")}">⌘J</span>
+        <span class="pm-kbd" title="${tr("Jump to next Needs-You terminal (⌘J / Ctrl+Shift+J)", "跳转至下一个待审批终端 (⌘J / Ctrl+Shift+J)")}">⌘J</span>
       </div>
       <div style="display:flex;flex-direction:column;gap:5px;margin-top:7px;">
         ${items
@@ -687,19 +934,66 @@ export function resolveVoiceCaptureStrategy(opts: {
   isSafeBaseUrl: boolean;
   hasMediaRecorder: boolean;
   hasSpeechRecognition: boolean;
-}): "whisper" | "browser_speech" | "unavailable" {
+  hasOnlineDaemon?: boolean;
+}): "whisper" | "daemon_whisper" | "browser_speech" | "unavailable" {
   const cleanKey = String(opts.apiKey || "").trim();
-  const hasRealKey = Boolean(cleanKey && !cleanKey.startsWith("••"));
+  const isRedactedHostKey = cleanKey.startsWith("••");
+  const hasRealKey = Boolean(cleanKey && !isRedactedHostKey);
   if (hasRealKey && opts.isSafeBaseUrl && opts.hasMediaRecorder) {
     return "whisper";
   }
-  if (!hasRealKey && opts.hasSpeechRecognition) {
-    return "browser_speech";
+  if (isRedactedHostKey && opts.hasMediaRecorder && (opts.hasOnlineDaemon ?? true)) {
+    return "daemon_whisper";
   }
   if (opts.hasSpeechRecognition) {
     return "browser_speech";
   }
   return "unavailable";
+}
+
+export interface SpeechResultItemLike {
+  isFinal?: boolean;
+  0?: { transcript?: string };
+  length?: number;
+}
+
+/**
+ * Rebuilds the complete SpeechRecognition transcript from `ev.results[0 .. length - 1]` on each event
+ * without accumulating across events, preventing exponential duplication on Safari/iOS WebKit where
+ * `ev.resultIndex` stays `0` across subsequent interim/final ticks.
+ */
+export function rebuildSpeechRecognitionTranscript(
+  results: ArrayLike<SpeechResultItemLike> | null | undefined
+): { finalText: string; interimText: string; combined: string } {
+  if (!results || typeof results.length !== "number") {
+    return { finalText: "", interimText: "", combined: "" };
+  }
+  const finals: string[] = [];
+  const interims: string[] = [];
+  for (let i = 0; i < results.length; i += 1) {
+    const item = results[i];
+    const chunk = String(item?.[0]?.transcript || "").trim();
+    if (!chunk) continue;
+    if (item?.isFinal) {
+      finals.push(chunk);
+    } else {
+      interims.push(chunk);
+    }
+  }
+  const finalText = finals.join(" ").trim();
+  const interimText = interims.join(" ").trim();
+  const combined = `${finalText} ${interimText}`.trim();
+  return { finalText, interimText, combined };
+}
+
+export function stepPaletteSelectionIndex(
+  currentIdx: number,
+  totalCount: number,
+  delta: 1 | -1
+): number {
+  if (totalCount <= 0) return 0;
+  const clamped = Math.max(0, Math.min(totalCount - 1, currentIdx | 0));
+  return ((clamped + delta) % totalCount + totalCount) % totalCount;
 }
 
 // ============================================================================
@@ -815,16 +1109,86 @@ export function validateGitCloneUrlClient(rawUrl: string): string | null {
 export function suggestFolderNameFromGitUrl(rawUrl: string): string {
   const trimmed = String(rawUrl || "").trim().replace(/\/+$/, "");
   if (!trimmed) return "";
-  const lastColon = trimmed.startsWith("git@") ? trimmed.split(":").pop() || "" : trimmed;
-  const base = (lastColon.split("/").pop() || "").replace(/\.git$/i, "").trim();
+
+  let pathPart = "";
+  if (/^(https?|ssh):\/\//i.test(trimmed)) {
+    const schemeEnd = trimmed.indexOf("://");
+    const afterScheme = trimmed.slice(schemeEnd + 3);
+    const slashIdx = afterScheme.indexOf("/");
+    if (slashIdx < 0) return "";
+    pathPart = afterScheme.slice(slashIdx + 1);
+  } else if (trimmed.startsWith("git@")) {
+    const colonIdx = trimmed.indexOf(":");
+    if (colonIdx < 0) return "";
+    pathPart = trimmed.slice(colonIdx + 1);
+  } else {
+    // Incomplete scheme prefix while user is still typing "h", "ht", "https:", "git", etc.
+    if (!trimmed.includes("/")) return "";
+    pathPart = trimmed;
+  }
+
+  const base = (pathPart.split("/").pop() || "").replace(/\.git$/i, "").trim();
   if (!base || validateSingleFolderName(base) !== null) return "";
   return base;
+}
+
+export function computeBootstrapAutoFolder(
+  gitUrl: string,
+  currentFolder: string,
+  manuallyEdited: boolean
+): string {
+  if (manuallyEdited) return currentFolder;
+  return suggestFolderNameFromGitUrl(gitUrl);
 }
 
 export function parentAbsolutePath(absPath: string): string {
   const clean = String(absPath || "").trim().replace(/\/+$/, "");
   if (!clean || clean === "/") return "/";
+  if (clean.startsWith("~/")) {
+    const idx = clean.lastIndexOf("/");
+    return idx <= 1 ? "~" : clean.slice(0, idx);
+  }
   const idx = clean.lastIndexOf("/");
   if (idx <= 0) return "/";
   return clean.slice(0, idx);
+}
+
+export function resolveSpawnPickerInitialRoot(opts: {
+  rootOverride?: string;
+  spawnCwd?: string;
+  activeTermCwd?: string;
+  firstRepoRoot?: string;
+}): string {
+  return (
+    String(opts.rootOverride || "").trim() ||
+    String(opts.spawnCwd || "").trim() ||
+    String(opts.activeTermCwd || "").trim() ||
+    String(opts.firstRepoRoot || "").trim() ||
+    "~"
+  );
+}
+
+export function canStepUpSpawnDirectory(rootPath: string, subPath: string): boolean {
+  if (Boolean(String(subPath || "").replace(/^\/+|\/+$/g, ""))) return true;
+  const cleanRoot = String(rootPath || "").trim().replace(/\/+$/, "");
+  if (cleanRoot.startsWith("/") && cleanRoot !== "") return true;
+  if (cleanRoot.startsWith("~/") && cleanRoot !== "~") return true;
+  return false;
+}
+
+export function collectPrunableVtKeys(
+  vtKeys: Iterable<string>,
+  peerId: string,
+  keepAddrs: ReadonlySet<string>
+): string[] {
+  const prefix = `${peerId}:`;
+  const stale: string[] = [];
+  for (const key of vtKeys) {
+    if (!key.startsWith(prefix)) continue;
+    const addr = key.slice(prefix.length);
+    if (!keepAddrs.has(addr)) {
+      stale.push(key);
+    }
+  }
+  return stale;
 }

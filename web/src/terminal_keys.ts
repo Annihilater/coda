@@ -97,6 +97,37 @@ export function encodeTerminalKeyEvent(
   }
 }
 
+export function sanitizeBracketedPasteText(raw: string): string {
+  let s = String(raw || "").replace(/\r\n/g, "\n");
+  while (
+    s.includes("\x1b[200~") ||
+    s.includes("\x1b[201~") ||
+    s.includes("\x9b200~") ||
+    s.includes("\x9b201~")
+  ) {
+    s = s
+      .replace(/\x1b\[200~/g, "")
+      .replace(/\x1b\[201~/g, "")
+      .replace(/\x9b200~/g, "")
+      .replace(/\x9b201~/g, "");
+  }
+  return s;
+}
+
 export function wrapBracketedPaste(text: string, bracketedPaste: boolean): string {
-  return bracketedPaste ? `\x1b[200~${text}\x1b[201~` : text;
+  if (bracketedPaste) {
+    return `\x1b[200~${sanitizeBracketedPasteText(text)}\x1b[201~`;
+  }
+  return String(text || "").replace(/\r\n/g, "\n");
+}
+
+/**
+ * Matches `⌘J` (macOS) or `Ctrl+Shift+J` (Linux/Windows) for jumping to the next Needs-You session,
+ * intentionally NOT hijacking `Alt+J` / `Option+J` so Emacs/tmux Meta-j (`\x1bj`) and macOS `∆` work.
+ */
+export function isJumpNeedsYouShortcut(e: TerminalKeyEventLike): boolean {
+  if (String(e.key || "").toLowerCase() !== "j") return false;
+  if (e.metaKey && !e.altKey && !e.ctrlKey && !e.shiftKey) return true;
+  if (e.ctrlKey && e.shiftKey && !e.altKey && !e.metaKey) return true;
+  return false;
 }

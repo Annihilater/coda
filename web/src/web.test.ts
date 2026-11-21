@@ -26,7 +26,12 @@ import {
   type VtDomContainerLike,
   type VtRowNodeLike,
 } from "./vt";
-import { encodeTerminalKeyEvent, wrapBracketedPaste } from "./terminal_keys";
+import {
+  encodeTerminalKeyEvent,
+  isJumpNeedsYouShortcut,
+  sanitizeBracketedPasteText,
+  wrapBracketedPaste,
+} from "./terminal_keys";
 import { TerminalNotificationTracker, isNeedsYouState } from "./notify";
 import { SmartPathBackoffPolicy, collectDirectWsCandidates } from "./smart_path";
 import {
@@ -45,29 +50,43 @@ import {
 import {
   createInitialPortPreviewState,
   decodePortPreviewBody,
+  decodePortPreviewPayload,
+  detectClientRenderedSpaHtml,
   parseWebPreviewPortAndPath,
   renderPortPreviewModal,
 } from "./port_preview";
 import {
   APPROVAL_CAPSULE_ITEMS,
   buildClipboardImageFilename,
+  canStepUpSpawnDirectory,
   collectNeedsAttentionItems,
+  collectPrunableVtKeys,
+  computeBootstrapAutoFolder,
   createDefaultNotificationSettings,
   createInitialGitDiffState,
   encodeApprovalActionBytes,
   encodeComposerBracketedPasteSubmit,
+  encodeComposerSubmit,
+  extractPureClipboardImages,
   filterUnifiedDiffByFile,
   formatUploadedPathForPty,
+  isKnownTuiAgentTerminal,
   parentAbsolutePath,
   parseGitStatusShort,
   parseUnifiedDiffLines,
   pickNextNeedsAttentionItem,
+  rebuildSpeechRecognitionTranscript,
   renderGitDiffModal,
   renderNeedsAttentionSidebarSection,
   renderNeedsYouCapsuleBar,
   renderPromptComposerPanel,
+  resolveClipboardImageExtension,
+  resolveEffectiveBracketedPaste,
+  resolveGitDiffFileRoot,
+  resolveSpawnPickerInitialRoot,
   resolveVoiceCaptureStrategy,
   shellEscapePath,
+  stepPaletteSelectionIndex,
   suggestFolderNameFromGitUrl,
   validateGitCloneUrlClient,
   validateNotificationWebhookSettings,
@@ -1005,6 +1024,16 @@ describe("v0.9.0 Git Diff Review Modal, Clipboard Screenshot Upload, Prompt Comp
         isSafeBaseUrl: true,
         hasMediaRecorder: true,
         hasSpeechRecognition: true,
+        hasOnlineDaemon: true,
+      })
+    ).toBe("daemon_whisper");
+    expect(
+      resolveVoiceCaptureStrategy({
+        apiKey: "••••••••",
+        isSafeBaseUrl: true,
+        hasMediaRecorder: true,
+        hasSpeechRecognition: true,
+        hasOnlineDaemon: false,
       })
     ).toBe("browser_speech");
     expect(
@@ -1087,5 +1116,414 @@ describe("v0.9.0 Git Diff Review Modal, Clipboard Screenshot Upload, Prompt Comp
         telegram_chat_id: "998877",
       })
     ).toBeNull();
+  });
+});
+
+describe("v1.0.0 Web Console Bug Fixes & UX Hardening", () => {
+  test("P0 Bug #1: extractPureClipboardImages ignores rich text+bitmap (Excel/Numbers/Word) and derives true image extensions", () => {
+    const fakePngBlob = new Blob([new Uint8Array([137, 80, 78, 71])], { type: "image/png" });
+    const fakeJpegBlob = new Blob([new Uint8Array([0xff, 0xd8, 0xff])], { type: "image/jpeg" });
+
+    // Rich copy from Excel / Numbers / Word / Notes contains BOTH text/plain AND image/png
+    const richClipboard = {
+      getData: (fmt: string) => (fmt === "text/plain" ? "cellA\tcellB\n100\t200" : ""),
+      items: [
+        { kind: "string", type: "text/plain" },
+        { kind: "file", type: "image/png", getAsFile: () => fakePngBlob },
+      ],
+      files: [fakePngBlob],
+    };
+    expect(extractPureClipboardImages(richClipboard)).toEqual([]);
+
+    // Pure screenshot paste has empty text/plain and returns the image blob(s)
+    const screenshotClipboard = {
+      getData: () => "",
+      items: [{ kind: "file", type: "image/jpeg", getAsFile: () => fakeJpegBlob }],
+      files: [],
+    };
+    expect(extractPureClipboardImages(screenshotClipboard)).toEqual([fakeJpegBlob]);
+
+    // Files fallback when items is empty
+    const filesOnlyClipboard = {
+      getData: () => "",
+      items: [],
+      files: [fakePngBlob],
+    };
+    expect(extractPureClipboardImages(filesOnlyClipboard)).toEqual([fakePngBlob]);
+
+    // True MIME / filename extension derivation instead of hardcoded .png
+    expect(resolveClipboardImageExtension("image/jpeg")).toBe("jpg");
+    expect(resolveClipboardImageExtension("image/webp; charset=binary")).toBe("webp");
+    expect(resolveClipboardImageExtension("image/gif")).toBe("gif");
+    expect(resolveClipboardImageExtension("image/png")).toBe("png");
+    expect(resolveClipboardImageExtension("", "photo.JPEG")).toBe("jpg");
+    expect(resolveClipboardImageExtension("", "anim.webp")).toBe("webp");
+    expect(buildClipboardImageFilename(1700000000999, 0, "image/jpeg")).toBe(
+      "clipboard-1700000000999.jpg"
+    );
+    expect(buildClipboardImageFilename(1700000000999, 2, "image/webp")).toBe(
+      "clipboard-1700000000999-2.webp"
+    );
+  });
+
+  test("P0 Bug #2: WebVtTerminal.loadSnapshot preserves ?2004h, iterative escape stripping blocks nested breakout & smart composer fallback", () => {
+    const vt = new WebVtTerminal(80, 24);
+    expect(vt.bracketedPaste).toBe(false);
+    expect(vt.bracketedPasteExplicit).toBeNull();
+
+    vt.feedText("\x1b[?2004h\x1b[?1h");
+    expect(vt.bracketedPaste).toBe(true);
+    expect(vt.bracketedPasteExplicit).toBe(true);
+    expect(vt.appCursorKeys).toBe(true);
+
+    // Loading a plain screen snapshot MUST preserve existing ?2004h & ?1h modes
+    vt.loadSnapshot("claude > ready for prompt\n");
+    expect(vt.bracketedPaste).toBe(true);
+    expect(vt.bracketedPasteExplicit).toBe(true);
+    expect(vt.appCursorKeys).toBe(true);
+
+    // Explicit \x1b[?2004l disables bracketed paste and records explicit=false
+    vt.feedText("\x1b[?2004l");
+    expect(vt.bracketedPaste).toBe(false);
+    expect(vt.bracketedPasteExplicit).toBe(false);
+    vt.loadSnapshot("$ ");
+    expect(vt.bracketedPaste).toBe(false);
+    expect(vt.bracketedPasteExplicit).toBe(false);
+
+    // Nested \x1b[\x1b[201~201~ and 8-bit CSI \x9b201~ cannot reconstruct a breakout sequence
+    const nestedEvil = "safe\x1b[\x1b[201~201~;touch /tmp/pwn\x9b\x9b200~200~end";
+    const sanitized = sanitizeBracketedPasteText(nestedEvil);
+    expect(sanitized).not.toContain("\x1b[201~");
+    expect(sanitized).not.toContain("\x1b[200~");
+    expect(sanitized).not.toContain("\x9b201~");
+    expect(sanitized).not.toContain("\x9b200~");
+    expect(wrapBracketedPaste(nestedEvil, true)).toBe(`\x1b[200~${sanitized}\x1b[201~`);
+    expect(encodeComposerBracketedPasteSubmit(nestedEvil)).toBe(`\x1b[200~${sanitized}\x1b[201~\r`);
+
+    // Smart composer mode: TUI agents default to bracketed paste unless ?2004l was explicitly sent; plain /bin/sh uses clean stdin
+    const claudeTerm = {
+      address: "t-claude",
+      name: "claude",
+      argv: ["claude"],
+      cwd: "/repo",
+      alive: true,
+      status: { state: "idle", app: "claude" },
+    };
+    const shTerm = {
+      address: "t-sh",
+      name: "shell",
+      argv: ["/bin/sh"],
+      cwd: "/repo",
+      alive: true,
+      status: { state: "idle" },
+    };
+    expect(isKnownTuiAgentTerminal(claudeTerm)).toBe(true);
+    expect(isKnownTuiAgentTerminal(shTerm)).toBe(false);
+    expect(
+      resolveEffectiveBracketedPaste({
+        bracketedPaste: false,
+        bracketedPasteExplicit: null,
+        term: claudeTerm,
+      })
+    ).toBe(true);
+    expect(
+      resolveEffectiveBracketedPaste({
+        bracketedPaste: false,
+        bracketedPasteExplicit: false,
+        term: claudeTerm,
+      })
+    ).toBe(false);
+    expect(
+      resolveEffectiveBracketedPaste({
+        bracketedPaste: false,
+        bracketedPasteExplicit: null,
+        term: shTerm,
+      })
+    ).toBe(false);
+
+    // Plain shell fallback never emits raw ^[[200~ garbage
+    expect(encodeComposerSubmit("echo 1\r\necho 2\n", false)).toBe("echo 1\necho 2\r");
+    expect(encodeComposerSubmit("echo 1\r\necho 2", true)).toBe("\x1b[200~echo 1\necho 2\x1b[201~\r");
+  });
+
+  test("P1 Bug #3 & UX Gap #3: Safari SpeechRecognition deduplication & E2EE daemon-proxied transcribe_audio wire contract", () => {
+    // Simulate Safari webkitSpeechRecognition firing multiple events with resultIndex=0
+    const tick1 = [{ isFinal: false, 0: { transcript: "hello" }, length: 1 }];
+    const tick2 = [{ isFinal: true, 0: { transcript: "hello world" }, length: 1 }];
+    const tick3 = [
+      { isFinal: true, 0: { transcript: "hello world" }, length: 1 },
+      { isFinal: false, 0: { transcript: "run cargo test" }, length: 1 },
+    ];
+    const tick4 = [
+      { isFinal: true, 0: { transcript: "hello world" }, length: 1 },
+      { isFinal: true, 0: { transcript: "run cargo test" }, length: 1 },
+    ];
+
+    const baseDraft = "Please ";
+    expect(`${baseDraft}${rebuildSpeechRecognitionTranscript(tick1).combined}`).toBe("Please hello");
+    expect(`${baseDraft}${rebuildSpeechRecognitionTranscript(tick2).combined}`).toBe(
+      "Please hello world"
+    );
+    expect(`${baseDraft}${rebuildSpeechRecognitionTranscript(tick3).combined}`).toBe(
+      "Please hello world run cargo test"
+    );
+    expect(`${baseDraft}${rebuildSpeechRecognitionTranscript(tick4).combined}`).toBe(
+      "Please hello world run cargo test"
+    );
+
+    // E2EE round-trip for transcribe_audio / transcribe_audio_result
+    const client = makeTestIdentity("web");
+    const daemon = makeTestIdentity("host");
+    const auth = createRelaySessionAuth(client, "c-v1", "d-v1");
+    const sClient = BrowserE2EESession.deriveRelayV2({
+      myStaticSecretB64: client.x25519SecretB64,
+      peerStaticPublicB64: daemon.x25519PublicB64,
+      sessionNonceB64: auth.session_nonce_b64,
+      clientDeviceId: "c-v1",
+      daemonDeviceId: "d-v1",
+      isInitiator: true,
+    });
+    const sDaemon = BrowserE2EESession.deriveRelayV2({
+      myStaticSecretB64: daemon.x25519SecretB64,
+      peerStaticPublicB64: client.x25519PublicB64,
+      sessionNonceB64: auth.session_nonce_b64,
+      clientDeviceId: "c-v1",
+      daemonDeviceId: "d-v1",
+      isInitiator: false,
+    });
+
+    const req = sDaemon.openMessage(
+      sClient.sealMessage({
+        op: "transcribe_audio",
+        req_id: "tr-42",
+        audio_b64: toB64(new Uint8Array([1, 2, 3, 4])),
+        mime_type: "audio/webm",
+        filename: "voice.webm",
+        language: "zh",
+      })
+    );
+    expect(req.op).toBe("transcribe_audio");
+    expect(req.req_id).toBe("tr-42");
+    expect(req.filename).toBe("voice.webm");
+
+    const res = sClient.openMessage(
+      sDaemon.sealMessage({
+        op: "transcribe_audio_result",
+        req_id: "tr-42",
+        ok: true,
+        text: "查看当前分支状态",
+        error: null,
+      })
+    );
+    expect(res).toEqual({
+      op: "transcribe_audio_result",
+      req_id: "tr-42",
+      ok: true,
+      text: "查看当前分支状态",
+      error: null,
+    });
+  });
+
+  test("P1 Bug #4: Workspace Bootstrapper keystroke-by-keystroke auto-fill & manual-edit lock", () => {
+    const url = "https://github.com/org/repo.git";
+    let folder = "";
+    const manual = false;
+
+    for (let i = 1; i <= url.length; i += 1) {
+      const typed = url.slice(0, i);
+      folder = computeBootstrapAutoFolder(typed, folder, manual);
+    }
+    expect(folder).toBe("repo");
+
+    // Partial scheme / host alone does not freeze folder on "h" or "github.com"
+    expect(suggestFolderNameFromGitUrl("h")).toBe("");
+    expect(suggestFolderNameFromGitUrl("https://")).toBe("");
+    expect(suggestFolderNameFromGitUrl("https://github.com")).toBe("");
+    expect(suggestFolderNameFromGitUrl("https://github.com/org/my-service.git")).toBe("my-service");
+
+    // Manual edit locks custom folder name until cleared
+    expect(
+      computeBootstrapAutoFolder("https://github.com/org/other-repo.git", "custom-dir", true)
+    ).toBe("custom-dir");
+    expect(computeBootstrapAutoFolder("https://github.com/org/other-repo.git", "", false)).toBe(
+      "other-repo"
+    );
+  });
+
+  test("P1 Bug #5 & UX Gap #4: Jump-Needs-You shortcut avoids Alt+J hijack & Command Palette arrow cycling", () => {
+    // ⌘J and Ctrl+Shift+J trigger Jump-Needs-You
+    expect(
+      isJumpNeedsYouShortcut({
+        key: "j",
+        code: "KeyJ",
+        metaKey: true,
+        ctrlKey: false,
+        altKey: false,
+        shiftKey: false,
+      })
+    ).toBe(true);
+    expect(
+      isJumpNeedsYouShortcut({
+        key: "J",
+        code: "KeyJ",
+        metaKey: false,
+        ctrlKey: true,
+        altKey: false,
+        shiftKey: true,
+      })
+    ).toBe(true);
+
+    // Alt+J / Option+J (macOS '∆' / Emacs / tmux M-j) and Ctrl+J (LF) MUST NOT be hijacked!
+    expect(
+      isJumpNeedsYouShortcut({
+        key: "∆",
+        code: "KeyJ",
+        metaKey: false,
+        ctrlKey: false,
+        altKey: true,
+        shiftKey: false,
+      })
+    ).toBe(false);
+    expect(
+      isJumpNeedsYouShortcut({
+        key: "j",
+        code: "KeyJ",
+        metaKey: false,
+        ctrlKey: false,
+        altKey: true,
+        shiftKey: false,
+      })
+    ).toBe(false);
+    expect(
+      isJumpNeedsYouShortcut({
+        key: "j",
+        code: "KeyJ",
+        metaKey: false,
+        ctrlKey: true,
+        altKey: false,
+        shiftKey: false,
+      })
+    ).toBe(false);
+
+    // Alt+J encodes cleanly as ESC + j for terminal apps (Emacs / bash / zsh / tmux)
+    expect(
+      encodeTerminalKeyEvent(
+        {
+          key: "j",
+          code: "KeyJ",
+          altKey: true,
+          ctrlKey: false,
+          metaKey: false,
+          shiftKey: false,
+        },
+        { appCursorKeys: false, imeComposing: false }
+      )
+    ).toBe("\x1bj");
+
+    // ⌘K palette selection wraps cleanly on ArrowUp / ArrowDown
+    expect(stepPaletteSelectionIndex(0, 5, 1)).toBe(1);
+    expect(stepPaletteSelectionIndex(4, 5, 1)).toBe(0);
+    expect(stepPaletteSelectionIndex(0, 5, -1)).toBe(4);
+    expect(stepPaletteSelectionIndex(0, 0, 1)).toBe(0);
+  });
+
+  test("P1 Bug #8 & #9: ~ Spawn Picker root, Up navigation, dead vtTerminals pruning & Git Diff error/T-status/Open-File", () => {
+    expect(resolveSpawnPickerInitialRoot({ spawnCwd: "~" })).toBe("~");
+    expect(resolveSpawnPickerInitialRoot({ spawnCwd: "~/projects/coda" })).toBe("~/projects/coda");
+    expect(resolveSpawnPickerInitialRoot({ spawnCwd: "", activeTermCwd: "" })).toBe("~");
+
+    expect(canStepUpSpawnDirectory("~", "")).toBe(false);
+    expect(canStepUpSpawnDirectory("~", "projects")).toBe(true);
+    expect(canStepUpSpawnDirectory("~/projects", "")).toBe(true);
+    expect(canStepUpSpawnDirectory("/", "")).toBe(false);
+    expect(canStepUpSpawnDirectory("/Users/alice", "")).toBe(true);
+    expect(parentAbsolutePath("~/projects/coda")).toBe("~/projects");
+    expect(parentAbsolutePath("~/projects")).toBe("~");
+
+    // Dead VT session pruning keeps only live/open terminals for the target peer
+    const allKeys = ["peerA:t1", "peerA:t2-dead", "peerA:t3-sec", "peerB:other"];
+    const stale = collectPrunableVtKeys(allKeys, "peerA", new Set(["t1", "t3-sec"]));
+    expect(stale).toEqual(["peerA:t2-dead"]);
+
+    // Git status T (typechange) and safe ' -> ' splitting only on R/C
+    const statusParsed = parseGitStatusShort(
+      [
+        " T scripts/link-tool",
+        ' M "docs/a -> b.md"',
+        '?? "notes/x -> y.txt"',
+        'C  "src/orig.ts" -> "src/copy.ts"',
+      ].join("\n")
+    );
+    expect(statusParsed).toEqual([
+      { status: "T", rawStatus: "T", path: "scripts/link-tool", origPath: null },
+      { status: "M", rawStatus: "M", path: "docs/a -> b.md", origPath: null },
+      { status: "??", rawStatus: "??", path: "notes/x -> y.txt", origPath: null },
+      { status: "C", rawStatus: "C", path: "src/copy.ts", origPath: "src/orig.ts" },
+    ]);
+
+    expect(resolveGitDiffFileRoot("/repo/root", "/repo/root/web")).toBe("/repo/root");
+    expect(resolveGitDiffFileRoot(null, "/repo/root/web")).toBe("/repo/root/web");
+
+    // Non-git directory MUST NOT falsely claim "Working tree clean"
+    const nonGit = createInitialGitDiffState();
+    nonGit.open = true;
+    nonGit.cwd = "/tmp/plain-folder";
+    nonGit.isGitRepo = false;
+    const nonGitHtml = renderGitDiffModal(nonGit, ["/tmp/plain-folder"], (en) => en);
+    expect(nonGitHtml).toContain("Not a Git Repo");
+    expect(nonGitHtml).not.toContain("Working tree clean");
+
+    //Untracked file has one-click "Open File" button and does not say "Working tree clean"
+    const untrackedSt = createInitialGitDiffState();
+    untrackedSt.open = true;
+    untrackedSt.cwd = "/repo/web";
+    untrackedSt.repoRoot = "/repo";
+    untrackedSt.branch = "main";
+    untrackedSt.files = [{ status: "??", rawStatus: "??", path: "web/new.ts", origPath: null }];
+    untrackedSt.selectedFile = "web/new.ts";
+    const untrackedHtml = renderGitDiffModal(untrackedSt, ["/repo/web"], (en) => en);
+    expect(untrackedHtml).toContain('data-gd-open-file="web/new.ts"');
+    expect(untrackedHtml).not.toContain("Working tree clean");
+  });
+
+  test("P2 Bug #10 & UX Gap #2: Port Preview allows :// in query string, keeps rawHtml clean on truncation & surfaces redirects/SPA hint", () => {
+    // Query parameter containing http:// must be allowed while full-URL path injection stays blocked
+    expect(
+      parseWebPreviewPortAndPath("3000", "/_next/image?url=http://127.0.0.1:3000/hero.png&w=640")
+    ).toEqual({
+      port: 3000,
+      path: "/_next/image?url=http://127.0.0.1:3000/hero.png&w=640",
+    });
+    expect("error" in parseWebPreviewPortAndPath("3000", "http://evil.example.com/x")).toBe(true);
+
+    // Truncated HTML keeps rawHtml clean (no appended marker inside srcdoc!) while setting truncated=true
+    const sampleHtml = '<!doctype html><html><body><div id="root"></div><script type="module" src="/@vite/client"></script></body></html>';
+    const decoded = decodePortPreviewPayload(
+      toB64(new TextEncoder().encode(sampleHtml)),
+      "text/html; charset=utf-8",
+      true
+    );
+    expect(decoded.truncated).toBe(true);
+    expect(decoded.rawHtml).toBe(sampleHtml);
+    expect(decoded.rawHtml).not.toContain("[truncated");
+    expect(detectClientRenderedSpaHtml(sampleHtml)).toBe(true);
+
+    const pp = createInitialPortPreviewState();
+    pp.open = true;
+    pp.portInput = "5173";
+    pp.pathInput = "/old";
+    pp.statusCode = 302;
+    pp.contentType = "text/html";
+    pp.headers = [["Location", "http://127.0.0.1:5173/dashboard?tab=1"]];
+    pp.rawHtml = decoded.rawHtml;
+    pp.bodyText = decoded.bodyText;
+    pp.truncated = true;
+    pp.viewTab = "render";
+
+    const modalHtml = renderPortPreviewModal(pp, "mac-studio", (en) => en);
+    expect(modalHtml).toContain("Truncated");
+    expect(modalHtml).toContain('data-pp-follow-path="/dashboard?tab=1"');
+    expect(modalHtml).toContain("Client-rendered SPA detected");
+    expect(modalHtml).not.toContain("[truncated at 128 KB]");
   });
 });

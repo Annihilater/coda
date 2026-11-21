@@ -44,7 +44,11 @@ import {
   svgIcon,
 } from "./icons";
 import { BentoMotionController } from "./bento_motion";
-import { encodeTerminalKeyEvent, wrapBracketedPaste } from "./terminal_keys";
+import {
+  encodeTerminalKeyEvent,
+  isJumpNeedsYouShortcut,
+  wrapBracketedPaste,
+} from "./terminal_keys";
 import {
   TerminalNotificationTracker,
   dispatchBrowserNotification,
@@ -73,7 +77,7 @@ import {
 import {
   type PortPreviewState,
   createInitialPortPreviewState,
-  decodePortPreviewBody,
+  decodePortPreviewPayload,
   parseWebPreviewPortAndPath,
   renderPortPreviewModal,
 } from "./port_preview";
@@ -82,21 +86,30 @@ import {
   type GitDiffModalState,
   type NotificationWebhookSettings,
   buildClipboardImageFilename,
+  canStepUpSpawnDirectory,
   collectNeedsAttentionItems,
+  collectPrunableVtKeys,
+  computeBootstrapAutoFolder,
   createDefaultNotificationSettings,
   createInitialGitDiffState,
   encodeApprovalActionBytes,
-  encodeComposerBracketedPasteSubmit,
+  encodeComposerSubmit,
+  extractPureClipboardImages,
   formatUploadedPathForPty,
+  isKnownTuiAgentTerminal,
   parentAbsolutePath,
   parseGitStatusShort,
   pickNextNeedsAttentionItem,
+  rebuildSpeechRecognitionTranscript,
   renderGitDiffModal,
   renderNeedsAttentionSidebarSection,
   renderNeedsYouCapsuleBar,
   renderPromptComposerPanel,
+  resolveEffectiveBracketedPaste,
+  resolveGitDiffFileRoot,
+  resolveSpawnPickerInitialRoot,
   resolveVoiceCaptureStrategy,
-  suggestFolderNameFromGitUrl,
+  stepPaletteSelectionIndex,
   validateGitCloneUrlClient,
   validateNotificationWebhookSettings,
   validateSingleFolderName,
@@ -147,6 +160,7 @@ export class CodaTerminalWebApp {
   private showMobileKeypadOnDesktop = false;
   private showCmdPalette = false;
   private cmdPaletteQuery = "";
+  private cmdPaletteSelectedIdx = 0;
   private siteInfo: SiteInfo | null = null;
   private pendingActivationCode: string = "";
   private pendingDeviceInfo: DeviceAuthPublicInfo | null = null;
@@ -174,6 +188,7 @@ export class CodaTerminalWebApp {
   private activeTerminalAddr: string | null = null;
   private splitMode = false;
   private secondaryTerminalAddr: string | null = null;
+  private focusedPane: "primary" | "secondary" = "primary";
   private showTermSearch = false;
   private termSearchQuery = "";
   private termSearchIdx = 0;
@@ -215,15 +230,30 @@ export class CodaTerminalWebApp {
   private spawnBootstrapParentDir = "~";
   private spawnBootstrapFolderName = "";
   private spawnBootstrapGitUrl = "";
+  private bootFolderManuallyEdited = false;
   private spawnBootstrapLoading = false;
+  private spawnBootstrapReqId: string | null = null;
+  private spawnBootstrapPeerId: string | null = null;
   private spawnBootstrapMsg: { kind: "ok" | "err"; text: string } | null = null;
   private showKeyboardInputBar = false;
   private isRecordingVoice = false;
   private isTranscribingVoice = false;
+  private pendingTranscribeReqId: string | null = null;
+  private pendingTranscribeTimer: ReturnType<typeof setTimeout> | null = null;
   private mediaRecorder: MediaRecorder | null = null;
   private mediaStream: MediaStream | null = null;
   private voiceChunks: Blob[] = [];
   private speechRecognition: any = null;
+  private rpcSeq = 0;
+  private nextFileInputTarget: "pty" | "draft" = "pty";
+  private pendingUploadTargets = new Map<
+    string,
+    { target: "pty" | "draft"; daemonId: string; terminalAddr: string }
+  >();
+  private settingsDirtyFields = new Set<string>();
+  private webhookTestInFlight = false;
+  private webhookSaveInFlight = false;
+  private pruneDevicesInFlight = false;
   private pairCommand: string | null = null;
   private latestInviteCode: string | null = null;
   private rttMs: number | null = null;
@@ -413,14 +443,14 @@ export class CodaTerminalWebApp {
     });
 
     window.addEventListener("keydown", (e) => {
-      const isJumpNeedsYou =
-        (e.metaKey && !e.ctrlKey && !e.altKey && e.key.toLowerCase() === "j") ||
-        (e.altKey && !e.ctrlKey && !e.metaKey && (e.code === "KeyJ" || e.key.toLowerCase() === "j"));
+      const isJumpNeedsYou = isJumpNeedsYouShortcut(e);
       // V3-24: Only intercept ⌘K / Ctrl+K on home & console (not login/register/activate forms),
       // and never double-handle events already consumed by `#term-box` (e.g. Ctrl+K kill-line).
       if (
         !e.defaultPrevented &&
         (e.metaKey || e.ctrlKey) &&
+        !e.altKey &&
+        !e.shiftKey &&
         e.key.toLowerCase() === "k" &&
         (this.route === "home" || this.route === "console")
       ) {
@@ -428,6 +458,7 @@ export class CodaTerminalWebApp {
         this.showCmdPalette = !this.showCmdPalette;
         if (this.showCmdPalette) {
           this.cmdPaletteQuery = "";
+          this.cmdPaletteSelectedIdx = 0;
         }
         this.render();
         if (this.showCmdPalette) {
@@ -436,16 +467,47 @@ export class CodaTerminalWebApp {
             inp?.focus();
           }, 0);
         }
-      } else if (!e.defaultPrevented && isJumpNeedsYou && this.route === "console") {
+      } else if (
+        this.route === "home" &&
+        this.showCmdPalette &&
+        (e.key === "ArrowDown" || e.key === "ArrowUp" || e.key === "Enter")
+      ) {
+        const homeRows = Array.from(
+          document.querySelectorAll<HTMLElement>("#cmd-mask .cmd-list .cmd-row")
+        );
+        if (homeRows.length > 0) {
+          e.preventDefault();
+          if (e.key === "Enter") {
+            const target = homeRows[Math.min(this.cmdPaletteSelectedIdx, homeRows.length - 1)];
+            target?.click();
+          } else {
+            this.cmdPaletteSelectedIdx = stepPaletteSelectionIndex(
+              this.cmdPaletteSelectedIdx,
+              homeRows.length,
+              e.key === "ArrowDown" ? 1 : -1
+            );
+            homeRows.forEach((row, idx) => {
+              row.classList.toggle("active", idx === this.cmdPaletteSelectedIdx);
+            });
+            homeRows[this.cmdPaletteSelectedIdx]?.scrollIntoView({ block: "nearest" });
+          }
+        }
+      } else if (
+        !e.defaultPrevented &&
+        isJumpNeedsYou &&
+        this.route === "console" &&
+        !this.isAnyModalOpen()
+      ) {
         e.preventDefault();
         this.jumpToNextNeedsYouTerminal();
       } else if (
         !e.defaultPrevented &&
         (e.metaKey || e.ctrlKey) &&
+        !e.altKey &&
+        !e.shiftKey &&
         e.key.toLowerCase() === "f" &&
         this.route === "console" &&
-        !this.showSettingsModal &&
-        !this.showCmdPalette
+        !this.isAnyModalOpen()
       ) {
         e.preventDefault();
         this.showTermSearch = true;
@@ -456,41 +518,56 @@ export class CodaTerminalWebApp {
           inp?.select();
         }, 0);
       } else if (e.key === "Escape" && this.showCmdPalette) {
+        e.preventDefault();
         this.showCmdPalette = false;
         this.render();
+      } else if (e.key === "Escape" && this.route === "console" && this.pendingActivationCode) {
+        e.preventDefault();
+        this.pendingActivationCode = "";
+        this.pendingDeviceInfo = null;
+        this.errorMsg = "";
+        window.history.replaceState({}, "", "/console");
+        this.render();
       } else if (e.key === "Escape" && this.gitDiff.open) {
+        e.preventDefault();
         this.gitDiff.open = false;
         this.render();
       } else if (e.key === "Escape" && this.fileBrowser.open) {
+        e.preventDefault();
         this.fileBrowser.open = false;
         this.render();
       } else if (e.key === "Escape" && this.portPreview.open) {
+        e.preventDefault();
         this.portPreview.open = false;
         this.render();
       } else if (e.key === "Escape" && this.showSpawnModal) {
+        e.preventDefault();
         this.showSpawnModal = false;
         this.render();
       } else if (e.key === "Escape" && this.showSettingsModal) {
+        e.preventDefault();
         this.showSettingsModal = false;
+        this.render();
+      } else if (e.key === "Escape" && this.route === "console" && this.showTermSearch) {
+        e.preventDefault();
+        this.showTermSearch = false;
+        this.render();
+      } else if (e.key === "Escape" && this.route === "console" && this.showPromptComposer) {
+        e.preventDefault();
+        this.showPromptComposer = false;
         this.render();
       }
     });
 
     // Global clipboard screenshot paste (`Ctrl+V` / `⌘V`) when an active terminal session is open.
+    // Never hijack paste inside `<input>`/`<textarea>`/`[contenteditable]`, `#term-search-input`, or open modals.
     window.addEventListener("paste", (e) => {
       if (e.defaultPrevented) return;
       if (this.route !== "console" || !this.selectedDaemon || !this.activeTerminalAddr) return;
-      if (
-        this.showSettingsModal ||
-        this.showSpawnModal ||
-        this.showCmdPalette ||
-        this.fileBrowser.open ||
-        this.portPreview.open ||
-        this.gitDiff.open
-      ) {
+      if (this.isAnyModalOpen() || this.isEditablePasteTarget(e.target)) {
         return;
       }
-      this.handleClipboardImagePaste(e);
+      this.handleClipboardImagePaste(e, "pty", this.getFocusedTerminalAddr());
     });
 
     // V3-23: Schedule catch-up paint as soon as user clears/collapses a text selection that deferred row patches.
@@ -544,7 +621,25 @@ export class CodaTerminalWebApp {
     const navConn = (navigator as unknown as { connection?: EventTarget }).connection;
     navConn?.addEventListener?.("change", triggerNetworkHotSwitch);
 
+    const syncVisualViewport = () => {
+      const vv = window.visualViewport;
+      if (!vv) return;
+      if (vv.height > 0) {
+        document.documentElement.style.setProperty("--coda-vvh", `${Math.round(vv.height)}px`);
+      }
+      const shellRoot = document.querySelector(".shell-root");
+      if (shellRoot) {
+        const isSmallScreen = window.innerWidth <= 768;
+        const softKbOpen = isSmallScreen && window.innerHeight - vv.height > 120;
+        shellRoot.classList.toggle("is-softkb-open", softKbOpen);
+      }
+    };
+    window.visualViewport?.addEventListener("resize", syncVisualViewport);
+    window.visualViewport?.addEventListener("scroll", syncVisualViewport);
+    syncVisualViewport();
+
     window.addEventListener("resize", () => {
+      syncVisualViewport();
       if (this.route === "console") {
         const nowNarrow = window.innerWidth < 900;
         if (nowNarrow !== this.lastIsNarrowViewport) {
@@ -654,26 +749,112 @@ export class CodaTerminalWebApp {
     return data;
   }
 
+  private nextReqId(prefix: string): string {
+    this.rpcSeq += 1;
+    return `${prefix}-${Date.now()}-${this.rpcSeq}`;
+  }
+
+  private isAnyModalOpen(): boolean {
+    return Boolean(
+      this.showSettingsModal ||
+        this.showCmdPalette ||
+        this.showSpawnModal ||
+        this.gitDiff.open ||
+        this.fileBrowser.open ||
+        this.portPreview.open ||
+        (this.route === "console" && this.pendingActivationCode)
+    );
+  }
+
+  private isEditablePasteTarget(target: EventTarget | null): boolean {
+    if (!target || typeof target !== "object") return false;
+    const el = target as HTMLElement;
+    const tag = String(el.tagName || "").toUpperCase();
+    if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return true;
+    if (el.isContentEditable) return true;
+    if (typeof el.closest === "function") {
+      if (
+        el.closest(
+          'input, textarea, select, [contenteditable=""], [contenteditable="true"], .modal-mask, #term-search-strip'
+        )
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private getFocusedTerminalAddr(): string | null {
+    if (this.splitMode && this.focusedPane === "secondary" && this.secondaryTerminalAddr) {
+      return this.secondaryTerminalAddr;
+    }
+    return this.activeTerminalAddr;
+  }
+
   private isTypingIntoInput(): boolean {
     if (this.imeComposing) return true;
     const active = typeof document !== "undefined" ? document.activeElement : null;
     if (!active) return false;
     const tag = active.tagName;
-    return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT";
+    return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || (active as HTMLElement).isContentEditable;
   }
 
   private vtKey(daemonId: string, terminalAddr: string): string {
     return `${daemonId}:${terminalAddr}`;
   }
 
-  private getOrCreateVt(daemonId: string, terminalAddr: string): WebVtTerminal {
+  private syncVtAgentDefaultMode(daemonId: string, term?: HerdrTerminal | null) {
+    if (!term) return;
+    const vt = this.vtTerminals.get(this.vtKey(daemonId, term.address));
+    if (vt && vt.bracketedPasteExplicit === null && isKnownTuiAgentTerminal(term)) {
+      vt.bracketedPaste = true;
+    }
+  }
+
+  private getOrCreateVt(
+    daemonId: string,
+    terminalAddr: string,
+    termHint?: HerdrTerminal | null
+  ): WebVtTerminal {
     const key = this.vtKey(daemonId, terminalAddr);
     let vt = this.vtTerminals.get(key);
+    const knownTerm =
+      termHint ??
+      (this.selectedDaemon?.id === daemonId
+        ? this.terminals.find((t) => t.address === terminalAddr)
+        : this.terminalsByPeer.get(daemonId)?.find((t) => t.address === terminalAddr));
     if (!vt) {
       vt = new WebVtTerminal(this.termCols, this.termRows);
+      if (isKnownTuiAgentTerminal(knownTerm)) {
+        vt.bracketedPaste = true;
+      }
       this.vtTerminals.set(key, vt);
+    } else if (vt.bracketedPasteExplicit === null && isKnownTuiAgentTerminal(knownTerm)) {
+      vt.bracketedPaste = true;
     }
     return vt;
+  }
+
+  private pruneStaleVtTerminalsForPeer(peerId: string, liveTerminals: readonly HerdrTerminal[]) {
+    const keepAddrs = new Set<string>();
+    for (const t of liveTerminals) {
+      if (t.alive) {
+        keepAddrs.add(t.address);
+      }
+    }
+    if (this.selectedDaemon?.id === peerId) {
+      if (this.activeTerminalAddr && liveTerminals.some((t) => t.address === this.activeTerminalAddr)) {
+        keepAddrs.add(this.activeTerminalAddr);
+      }
+      if (this.secondaryTerminalAddr && liveTerminals.some((t) => t.address === this.secondaryTerminalAddr)) {
+        keepAddrs.add(this.secondaryTerminalAddr);
+      }
+    }
+    const staleKeys = collectPrunableVtKeys(this.vtTerminals.keys(), peerId, keepAddrs);
+    for (const k of staleKeys) {
+      this.vtTerminals.delete(k);
+      this.vtStreamActive.delete(k);
+    }
   }
 
   private scheduleTerminalPaint() {
@@ -827,9 +1008,14 @@ export class CodaTerminalWebApp {
       const wasNearBottom = boxEl
         ? boxEl.scrollHeight - boxEl.scrollTop - boxEl.clientHeight <= 28
         : true;
+      const showPrimaryCursor = !(
+        this.splitMode &&
+        this.focusedPane === "secondary" &&
+        this.secondaryTerminalAddr
+      );
       const stats = vt.patchDom(
         screenEl,
-        true,
+        showPrimaryCursor,
         selectingInside && sel
           ? {
               anchorNode: sel.anchorNode,
@@ -863,7 +1049,7 @@ export class CodaTerminalWebApp {
           ? secBox.scrollHeight - secBox.scrollTop - secBox.clientHeight <= 28
           : true;
         const secPrevTop = secBox ? secBox.scrollTop : 0;
-        secVt.patchDom(secScreen, false, null);
+        secVt.patchDom(secScreen, this.focusedPane === "secondary", null);
         if (secBox) {
           secBox.scrollTop = secNearBottom ? secBox.scrollHeight : secPrevTop;
         }
@@ -939,6 +1125,17 @@ export class CodaTerminalWebApp {
   }
 
   private measureAndSyncTerminalSize(sendRemote = true) {
+    // Avoid SIGWINCH row thrashing when mobile virtual keyboard shrinks visualViewport temporarily.
+    const vv = typeof window !== "undefined" ? window.visualViewport : null;
+    if (
+      sendRemote &&
+      vv &&
+      typeof window !== "undefined" &&
+      window.innerWidth <= 768 &&
+      window.innerHeight - vv.height > 120
+    ) {
+      return;
+    }
     const { cols, rows } = this.computeTerminalDimsFromDom();
     const changed = cols !== this.termCols || rows !== this.termRows;
     this.termCols = cols;
@@ -951,6 +1148,23 @@ export class CodaTerminalWebApp {
         this.sendEncrypted(this.selectedDaemon, {
           op: "pty_resize",
           terminal: this.activeTerminalAddr,
+          cols,
+          rows,
+        });
+      }
+    }
+    if (
+      this.selectedDaemon &&
+      this.splitMode &&
+      this.secondaryTerminalAddr &&
+      this.secondaryTerminalAddr !== this.activeTerminalAddr
+    ) {
+      const secVt = this.getOrCreateVt(this.selectedDaemon.id, this.secondaryTerminalAddr);
+      secVt.resize(cols, rows);
+      if (changed && sendRemote) {
+        this.sendEncrypted(this.selectedDaemon, {
+          op: "pty_resize",
+          terminal: this.secondaryTerminalAddr,
           cols,
           rows,
         });
@@ -979,14 +1193,20 @@ export class CodaTerminalWebApp {
     this.negotiatingPeerId = null;
   }
 
-  /** V3-08: Single centralized daemon switch ensuring clean detach + directWs teardown before switching. */
+  /** V3-08: Single centralized daemon switch ensuring clean detach + voice cleanup + directWs teardown before switching. */
   private selectDaemon(peer: Device | null, opts: { initialTerminalAddr?: string | null } = {}) {
     const prevId = this.selectedDaemon?.id ?? null;
     const nextId = peer?.id ?? null;
+    if (prevId !== nextId || !nextId) {
+      this.cancelActiveVoiceCapture();
+    }
     if (prevId && prevId !== nextId) {
-      this.detachActiveTerminal();
+      this.detachAllOpenTerminals();
       this.teardownDirectWs();
     } else if (!nextId) {
+      if (prevId) {
+        this.detachAllOpenTerminals();
+      }
       this.teardownDirectWs();
     }
     this.selectedDaemon = peer;
@@ -996,8 +1216,18 @@ export class CodaTerminalWebApp {
     if (prevId !== nextId) {
       this.terminals = peer ? [...(this.terminalsByPeer.get(peer.id) || [])] : [];
       this.repos = [];
-      this.activeTerminalAddr = opts.initialTerminalAddr ?? null;
-      this.secondaryTerminalAddr = null;
+      let resolvedActive = opts.initialTerminalAddr ?? null;
+      if (!resolvedActive && this.terminals.length > 0) {
+        const savedTerm = readLocalPref("coda_last_terminal_addr", "");
+        const restored = savedTerm ? this.terminals.find((t) => t.address === savedTerm) : undefined;
+        resolvedActive = restored ? restored.address : this.terminals[0].address;
+      }
+      this.activeTerminalAddr = resolvedActive;
+      this.secondaryTerminalAddr =
+        this.splitMode && resolvedActive
+          ? this.terminals.find((t) => t.address !== resolvedActive)?.address ?? null
+          : null;
+      this.focusedPane = "primary";
       this.fileBrowser = createInitialFileBrowserState();
       this.portPreview = createInitialPortPreviewState();
       this.gitDiff = createInitialGitDiffState();
@@ -1009,12 +1239,24 @@ export class CodaTerminalWebApp {
       }
       if (peer?.is_online) {
         this.queryDaemonOverview(peer, true);
+        if (this.activeTerminalAddr) {
+          this.attachAndReadTerminal(this.activeTerminalAddr);
+        }
+        if (
+          this.splitMode &&
+          this.secondaryTerminalAddr &&
+          this.secondaryTerminalAddr !== this.activeTerminalAddr
+        ) {
+          this.attachAndReadTerminal(this.secondaryTerminalAddr);
+        }
         void this.tryNegotiateDirectLanWs(peer);
       }
     } else if (peer?.is_online) {
-      if (opts.initialTerminalAddr) {
+      if (opts.initialTerminalAddr && opts.initialTerminalAddr !== this.activeTerminalAddr) {
+        this.detachActiveTerminal();
         this.activeTerminalAddr = opts.initialTerminalAddr;
         writeLocalPref("coda_last_terminal_addr", this.activeTerminalAddr);
+        this.attachAndReadTerminal(this.activeTerminalAddr);
       }
       this.queryDaemonOverview(peer, true);
       void this.tryNegotiateDirectLanWs(peer);
@@ -1052,6 +1294,7 @@ export class CodaTerminalWebApp {
 
   private stopAllTransportsAndTimers() {
     this.relayGeneration += 1;
+    this.cancelActiveVoiceCapture();
     if (this.toastTimer) {
       clearTimeout(this.toastTimer);
       this.toastTimer = null;
@@ -1140,39 +1383,128 @@ export class CodaTerminalWebApp {
 
   private async loadAccountSettingsData() {
     if (!this.token) return;
-    try {
-      await this.refreshDevices();
-    } catch {
-      // ignore transient error
-    }
-    try {
-      this.authSessions = await this.api("/api/v1/auth/sessions");
-    } catch {
-      this.authSessions = [];
-    }
-    try {
-      const notif = await this.api("/api/v1/me/notifications");
-      if (notif && typeof notif === "object") {
-        this.notificationSettings = {
-          bark_url: String(notif.bark_url || ""),
-          telegram_bot_token: String(notif.telegram_bot_token || ""),
-          telegram_chat_id: String(notif.telegram_chat_id || ""),
-          feishu_webhook_url: String(notif.feishu_webhook_url || ""),
-          discord_webhook_url: String(notif.discord_webhook_url || ""),
-          generic_webhook_url: String(notif.generic_webhook_url || ""),
-          notify_on_needs_you: notif.notify_on_needs_you !== false,
-          notify_on_finished: notif.notify_on_finished !== false,
-        };
-      }
-    } catch {
-      // ignore if notifications endpoint unavailable
-    }
+    const reqToken = this.token;
+    const tasks: Array<Promise<void>> = [
+      this.refreshDevices().catch(() => {
+        // ignore transient error
+      }),
+      this.api("/api/v1/auth/sessions")
+        .then((sessions) => {
+          if (this.token === reqToken) {
+            this.authSessions = Array.isArray(sessions) ? sessions : [];
+          }
+        })
+        .catch(() => {
+          if (this.token === reqToken) this.authSessions = [];
+        }),
+      this.api("/api/v1/me/notifications")
+        .then((notif) => {
+          if (
+            this.token === reqToken &&
+            notif &&
+            typeof notif === "object" &&
+            !this.settingsDirtyFields.has("webhooks")
+          ) {
+            this.notificationSettings = {
+              bark_url: String(notif.bark_url || ""),
+              telegram_bot_token: String(notif.telegram_bot_token || ""),
+              telegram_chat_id: String(notif.telegram_chat_id || ""),
+              feishu_webhook_url: String(notif.feishu_webhook_url || ""),
+              discord_webhook_url: String(notif.discord_webhook_url || ""),
+              generic_webhook_url: String(notif.generic_webhook_url || ""),
+              notify_on_needs_you: notif.notify_on_needs_you !== false,
+              notify_on_finished: notif.notify_on_finished !== false,
+            };
+          }
+        })
+        .catch(() => {
+          // keep local notificationSettings untouched if endpoint fails
+        }),
+    ];
     if (this.user?.is_admin) {
-      try {
-        this.invitesList = await this.api("/api/v1/invites");
-      } catch {
-        this.invitesList = [];
-      }
+      tasks.push(
+        this.api("/api/v1/invites")
+          .then((list) => {
+            if (this.token === reqToken) {
+              this.invitesList = Array.isArray(list) ? list : [];
+            }
+          })
+          .catch(() => {
+            if (this.token === reqToken) this.invitesList = [];
+          })
+      );
+    }
+    await Promise.allSettled(tasks);
+  }
+
+  private renderSettingsPreservingInputs() {
+    if (!this.showSettingsModal) return;
+    if (this.settingsTab === "alerts" && this.settingsDirtyFields.has("webhooks")) {
+      return;
+    }
+    if (this.settingsTab === "voice" && this.settingsDirtyFields.has("voice")) {
+      return;
+    }
+    const modal = typeof document !== "undefined" ? document.getElementById("modal-bg") : null;
+    const savedValues = new Map<string, string>();
+    const savedChecked = new Map<string, boolean>();
+    let activeKey: string | null = null;
+    let selStart: number | null = null;
+    let selEnd: number | null = null;
+
+    if (modal) {
+      const activeEl = document.activeElement as HTMLInputElement | null;
+      modal.querySelectorAll<HTMLInputElement>("input[name]").forEach((inp) => {
+        const key = `${inp.form?.id || "form"}:${inp.name}`;
+        if (inp.type === "checkbox") {
+          savedChecked.set(key, inp.checked);
+        } else {
+          savedValues.set(key, inp.value);
+        }
+        if (inp === activeEl) {
+          activeKey = key;
+          try {
+            selStart = inp.selectionStart;
+            selEnd = inp.selectionEnd;
+          } catch {
+            selStart = null;
+            selEnd = null;
+          }
+        }
+      });
+    }
+
+    this.render();
+
+    const nextModal = typeof document !== "undefined" ? document.getElementById("modal-bg") : null;
+    if (nextModal && (savedValues.size > 0 || savedChecked.size > 0)) {
+      nextModal.querySelectorAll<HTMLInputElement>("input[name]").forEach((inp) => {
+        const key = `${inp.form?.id || "form"}:${inp.name}`;
+        if (inp.type === "checkbox" && savedChecked.has(key) && this.settingsDirtyFields.has("webhooks")) {
+          inp.checked = savedChecked.get(key)!;
+        } else if (inp.type !== "checkbox" && savedValues.has(key)) {
+          const prevVal = savedValues.get(key)!;
+          if (
+            prevVal &&
+            (key === activeKey ||
+              this.settingsDirtyFields.has("webhooks") ||
+              this.settingsDirtyFields.has("voice") ||
+              this.settingsDirtyFields.has(key))
+          ) {
+            inp.value = prevVal;
+          }
+        }
+        if (key === activeKey) {
+          inp.focus();
+          if (selStart !== null && selEnd !== null) {
+            try {
+              inp.setSelectionRange(selStart, selEnd);
+            } catch {
+              // ignore unsupported input types
+            }
+          }
+        }
+      });
     }
   }
 
@@ -1219,7 +1551,7 @@ export class CodaTerminalWebApp {
             this.queryDaemonOverview(this.selectedDaemon);
             void this.tryNegotiateDirectLanWs(this.selectedDaemon);
           }
-          if (!this.isTypingIntoInput() && !this.showSettingsModal) {
+          if (!this.isTypingIntoInput() && !this.isAnyModalOpen()) {
             this.render();
           }
         } catch {
@@ -1470,6 +1802,15 @@ export class CodaTerminalWebApp {
         this.vtStreamActive.delete(key);
         this.attachAndReadTerminal(this.activeTerminalAddr);
       }
+      if (
+        this.splitMode &&
+        this.secondaryTerminalAddr &&
+        this.secondaryTerminalAddr !== this.activeTerminalAddr
+      ) {
+        const secKey = this.vtKey(peer.id, this.secondaryTerminalAddr);
+        this.vtStreamActive.delete(secKey);
+        this.attachAndReadTerminal(this.secondaryTerminalAddr);
+      }
       void this.tryNegotiateDirectLanWs(peer);
     }
   }
@@ -1511,7 +1852,7 @@ export class CodaTerminalWebApp {
       } else if (this.directWsPeerId === devId) {
         this.directWs?.close();
       }
-      if (!this.isTypingIntoInput() && !this.showSettingsModal) {
+      if (!this.isTypingIntoInput() && !this.isAnyModalOpen()) {
         this.render();
       }
     } else if (frame.frame_type === "route_packet") {
@@ -1632,18 +1973,33 @@ export class CodaTerminalWebApp {
     }, wait);
   }
 
-  private reattachActiveTerminalPreserveScreen() {
-    if (!this.selectedDaemon || !this.activeTerminalAddr) return;
+  private reattachOpenTerminalsPreserveScreen() {
+    if (!this.selectedDaemon) return;
     const { cols, rows } = this.computeTerminalDimsFromDom();
     this.termCols = cols;
     this.termRows = rows;
-    this.sendEncrypted(this.selectedDaemon, {
-      op: "pty_attach",
-      req_id: `hot-${Date.now()}`,
-      terminal: this.activeTerminalAddr,
-      cols,
-      rows,
-    });
+    if (this.activeTerminalAddr) {
+      this.sendEncrypted(this.selectedDaemon, {
+        op: "pty_attach",
+        req_id: this.nextReqId("hot"),
+        terminal: this.activeTerminalAddr,
+        cols,
+        rows,
+      });
+    }
+    if (
+      this.splitMode &&
+      this.secondaryTerminalAddr &&
+      this.secondaryTerminalAddr !== this.activeTerminalAddr
+    ) {
+      this.sendEncrypted(this.selectedDaemon, {
+        op: "pty_attach",
+        req_id: this.nextReqId("hot2"),
+        terminal: this.secondaryTerminalAddr,
+        cols,
+        rows,
+      });
+    }
   }
 
   private async tryNegotiateDirectLanWs(peer: Device, manual = false) {
@@ -1677,14 +2033,27 @@ export class CodaTerminalWebApp {
             clearTimeout(this.directProbeTimer);
             this.directProbeTimer = null;
           }
-          // V3-01: Detach old Relay PTY subscription BEFORE attaching on LAN Direct to prevent dual streaming.
-          if (this.selectedDaemon?.id === peer.id && this.activeTerminalAddr) {
-            this.sendEncryptedViaRelay(peer, {
-              op: "pty_detach",
-              req_id: `hdet-${Date.now()}`,
-              terminal: this.activeTerminalAddr,
-            });
-            this.reattachActiveTerminalPreserveScreen();
+          // V3-01: Detach old Relay PTY subscriptions BEFORE attaching on LAN Direct to prevent dual streaming.
+          if (this.selectedDaemon?.id === peer.id) {
+            if (this.activeTerminalAddr) {
+              this.sendEncryptedViaRelay(peer, {
+                op: "pty_detach",
+                req_id: this.nextReqId("hdet"),
+                terminal: this.activeTerminalAddr,
+              });
+            }
+            if (
+              this.splitMode &&
+              this.secondaryTerminalAddr &&
+              this.secondaryTerminalAddr !== this.activeTerminalAddr
+            ) {
+              this.sendEncryptedViaRelay(peer, {
+                op: "pty_detach",
+                req_id: this.nextReqId("hdet2"),
+                terminal: this.secondaryTerminalAddr,
+              });
+            }
+            this.reattachOpenTerminalsPreserveScreen();
           }
           this.sendEncrypted(peer, {
             op: "ping",
@@ -1896,9 +2265,7 @@ export class CodaTerminalWebApp {
           const livePeer = this.devices.find((d) => d.id === peer.id);
           // Seamless failover back to Smart Relay without clearing VT screen buffer.
           if (this.selectedDaemon?.id === peer.id && livePeer?.is_online && this.ws?.readyState === WebSocket.OPEN) {
-            if (this.activeTerminalAddr) {
-              this.reattachActiveTerminalPreserveScreen();
-            }
+            this.reattachOpenTerminalsPreserveScreen();
             this.consoleNotice = {
               kind: "ok",
               text: this.tr(
@@ -1995,11 +2362,17 @@ export class CodaTerminalWebApp {
     if (this.selectedDaemon?.id !== peer.id) {
       this.selectDaemon(peer, { initialTerminalAddr: terminalAddr });
     } else {
-      if (this.activeTerminalAddr && this.activeTerminalAddr !== terminalAddr) {
-        this.detachActiveTerminal();
+      if (this.splitMode && this.secondaryTerminalAddr === terminalAddr) {
+        this.focusedPane = "secondary";
+      } else {
+        if (this.activeTerminalAddr && this.activeTerminalAddr !== terminalAddr) {
+          this.cancelActiveVoiceCapture();
+          this.detachActiveTerminal();
+        }
+        this.activeTerminalAddr = terminalAddr;
+        this.focusedPane = "primary";
+        writeLocalPref("coda_last_terminal_addr", terminalAddr);
       }
-      this.activeTerminalAddr = terminalAddr;
-      writeLocalPref("coda_last_terminal_addr", terminalAddr);
     }
     if (this.route !== "console") {
       this.navigate("/console");
@@ -2057,18 +2430,18 @@ export class CodaTerminalWebApp {
         this.voiceConfig = {
           provider: msg.voice_config.provider || "openai",
           base_url: msg.voice_config.base_url || "https://api.openai.com/v1",
-          api_key: incomingKey && !incomingKey.startsWith("••") ? incomingKey : this.voiceApiKeyLocal,
+          api_key: this.voiceApiKeyLocal || incomingKey,
           model: msg.voice_config.model || "gpt-4o-mini-transcribe",
         };
       }
-      if (!this.isTypingIntoInput() && !this.showSettingsModal) this.render();
+      if (!this.isTypingIntoInput() && !this.isAnyModalOpen()) this.render();
       return;
     }
 
     if (msg.op === "host_health_result") {
       if (msg.health) {
         this.hostHealthByPeer.set(peerId, msg.health as HostHealthSnapshot);
-        if (!this.isTypingIntoInput()) this.render();
+        if (!this.isTypingIntoInput() && !this.isAnyModalOpen()) this.render();
       }
       return;
     }
@@ -2103,7 +2476,14 @@ export class CodaTerminalWebApp {
     if (msg.op === "directory_listing") {
       if (!isSelected) return;
       if (String(msg.req_id || "").startsWith("spdir-")) {
-        if (!this.showSpawnModal || !this.spawnDirPicker.open) return;
+        if (
+          !this.showSpawnModal ||
+          !this.spawnDirPicker.open ||
+          !this.spawnDirPicker.reqId ||
+          msg.req_id !== this.spawnDirPicker.reqId
+        ) {
+          return;
+        }
         this.captureSpawnFormDraftFromDom();
         this.spawnDirPicker.loading = false;
         this.spawnDirPicker.rootPath = String(msg.root_path || this.spawnDirPicker.rootPath);
@@ -2114,19 +2494,41 @@ export class CodaTerminalWebApp {
         this.render();
         return;
       }
-      if (!this.fileBrowser.open) return;
-      this.fileBrowser.loading = false;
+      if (
+        !this.fileBrowser.open ||
+        !this.fileBrowser.dirReqId ||
+        msg.req_id !== this.fileBrowser.dirReqId
+      ) {
+        return;
+      }
+      this.fileBrowser.dirReqId = null;
+      if (!this.fileBrowser.previewReqId) {
+        this.fileBrowser.loading = false;
+      }
       this.fileBrowser.rootPath = String(msg.root_path || this.fileBrowser.rootPath);
       this.fileBrowser.subPath = String(msg.sub_path || "");
       this.fileBrowser.entries = Array.isArray(msg.entries) ? msg.entries : [];
-      this.fileBrowser.error = msg.error ? String(msg.error) : null;
+      if (msg.error) {
+        this.fileBrowser.error = String(msg.error);
+      } else if (!this.fileBrowser.previewReqId) {
+        this.fileBrowser.error = null;
+      }
       this.render();
       return;
     }
 
     if (msg.op === "git_diff_response") {
-      if (!isSelected || !this.gitDiff.open) return;
+      if (
+        !isSelected ||
+        !this.gitDiff.open ||
+        !this.gitDiff.reqId ||
+        msg.req_id !== this.gitDiff.reqId
+      ) {
+        return;
+      }
       this.gitDiff.loading = false;
+      this.gitDiff.isGitRepo = msg.is_git_repo !== false;
+      this.gitDiff.repoRoot = msg.repo_root ? String(msg.repo_root) : null;
       this.gitDiff.branch = String(msg.branch || "");
       this.gitDiff.statusShort = String(msg.status_short || "");
       this.gitDiff.diffUnified = String(msg.diff_unified || "");
@@ -2137,51 +2539,78 @@ export class CodaTerminalWebApp {
       ) {
         this.gitDiff.selectedFile = null;
       }
-      this.gitDiff.error = null;
+      if (msg.error) {
+        this.gitDiff.error = String(msg.error);
+      } else if (!this.gitDiff.isGitRepo) {
+        this.gitDiff.error = this.tr(
+          `Directory "${this.gitDiff.cwd}" is not inside a Git repository.`,
+          `目录「${this.gitDiff.cwd}」不是有效的 Git 仓库。`
+        );
+      } else {
+        this.gitDiff.error = null;
+      }
       this.render();
       return;
     }
 
     if (msg.op === "bootstrap_workspace_result") {
-      if (!isSelected) return;
-      this.captureSpawnFormDraftFromDom();
+      if (!this.spawnBootstrapReqId || msg.req_id !== this.spawnBootstrapReqId) return;
+      const matchesPeer = !this.spawnBootstrapPeerId || this.spawnBootstrapPeerId === peerId;
+      this.spawnBootstrapReqId = null;
+      this.spawnBootstrapPeerId = null;
       this.spawnBootstrapLoading = false;
+      if (!matchesPeer) return;
+      if (isSelected) {
+        this.captureSpawnFormDraftFromDom();
+      }
+      let toastSummary = "";
       if (msg.ok && msg.workspace_path) {
-        this.spawnCwd = String(msg.workspace_path);
-        this.spawnBootstrapMsg = {
-          kind: "ok",
-          text: String(
-            msg.detail ||
-              this.tr(
-                `Workspace ready: ${msg.workspace_path}`,
-                `工作区已就绪：${msg.workspace_path}`
-              )
-          ),
-        };
-        if (this.selectedDaemon?.is_online) {
-          this.sendEncrypted(this.selectedDaemon, {
-            op: "list_workspaces",
-            req_id: `ws-${Date.now()}`,
-            root_dirs: [],
-          });
+        toastSummary = String(
+          msg.detail ||
+            this.tr(
+              `Workspace ready: ${msg.workspace_path}`,
+              `工作区已就绪：${msg.workspace_path}`
+            )
+        );
+        if (isSelected) {
+          this.spawnCwd = String(msg.workspace_path);
+          this.spawnBootstrapMsg = { kind: "ok", text: toastSummary };
+          if (this.selectedDaemon?.is_online) {
+            this.sendEncrypted(this.selectedDaemon, {
+              op: "list_workspaces",
+              req_id: this.nextReqId("ws"),
+              root_dirs: [],
+            });
+          }
         }
       } else {
-        this.spawnBootstrapMsg = {
-          kind: "err",
-          text: String(
-            msg.detail || this.tr("Failed bootstrapping workspace", "初始化工作区失败")
-          ),
-        };
+        toastSummary = String(
+          msg.detail || this.tr("Failed bootstrapping workspace", "初始化工作区失败")
+        );
+        if (isSelected) {
+          this.spawnBootstrapMsg = { kind: "err", text: toastSummary };
+        }
       }
-      if (this.showSpawnModal) {
+      this.showToastNotice(msg.ok ? "ok" : "err", toastSummary);
+      if (this.showSpawnModal && isSelected) {
         this.render();
       }
       return;
     }
 
     if (msg.op === "file_preview_response") {
-      if (!isSelected || !this.fileBrowser.open) return;
-      this.fileBrowser.loading = false;
+      if (
+        !isSelected ||
+        !this.fileBrowser.open ||
+        !this.fileBrowser.previewReqId ||
+        msg.req_id !== this.fileBrowser.previewReqId
+      ) {
+        return;
+      }
+      this.fileBrowser.previewReqId = null;
+      if (!this.fileBrowser.dirReqId) {
+        this.fileBrowser.loading = false;
+      }
       if (msg.error) {
         this.fileBrowser.error = String(msg.error);
       } else {
@@ -2194,16 +2623,58 @@ export class CodaTerminalWebApp {
     }
 
     if (msg.op === "http_local_preview_response") {
-      if (!isSelected || !this.portPreview.open) return;
+      if (
+        !isSelected ||
+        !this.portPreview.open ||
+        !this.portPreview.reqId ||
+        msg.req_id !== this.portPreview.reqId
+      ) {
+        return;
+      }
+      this.portPreview.reqId = null;
       this.portPreview.loading = false;
       this.portPreview.error = null;
       this.portPreview.statusCode = Number(msg.status_code || 0);
       this.portPreview.contentType = String(msg.content_type || "text/plain");
-      this.portPreview.bodyText = decodePortPreviewBody(
+      this.portPreview.headers = Array.isArray(msg.headers) ? msg.headers : [];
+      const decoded = decodePortPreviewPayload(
         String(msg.body_b64 || ""),
-        this.portPreview.contentType
+        this.portPreview.contentType,
+        Boolean(msg.truncated)
       );
+      this.portPreview.bodyText = decoded.bodyText;
+      this.portPreview.rawHtml = decoded.rawHtml;
+      this.portPreview.truncated = decoded.truncated;
       this.render();
+      return;
+    }
+
+    if (msg.op === "transcribe_audio_result") {
+      if (
+        !isSelected ||
+        !this.pendingTranscribeReqId ||
+        msg.req_id !== this.pendingTranscribeReqId
+      ) {
+        return;
+      }
+      this.pendingTranscribeReqId = null;
+      if (this.pendingTranscribeTimer) {
+        clearTimeout(this.pendingTranscribeTimer);
+        this.pendingTranscribeTimer = null;
+      }
+      this.isTranscribingVoice = false;
+      if (msg.ok && String(msg.text || "").trim()) {
+        this.insertTranscribedText(String(msg.text));
+      } else {
+        this.syncVoiceButtonInPlace();
+        this.showToastNotice(
+          "err",
+          String(
+            msg.error ||
+              this.tr("Empty or failed voice transcription on host.", "远端主机未识别到有效语音内容。")
+          )
+        );
+      }
       return;
     }
 
@@ -2231,16 +2702,17 @@ export class CodaTerminalWebApp {
       this.terminalsByPeer.set(peerId, incomingTerms);
 
       if (!isSelected) {
+        this.pruneStaleVtTerminalsForPeer(peerId, incomingTerms);
         // V3-08 / V3-32: Observe notifications for background daemons without polluting active daemon UI.
         for (const term of incomingTerms) {
+          this.syncVtAgentDefaultMode(peerId, term);
           this.observeTerminalStatusNotification(peerId, term);
         }
         if (
           prevNeedsCount !== nextNeedsCount &&
           this.route === "console" &&
           !this.isTypingIntoInput() &&
-          !this.showSettingsModal &&
-          !this.showSpawnModal
+          !this.isAnyModalOpen()
         ) {
           this.render();
         }
@@ -2252,6 +2724,9 @@ export class CodaTerminalWebApp {
       }
       if (this.secondaryTerminalAddr && !this.terminals.some((t) => t.address === this.secondaryTerminalAddr)) {
         this.secondaryTerminalAddr = null;
+        if (this.focusedPane === "secondary") {
+          this.focusedPane = "primary";
+        }
       }
       if (this.splitMode && !this.secondaryTerminalAddr && this.terminals.length > 1) {
         const alt = this.terminals.find((t) => t.address !== this.activeTerminalAddr);
@@ -2268,14 +2743,16 @@ export class CodaTerminalWebApp {
         writeLocalPref("coda_last_terminal_addr", this.activeTerminalAddr);
         newlyRestoredAddr = this.activeTerminalAddr;
       }
+      this.pruneStaleVtTerminalsForPeer(peerId, this.terminals);
       // V3-32: Observe notifications AFTER activeTerminalAddr is restored so switching back does not false-alert.
       for (const term of this.terminals) {
+        this.syncVtAgentDefaultMode(peerId, term);
         this.observeTerminalStatusNotification(peerId, term);
       }
       if (newlyRestoredAddr) {
         this.attachAndReadTerminal(newlyRestoredAddr);
       }
-      if (!this.isTypingIntoInput() && !this.showSettingsModal && !this.showSpawnModal) this.render();
+      if (!this.isTypingIntoInput() && !this.isAnyModalOpen()) this.render();
       return;
     }
 
@@ -2381,8 +2858,24 @@ export class CodaTerminalWebApp {
         }
         this.terminalsByPeer.set(
           peerId,
-          peerList.filter((t) => t.alive || t.address === this.activeTerminalAddr)
+          peerList.filter(
+            (t) =>
+              t.alive ||
+              (isSelected &&
+                (t.address === this.activeTerminalAddr || t.address === this.secondaryTerminalAddr))
+          )
         );
+        if (!msg.terminal.alive) {
+          const isOpenHere =
+            isSelected &&
+            (msg.terminal.address === this.activeTerminalAddr ||
+              msg.terminal.address === this.secondaryTerminalAddr);
+          if (!isOpenHere) {
+            const deadKey = this.vtKey(peerId, msg.terminal.address);
+            this.vtTerminals.delete(deadKey);
+            this.vtStreamActive.delete(deadKey);
+          }
+        }
 
         if (isSelected) {
           const idx = this.terminals.findIndex((t) => t.address === msg.terminal.address);
@@ -2391,17 +2884,21 @@ export class CodaTerminalWebApp {
           } else if (msg.terminal.alive) {
             this.terminals.unshift(msg.terminal);
           }
+          this.syncVtAgentDefaultMode(peerId, msg.terminal);
         }
         this.observeTerminalStatusNotification(peerId, msg.terminal);
         if (
           wasNeedsYou !== nowNeedsYou &&
           this.route === "console" &&
           !this.isTypingIntoInput() &&
-          !this.showSettingsModal &&
-          !this.showSpawnModal
+          !this.isAnyModalOpen()
         ) {
           this.render();
-        } else if (isSelected && msg.terminal.address === this.activeTerminalAddr) {
+        } else if (
+          isSelected &&
+          (msg.terminal.address === this.activeTerminalAddr ||
+            (this.splitMode && msg.terminal.address === this.secondaryTerminalAddr))
+        ) {
           this.scheduleTerminalPaint();
         }
       }
@@ -2409,10 +2906,47 @@ export class CodaTerminalWebApp {
     }
 
     if (msg.op === "upload_terminal_file_result") {
+      const reqId = String(msg.req_id || "");
+      const meta = reqId ? this.pendingUploadTargets.get(reqId) : undefined;
+      if (reqId) {
+        this.pendingUploadTargets.delete(reqId);
+      }
       const peerDev = this.devices.find((d) => d.id === peerId);
       if (msg.ok && msg.remote_path) {
-        const targetTerminal = String(msg.terminal || this.activeTerminalAddr || "");
         const escapedForPty = formatUploadedPathForPty(String(msg.remote_path));
+        if (meta?.target === "draft") {
+          if (isSelected && meta.daemonId === peerId) {
+            const sep = this.draftInput && !/\s$/.test(this.draftInput) ? " " : "";
+            this.draftInput = `${this.draftInput}${sep}${escapedForPty}`;
+            this.updateDraftPreviewInPlace();
+            const composerArea = document.getElementById(
+              "prompt-composer-textarea"
+            ) as HTMLTextAreaElement | null;
+            const desktopInp = document.getElementById(
+              "desktop-prompt-input"
+            ) as HTMLInputElement | null;
+            const kbInp = document.getElementById("kb-input") as HTMLInputElement | null;
+            if (composerArea) {
+              composerArea.value = this.draftInput;
+              composerArea.focus();
+            } else if (desktopInp) {
+              desktopInp.value = this.draftInput;
+              desktopInp.focus();
+            } else if (kbInp) {
+              kbInp.value = this.draftInput;
+              kbInp.focus();
+            }
+            this.showToastNotice(
+              "ok",
+              this.tr(
+                `Uploaded & attached to prompt draft: ${msg.remote_path}`,
+                `已加密上传并插入待发送草稿：${msg.remote_path}`
+              )
+            );
+          }
+          return;
+        }
+        const targetTerminal = String(msg.terminal || meta?.terminalAddr || this.activeTerminalAddr || "");
         if (peerDev && targetTerminal) {
           this.sendEncrypted(peerDev, {
             op: "pty_input",
@@ -2445,9 +2979,30 @@ export class CodaTerminalWebApp {
     if (!this.selectedDaemon || !this.activeTerminalAddr) return;
     this.sendEncrypted(this.selectedDaemon, {
       op: "pty_detach",
-      req_id: `det-${Date.now()}`,
+      req_id: this.nextReqId("det"),
       terminal: this.activeTerminalAddr,
     });
+  }
+
+  private detachAllOpenTerminals() {
+    if (!this.selectedDaemon) return;
+    if (this.activeTerminalAddr) {
+      this.sendEncrypted(this.selectedDaemon, {
+        op: "pty_detach",
+        req_id: this.nextReqId("det"),
+        terminal: this.activeTerminalAddr,
+      });
+    }
+    if (
+      this.secondaryTerminalAddr &&
+      this.secondaryTerminalAddr !== this.activeTerminalAddr
+    ) {
+      this.sendEncrypted(this.selectedDaemon, {
+        op: "pty_detach",
+        req_id: this.nextReqId("det2"),
+        terminal: this.secondaryTerminalAddr,
+      });
+    }
   }
 
   private attachAndReadTerminal(addr: string) {
@@ -2542,16 +3097,20 @@ export class CodaTerminalWebApp {
     if (this.splitMode) {
       const alt = this.terminals.find((t) => t.address !== this.activeTerminalAddr);
       this.secondaryTerminalAddr = alt ? alt.address : null;
+      this.focusedPane = "primary";
       if (this.secondaryTerminalAddr) {
         this.attachAndReadTerminal(this.secondaryTerminalAddr);
       }
-    } else if (this.secondaryTerminalAddr && this.selectedDaemon) {
-      this.sendEncrypted(this.selectedDaemon, {
-        op: "pty_detach",
-        req_id: `det2-${Date.now()}`,
-        terminal: this.secondaryTerminalAddr,
-      });
-      this.secondaryTerminalAddr = null;
+    } else {
+      this.focusedPane = "primary";
+      if (this.secondaryTerminalAddr && this.selectedDaemon) {
+        this.sendEncrypted(this.selectedDaemon, {
+          op: "pty_detach",
+          req_id: this.nextReqId("det2"),
+          terminal: this.secondaryTerminalAddr,
+        });
+        this.secondaryTerminalAddr = null;
+      }
     }
   }
 
@@ -2566,7 +3125,7 @@ export class CodaTerminalWebApp {
       activeTerm?.cwd ||
       this.repos[0]?.root_path ||
       ".";
-    const reqId = `gd-${Date.now()}`;
+    const reqId = this.nextReqId("gd");
     this.gitDiff = {
       open: true,
       cwd: targetCwd,
@@ -2575,6 +3134,8 @@ export class CodaTerminalWebApp {
       diffUnified: "",
       files: [],
       selectedFile: null,
+      isGitRepo: true,
+      repoRoot: null,
       loading: true,
       error: null,
       reqId,
@@ -2589,7 +3150,7 @@ export class CodaTerminalWebApp {
 
   private refreshRemoteGitDiff() {
     if (!this.selectedDaemon?.is_online || !this.gitDiff.open) return;
-    const reqId = `gd-${Date.now()}`;
+    const reqId = this.nextReqId("gd");
     this.gitDiff.loading = true;
     this.gitDiff.error = null;
     this.gitDiff.reqId = reqId;
@@ -2597,6 +3158,42 @@ export class CodaTerminalWebApp {
       op: "git_diff_request",
       req_id: reqId,
       cwd: this.gitDiff.cwd || ".",
+    });
+    this.render();
+  }
+
+  private openFileFromGitDiff(relPath: string) {
+    if (!this.selectedDaemon?.is_online || !relPath) return;
+    const baseRoot = resolveGitDiffFileRoot(this.gitDiff.repoRoot, this.gitDiff.cwd);
+    const cleanRel = relPath.replace(/^\/+/, "");
+    const containingSubPath = parentSubPath(cleanRel);
+    const dirReqId = this.nextReqId("lsdir");
+    const previewReqId = this.nextReqId("rfp");
+    this.gitDiff.open = false;
+    this.fileBrowser = {
+      open: true,
+      rootPath: baseRoot,
+      subPath: containingSubPath,
+      entries: [],
+      selectedRelPath: cleanRel,
+      previewContent: "",
+      previewTruncated: false,
+      loading: true,
+      error: null,
+      dirReqId,
+      previewReqId,
+    };
+    this.sendEncrypted(this.selectedDaemon, {
+      op: "list_directory",
+      req_id: dirReqId,
+      root_path: baseRoot,
+      sub_path: containingSubPath,
+    });
+    this.sendEncrypted(this.selectedDaemon, {
+      op: "read_file_preview",
+      req_id: previewReqId,
+      path: joinRootAndRel(baseRoot, cleanRel),
+      max_bytes: 65536,
     });
     this.render();
   }
@@ -2643,6 +3240,7 @@ export class CodaTerminalWebApp {
       defaultCwd && defaultCwd.startsWith("/") ? parentAbsolutePath(defaultCwd) : "~";
     this.spawnBootstrapFolderName = "";
     this.spawnBootstrapGitUrl = "";
+    this.bootFolderManuallyEdited = false;
     this.spawnBootstrapLoading = false;
     this.spawnBootstrapMsg = null;
     this.showSpawnModal = true;
@@ -2653,13 +3251,13 @@ export class CodaTerminalWebApp {
     if (!this.selectedDaemon?.is_online) return;
     this.captureSpawnFormDraftFromDom();
     const activeTerm = this.terminals.find((t) => t.address === this.activeTerminalAddr);
-    const candidate =
-      rootOverride ||
-      (this.spawnCwd && !this.spawnCwd.startsWith("~") ? this.spawnCwd : "") ||
-      (activeTerm?.cwd && !activeTerm.cwd.startsWith("~") ? activeTerm.cwd : "") ||
-      this.repos[0]?.root_path ||
-      ".";
-    const reqId = `spdir-${Date.now()}`;
+    const candidate = resolveSpawnPickerInitialRoot({
+      rootOverride,
+      spawnCwd: this.spawnCwd,
+      activeTermCwd: activeTerm?.cwd,
+      firstRepoRoot: this.repos[0]?.root_path,
+    });
+    const reqId = this.nextReqId("spdir");
     this.spawnDirPicker = {
       open: true,
       rootPath: candidate,
@@ -2681,7 +3279,7 @@ export class CodaTerminalWebApp {
   private browseSpawnDirSubPath(subPath: string) {
     if (!this.selectedDaemon?.is_online || !this.spawnDirPicker.rootPath) return;
     this.captureSpawnFormDraftFromDom();
-    const reqId = `spdir-${Date.now()}`;
+    const reqId = this.nextReqId("spdir");
     this.spawnDirPicker.subPath = subPath;
     this.spawnDirPicker.loading = true;
     this.spawnDirPicker.error = null;
@@ -2701,8 +3299,8 @@ export class CodaTerminalWebApp {
       this.browseSpawnDirSubPath(parentSubPath(cleanSub));
       return;
     }
-    const root = this.spawnDirPicker.rootPath;
-    if (root.startsWith("/") && root !== "/") {
+    const root = this.spawnDirPicker.rootPath.trim().replace(/\/+$/, "");
+    if ((root.startsWith("/") && root !== "") || (root.startsWith("~/") && root !== "~")) {
       this.openSpawnDirectoryPicker(parentAbsolutePath(root));
     }
   }
@@ -2727,7 +3325,10 @@ export class CodaTerminalWebApp {
       return;
     }
 
+    const reqId = this.nextReqId("boot");
     this.spawnBootstrapLoading = true;
+    this.spawnBootstrapReqId = reqId;
+    this.spawnBootstrapPeerId = this.selectedDaemon.id;
     this.spawnBootstrapMsg = {
       kind: "ok",
       text: rawUrl
@@ -2736,7 +3337,7 @@ export class CodaTerminalWebApp {
     };
     this.sendEncrypted(this.selectedDaemon, {
       op: "bootstrap_workspace",
-      req_id: `boot-${Date.now()}`,
+      req_id: reqId,
       parent_dir,
       folder_name,
       git_clone_url: rawUrl || null,
@@ -2755,6 +3356,7 @@ export class CodaTerminalWebApp {
       activeTerm?.cwd ||
       this.repos[0]?.root_path ||
       ".";
+    const dirReqId = this.nextReqId("lsdir");
     this.fileBrowser = {
       open: true,
       rootPath: defaultRoot,
@@ -2765,10 +3367,12 @@ export class CodaTerminalWebApp {
       previewTruncated: false,
       loading: true,
       error: null,
+      dirReqId,
+      previewReqId: null,
     };
     this.sendEncrypted(this.selectedDaemon, {
       op: "list_directory",
-      req_id: `lsdir-${Date.now()}`,
+      req_id: dirReqId,
       root_path: defaultRoot,
       sub_path: "",
     });
@@ -2777,12 +3381,14 @@ export class CodaTerminalWebApp {
 
   private browseRemoteSubPath(subPath: string) {
     if (!this.selectedDaemon?.is_online || !this.fileBrowser.rootPath) return;
+    const dirReqId = this.nextReqId("lsdir");
     this.fileBrowser.subPath = subPath;
     this.fileBrowser.loading = true;
     this.fileBrowser.error = null;
+    this.fileBrowser.dirReqId = dirReqId;
     this.sendEncrypted(this.selectedDaemon, {
       op: "list_directory",
-      req_id: `lsdir-${Date.now()}`,
+      req_id: dirReqId,
       root_path: this.fileBrowser.rootPath,
       sub_path: subPath,
     });
@@ -2791,12 +3397,16 @@ export class CodaTerminalWebApp {
 
   private previewRemoteFile(relPath: string) {
     if (!this.selectedDaemon?.is_online || !this.fileBrowser.rootPath) return;
+    const previewReqId = this.nextReqId("rfp");
     this.fileBrowser.selectedRelPath = relPath;
+    this.fileBrowser.previewContent = "";
+    this.fileBrowser.previewTruncated = false;
     this.fileBrowser.loading = true;
     this.fileBrowser.error = null;
+    this.fileBrowser.previewReqId = previewReqId;
     this.sendEncrypted(this.selectedDaemon, {
       op: "read_file_preview",
-      req_id: `rfp-${Date.now()}`,
+      req_id: previewReqId,
       path: joinRootAndRel(this.fileBrowser.rootPath, relPath),
       max_bytes: 65536,
     });
@@ -2821,16 +3431,19 @@ export class CodaTerminalWebApp {
     if ("error" in parsed) {
       this.portPreview.error = parsed.error;
       this.portPreview.loading = false;
+      this.portPreview.reqId = null;
       this.render();
       return;
     }
+    const reqId = this.nextReqId("pp");
     this.portPreview.portInput = String(parsed.port);
     this.portPreview.pathInput = parsed.path;
     this.portPreview.loading = true;
     this.portPreview.error = null;
+    this.portPreview.reqId = reqId;
     this.sendEncrypted(this.selectedDaemon, {
       op: "http_local_preview_request",
-      req_id: `pp-${Date.now()}`,
+      req_id: reqId,
       port: parsed.port,
       path: parsed.path,
     });
@@ -2855,37 +3468,38 @@ export class CodaTerminalWebApp {
     this.render();
   }
 
-  private sendPtyInputBytes(bytes: Uint8Array | string) {
-    if (!this.selectedDaemon || !this.activeTerminalAddr) return;
+  private sendPtyInputBytesTo(terminalAddr: string | null, bytes: Uint8Array | string) {
+    if (!this.selectedDaemon || !terminalAddr) return;
     const raw = typeof bytes === "string" ? new TextEncoder().encode(bytes) : bytes;
     if (raw.length === 0) return;
     this.sendEncrypted(this.selectedDaemon, {
       op: "pty_input",
-      terminal: this.activeTerminalAddr,
+      terminal: terminalAddr,
       data_b64: toB64(raw),
     });
   }
 
-  private handleClipboardImagePaste(e: ClipboardEvent): boolean {
-    const items = e.clipboardData?.items;
-    if (!items) return false;
-    const imageBlobs: Blob[] = [];
-    for (let i = 0; i < items.length; i += 1) {
-      const item = items[i];
-      if (item.kind === "file" && item.type.startsWith("image/")) {
-        const blob = item.getAsFile();
-        if (blob) imageBlobs.push(blob);
-      }
-    }
+  private sendPtyInputBytes(bytes: Uint8Array | string) {
+    this.sendPtyInputBytesTo(this.getFocusedTerminalAddr(), bytes);
+  }
+
+  private handleClipboardImagePaste(
+    e: ClipboardEvent,
+    targetMode: "pty" | "draft" = "pty",
+    terminalOverride?: string | null
+  ): boolean {
+    const imageBlobs = extractPureClipboardImages(e.clipboardData);
     if (imageBlobs.length === 0) return false;
     e.preventDefault();
     const pinnedDaemon = this.selectedDaemon;
-    const pinnedTerminal = this.activeTerminalAddr;
+    const pinnedTerminal = terminalOverride ?? this.getFocusedTerminalAddr();
     const baseTs = Date.now();
     void (async () => {
       for (let idx = 0; idx < imageBlobs.length; idx += 1) {
-        const fname = buildClipboardImageFilename(baseTs, idx);
-        await this.uploadSingleFileToHost(imageBlobs[idx], pinnedDaemon, pinnedTerminal, fname);
+        const blob = imageBlobs[idx];
+        const origName = "name" in blob ? String((blob as File).name || "") : "";
+        const fname = buildClipboardImageFilename(baseTs, idx, blob.type, origName);
+        await this.uploadSingleFileToHost(blob, pinnedDaemon, pinnedTerminal, fname, targetMode);
       }
     })();
     return true;
@@ -2895,10 +3509,11 @@ export class CodaTerminalWebApp {
     file: Blob | File,
     pinnedDaemon?: Device | null,
     pinnedTerminal?: string | null,
-    explicitFilename?: string
+    explicitFilename?: string,
+    targetMode: "pty" | "draft" = "pty"
   ) {
     const targetDaemon = pinnedDaemon ?? this.selectedDaemon;
-    const targetTerminal = pinnedTerminal ?? this.activeTerminalAddr;
+    const targetTerminal = pinnedTerminal ?? this.getFocusedTerminalAddr();
     if (!targetDaemon || !targetTerminal) {
       this.showToastNotice(
         "err",
@@ -2918,16 +3533,27 @@ export class CodaTerminalWebApp {
     }
     const seq = ++this.uploadCounter;
     const reqToken = this.token;
-    const rawName = explicitFilename || ("name" in file ? String(file.name || "") : "");
+    const fileOrigName = "name" in file ? String(file.name || "") : "";
+    const rawName = explicitFilename || fileOrigName;
     const cleanedName = rawName.trim().replace(/^\.+/, "").slice(0, 100);
     const safeName =
       cleanedName ||
-      buildClipboardImageFilename(Date.now(), seq - 1);
+      buildClipboardImageFilename(Date.now(), seq - 1, file.type, fileOrigName);
     try {
       const bytes = new Uint8Array(await file.arrayBuffer());
       if (!this.token || this.token !== reqToken || this.selectedDaemon?.id !== targetDaemon.id) {
         return;
       }
+      const reqId = `up-${Date.now()}-${seq}`;
+      if (this.pendingUploadTargets.size >= 64) {
+        const oldest = this.pendingUploadTargets.keys().next().value;
+        if (oldest) this.pendingUploadTargets.delete(oldest);
+      }
+      this.pendingUploadTargets.set(reqId, {
+        target: targetMode,
+        daemonId: targetDaemon.id,
+        terminalAddr: targetTerminal,
+      });
       const b64 = toB64(bytes);
       this.showToastNotice(
         "ok",
@@ -2935,7 +3561,7 @@ export class CodaTerminalWebApp {
       );
       this.sendEncrypted(targetDaemon, {
         op: "upload_terminal_file",
-        req_id: `up-${Date.now()}-${seq}`,
+        req_id: reqId,
         terminal: targetTerminal,
         filename: safeName,
         data_b64: b64,
@@ -2971,7 +3597,7 @@ export class CodaTerminalWebApp {
         `Jump to Next Needs-You Session${attentionItems.length > 0 ? ` (${attentionItems.length})` : ""}`,
         `跳转至下一个待审批 (Needs-You) 终端${attentionItems.length > 0 ? ` (${attentionItems.length})` : ""}`
       ),
-      hint: "⌘J / Alt+J",
+      hint: "⌘J / Ctrl+Shift+J",
       action: () => this.jumpToNextNeedsYouTerminal(),
     });
 
@@ -2997,9 +3623,11 @@ export class CodaTerminalWebApp {
         hint: `${st} · ${term.cwd || "~"}`,
         action: () => {
           if (this.activeTerminalAddr && this.activeTerminalAddr !== term.address) {
+            this.cancelActiveVoiceCapture();
             this.detachActiveTerminal();
           }
           this.activeTerminalAddr = term.address;
+          this.focusedPane = "primary";
           writeLocalPref("coda_last_terminal_addr", term.address);
           this.attachAndReadTerminal(term.address);
         },
@@ -3127,8 +3755,9 @@ export class CodaTerminalWebApp {
           this.showSettingsModal = true;
           this.settingsTab = "alerts";
           this.settingsFeedback = null;
+          this.settingsDirtyFields.clear();
           void this.loadAccountSettingsData().then(() => {
-            if (this.showSettingsModal) this.render();
+            this.renderSettingsPreservingInputs();
           });
         },
       },
@@ -3140,8 +3769,9 @@ export class CodaTerminalWebApp {
         action: () => {
           this.showSettingsModal = true;
           this.settingsFeedback = null;
+          this.settingsDirtyFields.clear();
           void this.loadAccountSettingsData().then(() => {
-            if (this.showSettingsModal) this.render();
+            this.renderSettingsPreservingInputs();
           });
         },
       },
@@ -3175,6 +3805,27 @@ export class CodaTerminalWebApp {
     );
   }
 
+  private renderConsolePaletteRowsHtml(
+    items: ReadonlyArray<{ id: string; group: string; label: string; hint: string }>
+  ): string {
+    if (items.length === 0) {
+      return `<div style="padding:18px 10px;text-align:center;font-size:12px;color:var(--text-tertiary);">${this.tr("No matching commands", "无匹配指令")}</div>`;
+    }
+    const sel = Math.max(0, Math.min(items.length - 1, this.cmdPaletteSelectedIdx));
+    return items
+      .map(
+        (it, idx) => `
+          <button type="button" class="cmd-row ${idx === sel ? "active" : ""}" role="option" aria-selected="${idx === sel ? "true" : "false"}" data-cmd-idx="${idx}">
+            <span style="display:inline-flex;align-items:center;gap:8px;min-width:0;">
+              <span class="pm-badge" style="font-size:10px;padding:2px 6px;">${this.escapeHtml(it.group)}</span>
+              <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${this.escapeHtml(it.label)}</span>
+            </span>
+            <span class="coda-mono" style="font-size:11px;color:var(--text-tertiary);flex-shrink:0;margin-left:8px;">${this.escapeHtml(it.hint)}</span>
+          </button>`
+      )
+      .join("");
+  }
+
   private renderConsoleCommandPaletteModal(): string {
     const items = this.getConsolePaletteItems(this.cmdPaletteQuery);
     return `
@@ -3185,27 +3836,11 @@ export class CodaTerminalWebApp {
             <input id="console-cmd-input" class="pm-input" style="margin:0;border:none;background:transparent;padding:4px 0;flex:1;box-shadow:none;" value="${this.escapeHtml(
               this.cmdPaletteQuery
             )}" placeholder="${this.tr("Jump to host, terminal, git diff, or run action…", "搜索主机、终端会话、Git Diff 或执行快捷操作…")}" autocomplete="off" />
+            <span class="pm-kbd">↑↓</span>
             <span class="pm-kbd">ESC</span>
           </div>
-          <div class="cmd-list" id="console-cmd-list" style="max-height:340px;overflow-y:auto;">
-            ${
-              items.length === 0
-                ? `<div style="padding:18px 10px;text-align:center;font-size:12px;color:var(--text-tertiary);">${this.tr("No matching commands", "无匹配指令")}</div>`
-                : items
-                    .map(
-                      (it, idx) => `
-                  <button type="button" class="cmd-row" data-cmd-idx="${idx}" style="${
-                    idx === 0 ? "background:var(--bg-elevated);border-color:var(--border-primary);" : ""
-                  }">
-                    <span style="display:inline-flex;align-items:center;gap:8px;min-width:0;">
-                      <span class="pm-badge" style="font-size:10px;padding:2px 6px;">${this.escapeHtml(it.group)}</span>
-                      <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${this.escapeHtml(it.label)}</span>
-                    </span>
-                    <span class="coda-mono" style="font-size:11px;color:var(--text-tertiary);flex-shrink:0;margin-left:8px;">${this.escapeHtml(it.hint)}</span>
-                  </button>`
-                    )
-                    .join("")
-            }
+          <div class="cmd-list" id="console-cmd-list" role="listbox" style="max-height:340px;overflow-y:auto;">
+            ${this.renderConsolePaletteRowsHtml(items)}
           </div>
         </div>
       </div>
@@ -3235,6 +3870,10 @@ export class CodaTerminalWebApp {
 
   private stopVoiceCaptureResources() {
     this.voiceChunks = [];
+    if (this.pendingTranscribeTimer) {
+      clearTimeout(this.pendingTranscribeTimer);
+      this.pendingTranscribeTimer = null;
+    }
     if (this.speechRecognition) {
       this.speechRecognition.onresult = null;
       this.speechRecognition.onerror = null;
@@ -3256,6 +3895,20 @@ export class CodaTerminalWebApp {
         try { track.stop(); } catch {}
       }
       this.mediaStream = null;
+    }
+  }
+
+  private cancelActiveVoiceCapture() {
+    this.pendingTranscribeReqId = null;
+    const wasActive =
+      this.isRecordingVoice ||
+      this.isTranscribingVoice ||
+      Boolean(this.speechRecognition || this.mediaRecorder || this.mediaStream);
+    this.stopVoiceCaptureResources();
+    this.isRecordingVoice = false;
+    this.isTranscribingVoice = false;
+    if (wasActive) {
+      this.syncVoiceButtonInPlace();
     }
   }
 
@@ -3331,10 +3984,16 @@ export class CodaTerminalWebApp {
       isSafeBaseUrl: this.isSafeVoiceBaseUrl(this.voiceConfig.base_url),
       hasMediaRecorder: hasMediaRec,
       hasSpeechRecognition: Boolean(SpeechRec),
+      hasOnlineDaemon: Boolean(this.selectedDaemon?.is_online),
     });
 
     if (strategy === "whisper") {
-      await this.startMediaRecorderVoice(effectiveKey);
+      await this.startMediaRecorderVoice(effectiveKey, "direct");
+      return;
+    }
+
+    if (strategy === "daemon_whisper") {
+      await this.startMediaRecorderVoice("", "daemon");
       return;
     }
 
@@ -3352,7 +4011,12 @@ export class CodaTerminalWebApp {
     );
   }
 
-  private async startMediaRecorderVoice(apiKey: string) {
+  private async startMediaRecorderVoice(
+    apiKey: string,
+    mode: "direct" | "daemon" = "direct"
+  ) {
+    const originDaemon = this.selectedDaemon;
+    const originTerminalAddr = this.getFocusedTerminalAddr();
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       this.mediaStream = stream;
@@ -3386,12 +4050,20 @@ export class CodaTerminalWebApp {
           }
           this.mediaStream = null;
         }
-        if (chunks.length === 0) {
+        if (
+          chunks.length === 0 ||
+          this.selectedDaemon?.id !== originDaemon?.id ||
+          this.getFocusedTerminalAddr() !== originTerminalAddr
+        ) {
           this.syncVoiceButtonInPlace();
           return;
         }
         const blob = new Blob(chunks, { type: actualType });
-        await this.transcribeAudioBlob(blob, apiKey, actualType);
+        if (mode === "daemon") {
+          await this.transcribeAudioViaDaemon(blob, actualType, originDaemon);
+        } else {
+          await this.transcribeAudioBlob(blob, apiKey, actualType, originDaemon?.id ?? null, originTerminalAddr);
+        }
       };
       recorder.start();
     } catch (err: any) {
@@ -3408,7 +4080,100 @@ export class CodaTerminalWebApp {
     }
   }
 
-  private async transcribeAudioBlob(blob: Blob, apiKey: string, mimeType: string) {
+  private async transcribeAudioViaDaemon(
+    blob: Blob,
+    mimeType: string,
+    targetDaemon: Device | null | undefined
+  ) {
+    if (!this.token || !targetDaemon?.is_online || this.selectedDaemon?.id !== targetDaemon.id) {
+      this.syncVoiceButtonInPlace();
+      return;
+    }
+    if (blob.size > MAX_UPLOAD_BYTES) {
+      this.showToastNotice(
+        "err",
+        this.tr(
+          "Voice recording exceeds 4 MiB wire limit — record a shorter segment.",
+          "单段语音超过 4 MiB 传输上限，请缩短单次录音时长。"
+        )
+      );
+      return;
+    }
+    const reqToken = this.token;
+    const reqId = this.nextReqId("asr");
+    this.pendingTranscribeReqId = reqId;
+    this.isTranscribingVoice = true;
+    this.showToastNotice(
+      "ok",
+      this.tr(
+        "Transcribing audio over E2EE via host Whisper key…",
+        "正在通过端到端加密通道由远端主机 Whisper Key 转写语音…"
+      )
+    );
+    this.syncVoiceButtonInPlace();
+
+    if (this.pendingTranscribeTimer) {
+      clearTimeout(this.pendingTranscribeTimer);
+    }
+    this.pendingTranscribeTimer = setTimeout(() => {
+      if (this.pendingTranscribeReqId === reqId) {
+        this.pendingTranscribeReqId = null;
+        this.pendingTranscribeTimer = null;
+        this.isTranscribingVoice = false;
+        this.syncVoiceButtonInPlace();
+        this.showToastNotice(
+          "err",
+          this.tr("Host voice transcription timed out.", "远端主机语音转写响应超时。")
+        );
+      }
+    }, 35_000);
+
+    try {
+      const bytes = new Uint8Array(await blob.arrayBuffer());
+      if (
+        !this.token ||
+        this.token !== reqToken ||
+        this.pendingTranscribeReqId !== reqId ||
+        this.selectedDaemon?.id !== targetDaemon.id
+      ) {
+        return;
+      }
+      const ext = mimeType.includes("mp4") || mimeType.includes("m4a") ? "m4a" : "webm";
+      this.sendEncrypted(targetDaemon, {
+        op: "transcribe_audio",
+        req_id: reqId,
+        audio_b64: toB64(bytes),
+        mime_type: mimeType,
+        filename: `voice.${ext}`,
+        language: this.locale === "zh" ? "zh" : "en",
+      });
+    } catch (err: any) {
+      if (this.pendingTranscribeReqId === reqId) {
+        this.pendingTranscribeReqId = null;
+        if (this.pendingTranscribeTimer) {
+          clearTimeout(this.pendingTranscribeTimer);
+          this.pendingTranscribeTimer = null;
+        }
+        this.isTranscribingVoice = false;
+        this.syncVoiceButtonInPlace();
+        this.showToastNotice(
+          "err",
+          this.tr(
+            `Failed encoding audio for E2EE Whisper: ${err?.message || "error"}`,
+            `语音加密发送失败：${err?.message || "未知错误"}`
+          )
+        );
+      }
+    }
+  }
+
+  private async transcribeAudioBlob(
+    blob: Blob,
+    apiKey: string,
+    mimeType: string,
+    originDaemonId: string | null = null,
+    originTerminalAddr: string | null = null
+  ) {
     if (!this.token) return;
     const reqToken = this.token;
     if (!this.isSafeVoiceBaseUrl(this.voiceConfig.base_url)) {
@@ -3438,8 +4203,14 @@ export class CodaTerminalWebApp {
         body: form,
       });
       const textBody = await resp.text();
-      if (!this.token || this.token !== reqToken) {
+      if (
+        !this.token ||
+        this.token !== reqToken ||
+        (originDaemonId !== null && this.selectedDaemon?.id !== originDaemonId) ||
+        (originTerminalAddr !== null && this.getFocusedTerminalAddr() !== originTerminalAddr)
+      ) {
         this.isTranscribingVoice = false;
+        this.syncVoiceButtonInPlace();
         return;
       }
       if (!resp.ok) {
@@ -3481,18 +4252,49 @@ export class CodaTerminalWebApp {
       rec.maxAlternatives = 1;
       this.speechRecognition = rec;
       this.isRecordingVoice = true;
-      let finalSegments = "";
-      let latestInterim = "";
+      const baseDraftBeforeSpeech = this.draftInput;
+      const originDaemonId = this.selectedDaemon?.id ?? null;
+      const originTerminalAddr = this.getFocusedTerminalAddr();
+      let latestCombined = "";
       let flushed = false;
+
+      const applyLiveDraft = (combined: string) => {
+        const nextDraft = combined
+          ? baseDraftBeforeSpeech
+            ? `${baseDraftBeforeSpeech} ${combined}`
+            : combined
+          : baseDraftBeforeSpeech;
+        this.draftInput = nextDraft;
+        this.updateDraftPreviewInPlace();
+        const composerArea = document.getElementById(
+          "prompt-composer-textarea"
+        ) as HTMLTextAreaElement | null;
+        const desktopInp = document.getElementById(
+          "desktop-prompt-input"
+        ) as HTMLInputElement | null;
+        const kbInp = document.getElementById("kb-input") as HTMLInputElement | null;
+        if (composerArea) composerArea.value = nextDraft;
+        if (desktopInp) desktopInp.value = nextDraft;
+        if (kbInp) kbInp.value = nextDraft;
+      };
 
       const flushTranscript = () => {
         if (flushed) return;
         flushed = true;
-        const combined = `${finalSegments} ${latestInterim}`.trim();
         this.isRecordingVoice = false;
         this.speechRecognition = null;
-        if (combined) {
-          this.insertTranscribedText(combined);
+        if (
+          !this.token ||
+          this.selectedDaemon?.id !== originDaemonId ||
+          this.getFocusedTerminalAddr() !== originTerminalAddr
+        ) {
+          this.syncVoiceButtonInPlace();
+          return;
+        }
+        const cleaned = latestCombined.trim();
+        if (cleaned) {
+          this.draftInput = baseDraftBeforeSpeech;
+          this.insertTranscribedText(cleaned);
         } else {
           this.syncVoiceButtonInPlace();
         }
@@ -3508,25 +4310,24 @@ export class CodaTerminalWebApp {
       this.syncVoiceButtonInPlace();
 
       rec.onresult = (ev: any) => {
-        let interim = "";
-        const startIdx = typeof ev?.resultIndex === "number" ? ev.resultIndex : 0;
-        const results = ev?.results || [];
-        for (let i = startIdx; i < results.length; i += 1) {
-          const item = results[i];
-          const chunk = String(item?.[0]?.transcript || "");
-          if (!chunk) continue;
-          if (item.isFinal) {
-            finalSegments = finalSegments ? `${finalSegments} ${chunk.trim()}` : chunk.trim();
-          } else {
-            interim += chunk;
-          }
+        if (
+          !this.token ||
+          this.selectedDaemon?.id !== originDaemonId ||
+          this.getFocusedTerminalAddr() !== originTerminalAddr
+        ) {
+          flushed = true;
+          this.cancelActiveVoiceCapture();
+          return;
         }
-        latestInterim = interim.trim();
-        const preview = `${finalSegments} ${latestInterim}`.trim();
-        if (preview) {
+        // Rebuild full transcript cleanly from `0 .. results.length - 1` on every event
+        // so Safari `resultIndex = 0` ticks never duplicate finalized segments.
+        const { combined } = rebuildSpeechRecognitionTranscript(ev?.results);
+        latestCombined = combined;
+        applyLiveDraft(combined);
+        if (combined) {
           this.consoleNotice = {
             kind: "ok",
-            text: this.tr(`Dictating: "${preview}"`, `实时听写中：「${preview}」`),
+            text: this.tr(`Dictating: "${combined}"`, `实时听写中：「${combined}」`),
           };
           this.updateConsoleNoticeInPlace();
         }
@@ -4702,7 +5503,7 @@ export class CodaTerminalWebApp {
             <button id="btn-close-cmd" type="button" class="circle-btn">${svgIcon("close", 13)}</button>
           </div>
           <div class="cmd-list">
-            <button type="button" class="cmd-row" id="cmd-copy-install">
+            <button type="button" class="cmd-row active" id="cmd-copy-install">
               <span style="display:inline-flex;align-items:center;gap:8px;">${svgIcon("copy", 14)} ${this.tr("Copy one-line install command (curl | sh)", "复制一行接入命令 (curl | sh)")}</span>
               <span class="pm-kbd">Enter</span>
             </button>
@@ -4751,6 +5552,7 @@ export class CodaTerminalWebApp {
   private bindCommandPalette(installCmd: string) {
     document.getElementById("btn-cmd-k")?.addEventListener("click", () => {
       this.showCmdPalette = true;
+      this.cmdPaletteSelectedIdx = 0;
       this.render();
     });
     document.getElementById("btn-close-cmd")?.addEventListener("click", () => {
@@ -5172,8 +5974,20 @@ export class CodaTerminalWebApp {
     this.lastRenderedTermKey = selectedVtKey;
     const activeVt = selectedVtKey ? this.vtTerminals.get(selectedVtKey) : undefined;
     const isVtStream = Boolean(activeVt && this.vtStreamActive.has(selectedVtKey));
+    const showPrimaryCursor = !(
+      this.splitMode &&
+      !isNarrowViewport &&
+      this.focusedPane === "secondary" &&
+      this.secondaryTerminalAddr
+    );
+    const focusedAddr = this.getFocusedTerminalAddr() || activeTerm?.address || null;
+    const focusedTerm = this.terminals.find((t) => t.address === focusedAddr) || activeTerm;
+    const focusedVt =
+      this.selectedDaemon && focusedAddr
+        ? this.vtTerminals.get(this.vtKey(this.selectedDaemon.id, focusedAddr))
+        : activeVt;
     const initialVtHtml = isVtStream && activeVt
-      ? activeVt.renderInitialRowsHtml(true)
+      ? activeVt.renderInitialRowsHtml(showPrimaryCursor)
       : this.tr(
           `  - Connected to PostgreSQL 18 multi-tenant control plane &amp; E2EE tunnel (X25519 + ChaCha20-Poly1305)\n  - Local Herdr Core online. Use '+' on the right rail to launch Shell / Claude Code / Codex / Grok / AGY / Gemini CLI.\n\n* Ready · ${this.rttMs !== null ? `RTT ${this.rttMs}ms` : "Relay WSS :443 Ready"}`,
           `  - 已连接 PostgreSQL 18 多租户控制面与端到端加密隧道 (X25519 + ChaCha20-Poly1305)\n  - 本机 Herdr Core 在线，随时可通过右侧「+」拉起 Shell / Claude Code / Codex / Grok / AGY / Gemini CLI\n\n* Ready · ${this.rttMs !== null ? `RTT ${this.rttMs}ms` : "Relay WSS :443 Ready"}`
@@ -5223,8 +6037,18 @@ export class CodaTerminalWebApp {
         d.id !== this.myClientDevice?.id
     ).length;
     const effectiveVoiceKey = (this.voiceApiKeyLocal || this.voiceConfig.api_key || "").trim();
-    const hasWhisperKey = Boolean(effectiveVoiceKey && !effectiveVoiceKey.startsWith("••"));
+    const hasWhisperKey = Boolean(
+      effectiveVoiceKey && (!effectiveVoiceKey.startsWith("••") || this.selectedDaemon?.is_online)
+    );
     const hasSpeechFallback = this.hasBrowserSpeechRecognition();
+    const composerUseBracketedPaste = resolveEffectiveBracketedPaste({
+      bracketedPaste: focusedVt?.bracketedPaste,
+      bracketedPasteExplicit: focusedVt?.bracketedPasteExplicit,
+      term: focusedTerm,
+    });
+    const anyModalOpen = this.isAnyModalOpen();
+    const isComposerFocused =
+      typeof document !== "undefined" && document.activeElement?.id === "prompt-composer-textarea";
     const workspaceRoots = [
       ...(activeTerm?.cwd ? [activeTerm.cwd] : []),
       ...this.repos.map((r) => r.root_path),
@@ -5232,7 +6056,7 @@ export class CodaTerminalWebApp {
     ];
 
     root.innerHTML = `
-      <div class="shell-root">
+      <div class="shell-root${isComposerFocused ? " is-composer-focused" : ""}"${anyModalOpen ? " inert" : ""}>
         ${
           this.showSidebar && isNarrowViewport
             ? `<div class="sidebar-backdrop" id="sidebar-backdrop"></div>`
@@ -5378,7 +6202,7 @@ export class CodaTerminalWebApp {
             <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
               ${
                 needsAttentionItems.length > 0
-                  ? `<button type="button" id="btn-topbar-needs-you" class="pm-cmd-trigger" style="height:30px;padding:0 9px;border-color:var(--amber-bd);background:var(--amber-bg);color:var(--amber);" title="${this.tr("Jump to next Needs-You terminal (⌘J / Alt+J)", "跳转至下一个待审批终端 (⌘J / Alt+J)")}">
+                  ? `<button type="button" id="btn-topbar-needs-you" class="pm-cmd-trigger" style="height:30px;padding:0 9px;border-color:var(--amber-bd);background:var(--amber-bg);color:var(--amber);" title="${this.tr("Jump to next Needs-You terminal (⌘J / Ctrl+Shift+J)", "跳转至下一个待审批终端 (⌘J / Ctrl+Shift+J)")}">
                       <span class="needs-you-dot"></span>
                       <span class="coda-mono">${needsAttentionItems.length}</span>
                       <span class="pm-kbd">⌘J</span>
@@ -5445,7 +6269,7 @@ export class CodaTerminalWebApp {
           <div class="term-split-grid ${this.splitMode && !isNarrowViewport ? "is-split" : ""}">
             <div class="term-viewport-wrap">
               <div id="console-floating-toast-slot">${this.renderFloatingToastHtml()}</div>
-              <div class="term-viewport pane-focused" id="term-box" tabindex="0" aria-label="${this.tr("Interactive Terminal Viewport", "交互式终端视口")}"><div id="console-notice-slot">${this.renderConsoleNoticeHtml()}</div><div id="term-screen-output" data-vt-mode="${isVtStream ? "rows" : "placeholder"}" data-vt-evictions="${activeVt?.getScrollbackEvictions() ?? 0}" data-vt-alt="${activeVt?.isUsingAltScreen() ? "1" : "0"}" style="white-space:pre;overflow-x:auto;">${initialVtHtml}</div>
+              <div class="term-viewport ${showPrimaryCursor ? "pane-focused" : ""}" id="term-box" tabindex="${anyModalOpen ? "-1" : "0"}" aria-label="${this.tr("Interactive Terminal Viewport", "交互式终端视口")}"><div id="console-notice-slot">${this.renderConsoleNoticeHtml()}</div><div id="term-screen-output" data-vt-mode="${isVtStream ? "rows" : "placeholder"}" data-vt-evictions="${activeVt?.getScrollbackEvictions() ?? 0}" data-vt-alt="${activeVt?.isUsingAltScreen() ? "1" : "0"}" style="white-space:pre;overflow-x:auto;">${initialVtHtml}</div>
 <div id="term-draft-slot">${this.renderDraftPreviewHtml()}</div>
 <div id="term-footer-meta" style="font-size:12px;color:var(--text-tertiary);margin-top:8px;">${this.escapeHtml(footerTransport)} &middot; E2EE X25519 + ChaCha20 &middot; ${this.termCols}&times;${this.termRows} &middot; ${this.terminals.length} PTY &middot; ${this.tr("⌘+Click URL · Ctrl+V/⌘V screenshot to upload", "⌘+点击打开链接 · Ctrl+V/⌘V 粘贴截图直传终端")}</div></div>
               <button type="button" id="btn-scroll-bottom" class="term-scroll-bottom-btn" title="${this.tr("Jump to latest output", "回到底部最新输出")}">
@@ -5459,8 +6283,9 @@ export class CodaTerminalWebApp {
                     const secKey = this.selectedDaemon && secTerm ? this.vtKey(this.selectedDaemon.id, secTerm.address) : "";
                     const secVt = secKey ? this.vtTerminals.get(secKey) : undefined;
                     const secIsStream = Boolean(secVt && this.vtStreamActive.has(secKey));
+                    const secFocused = Boolean(secTerm && this.focusedPane === "secondary");
                     const secHtml = secIsStream && secVt
-                      ? secVt.renderInitialRowsHtml(false)
+                      ? secVt.renderInitialRowsHtml(secFocused)
                       : this.escapeHtml(
                           secTerm
                             ? this.tr("Connecting secondary split terminal…", "正在连接副分屏终端…")
@@ -5468,7 +6293,7 @@ export class CodaTerminalWebApp {
                         );
                     return `
             <div class="term-viewport-wrap">
-              <div class="term-viewport" id="term-box-secondary" tabindex="0" aria-label="${this.tr("Secondary Split Terminal", "副分屏终端")}">
+              <div class="term-viewport ${secFocused ? "pane-focused" : ""}" id="term-box-secondary" tabindex="${anyModalOpen ? "-1" : "0"}" aria-label="${this.tr("Secondary Split Terminal", "副分屏终端")}">
                 <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;padding-bottom:6px;margin-bottom:6px;border-bottom:1px solid var(--border-primary);font-size:11.5px;">
                   <span class="coda-mono" style="color:var(--text-secondary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${this.escapeHtml(secTerm?.name || secTerm?.address || this.tr("Secondary Pane", "副分屏"))}</span>
                   <div style="display:flex;gap:6px;align-items:center;">
@@ -5501,7 +6326,7 @@ export class CodaTerminalWebApp {
           </div>
 
           <!-- OSC 7501 Needs-You One-Tap Approval Capsule Bar -->
-          ${renderNeedsYouCapsuleBar(activeTerm, (en, zh) => this.tr(en, zh))}
+          ${renderNeedsYouCapsuleBar(focusedTerm, (en, zh) => this.tr(en, zh))}
 
           <!-- Toggleable Multi-Line Prompt Composer Drawer -->
           ${renderPromptComposerPanel({
@@ -5511,6 +6336,7 @@ export class CodaTerminalWebApp {
             isTranscribingVoice: this.isTranscribingVoice,
             hasSpeechFallback,
             hasWhisperKey,
+            useBracketedPaste: composerUseBracketedPaste,
             tr: (en, zh) => this.tr(en, zh),
           })}
 
@@ -5671,12 +6497,13 @@ export class CodaTerminalWebApp {
                 this.spawnDirPicker.open
                   ? (() => {
                       const currentBrowsed = joinRootAndRel(
-                        this.spawnDirPicker.rootPath || ".",
+                        this.spawnDirPicker.rootPath || "~",
                         this.spawnDirPicker.subPath
                       );
-                      const canGoUp =
-                        Boolean(this.spawnDirPicker.subPath.replace(/^\/+|\/+$/g, "")) ||
-                        (this.spawnDirPicker.rootPath.startsWith("/") && this.spawnDirPicker.rootPath !== "/");
+                      const canGoUp = canStepUpSpawnDirectory(
+                        this.spawnDirPicker.rootPath,
+                        this.spawnDirPicker.subPath
+                      );
                       return `
               <div class="spawn-subbox">
                 <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;">
@@ -5779,7 +6606,7 @@ export class CodaTerminalWebApp {
       ${
         this.pendingActivationCode
           ? `
-        <div class="modal-mask">
+        <div class="modal-mask" id="activate-modal-mask">
           <div class="modal-card">
             <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
               <strong style="font-size:15px;display:inline-flex;align-items:center;gap:8px;">${svgIcon("key", 15)} ${this.tr(`Authorize Device for @${this.escapeHtml(this.user.handle)}`, `确认授权设备接入 @${this.escapeHtml(this.user.handle)}`)}</strong>
@@ -5835,7 +6662,7 @@ export class CodaTerminalWebApp {
               </form>
               <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;">
                 <button id="btn-gen-pair" type="button" class="pm-btn pm-btn-secondary pm-btn-sm">${this.tr("+ 6-Digit Pair Token", "+ 生成 6 位配对码")}</button>
-                <button id="btn-prune-stale-devices" type="button" class="pm-btn pm-btn-secondary pm-btn-sm">
+                <button id="btn-prune-stale-devices" type="button" class="pm-btn pm-btn-secondary pm-btn-sm" ${this.pruneDevicesInFlight ? "disabled" : ""}>
                   ${this.tr("Clean Offline Browser Devices", "清理离线浏览器设备")}${offlineWebClientCount > 0 ? ` (${offlineWebClientCount})` : ""}
                 </button>
                 <button id="btn-go-home" type="button" class="pm-btn pm-btn-secondary pm-btn-sm">${this.tr("Home", "官网首页")}</button>
@@ -5952,10 +6779,10 @@ export class CodaTerminalWebApp {
                   <input name="generic_webhook_url" class="pm-input coda-mono" style="margin:0;height:34px;font-size:12px;" value="${this.escapeHtml(this.notificationSettings.generic_webhook_url)}" placeholder="https://hooks.example.com/coda-alert" />
                 </div>
                 <div style="display:flex;gap:8px;margin-top:4px;">
-                  <button type="submit" class="pm-btn pm-btn-primary" style="flex:1;">
+                  <button type="submit" id="btn-save-webhooks" class="pm-btn pm-btn-primary" style="flex:1;" ${this.webhookSaveInFlight ? "disabled" : ""}>
                     ${this.tr("Save Webhooks", "保存推送配置")}
                   </button>
-                  <button type="button" id="btn-test-webhooks" class="pm-btn pm-btn-secondary">
+                  <button type="button" id="btn-test-webhooks" class="pm-btn pm-btn-secondary" ${this.webhookTestInFlight ? "disabled" : ""}>
                     ${this.tr("Send Test Push", "发送测试推送")}
                   </button>
                 </div>
@@ -6104,9 +6931,10 @@ export class CodaTerminalWebApp {
     const openSettings = () => {
       this.showSettingsModal = true;
       this.settingsFeedback = null;
+      this.settingsDirtyFields.clear();
       this.render();
       void this.loadAccountSettingsData().then(() => {
-        if (this.showSettingsModal) this.render();
+        if (this.showSettingsModal) this.renderSettingsPreservingInputs();
       });
     };
 
@@ -6114,6 +6942,11 @@ export class CodaTerminalWebApp {
       this.stopVoiceCaptureResources();
       this.isRecordingVoice = false;
       this.isTranscribingVoice = false;
+      this.pendingTranscribeReqId = null;
+      if (this.pendingTranscribeTimer) {
+        clearTimeout(this.pendingTranscribeTimer);
+        this.pendingTranscribeTimer = null;
+      }
       this.stopAllTransportsAndTimers();
       clearSessionToken();
       this.token = null;
@@ -6143,6 +6976,7 @@ export class CodaTerminalWebApp {
       this.activeTerminalAddr = null;
       this.splitMode = false;
       this.secondaryTerminalAddr = null;
+      this.focusedPane = "primary";
       this.showTermSearch = false;
       this.termSearchQuery = "";
       this.termSearchIdx = 0;
@@ -6152,6 +6986,16 @@ export class CodaTerminalWebApp {
       this.gitDiff = createInitialGitDiffState();
       this.showPromptComposer = false;
       this.draftInput = "";
+      this.bootFolderManuallyEdited = false;
+      this.spawnBootstrapReqId = null;
+      this.spawnBootstrapPeerId = null;
+      this.nextFileInputTarget = "pty";
+      this.pendingUploadTargets.clear();
+      this.settingsDirtyFields.clear();
+      this.webhookTestInFlight = false;
+      this.webhookSaveInFlight = false;
+      this.pruneDevicesInFlight = false;
+      this.cmdPaletteSelectedIdx = 0;
       this.pairCommand = null;
       this.latestInviteCode = null;
       this.rttMs = null;
@@ -6194,12 +7038,18 @@ export class CodaTerminalWebApp {
       });
     });
 
-    document.getElementById("btn-dismiss-activate")?.addEventListener("click", () => {
+    const dismissPendingActivation = () => {
       this.pendingActivationCode = "";
       this.pendingDeviceInfo = null;
       this.errorMsg = "";
       window.history.replaceState({}, "", "/console");
       this.render();
+    };
+    document.getElementById("btn-dismiss-activate")?.addEventListener("click", dismissPendingActivation);
+    document.getElementById("activate-modal-mask")?.addEventListener("click", (e) => {
+      if ((e.target as HTMLElement).id === "activate-modal-mask") {
+        dismissPendingActivation();
+      }
     });
     document.getElementById("btn-approve-device")?.addEventListener("click", async () => {
       try {
@@ -6234,10 +7084,18 @@ export class CodaTerminalWebApp {
         this.render();
         if (tab === "security" || tab === "devices" || tab === "alerts") {
           void this.loadAccountSettingsData().then(() => {
-            if (this.showSettingsModal) this.render();
+            if (this.showSettingsModal) this.renderSettingsPreservingInputs();
           });
         }
       });
+    });
+
+    root.querySelectorAll<HTMLInputElement>("#modal-bg input[name]").forEach((inp) => {
+      const markDirty = () => {
+        this.settingsDirtyFields.add(`${inp.form?.id || "form"}:${inp.name}`);
+      };
+      inp.addEventListener("input", markDirty);
+      inp.addEventListener("change", markDirty);
     });
 
     document.getElementById("quick-approve-form")?.addEventListener("submit", async (e) => {
@@ -6262,9 +7120,16 @@ export class CodaTerminalWebApp {
       }
     });
 
-    document.getElementById("btn-prune-stale-devices")?.addEventListener("click", async () => {
+    const pruneBtn = document.getElementById("btn-prune-stale-devices") as HTMLButtonElement | null;
+    pruneBtn?.addEventListener("click", async () => {
+      if (this.pruneDevicesInFlight) return;
+      this.pruneDevicesInFlight = true;
+      pruneBtn.disabled = true;
       try {
-        const res = await this.api("/api/v1/devices/prune-stale", "POST", { max_idle_days: 0 });
+        const res = await this.api("/api/v1/devices/prune-stale", "POST", {
+          max_idle_days: 0,
+          exclude_device_id: this.myClientDevice?.id ?? null,
+        });
         const count = Number(res?.pruned_count ?? 0);
         await this.refreshDevices();
         this.settingsFeedback = {
@@ -6274,13 +7139,14 @@ export class CodaTerminalWebApp {
             `已清理 ${count} 台离线浏览器客户端设备。`
           ),
         };
-        this.render();
       } catch (err: any) {
         this.settingsFeedback = {
           kind: "err",
           text: String(err?.message || this.tr("Failed pruning stale browser devices", "清理离线浏览器设备失败")),
         };
-        this.render();
+      } finally {
+        this.pruneDevicesInFlight = false;
+        this.renderSettingsPreservingInputs();
       }
     });
 
@@ -6300,16 +7166,33 @@ export class CodaTerminalWebApp {
       };
     };
 
-    document.getElementById("webhook-settings-form")?.addEventListener("submit", async (e) => {
+    const webhookForm = document.getElementById("webhook-settings-form") as HTMLFormElement | null;
+    const markWebhooksDirty = () => {
+      this.settingsDirtyFields.add("webhooks");
+      const cur = readWebhookFormValues();
+      if (cur) {
+        this.notificationSettings = cur;
+      }
+    };
+    webhookForm?.addEventListener("input", markWebhooksDirty);
+    webhookForm?.addEventListener("change", markWebhooksDirty);
+
+    webhookForm?.addEventListener("submit", async (e) => {
       e.preventDefault();
+      if (this.webhookSaveInFlight) return;
       const nextCfg = readWebhookFormValues();
       if (!nextCfg) return;
       const vErr = validateNotificationWebhookSettings(nextCfg);
       if (vErr) {
         this.settingsFeedback = { kind: "err", text: vErr };
+        this.settingsDirtyFields.delete("webhooks");
+        this.notificationSettings = nextCfg;
         this.render();
         return;
       }
+      this.webhookSaveInFlight = true;
+      const saveBtn = document.getElementById("btn-save-webhooks") as HTMLButtonElement | null;
+      if (saveBtn) saveBtn.disabled = true;
       try {
         const saved = await this.api("/api/v1/me/notifications", "PUT", nextCfg);
         this.notificationSettings = {
@@ -6322,53 +7205,67 @@ export class CodaTerminalWebApp {
           notify_on_needs_you: saved?.notify_on_needs_you !== false,
           notify_on_finished: saved?.notify_on_finished !== false,
         };
+        this.settingsDirtyFields.delete("webhooks");
         this.settingsFeedback = {
           kind: "ok",
           text: this.tr("Saved offline alert webhook settings.", "已保存离线告警推送 Webhook 配置。"),
         };
-        this.render();
       } catch (err: any) {
+        this.notificationSettings = nextCfg;
+        this.settingsDirtyFields.delete("webhooks");
         this.settingsFeedback = {
           kind: "err",
           text: String(err?.message || this.tr("Failed saving webhook settings", "保存离线推送配置失败")),
         };
+      } finally {
+        this.webhookSaveInFlight = false;
         this.render();
       }
     });
 
-    document.getElementById("btn-test-webhooks")?.addEventListener("click", async () => {
+    const btnTestWebhooks = document.getElementById("btn-test-webhooks") as HTMLButtonElement | null;
+    btnTestWebhooks?.addEventListener("click", async () => {
+      if (this.webhookTestInFlight) return;
       const nextCfg = readWebhookFormValues();
       if (nextCfg) {
         const vErr = validateNotificationWebhookSettings(nextCfg);
         if (vErr) {
+          this.notificationSettings = nextCfg;
+          this.settingsDirtyFields.delete("webhooks");
           this.settingsFeedback = { kind: "err", text: vErr };
           this.render();
           return;
         }
-        try {
-          const saved = await this.api("/api/v1/me/notifications", "PUT", nextCfg);
-          if (saved && typeof saved === "object") {
-            this.notificationSettings = {
-              bark_url: String(saved.bark_url ?? nextCfg.bark_url),
-              telegram_bot_token: String(saved.telegram_bot_token ?? nextCfg.telegram_bot_token),
-              telegram_chat_id: String(saved.telegram_chat_id ?? nextCfg.telegram_chat_id),
-              feishu_webhook_url: String(saved.feishu_webhook_url ?? nextCfg.feishu_webhook_url),
-              discord_webhook_url: String(saved.discord_webhook_url ?? nextCfg.discord_webhook_url),
-              generic_webhook_url: String(saved.generic_webhook_url ?? nextCfg.generic_webhook_url),
-              notify_on_needs_you: saved.notify_on_needs_you !== false,
-              notify_on_finished: saved.notify_on_finished !== false,
-            };
-          }
-        } catch (err: any) {
-          this.settingsFeedback = {
-            kind: "err",
-            text: String(err?.message || this.tr("Failed saving webhook settings before test", "测试前保存推送配置失败")),
-          };
-          this.render();
-          return;
-        }
       }
+      this.webhookTestInFlight = true;
+      btnTestWebhooks.disabled = true;
       try {
+        if (nextCfg) {
+          try {
+            const saved = await this.api("/api/v1/me/notifications", "PUT", nextCfg);
+            if (saved && typeof saved === "object") {
+              this.notificationSettings = {
+                bark_url: String(saved.bark_url ?? nextCfg.bark_url),
+                telegram_bot_token: String(saved.telegram_bot_token ?? nextCfg.telegram_bot_token),
+                telegram_chat_id: String(saved.telegram_chat_id ?? nextCfg.telegram_chat_id),
+                feishu_webhook_url: String(saved.feishu_webhook_url ?? nextCfg.feishu_webhook_url),
+                discord_webhook_url: String(saved.discord_webhook_url ?? nextCfg.discord_webhook_url),
+                generic_webhook_url: String(saved.generic_webhook_url ?? nextCfg.generic_webhook_url),
+                notify_on_needs_you: saved.notify_on_needs_you !== false,
+                notify_on_finished: saved.notify_on_finished !== false,
+              };
+            }
+            this.settingsDirtyFields.delete("webhooks");
+          } catch (err: any) {
+            this.notificationSettings = nextCfg;
+            this.settingsDirtyFields.delete("webhooks");
+            this.settingsFeedback = {
+              kind: "err",
+              text: String(err?.message || this.tr("Failed saving webhook settings before test", "测试前保存推送配置失败")),
+            };
+            return;
+          }
+        }
         const res = await this.api("/api/v1/me/notifications/test", "POST", {});
         const delivered: string[] = Array.isArray(res?.delivered_channels) ? res.delivered_channels : [];
         const errors: string[] = Array.isArray(res?.errors) ? res.errors : [];
@@ -6394,12 +7291,13 @@ export class CodaTerminalWebApp {
             ),
           };
         }
-        this.render();
       } catch (err: any) {
         this.settingsFeedback = {
           kind: "err",
           text: String(err?.message || this.tr("Test push failed", "测试推送请求失败")),
         };
+      } finally {
+        this.webhookTestInFlight = false;
         this.render();
       }
     });
@@ -6444,6 +7342,7 @@ export class CodaTerminalWebApp {
           this.e2eeSessions.delete(id);
           this.directE2eeSessions.delete(id);
           this.terminalsByPeer.delete(id);
+          this.pruneStaleVtTerminalsForPeer(id, []);
           if (this.directWsPeerId === id) {
             this.teardownDirectWs();
           }
@@ -6638,6 +7537,22 @@ export class CodaTerminalWebApp {
       this.termResizeObserver = null;
     }
     const termBox = document.getElementById("term-box");
+    const secTermBox = document.getElementById("term-box-secondary");
+    const setFocusedPane = (pane: "primary" | "secondary") => {
+      const effective: "primary" | "secondary" =
+        pane === "secondary" && this.splitMode && !isNarrowViewport && this.secondaryTerminalAddr
+          ? "secondary"
+          : "primary";
+      if (this.focusedPane === effective) return;
+      this.focusedPane = effective;
+      termBox?.classList.toggle("pane-focused", effective === "primary");
+      secTermBox?.classList.toggle("pane-focused", effective === "secondary");
+      const nextFocusedTerm = this.terminals.find(
+        (t) => t.address === (effective === "secondary" ? this.secondaryTerminalAddr : this.activeTerminalAddr)
+      );
+      this.syncNeedsYouBarInPlace(nextFocusedTerm);
+      this.scheduleTerminalPaint();
+    };
     if (termBox) {
       // V3-22: Restore scroll position across console re-renders (pin to bottom on terminal switch or if already near bottom).
       termBox.scrollTop = switchedTerminal || prevWasNearBottom ? termBox.scrollHeight : prevScrollTop;
@@ -6648,20 +7563,29 @@ export class CodaTerminalWebApp {
         this.scheduleTerminalResizeSync();
       });
       this.termResizeObserver.observe(termBox);
+      if (secTermBox) {
+        this.termResizeObserver.observe(secTermBox);
+      }
     }
+
+    termBox?.addEventListener("focus", () => {
+      setFocusedPane("primary");
+    });
+    termBox?.addEventListener("mousedown", () => {
+      setFocusedPane("primary");
+    });
 
     // Direct raw keystroke, drag-drop file upload, scrollback jump-to-bottom & clipboard image/text paste
     termBox?.addEventListener("keydown", (e) => {
-      const isJumpNeedsYou =
-        (e.metaKey && !e.ctrlKey && !e.altKey && e.key.toLowerCase() === "j") ||
-        (e.altKey && !e.ctrlKey && !e.metaKey && (e.code === "KeyJ" || e.key.toLowerCase() === "j"));
-      if (isJumpNeedsYou) {
+      if (this.isAnyModalOpen()) return;
+      if (isJumpNeedsYouShortcut(e)) {
         e.preventDefault();
         e.stopPropagation();
         this.jumpToNextNeedsYouTerminal();
         return;
       }
       if (!this.selectedDaemon || !this.activeTerminalAddr) return;
+      setFocusedPane("primary");
       const keyVt = this.vtTerminals.get(this.vtKey(this.selectedDaemon.id, this.activeTerminalAddr));
       const seq = encodeTerminalKeyEvent(e, {
         appCursorKeys: keyVt?.appCursorKeys ?? false,
@@ -6671,19 +7595,77 @@ export class CodaTerminalWebApp {
         e.preventDefault();
         // V3-24: Prevent terminal keys like Ctrl+K from bubbling up to window ⌘K palette handler.
         e.stopPropagation();
-        this.sendPtyInputBytes(seq);
+        this.sendPtyInputBytesTo(this.activeTerminalAddr, seq);
       }
     });
 
     termBox?.addEventListener("paste", (e) => {
+      if (this.isAnyModalOpen() || this.isEditablePasteTarget(e.target)) return;
       if (!this.selectedDaemon || !this.activeTerminalAddr) return;
-      if (this.handleClipboardImagePaste(e)) return;
-      const text = e.clipboardData?.getData("text");
+      setFocusedPane("primary");
+      if (this.handleClipboardImagePaste(e, "pty", this.activeTerminalAddr)) return;
+      const text = e.clipboardData?.getData("text/plain") || e.clipboardData?.getData("text") || "";
       if (!text) return;
       e.preventDefault();
       const keyVt = this.vtTerminals.get(this.vtKey(this.selectedDaemon.id, this.activeTerminalAddr));
-      const payload = wrapBracketedPaste(text, Boolean(keyVt?.bracketedPaste));
-      this.sendPtyInputBytes(payload);
+      const curTerm = this.terminals.find((t) => t.address === this.activeTerminalAddr);
+      const useBp = resolveEffectiveBracketedPaste({
+        bracketedPaste: keyVt?.bracketedPaste,
+        bracketedPasteExplicit: keyVt?.bracketedPasteExplicit,
+        term: curTerm,
+      });
+      this.sendPtyInputBytesTo(this.activeTerminalAddr, wrapBracketedPaste(text, useBp));
+    });
+
+    secTermBox?.addEventListener("focus", (e) => {
+      const tag = String((e.target as HTMLElement | null)?.tagName || "").toUpperCase();
+      if (tag === "SELECT" || tag === "BUTTON" || tag === "INPUT") return;
+      setFocusedPane("secondary");
+    });
+    secTermBox?.addEventListener("mousedown", (e) => {
+      const tag = String((e.target as HTMLElement | null)?.tagName || "").toUpperCase();
+      if (tag === "SELECT" || tag === "BUTTON" || tag === "INPUT" || tag === "OPTION") return;
+      setFocusedPane("secondary");
+    });
+    secTermBox?.addEventListener("keydown", (e) => {
+      if (this.isAnyModalOpen()) return;
+      const tag = String((e.target as HTMLElement | null)?.tagName || "").toUpperCase();
+      if (tag === "SELECT" || tag === "BUTTON" || tag === "INPUT") return;
+      if (isJumpNeedsYouShortcut(e)) {
+        e.preventDefault();
+        e.stopPropagation();
+        this.jumpToNextNeedsYouTerminal();
+        return;
+      }
+      if (!this.selectedDaemon || !this.secondaryTerminalAddr) return;
+      setFocusedPane("secondary");
+      const secVt = this.vtTerminals.get(this.vtKey(this.selectedDaemon.id, this.secondaryTerminalAddr));
+      const seq = encodeTerminalKeyEvent(e, {
+        appCursorKeys: secVt?.appCursorKeys ?? false,
+        imeComposing: this.imeComposing,
+      });
+      if (seq !== null) {
+        e.preventDefault();
+        e.stopPropagation();
+        this.sendPtyInputBytesTo(this.secondaryTerminalAddr, seq);
+      }
+    });
+    secTermBox?.addEventListener("paste", (e) => {
+      if (this.isAnyModalOpen() || this.isEditablePasteTarget(e.target)) return;
+      if (!this.selectedDaemon || !this.secondaryTerminalAddr) return;
+      setFocusedPane("secondary");
+      if (this.handleClipboardImagePaste(e, "pty", this.secondaryTerminalAddr)) return;
+      const text = e.clipboardData?.getData("text/plain") || e.clipboardData?.getData("text") || "";
+      if (!text) return;
+      e.preventDefault();
+      const secVt = this.vtTerminals.get(this.vtKey(this.selectedDaemon.id, this.secondaryTerminalAddr));
+      const secTerm = this.terminals.find((t) => t.address === this.secondaryTerminalAddr);
+      const useBp = resolveEffectiveBracketedPaste({
+        bracketedPaste: secVt?.bracketedPaste,
+        bracketedPasteExplicit: secVt?.bracketedPasteExplicit,
+        term: secTerm,
+      });
+      this.sendPtyInputBytesTo(this.secondaryTerminalAddr, wrapBracketedPaste(text, useBp));
     });
 
     const dragHasFiles = (e: DragEvent): boolean => {
@@ -6718,7 +7700,7 @@ export class CodaTerminalWebApp {
         const pinnedTerminal = this.activeTerminalAddr;
         void (async () => {
           for (const f of files) {
-            await this.uploadSingleFileToHost(f, pinnedDaemon, pinnedTerminal);
+            await this.uploadSingleFileToHost(f, pinnedDaemon, pinnedTerminal, undefined, "pty");
           }
         })();
       }
@@ -6736,11 +7718,12 @@ export class CodaTerminalWebApp {
     // OSC 7501 Needs-You one-tap capsule approval buttons (`Allow (y)`, `Reject (Esc)`, `1`, `2`, `3`, `Enter`)
     document.querySelectorAll<HTMLButtonElement>("[data-approve]").forEach((btn) => {
       btn.addEventListener("click", () => {
-        if (!this.selectedDaemon || !this.activeTerminalAddr) return;
+        const targetAddr = this.getFocusedTerminalAddr();
+        if (!this.selectedDaemon || !targetAddr) return;
         const action = (btn.dataset.approve || "allow") as ApprovalCapsuleAction;
-        this.sendPtyInputBytes(encodeApprovalActionBytes(action));
-        // V3-10: Optimistically transition active terminal out of NeedsYou so bar & sidebar inbox update cleanly.
-        const active = this.terminals.find((t) => t.address === this.activeTerminalAddr);
+        this.sendPtyInputBytesTo(targetAddr, encodeApprovalActionBytes(action));
+        // V3-10: Optimistically transition focused terminal out of NeedsYou so bar & sidebar inbox update cleanly.
+        const active = this.terminals.find((t) => t.address === targetAddr);
         if (active) {
           active.status = {
             ...(active.status || {}),
@@ -6761,11 +7744,19 @@ export class CodaTerminalWebApp {
       if (this.imeComposing) return;
       const area = document.getElementById("prompt-composer-textarea") as HTMLTextAreaElement | null;
       const rawText = area ? area.value : this.draftInput;
-      if (this.selectedDaemon && this.activeTerminalAddr) {
+      const targetAddr = this.getFocusedTerminalAddr();
+      if (this.selectedDaemon && targetAddr) {
         if (rawText.trim()) {
-          this.sendPtyInputBytes(encodeComposerBracketedPasteSubmit(rawText));
+          const targetVt = this.vtTerminals.get(this.vtKey(this.selectedDaemon.id, targetAddr));
+          const targetTerm = this.terminals.find((t) => t.address === targetAddr);
+          const useBp = resolveEffectiveBracketedPaste({
+            bracketedPaste: targetVt?.bracketedPaste,
+            bracketedPasteExplicit: targetVt?.bracketedPasteExplicit,
+            term: targetTerm,
+          });
+          this.sendPtyInputBytesTo(targetAddr, encodeComposerSubmit(rawText, useBp));
         } else {
-          this.sendPtyInputBytes("\r");
+          this.sendPtyInputBytesTo(targetAddr, "\r");
         }
       }
       this.draftInput = "";
@@ -6781,6 +7772,10 @@ export class CodaTerminalWebApp {
     };
 
     const composerTextarea = document.getElementById("prompt-composer-textarea") as HTMLTextAreaElement | null;
+    composerTextarea?.addEventListener("focus", () => {
+      root.querySelector(".shell-root")?.classList.add("is-composer-focused");
+      this.scheduleTerminalResizeSync();
+    });
     composerTextarea?.addEventListener("compositionstart", () => {
       this.imeComposing = true;
     });
@@ -6790,6 +7785,8 @@ export class CodaTerminalWebApp {
     });
     composerTextarea?.addEventListener("blur", () => {
       this.imeComposing = false;
+      root.querySelector(".shell-root")?.classList.remove("is-composer-focused");
+      this.scheduleTerminalResizeSync();
     });
     composerTextarea?.addEventListener("input", () => {
       this.draftInput = composerTextarea.value;
@@ -6805,7 +7802,7 @@ export class CodaTerminalWebApp {
       }
     });
     composerTextarea?.addEventListener("paste", (e) => {
-      this.handleClipboardImagePaste(e);
+      this.handleClipboardImagePaste(e, "draft");
     });
 
     document.getElementById("btn-open-composer")?.addEventListener("click", () => {
@@ -6840,7 +7837,8 @@ export class CodaTerminalWebApp {
     });
     document.getElementById("btn-composer-attach")?.addEventListener("click", () => {
       const fileInp = document.getElementById("rail-file-input") as HTMLInputElement | null;
-      if (fileInp && this.selectedDaemon && this.activeTerminalAddr) {
+      if (fileInp && this.selectedDaemon && this.getFocusedTerminalAddr()) {
+        this.nextFileInputTarget = "draft";
         fileInp.click();
       }
     });
@@ -6899,6 +7897,12 @@ export class CodaTerminalWebApp {
         const raw = pill.dataset.gdFile || "";
         this.gitDiff.selectedFile = raw ? raw : null;
         this.render();
+      });
+    });
+    root.querySelectorAll<HTMLButtonElement>("[data-gd-open-file]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const rel = btn.dataset.gdOpenFile || "";
+        if (rel) this.openFileFromGitDiff(rel);
       });
     });
 
@@ -6983,6 +7987,7 @@ export class CodaTerminalWebApp {
       const prevPrimary = this.activeTerminalAddr;
       this.activeTerminalAddr = this.secondaryTerminalAddr;
       this.secondaryTerminalAddr = prevPrimary;
+      this.focusedPane = "primary";
       writeLocalPref("coda_last_terminal_addr", this.activeTerminalAddr);
       this.render();
     });
@@ -7028,26 +8033,40 @@ export class CodaTerminalWebApp {
         this.render();
       }
     });
+    const ppPortInp = document.getElementById("pp-port-input") as HTMLInputElement | null;
+    const ppPathInp = document.getElementById("pp-path-input") as HTMLInputElement | null;
+    ppPortInp?.addEventListener("input", () => {
+      this.portPreview.portInput = ppPortInp.value;
+    });
+    ppPathInp?.addEventListener("input", () => {
+      this.portPreview.pathInput = ppPathInp.value;
+    });
     document.getElementById("port-preview-form")?.addEventListener("submit", (e) => {
       e.preventDefault();
-      const pInp = document.getElementById("pp-port-input") as HTMLInputElement | null;
-      const pathInp = document.getElementById("pp-path-input") as HTMLInputElement | null;
       this.submitRemotePortPreview(
-        pInp ? pInp.value : this.portPreview.portInput,
-        pathInp ? pathInp.value : this.portPreview.pathInput
+        ppPortInp ? ppPortInp.value : this.portPreview.portInput,
+        ppPathInp ? ppPathInp.value : this.portPreview.pathInput
       );
     });
     root.querySelectorAll<HTMLButtonElement>("[data-pp-port]").forEach((btn) => {
       btn.addEventListener("click", () => {
         const p = btn.dataset.ppPort || "3000";
-        const pathInp = document.getElementById("pp-path-input") as HTMLInputElement | null;
-        this.submitRemotePortPreview(p, pathInp ? pathInp.value : this.portPreview.pathInput);
+        this.submitRemotePortPreview(p, ppPathInp ? ppPathInp.value : this.portPreview.pathInput);
       });
     });
     root.querySelectorAll<HTMLButtonElement>("[data-pp-tab]").forEach((btn) => {
       btn.addEventListener("click", () => {
+        if (ppPortInp) this.portPreview.portInput = ppPortInp.value;
+        if (ppPathInp) this.portPreview.pathInput = ppPathInp.value;
         this.portPreview.viewTab = btn.dataset.ppTab === "render" ? "render" : "source";
         this.render();
+      });
+    });
+    root.querySelectorAll<HTMLButtonElement>("[data-pp-follow-path]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const nextPath = btn.dataset.ppFollowPath || "/";
+        const curPort = ppPortInp ? ppPortInp.value : this.portPreview.portInput;
+        this.submitRemotePortPreview(curPort, nextPath);
       });
     });
 
@@ -7055,11 +8074,12 @@ export class CodaTerminalWebApp {
     root.querySelectorAll<HTMLButtonElement>("[data-quick-cmd]").forEach((chipBtn) => {
       chipBtn.addEventListener("click", () => {
         const cmd = chipBtn.dataset.quickCmd || "";
-        if (!cmd || !this.selectedDaemon || !this.activeTerminalAddr) return;
+        const targetAddr = this.getFocusedTerminalAddr();
+        if (!cmd || !this.selectedDaemon || !targetAddr) return;
         this.sendEncrypted(this.selectedDaemon, {
           op: "send_terminal_text",
-          req_id: `qcmd-${Date.now()}`,
-          terminal: this.activeTerminalAddr,
+          req_id: this.nextReqId("qcmd"),
+          terminal: targetAddr,
           text: cmd,
         });
       });
@@ -7069,6 +8089,7 @@ export class CodaTerminalWebApp {
     document.getElementById("btn-console-cmd-k")?.addEventListener("click", () => {
       this.showCmdPalette = true;
       this.cmdPaletteQuery = "";
+      this.cmdPaletteSelectedIdx = 0;
       this.render();
       setTimeout(() => {
         (document.getElementById("console-cmd-input") as HTMLInputElement | null)?.focus();
@@ -7082,17 +8103,40 @@ export class CodaTerminalWebApp {
     });
     const runConsolePaletteIdx = (idx: number) => {
       const items = this.getConsolePaletteItems(this.cmdPaletteQuery);
-      const chosen = items[idx];
+      if (items.length === 0) return;
+      const clamped = Math.max(0, Math.min(items.length - 1, idx));
+      const chosen = items[clamped];
       if (!chosen) return;
       this.showCmdPalette = false;
       this.cmdPaletteQuery = "";
+      this.cmdPaletteSelectedIdx = 0;
       chosen.action();
       this.render();
+    };
+    const syncConsolePaletteSelectionInPlace = (scrollIntoView: boolean) => {
+      const listEl = document.getElementById("console-cmd-list");
+      if (!listEl) return;
+      const rows = listEl.querySelectorAll<HTMLButtonElement>("[data-cmd-idx]");
+      if (rows.length === 0) return;
+      const clamped = Math.max(0, Math.min(rows.length - 1, this.cmdPaletteSelectedIdx));
+      this.cmdPaletteSelectedIdx = clamped;
+      rows.forEach((row, i) => {
+        const active = i === clamped;
+        row.classList.toggle("active", active);
+        row.setAttribute("aria-selected", active ? "true" : "false");
+        if (active && scrollIntoView && typeof row.scrollIntoView === "function") {
+          row.scrollIntoView({ block: "nearest" });
+        }
+      });
     };
     const bindConsolePaletteRows = () => {
       document.querySelectorAll<HTMLButtonElement>("[data-cmd-idx]").forEach((btn) => {
         btn.addEventListener("click", () => {
           runConsolePaletteIdx(Number(btn.dataset.cmdIdx || "0"));
+        });
+        btn.addEventListener("mouseenter", () => {
+          this.cmdPaletteSelectedIdx = Number(btn.dataset.cmdIdx || "0");
+          syncConsolePaletteSelectionInPlace(false);
         });
       });
     };
@@ -7109,33 +8153,29 @@ export class CodaTerminalWebApp {
     });
     consoleCmdInput?.addEventListener("input", () => {
       this.cmdPaletteQuery = consoleCmdInput.value;
+      this.cmdPaletteSelectedIdx = 0;
       const listEl = document.getElementById("console-cmd-list");
       if (!listEl) return;
       const items = this.getConsolePaletteItems(this.cmdPaletteQuery);
-      listEl.innerHTML =
-        items.length === 0
-          ? `<div style="padding:18px 10px;text-align:center;font-size:12px;color:var(--text-tertiary);">${this.tr("No matching commands", "无匹配指令")}</div>`
-          : items
-              .map(
-                (it, idx) => `
-            <button type="button" class="cmd-row" data-cmd-idx="${idx}" style="${
-              idx === 0 ? "background:var(--bg-elevated);border-color:var(--border-primary);" : ""
-            }">
-              <span style="display:inline-flex;align-items:center;gap:8px;min-width:0;">
-                <span class="pm-badge" style="font-size:10px;padding:2px 6px;">${this.escapeHtml(it.group)}</span>
-                <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${this.escapeHtml(it.label)}</span>
-              </span>
-              <span class="coda-mono" style="font-size:11px;color:var(--text-tertiary);flex-shrink:0;margin-left:8px;">${this.escapeHtml(it.hint)}</span>
-            </button>`
-              )
-              .join("");
+      listEl.innerHTML = this.renderConsolePaletteRowsHtml(items);
       bindConsolePaletteRows();
     });
     consoleCmdInput?.addEventListener("keydown", (e) => {
+      if ((e.key === "ArrowDown" || e.key === "ArrowUp") && !e.isComposing && !this.imeComposing) {
+        e.preventDefault();
+        const items = this.getConsolePaletteItems(this.cmdPaletteQuery);
+        this.cmdPaletteSelectedIdx = stepPaletteSelectionIndex(
+          this.cmdPaletteSelectedIdx,
+          items.length,
+          e.key === "ArrowDown" ? 1 : -1
+        );
+        syncConsolePaletteSelectionInPlace(true);
+        return;
+      }
       // V3-24: Guard Enter with IME composition check so CJK candidate selection does not execute command.
       if (e.key === "Enter" && !e.isComposing && !this.imeComposing) {
         e.preventDefault();
-        runConsolePaletteIdx(0);
+        runConsolePaletteIdx(this.cmdPaletteSelectedIdx);
       } else if (e.key === "Escape") {
         e.preventDefault();
         this.showCmdPalette = false;
@@ -7143,10 +8183,10 @@ export class CodaTerminalWebApp {
       }
     });
     document.getElementById("desktop-prompt-input")?.addEventListener("paste", (e) => {
-      this.handleClipboardImagePaste(e as ClipboardEvent);
+      this.handleClipboardImagePaste(e as ClipboardEvent, "draft");
     });
     document.getElementById("kb-input")?.addEventListener("paste", (e) => {
-      this.handleClipboardImagePaste(e as ClipboardEvent);
+      this.handleClipboardImagePaste(e as ClipboardEvent, "draft");
     });
 
     document.getElementById("btn-logout")?.addEventListener("click", async () => {
@@ -7202,22 +8242,23 @@ export class CodaTerminalWebApp {
       }
     });
 
-    // Mobile 1-step submit: sends command directly to PTY!
+    // Mobile 1-step submit: sends command directly to focused PTY!
     document.getElementById("kb-form")?.addEventListener("submit", (e) => {
       e.preventDefault();
       if (this.imeComposing) return;
       const inp = document.getElementById("kb-input") as HTMLInputElement | null;
       const text = inp ? inp.value : this.draftInput;
-      if (this.selectedDaemon && this.activeTerminalAddr) {
+      const targetAddr = this.getFocusedTerminalAddr();
+      if (this.selectedDaemon && targetAddr) {
         if (text.trim()) {
           this.sendEncrypted(this.selectedDaemon, {
             op: "send_terminal_text",
-            req_id: `tx-${Date.now()}`,
-            terminal: this.activeTerminalAddr,
+            req_id: this.nextReqId("tx"),
+            terminal: targetAddr,
             text,
           });
         } else {
-          this.sendPtyInputBytes("\r");
+          this.sendPtyInputBytesTo(targetAddr, "\r");
         }
       }
       this.draftInput = "";
@@ -7255,17 +8296,18 @@ export class CodaTerminalWebApp {
       if (this.imeComposing) return;
       const inp = document.getElementById("desktop-prompt-input") as HTMLInputElement | null;
       const text = inp ? inp.value : this.draftInput;
-      if (this.selectedDaemon && this.activeTerminalAddr) {
+      const targetAddr = this.getFocusedTerminalAddr();
+      if (this.selectedDaemon && targetAddr) {
         if (text.trim()) {
           this.sendEncrypted(this.selectedDaemon, {
             op: "send_terminal_text",
-            req_id: `tx-${Date.now()}`,
-            terminal: this.activeTerminalAddr,
+            req_id: this.nextReqId("tx"),
+            terminal: targetAddr,
             text,
           });
         } else {
           // Empty Enter sends bare CR (\r) for interactive prompts
-          this.sendPtyInputBytes("\r");
+          this.sendPtyInputBytesTo(targetAddr, "\r");
         }
       }
       this.draftInput = "";
@@ -7314,7 +8356,7 @@ export class CodaTerminalWebApp {
     document.getElementById("btn-spawn-dir-use")?.addEventListener("click", () => {
       this.captureSpawnFormDraftFromDom();
       const chosen = joinRootAndRel(
-        this.spawnDirPicker.rootPath || ".",
+        this.spawnDirPicker.rootPath || "~",
         this.spawnDirPicker.subPath
       );
       this.spawnCwd = chosen;
@@ -7339,16 +8381,22 @@ export class CodaTerminalWebApp {
       this.spawnBootstrapOpen = false;
       this.render();
     });
+    const bootFolderInp = document.getElementById("spawn-boot-folder") as HTMLInputElement | null;
+    bootFolderInp?.addEventListener("input", () => {
+      this.spawnBootstrapFolderName = bootFolderInp.value;
+      this.bootFolderManuallyEdited = bootFolderInp.value.trim().length > 0;
+    });
     const bootGitUrlInp = document.getElementById("spawn-boot-git-url") as HTMLInputElement | null;
     bootGitUrlInp?.addEventListener("input", () => {
       this.spawnBootstrapGitUrl = bootGitUrlInp.value;
-      const folderInp = document.getElementById("spawn-boot-folder") as HTMLInputElement | null;
-      if (folderInp && !folderInp.value.trim()) {
-        const suggested = suggestFolderNameFromGitUrl(bootGitUrlInp.value);
-        if (suggested) {
-          folderInp.value = suggested;
-          this.spawnBootstrapFolderName = suggested;
-        }
+      const nextFolder = computeBootstrapAutoFolder(
+        bootGitUrlInp.value,
+        bootFolderInp ? bootFolderInp.value : this.spawnBootstrapFolderName,
+        this.bootFolderManuallyEdited
+      );
+      this.spawnBootstrapFolderName = nextFolder;
+      if (bootFolderInp && bootFolderInp.value !== nextFolder) {
+        bootFolderInp.value = nextFolder;
       }
     });
     document.getElementById("btn-spawn-run-bootstrap")?.addEventListener("click", () => {
@@ -7381,22 +8429,26 @@ export class CodaTerminalWebApp {
 
     document.getElementById("rail-refresh-btn")?.addEventListener("click", () => {
       const fileInp = document.getElementById("rail-file-input") as HTMLInputElement | null;
-      if (fileInp && this.selectedDaemon && this.activeTerminalAddr) {
+      const targetAddr = this.getFocusedTerminalAddr();
+      if (fileInp && this.selectedDaemon && targetAddr) {
+        this.nextFileInputTarget = "pty";
         fileInp.click();
-      } else if (this.activeTerminalAddr) {
-        this.requestScreen(this.activeTerminalAddr);
+      } else if (targetAddr) {
+        this.requestScreen(targetAddr);
       }
     });
 
     document.getElementById("rail-file-input")?.addEventListener("change", async (ev) => {
       const inp = ev.target as HTMLInputElement;
       const files = Array.from(inp.files || []);
+      const targetMode = this.nextFileInputTarget;
+      this.nextFileInputTarget = "pty";
       inp.value = "";
       if (files.length === 0) return;
       const pinnedDaemon = this.selectedDaemon;
-      const pinnedTerminal = this.activeTerminalAddr;
+      const pinnedTerminal = this.getFocusedTerminalAddr();
       for (const file of files) {
-        await this.uploadSingleFileToHost(file, pinnedDaemon, pinnedTerminal);
+        await this.uploadSingleFileToHost(file, pinnedDaemon, pinnedTerminal, undefined, targetMode);
       }
     });
 
@@ -7432,7 +8484,13 @@ export class CodaTerminalWebApp {
       }
     });
 
-    document.getElementById("voice-cfg-form")?.addEventListener("submit", (e) => {
+    const voiceCfgForm = document.getElementById("voice-cfg-form") as HTMLFormElement | null;
+    const markVoiceDirty = () => {
+      this.settingsDirtyFields.add("voice");
+    };
+    voiceCfgForm?.addEventListener("input", markVoiceDirty);
+    voiceCfgForm?.addEventListener("change", markVoiceDirty);
+    voiceCfgForm?.addEventListener("submit", (e) => {
       e.preventDefault();
       const fd = Object.fromEntries(new FormData(e.target as HTMLFormElement).entries()) as any;
       const nextBaseUrl = String(fd.base_url || "https://api.openai.com/v1").trim();
@@ -7441,22 +8499,28 @@ export class CodaTerminalWebApp {
           kind: "err",
           text: this.tr("Base URL must use https:// (or localhost http://).", "Base URL 必须使用 https://（或本机 localhost）。"),
         };
-        this.render();
+        this.renderSettingsPreservingInputs();
         return;
       }
       const typedKey = String(fd.api_key || "").trim();
+      const preservedHostRedacted = !typedKey && this.voiceConfig.api_key.startsWith("••");
       this.voiceApiKeyLocal = typedKey;
-      this.voiceConfig = {
+      const wireConfig: VoiceModelConfig = {
         provider: String(fd.provider || "openai").trim() || "openai",
         base_url: nextBaseUrl,
         api_key: typedKey,
         model: String(fd.model || "gpt-4o-mini-transcribe").trim() || "gpt-4o-mini-transcribe",
       };
+      this.voiceConfig = {
+        ...wireConfig,
+        api_key: preservedHostRedacted ? "••••••••" : typedKey,
+      };
+      this.settingsDirtyFields.delete("voice");
       if (this.selectedDaemon?.is_online) {
         this.sendEncrypted(this.selectedDaemon, {
           op: "set_voice_config",
-          req_id: `v-${Date.now()}`,
-          config: this.voiceConfig,
+          req_id: this.nextReqId("v"),
+          config: wireConfig,
         });
       }
       this.settingsFeedback = {
@@ -7471,9 +8535,12 @@ export class CodaTerminalWebApp {
         e.stopPropagation();
         const addr = (el as HTMLElement).dataset.killTerm!;
         if (!addr || !this.selectedDaemon) return;
+        if (addr === this.activeTerminalAddr || addr === this.secondaryTerminalAddr) {
+          this.cancelActiveVoiceCapture();
+        }
         this.sendEncrypted(this.selectedDaemon, {
           op: "kill_terminal",
-          req_id: `kt-${Date.now()}`,
+          req_id: this.nextReqId("kt"),
           terminal: addr,
         });
         this.terminals = this.terminals.filter((t) => t.address !== addr);
@@ -7481,10 +8548,29 @@ export class CodaTerminalWebApp {
         this.vtStreamActive.delete(this.vtKey(this.selectedDaemon.id, addr));
         this.vtTerminals.delete(this.vtKey(this.selectedDaemon.id, addr));
         if (this.activeTerminalAddr === addr) {
-          this.activeTerminalAddr = this.terminals[0]?.address ?? null;
+          const nextPrimary = this.terminals[0]?.address ?? null;
+          this.activeTerminalAddr = nextPrimary;
+          if (nextPrimary && this.secondaryTerminalAddr === nextPrimary) {
+            const nextSec = this.terminals.find((t) => t.address !== nextPrimary)?.address ?? null;
+            this.secondaryTerminalAddr = nextSec;
+            if (nextSec && this.splitMode) {
+              this.attachAndReadTerminal(nextSec);
+            }
+          }
           if (this.activeTerminalAddr) {
             this.attachAndReadTerminal(this.activeTerminalAddr);
           }
+        } else if (this.secondaryTerminalAddr === addr) {
+          const nextSec = this.splitMode
+            ? this.terminals.find((t) => t.address !== this.activeTerminalAddr)?.address ?? null
+            : null;
+          this.secondaryTerminalAddr = nextSec;
+          if (nextSec) {
+            this.attachAndReadTerminal(nextSec);
+          }
+        }
+        if (!this.secondaryTerminalAddr) {
+          this.focusedPane = "primary";
         }
         this.render();
       });
@@ -7505,12 +8591,26 @@ export class CodaTerminalWebApp {
       el.addEventListener("click", () => {
         const nextAddr = (el as HTMLElement).dataset.term!;
         if (!nextAddr) return;
-        if (this.activeTerminalAddr && this.activeTerminalAddr !== nextAddr) {
-          this.detachActiveTerminal();
+        const prevPrimary = this.activeTerminalAddr;
+        if (prevPrimary && prevPrimary !== nextAddr) {
+          this.cancelActiveVoiceCapture();
+          if (!(this.splitMode && this.secondaryTerminalAddr === nextAddr && prevPrimary)) {
+            this.detachActiveTerminal();
+          }
+        }
+        if (this.splitMode && this.secondaryTerminalAddr === nextAddr) {
+          this.secondaryTerminalAddr =
+            prevPrimary && prevPrimary !== nextAddr
+              ? prevPrimary
+              : this.terminals.find((t) => t.address !== nextAddr)?.address ?? null;
         }
         this.activeTerminalAddr = nextAddr;
+        this.focusedPane = "primary";
         writeLocalPref("coda_last_terminal_addr", nextAddr);
         this.attachAndReadTerminal(nextAddr);
+        if (this.splitMode && this.secondaryTerminalAddr) {
+          this.attachAndReadTerminal(this.secondaryTerminalAddr);
+        }
         if (isNarrowViewport) this.showSidebar = false;
         this.render();
       });
@@ -7519,12 +8619,13 @@ export class CodaTerminalWebApp {
     document.querySelectorAll("[data-k]").forEach((el) => {
       el.addEventListener("click", () => {
         const k = (el as HTMLElement).dataset.k!;
+        const targetAddr = this.getFocusedTerminalAddr();
         if (k === "slash") {
           if (this.draftInput) {
             this.draftInput = `${this.draftInput}/`;
             this.render();
           } else {
-            this.sendPtyInputBytes("/");
+            this.sendPtyInputBytesTo(targetAddr, "/");
           }
           return;
         }
@@ -7533,46 +8634,48 @@ export class CodaTerminalWebApp {
             this.draftInput = this.draftInput.slice(0, -1);
             this.render();
           } else {
-            this.sendPtyInputBytes("\x7f");
+            this.sendPtyInputBytesTo(targetAddr, "\x7f");
           }
           return;
         }
         if (k === "enter") {
-          if (this.selectedDaemon && this.activeTerminalAddr) {
+          if (this.selectedDaemon && targetAddr) {
             if (this.draftInput.trim()) {
               this.sendEncrypted(this.selectedDaemon, {
                 op: "send_terminal_text",
-                req_id: `tx-${Date.now()}`,
-                terminal: this.activeTerminalAddr,
+                req_id: this.nextReqId("tx"),
+                terminal: targetAddr,
                 text: this.draftInput,
               });
             } else {
-              this.sendPtyInputBytes("\r");
+              this.sendPtyInputBytesTo(targetAddr, "\r");
             }
           }
           this.draftInput = "";
           this.render();
           return;
         }
-        if (this.selectedDaemon && this.activeTerminalAddr) {
+        if (this.selectedDaemon && targetAddr) {
+          const targetVt = this.vtTerminals.get(this.vtKey(this.selectedDaemon.id, targetAddr));
+          const appCursor = Boolean(targetVt?.appCursorKeys);
           const rawMap: Record<string, string> = {
             esc: "\x1b",
             tab: "\t",
             "shift+tab": "\x1b[Z",
             "ctrl+c": "\x03",
             "ctrl+d": "\x04",
-            up: "\x1b[A",
-            down: "\x1b[B",
-            right: "\x1b[C",
-            left: "\x1b[D",
+            up: appCursor ? "\x1bOA" : "\x1b[A",
+            down: appCursor ? "\x1bOB" : "\x1b[B",
+            right: appCursor ? "\x1bOC" : "\x1b[C",
+            left: appCursor ? "\x1bOD" : "\x1b[D",
           };
           if (rawMap[k]) {
-            this.sendPtyInputBytes(rawMap[k]);
+            this.sendPtyInputBytesTo(targetAddr, rawMap[k]);
           } else {
             this.sendEncrypted(this.selectedDaemon, {
               op: "send_terminal_keys",
-              req_id: `k-${Date.now()}`,
-              terminal: this.activeTerminalAddr,
+              req_id: this.nextReqId("k"),
+              terminal: targetAddr,
               keys: [k],
             });
           }

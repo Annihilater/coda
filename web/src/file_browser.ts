@@ -18,6 +18,8 @@ export interface RemoteFileBrowserState {
   previewTruncated: boolean;
   loading: boolean;
   error: string | null;
+  dirReqId: string | null;
+  previewReqId: string | null;
 }
 
 export function createInitialFileBrowserState(): RemoteFileBrowserState {
@@ -31,6 +33,8 @@ export function createInitialFileBrowserState(): RemoteFileBrowserState {
     previewTruncated: false,
     loading: false,
     error: null,
+    dirReqId: null,
+    previewReqId: null,
   };
 }
 
@@ -125,9 +129,13 @@ export function renderRemoteFileBrowserModal(
               st.selectedRelPath
                 ? `<div style="display:flex;justify-content:space-between;align-items:center;padding:6px 10px;border-bottom:1px solid var(--border-primary);font-size:11.5px;">
                     <span class="coda-mono" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHtml(st.selectedRelPath)}</span>
-                    ${st.previewTruncated ? `<span class="pm-badge">${tr("Truncated 64KB", "已截断 64KB")}</span>` : ""}
+                    ${st.previewTruncated ? `<span class="pm-badge amber">${tr("Truncated 64KB", "已截断 64KB")}</span>` : ""}
                   </div>
-                  <pre class="coda-mono" style="margin:0;padding:10px;font-size:11.5px;line-height:1.5;overflow:auto;flex:1;white-space:pre-wrap;word-break:break-word;">${escapeHtml(st.previewContent || tr("(Empty file)", "（空文件）"))}</pre>`
+                  <pre class="coda-mono" style="margin:0;padding:10px;font-size:11.5px;line-height:1.5;overflow:auto;flex:1;white-space:pre-wrap;word-break:break-word;">${escapeHtml(
+                    st.loading && !st.previewContent
+                      ? tr("Loading file preview…", "正在读取文件预览…")
+                      : st.previewContent || tr("(Empty file)", "（空文件）")
+                  )}</pre>`
                 : `<div style="padding:18px;font-size:12px;color:var(--text-tertiary);">${tr("Select a file on the left to inspect its contents over E2EE.", "点击左侧文件即可通过端到端加密通道预览源码内容。")}</div>`
             }
           </div>

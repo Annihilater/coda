@@ -374,6 +374,7 @@
       transition: background-color 0.16s, border-color 0.16s, color 0.16s, transform 0.12s;
     }
     .pm-btn:active { transform: scale(0.985); }
+    .pm-btn:disabled { opacity: 0.55; cursor: not-allowed; transform: none; }
     .pm-btn-sm { height: 30px; padding: 0 11px; font-size: 12px; }
     .pm-btn-lg { height: 42px; padding: 0 18px; font-size: 13.5px; }
     .pm-btn-primary {
@@ -1328,8 +1329,9 @@
       position: relative;
       display: flex;
       height: 100vh;
-      height: 100dvh;
+      height: var(--coda-vvh, 100dvh);
       width: 100vw;
+      max-width: 100%;
       background: var(--bg-canvas);
       color: var(--text-primary);
       overflow: hidden;
@@ -1583,7 +1585,8 @@
       font-size: 13px;
       text-align: left;
     }
-    .cmd-row:hover {
+    .cmd-row:hover,
+    .cmd-row.active {
       background: var(--bg-elevated);
       border-color: var(--border-primary);
     }
@@ -1984,6 +1987,27 @@
       display: flex;
       flex-direction: column;
       gap: 8px;
+    }
+    @media (max-width: 768px) {
+      input,
+      textarea,
+      select,
+      .pm-input,
+      .composer-textarea,
+      .desktop-composer-inp {
+        font-size: 16px !important;
+      }
+      .shell-root.is-composer-focused .keypad-grid,
+      .shell-root.is-softkb-open .keypad-grid {
+        display: none !important;
+      }
+      .shell-root.is-composer-focused .quick-chip-strip {
+        display: none !important;
+      }
+      .shell-root.is-composer-focused .composer-textarea {
+        min-height: 68px;
+        max-height: 34dvh;
+      }
     }
   </style>
 </head>

@@ -222,6 +222,7 @@ export class WebVtTerminal {
   private oscBuf = "";
   public cursorVisible = true;
   public bracketedPaste = false;
+  public bracketedPasteExplicit: boolean | null = null;
   public appCursorKeys = false;
   public latestStatus: VtHerdrStatus | null = null;
   private pendingStatus: VtHerdrStatus | null = null;
@@ -282,6 +283,7 @@ export class WebVtTerminal {
     this.style = { ...DEFAULT_STYLE };
     this.cursorVisible = true;
     this.bracketedPaste = false;
+    this.bracketedPasteExplicit = null;
     this.appCursorKeys = false;
     this.latestStatus = null;
     this.pendingStatus = null;
@@ -293,7 +295,19 @@ export class WebVtTerminal {
   }
 
   loadSnapshot(text: string): void {
+    const prevBracketed = this.bracketedPaste;
+    const prevBracketedExplicit = this.bracketedPasteExplicit;
+    const prevAppCursorKeys = this.appCursorKeys;
     this.reset();
+    if (prevBracketed) {
+      this.bracketedPaste = true;
+    }
+    if (prevBracketedExplicit !== null) {
+      this.bracketedPasteExplicit = prevBracketedExplicit;
+    }
+    if (prevAppCursorKeys) {
+      this.appCursorKeys = true;
+    }
     // Snapshots use '\n' line separators; normalize bare LF to CRLF while preserving explicit '\r'.
     const normalized = text.replace(/\r?\n/g, "\r\n");
     this.feedText(normalized);
@@ -643,6 +657,7 @@ export class WebVtTerminal {
             this.cursorVisible = true;
           } else if (m === 2004) {
             this.bracketedPaste = true;
+            this.bracketedPasteExplicit = true;
           } else if (m === 1049 || m === 1047 || m === 47) {
             if (!this.usingAltScreen) {
               this.primarySavedOnAlt = {
@@ -672,6 +687,7 @@ export class WebVtTerminal {
             this.cursorVisible = false;
           } else if (m === 2004) {
             this.bracketedPaste = false;
+            this.bracketedPasteExplicit = false;
           } else if (m === 1049 || m === 1047 || m === 47) {
             this.usingAltScreen = false;
             if (this.primarySavedOnAlt) {
