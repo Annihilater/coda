@@ -3,6 +3,9 @@ import CodaKit
 import Combine
 import SwiftUI
 import UniformTypeIdentifiers
+#if canImport(PhotosUI)
+import PhotosUI
+#endif
 
 // MARK: - Full-Screen Mobile / Right-Pane iPad & Mac Terminal View (`herdr.dev/mobile/`)
 
@@ -15,8 +18,12 @@ private final class TerminalViewportLocalState: ObservableObject {
     @Published var searchMatchIndex: Int = 0
     @Published var baseFontScale: CGFloat = 1.0
     @Published var atBottom: Bool = true
+    #if canImport(PhotosUI)
+    @Published var selectedPhotoItem: PhotosPickerItem? = nil
+    #endif
     var lastHandledRevision: UInt64 = 0
     var suppressDisappearUntil: Date = .distantPast
+    var lastAltDragY: CGFloat = 0
 }
 
 public struct CodaTerminalSessionView: View {
@@ -49,6 +56,50 @@ public struct CodaTerminalSessionView: View {
         self.hideBottomControls = hideBottomControls
     }
 
+    private var shouldShowTopBlockedBanner: Bool {
+        guard session.state == .needsYou else { return false }
+        if hideBottomControls { return true }
+        // On compact viewports or when the direct input composer is open, avoid stacking two
+        // redundant Needs-You bars (`blockedActionBanner` + `floatingNeedsYouApprovalBar`) so
+        // terminal lines remain visible on iPhone SE, landscape, and Duo Cover!
+        if isCompactHeight || local.showDirectInputBar {
+            return false
+        }
+        return true
+    }
+
+    private var shouldShowQuickCommandsStrip: Bool {
+        guard local.showDirectInputBar || store.showTactileTwoRowKeypad else { return false }
+        if isCompactHeight && local.showDirectInputBar {
+            return false
+        }
+        return true
+    }
+
+    private var bottomOverlayClearance: CGFloat {
+        if hideBottomControls {
+            return 18
+        }
+        var total: CGFloat = 56 // floatingQuickDock base height
+        if session.status == .needsYou {
+            total += 46
+        }
+        if shouldShowQuickCommandsStrip {
+            total += 36
+        }
+        if local.showDirectInputBar {
+            total += local.useMultiLineComposer ? (isCompactHeight ? 92 : 112) : 76
+        }
+        if store.dpadVisible && !(isCompactHeight && local.showDirectInputBar) {
+            total += 48
+        }
+        if store.showTactileTwoRowKeypad && !(isCompactHeight && local.showDirectInputBar) {
+            total += 90
+        }
+        total += (isCompact || isCompactHeight) ? 8 : 14
+        return total
+    }
+
     public var body: some View {
         VStack(spacing: 0) {
             topHeaderBar
@@ -75,7 +126,7 @@ public struct CodaTerminalSessionView: View {
                     .padding(.top, 6)
             }
 
-            if session.state == .needsYou {
+            if shouldShowTopBlockedBanner {
                 blockedActionBanner
                     .padding(.horizontal, 12)
                     .padding(.top, 8)
@@ -103,23 +154,23 @@ public struct CodaTerminalSessionView: View {
                                 .transition(.move(edge: .bottom).combined(with: .opacity))
                         }
 
-                        if local.showDirectInputBar || store.showTactileTwoRowKeypad {
+                        if shouldShowQuickCommandsStrip {
                             quickCommandsStrip
                                 .transition(.move(edge: .bottom).combined(with: .opacity))
                         }
 
                         if local.showDirectInputBar {
                             directKeystrokeStrip
-                                .padding(.horizontal, 12)
+                                .padding(.horizontal, 4)
                                 .transition(.move(edge: .bottom).combined(with: .opacity))
                         }
 
-                        if store.dpadVisible {
+                        if store.dpadVisible && !(isCompactHeight && local.showDirectInputBar) {
                             dpadRow
                                 .transition(.move(edge: .bottom).combined(with: .opacity))
                         }
 
-                        if store.showTactileTwoRowKeypad {
+                        if store.showTactileTwoRowKeypad && !(isCompactHeight && local.showDirectInputBar) {
                             CodaDuoTactileTwoRowKeypad(store: store, targetSession: session)
                                 .transition(.move(edge: .bottom).combined(with: .opacity))
                         }
@@ -132,6 +183,20 @@ public struct CodaTerminalSessionView: View {
             }
         }
         .background(CodaHerdrTheme.canvasBG)
+        .onDisappear {
+            if !store.showComposeSheet && (store.voiceDictationSessionID == nil || store.voiceDictationSessionID == session.id) {
+                store.cancelVoiceDictation()
+            }
+        }
+        #if canImport(PhotosUI)
+        .onChange(of: local.selectedPhotoItem) { _, nextItem in
+            guard let item = nextItem else { return }
+            local.selectedPhotoItem = nil
+            Task { @MainActor in
+                await uploadPickedPhotoItem(item, intoDirectInput: true)
+            }
+        }
+        #endif
         .sheet(
             isPresented: Binding(
                 get: { !isSecondaryLeaf && store.showComposeSheet },
@@ -246,6 +311,14 @@ public struct CodaTerminalSessionView: View {
                         .foregroundStyle(CodaHerdrTheme.textPrimary)
                         .lineLimit(1)
                         .truncationMode(.tail)
+                    if store.isSessionInAltScreen(session.id) {
+                        Text("ALT")
+                            .font(.system(size: 9, weight: .bold, design: .monospaced))
+                            .foregroundStyle(CodaHerdrTheme.cyanWorking)
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 1.5)
+                            .background(Capsule().fill(CodaHerdrTheme.cyanWorking.opacity(0.16)))
+                    }
                 }
 
                 HStack(spacing: 6) {
@@ -412,6 +485,9 @@ public struct CodaTerminalSessionView: View {
                     Spacer(minLength: 28)
                 }
                 quickApprovePill("Esc") {
+                    store.sendQuickKey(.esc, to: session)
+                }
+                quickApprovePill(tr("Interrupt (^C)", "中断 (^C)", locale: store.locale)) {
                     store.interruptSession(session)
                 }
                 if !isSplitThumb {
@@ -564,7 +640,7 @@ public struct CodaTerminalSessionView: View {
                     }
 
                     Color.clear
-                        .frame(height: hideBottomControls ? 18 : ((local.showDirectInputBar ? 148 : 88) + (store.showTactileTwoRowKeypad ? 86 : 0)))
+                        .frame(height: bottomOverlayClearance + 14)
                         .id("terminal_bottom_anchor")
                         .onAppear {
                             local.atBottom = true
@@ -577,17 +653,40 @@ public struct CodaTerminalSessionView: View {
                 }
                 .padding(.horizontal, 12)
                 .padding(.top, 10)
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    guard !hideBottomControls else { return }
+                    if !local.showDirectInputBar {
+                        withAnimation(.snappy(duration: 0.16)) {
+                            local.showDirectInputBar = true
+                        }
+                    }
+                    Task { @MainActor in
+                        directKeyboardFocused = true
+                    }
+                }
             }
             .simultaneousGesture(
                 DragGesture(minimumDistance: 12)
                     .onChanged { value in
-                        if value.translation.height > 12 {
+                        if store.isSessionInAltScreen(session.id) {
+                            let deltaY = value.translation.height - local.lastAltDragY
+                            if abs(deltaY) >= 24 {
+                                let steps = max(1, min(4, Int(abs(deltaY) / 24)))
+                                local.lastAltDragY = value.translation.height
+                                store.sendTerminalScroll(up: deltaY > 0, lines: steps, to: session)
+                            }
+                        } else if value.translation.height > 12 {
                             local.atBottom = false
                         }
+                    }
+                    .onEnded { _ in
+                        local.lastAltDragY = 0
                     }
             )
             .codaDismissKeyboardInteractively()
             .onChange(of: session.id) { _, _ in
+                store.cancelVoiceDictation()
                 local.atBottom = true
                 local.lastHandledRevision = renderRevision
                 local.suppressDisappearUntil = Date().addingTimeInterval(0.25)
@@ -650,7 +749,7 @@ public struct CodaTerminalSessionView: View {
                 }
                 .buttonStyle(.plain)
                 .padding(.trailing, 14)
-                .padding(.bottom, hideBottomControls ? 14 : ((local.showDirectInputBar ? 124 : 74) + (store.showTactileTwoRowKeypad ? 86 : 0)))
+                .padding(.bottom, hideBottomControls ? 14 : (bottomOverlayClearance + 6))
             }
         }
     }
@@ -783,9 +882,15 @@ public struct CodaTerminalSessionView: View {
                 }
                 approvalCapsuleButton(
                     tr("Reject (Esc)", "拒绝 (Esc)", locale: store.locale),
-                    tint: CodaHerdrTheme.redDiff
+                    tint: CodaHerdrTheme.amberNeedsYou
                 ) {
                     store.sendQuickKey(.esc, to: session)
+                }
+                approvalCapsuleButton(
+                    tr("Interrupt (^C)", "中断 (^C)", locale: store.locale),
+                    tint: CodaHerdrTheme.redDiff
+                ) {
+                    store.interruptSession(session)
                 }
                 approvalCapsuleButton("1", tint: CodaHerdrTheme.amberNeedsYou) {
                     store.sendDirectText("1", submit: true, to: session)
@@ -832,8 +937,10 @@ public struct CodaTerminalSessionView: View {
     }
 
     private var directKeystrokeStrip: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 6) {
+        let isVoiceActiveHere = (store.isRecordingVoice || store.isTranscribingVoice)
+            && (store.voiceDictationSessionID == nil || store.voiceDictationSessionID == session.id)
+        return VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 5) {
                 Button {
                     withAnimation(.snappy(duration: 0.16)) {
                         local.useMultiLineComposer.toggle()
@@ -845,8 +952,8 @@ public struct CodaTerminalSessionView: View {
                             .font(.system(size: 10.5, weight: .semibold))
                         Text(
                             local.useMultiLineComposer
-                                ? tr("Prompt Composer · Bracketed Paste", "多行指令编排 · 括号粘贴发送", locale: store.locale)
-                                : tr("Direct Keystroke · Tap for Multi-Line", "单行按键 · 点击切换多行编排", locale: store.locale)
+                                ? tr("Composer", "多行编排", locale: store.locale)
+                                : tr("Direct", "单行按键", locale: store.locale)
                         )
                         .font(.system(size: 10.5, weight: .semibold))
                     }
@@ -867,42 +974,64 @@ public struct CodaTerminalSessionView: View {
                     modifierChip("ALT")
                 }
 
-                Spacer()
+                Spacer(minLength: 4)
+
+                #if canImport(PhotosUI)
+                PhotosPicker(selection: $local.selectedPhotoItem, matching: .images) {
+                    Image(systemName: "photo")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(CodaHerdrTheme.textPrimary)
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 4)
+                        .background(Capsule().fill(CodaHerdrTheme.cardBG))
+                }
+                .buttonStyle(.plain)
+                #endif
+
+                Button {
+                    pasteClipboardIntoDirectBar()
+                } label: {
+                    Image(systemName: "doc.on.clipboard")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(CodaHerdrTheme.textPrimary)
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 4)
+                        .background(Capsule().fill(CodaHerdrTheme.cardBG))
+                }
+                .buttonStyle(.plain)
 
                 Button {
                     local.useMultiLineComposer = true
                     Task {
-                        await store.toggleVoiceDictation { transcript in
-                            if local.directInputBuffer.isEmpty
-                                || local.directInputBuffer.hasSuffix(" ")
-                                || local.directInputBuffer.hasSuffix("\n") {
-                                local.directInputBuffer += transcript
-                            } else {
-                                local.directInputBuffer += " \(transcript)"
-                            }
+                        await store.toggleVoiceDictation(for: session.id) { transcript in
+                            appendTokenToDirectInput(transcript, trailingSpace: false)
                         }
                     }
                 } label: {
                     HStack(spacing: 4) {
-                        if store.isTranscribingVoice {
+                        if isVoiceActiveHere && store.isTranscribingVoice {
                             ProgressView().controlSize(.mini).tint(CodaHerdrTheme.cyanWorking)
                         } else {
-                            Image(systemName: store.isRecordingVoice ? "stop.circle.fill" : "mic.fill")
+                            Image(systemName: (isVoiceActiveHere && store.isRecordingVoice) ? "stop.circle.fill" : "mic.fill")
                                 .font(.system(size: 11, weight: .semibold))
                         }
-                        Text(
-                            store.isRecordingVoice
-                                ? tr("Stop", "停止", locale: store.locale)
-                                : tr("Dictate", "语音", locale: store.locale)
-                        )
-                        .font(.system(size: 10.5, weight: .semibold))
+                        if isVoiceActiveHere && store.isRecordingVoice {
+                            Text(String(format: "%d:%02d", store.voiceRecordingSeconds / 60, store.voiceRecordingSeconds % 60))
+                                .font(.system(size: 10.5, weight: .bold, design: .monospaced))
+                            Capsule()
+                                .fill(Color.white.opacity(0.9))
+                                .frame(width: max(4, CGFloat(store.voiceAudioLevel) * 14), height: 6)
+                        } else {
+                            Text(tr("Dictate", "语音", locale: store.locale))
+                                .font(.system(size: 10.5, weight: .semibold))
+                        }
                     }
-                    .foregroundStyle(store.isRecordingVoice ? .white : CodaHerdrTheme.textPrimary)
+                    .foregroundStyle((isVoiceActiveHere && store.isRecordingVoice) ? .white : CodaHerdrTheme.textPrimary)
                     .padding(.horizontal, 8)
                     .padding(.vertical, 3.5)
                     .background(
                         Capsule()
-                            .fill(store.isRecordingVoice ? CodaHerdrTheme.redDiff : CodaHerdrTheme.cardBG)
+                            .fill((isVoiceActiveHere && store.isRecordingVoice) ? CodaHerdrTheme.redDiff : CodaHerdrTheme.cardBG)
                     )
                 }
                 .buttonStyle(.plain)
@@ -922,6 +1051,20 @@ public struct CodaTerminalSessionView: View {
                 .buttonStyle(.plain)
             }
 
+            if isVoiceActiveHere && !store.voicePartialTranscript.isEmpty {
+                Text(store.voicePartialTranscript)
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundStyle(CodaHerdrTheme.cyanWorking)
+                    .lineLimit(2)
+            }
+
+            if let uploadMsg = store.uploadStatusBanner {
+                Text(uploadMsg)
+                    .font(.system(size: 10.5, design: .monospaced))
+                    .foregroundStyle(CodaHerdrTheme.cyanWorking)
+                    .lineLimit(1)
+            }
+
             if let voiceErr = store.voiceError {
                 Text(voiceErr)
                     .font(.system(size: 11))
@@ -932,14 +1075,14 @@ public struct CodaTerminalSessionView: View {
                 if local.useMultiLineComposer {
                     TextField(
                         tr(
-                            "Compose multi-line prompt or review dictation (sends via Bracketed Paste)...",
-                            "编写或修改多行提示词（通过 Bracketed Paste 安全发送）...",
+                            "Compose multi-line prompt or review dictation...",
+                            "编写或修改多行提示词...",
                             locale: store.locale
                         ),
                         text: $local.directInputBuffer,
                         axis: .vertical
                     )
-                    .lineLimit(3...7)
+                    .lineLimit(isCompactHeight ? 2...4 : 3...6)
                     .font(.system(size: 13, design: .monospaced))
                     .foregroundStyle(CodaHerdrTheme.textPrimary)
                     .focused($directKeyboardFocused)
@@ -953,10 +1096,12 @@ public struct CodaTerminalSessionView: View {
                     .foregroundStyle(CodaHerdrTheme.textPrimary)
                     .focused($directKeyboardFocused)
                     .codaNoAutocapAndSpelling()
-                    .onChange(of: local.directInputBuffer) { _, next in
-                        if (store.ctrlActive || store.altActive), let last = next.last {
-                            local.directInputBuffer = ""
-                            store.sendDirectText(String(last), submit: false, to: session)
+                    .onChange(of: local.directInputBuffer) { oldValue, next in
+                        guard store.ctrlActive || store.altActive else { return }
+                        if next.count == oldValue.count + 1, next.hasPrefix(oldValue) {
+                            let typed = String(next.dropFirst(oldValue.count))
+                            local.directInputBuffer = oldValue
+                            store.sendDirectText(typed, submit: false, to: session)
                         }
                     }
                     .onSubmit {
@@ -984,6 +1129,7 @@ public struct CodaTerminalSessionView: View {
                     )
                 }
                 .buttonStyle(.plain)
+                .disabled(store.isUploadingAttachment)
             }
         }
         .padding(.horizontal, 12)
@@ -999,6 +1145,51 @@ public struct CodaTerminalSessionView: View {
             }
         }
     }
+
+    private func appendTokenToDirectInput(_ token: String, trailingSpace: Bool) {
+        guard !token.isEmpty else { return }
+        if local.directInputBuffer.isEmpty
+            || local.directInputBuffer.hasSuffix(" ")
+            || local.directInputBuffer.hasSuffix("\n") {
+            local.directInputBuffer += token + (trailingSpace ? " " : "")
+        } else {
+            local.directInputBuffer += " " + token + (trailingSpace ? " " : "")
+        }
+    }
+
+    private func pasteClipboardIntoDirectBar() {
+        if let imgData = readImagePNGFromClipboard() {
+            let filename = "clipboard-\(Int(Date().timeIntervalSince1970)).png"
+            store.uploadAttachmentData(data: imgData, filename: filename, for: session) { inserted in
+                appendTokenToDirectInput(inserted, trailingSpace: true)
+            }
+        } else if let text = readTextFromClipboard(), !text.isEmpty {
+            if text.contains("\n") {
+                local.useMultiLineComposer = true
+            }
+            appendTokenToDirectInput(text, trailingSpace: false)
+        } else {
+            store.uploadStatusBanner = tr("Clipboard is empty.", "剪贴板为空。", locale: store.locale)
+        }
+    }
+
+    #if canImport(PhotosUI)
+    private func uploadPickedPhotoItem(_ item: PhotosPickerItem, intoDirectInput: Bool) async {
+        let ext = item.supportedContentTypes.first?.preferredFilenameExtension ?? "png"
+        guard let data = try? await item.loadTransferable(type: Data.self), !data.isEmpty else {
+            store.uploadStatusBanner = tr("Could not load selected photo.", "无法读取所选照片。", locale: store.locale)
+            return
+        }
+        let filename = "photo-\(Int(Date().timeIntervalSince1970)).\(ext)"
+        if intoDirectInput {
+            store.uploadAttachmentData(data: data, filename: filename, for: session) { inserted in
+                appendTokenToDirectInput(inserted, trailingSpace: true)
+            }
+        } else {
+            store.uploadAttachmentData(data: data, filename: filename, for: session)
+        }
+    }
+    #endif
 
     private func submitDirectOrComposerInput() {
         let text = local.directInputBuffer
@@ -1144,6 +1335,7 @@ public struct CodaTerminalSessionView: View {
                 }
             } else {
                 directKeyboardFocused = false
+                store.cancelVoiceDictation()
             }
         } label: {
             Image(systemName: local.showDirectInputBar ? "keyboard.chevron.compact.down" : "keyboard")
@@ -1303,6 +1495,9 @@ public struct CodaMiniPaneMapGlyph: View {
 
 private final class ComposeSheetLocalState: ObservableObject {
     @Published var showFileImporter: Bool = false
+    #if canImport(PhotosUI)
+    @Published var selectedPhotoItem: PhotosPickerItem? = nil
+    #endif
 }
 
 public struct CodaComposePromptSheet: View {
@@ -1311,8 +1506,19 @@ public struct CodaComposePromptSheet: View {
     @Environment(\.dismiss) private var dismiss
     @StateObject private var local = ComposeSheetLocalState()
 
+    private var sessionDraftBinding: Binding<String> {
+        Binding(
+            get: { store.composeDraft(for: session.id) },
+            set: { store.setComposeDraft($0, for: session.id) }
+        )
+    }
+
     public var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        let draftText = store.composeDraft(for: session.id)
+        let isVoiceActiveHere = (store.isRecordingVoice || store.isTranscribingVoice)
+            && (store.voiceDictationSessionID == nil || store.voiceDictationSessionID == session.id)
+
+        return VStack(alignment: .leading, spacing: 12) {
             HStack {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(tr("Compose Prompt", "撰写指令", locale: store.locale))
@@ -1329,7 +1535,7 @@ public struct CodaComposePromptSheet: View {
                 .foregroundStyle(CodaHerdrTheme.textSecondary)
             }
 
-            TextEditor(text: $store.composeText)
+            TextEditor(text: sessionDraftBinding)
                 .font(.system(size: 14, design: .monospaced))
                 .foregroundStyle(CodaHerdrTheme.textPrimary)
                 .scrollContentBackground(.hidden)
@@ -1341,10 +1547,23 @@ public struct CodaComposePromptSheet: View {
                         .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(CodaHerdrTheme.borderHairline, lineWidth: 1))
                 )
 
-            if let uploadBanner = store.uploadStatusBanner {
-                Text(uploadBanner)
+            if isVoiceActiveHere && !store.voicePartialTranscript.isEmpty {
+                Text(store.voicePartialTranscript)
                     .font(.system(size: 11, design: .monospaced))
                     .foregroundStyle(CodaHerdrTheme.cyanWorking)
+                    .lineLimit(2)
+            }
+
+            if let uploadBanner = store.uploadStatusBanner {
+                HStack(spacing: 6) {
+                    if store.isUploadingAttachment {
+                        ProgressView().controlSize(.mini).tint(CodaHerdrTheme.cyanWorking)
+                    }
+                    Text(uploadBanner)
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(CodaHerdrTheme.cyanWorking)
+                        .lineLimit(1)
+                }
             }
 
             if let voiceErr = store.voiceError {
@@ -1353,99 +1572,147 @@ public struct CodaComposePromptSheet: View {
                     .foregroundStyle(CodaHerdrTheme.redDiff)
             }
 
-            HStack(spacing: 8) {
-                Button {
-                    local.showFileImporter = true
-                } label: {
-                    Label(tr("Attach", "上传文件", locale: store.locale), systemImage: "paperclip")
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    Button {
+                        local.showFileImporter = true
+                    } label: {
+                        Label(tr("Files", "文件", locale: store.locale), systemImage: "paperclip")
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundStyle(CodaHerdrTheme.textPrimary)
+                            .padding(.horizontal, 11)
+                            .padding(.vertical, 8)
+                            .background(
+                                Capsule()
+                                    .fill(CodaHerdrTheme.elevatedBG)
+                                    .overlay(Capsule().strokeBorder(CodaHerdrTheme.borderHairline, lineWidth: 1))
+                            )
+                    }
+                    .buttonStyle(.plain)
+
+                    #if canImport(PhotosUI)
+                    let photosTitle = tr("Photos", "相册", locale: store.locale)
+                    PhotosPicker(selection: $local.selectedPhotoItem, matching: .images) {
+                        Label(photosTitle, systemImage: "photo.on.rectangle")
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundStyle(CodaHerdrTheme.textPrimary)
+                            .padding(.horizontal, 11)
+                            .padding(.vertical, 8)
+                            .background(
+                                Capsule()
+                                    .fill(CodaHerdrTheme.elevatedBG)
+                                    .overlay(Capsule().strokeBorder(CodaHerdrTheme.borderHairline, lineWidth: 1))
+                            )
+                    }
+                    .buttonStyle(.plain)
+                    #endif
+
+                    Button {
+                        pasteClipboardIntoCompose()
+                    } label: {
+                        Label(tr("Paste", "粘贴截图", locale: store.locale), systemImage: "doc.on.clipboard")
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundStyle(CodaHerdrTheme.textPrimary)
+                            .padding(.horizontal, 11)
+                            .padding(.vertical, 8)
+                            .background(
+                                Capsule()
+                                    .fill(CodaHerdrTheme.elevatedBG)
+                                    .overlay(Capsule().strokeBorder(CodaHerdrTheme.borderHairline, lineWidth: 1))
+                            )
+                    }
+                    .buttonStyle(.plain)
+
+                    Button {
+                        Task { await store.toggleVoiceDictation(for: session.id) }
+                    } label: {
+                        HStack(spacing: 6) {
+                            if isVoiceActiveHere && store.isTranscribingVoice {
+                                ProgressView()
+                                    .controlSize(.small)
+                                    .tint(CodaHerdrTheme.cyanWorking)
+                            } else {
+                                Image(systemName: (isVoiceActiveHere && store.isRecordingVoice) ? "stop.circle.fill" : "mic.fill")
+                            }
+                            if isVoiceActiveHere && store.isRecordingVoice {
+                                Text(String(format: "%d:%02d", store.voiceRecordingSeconds / 60, store.voiceRecordingSeconds % 60))
+                                    .font(.system(size: 11.5, weight: .bold, design: .monospaced))
+                                Capsule()
+                                    .fill(Color.white.opacity(0.9))
+                                    .frame(width: max(4, CGFloat(store.voiceAudioLevel) * 16), height: 7)
+                            } else {
+                                Text(
+                                    (isVoiceActiveHere && store.isTranscribingVoice)
+                                        ? tr("Transcribing...", "转写中...", locale: store.locale)
+                                        : tr("Voice", "语音", locale: store.locale)
+                                )
+                            }
+                        }
                         .font(.system(size: 12, weight: .medium))
-                        .foregroundStyle(CodaHerdrTheme.textPrimary)
-                        .padding(.horizontal, 12)
+                        .foregroundStyle(
+                            (isVoiceActiveHere && store.isRecordingVoice)
+                                ? .white
+                                : ((isVoiceActiveHere && store.isTranscribingVoice) ? CodaHerdrTheme.cyanWorking : CodaHerdrTheme.textPrimary)
+                        )
+                        .padding(.horizontal, 11)
                         .padding(.vertical, 8)
                         .background(
                             Capsule()
-                                .fill(CodaHerdrTheme.elevatedBG)
-                                .overlay(Capsule().strokeBorder(CodaHerdrTheme.borderHairline, lineWidth: 1))
-                        )
-                }
-                .buttonStyle(.plain)
-
-                Button {
-                    Task { await store.toggleVoiceDictation() }
-                } label: {
-                    HStack(spacing: 6) {
-                        if store.isTranscribingVoice {
-                            ProgressView()
-                                .controlSize(.small)
-                                .tint(CodaHerdrTheme.cyanWorking)
-                        } else {
-                            Image(systemName: store.isRecordingVoice ? "stop.circle.fill" : "mic.fill")
-                        }
-                        Text(
-                            store.isTranscribingVoice
-                                ? tr("Transcribing...", "转写中...", locale: store.locale)
-                                : (store.isRecordingVoice
-                                    ? tr("Stop", "停止录音", locale: store.locale)
-                                    : tr("Voice", "语音输入", locale: store.locale))
+                                .fill((isVoiceActiveHere && store.isRecordingVoice) ? CodaHerdrTheme.redDiff : CodaHerdrTheme.elevatedBG)
+                                .overlay(
+                                    Capsule().strokeBorder(
+                                        (isVoiceActiveHere && store.isRecordingVoice) ? CodaHerdrTheme.redDiff : CodaHerdrTheme.borderHairline,
+                                        lineWidth: 1
+                                    )
+                                )
                         )
                     }
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(
-                        store.isRecordingVoice
-                            ? .white
-                            : (store.isTranscribingVoice ? CodaHerdrTheme.cyanWorking : CodaHerdrTheme.textPrimary)
-                    )
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 8)
-                    .background(
-                        Capsule()
-                            .fill(store.isRecordingVoice ? CodaHerdrTheme.redDiff : CodaHerdrTheme.elevatedBG)
-                            .overlay(
-                                Capsule().strokeBorder(
-                                    store.isRecordingVoice ? CodaHerdrTheme.redDiff : CodaHerdrTheme.borderHairline,
-                                    lineWidth: 1
-                                )
+                    .buttonStyle(.plain)
+                    .disabled(store.isTranscribingVoice)
+
+                    Button {
+                        store.cancelVoiceDictation()
+                        store.pendingOpenSettingsAfterCompose = true
+                        dismiss()
+                    } label: {
+                        Image(systemName: "slider.horizontal.3")
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundStyle(CodaHerdrTheme.textSecondary)
+                            .frame(width: 32, height: 32)
+                            .background(
+                                Circle()
+                                    .fill(CodaHerdrTheme.elevatedBG)
+                                    .overlay(Circle().strokeBorder(CodaHerdrTheme.borderHairline, lineWidth: 1))
                             )
-                    )
+                    }
+                    .buttonStyle(.plain)
                 }
-                .buttonStyle(.plain)
-                .disabled(store.isTranscribingVoice)
+            }
 
-                Button {
-                    store.cancelVoiceDictation()
-                    store.pendingOpenSettingsAfterCompose = true
-                    dismiss()
-                } label: {
-                    Image(systemName: "slider.horizontal.3")
-                        .font(.system(size: 12, weight: .medium))
-                        .foregroundStyle(CodaHerdrTheme.textSecondary)
-                        .frame(width: 32, height: 32)
-                        .background(
-                            Circle()
-                                .fill(CodaHerdrTheme.elevatedBG)
-                                .overlay(Circle().strokeBorder(CodaHerdrTheme.borderHairline, lineWidth: 1))
-                        )
-                }
-                .buttonStyle(.plain)
-
+            HStack {
                 Spacer()
-
                 Button {
                     store.submitComposePrompt(for: session)
                     dismiss()
                 } label: {
                     HStack(spacing: 6) {
-                        Text(tr("Send", "发送", locale: store.locale))
+                        if store.isUploadingAttachment {
+                            ProgressView().controlSize(.small).tint(.black)
+                        }
+                        Text(store.isUploadingAttachment ? tr("Uploading…", "上传中…", locale: store.locale) : tr("Send", "发送", locale: store.locale))
                         Image(systemName: "arrow.up")
                     }
                     .font(.system(size: 13, weight: .semibold))
                     .foregroundStyle(.black)
-                    .padding(.horizontal, 16)
+                    .padding(.horizontal, 18)
                     .padding(.vertical, 9)
                     .background(Capsule().fill(CodaHerdrTheme.textPrimary))
                 }
                 .buttonStyle(.plain)
-                .disabled(store.composeText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                .disabled(
+                    draftText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                        || store.isUploadingAttachment
+                )
             }
         }
         .padding(18)
@@ -1461,6 +1728,32 @@ public struct CodaComposePromptSheet: View {
             if case .success(let url) = result {
                 store.uploadAttachment(fileURL: url, for: session)
             }
+        }
+        #if canImport(PhotosUI)
+        .onChange(of: local.selectedPhotoItem) { _, nextItem in
+            guard let item = nextItem else { return }
+            local.selectedPhotoItem = nil
+            Task { @MainActor in
+                let ext = item.supportedContentTypes.first?.preferredFilenameExtension ?? "png"
+                guard let data = try? await item.loadTransferable(type: Data.self), !data.isEmpty else {
+                    store.uploadStatusBanner = tr("Could not load selected photo.", "无法读取所选照片。", locale: store.locale)
+                    return
+                }
+                let filename = "photo-\(Int(Date().timeIntervalSince1970)).\(ext)"
+                store.uploadAttachmentData(data: data, filename: filename, for: session)
+            }
+        }
+        #endif
+    }
+
+    private func pasteClipboardIntoCompose() {
+        if let imgData = readImagePNGFromClipboard() {
+            let filename = "clipboard-\(Int(Date().timeIntervalSince1970)).png"
+            store.uploadAttachmentData(data: imgData, filename: filename, for: session)
+        } else if let text = readTextFromClipboard(), !text.isEmpty {
+            store.appendComposeDraft(text, for: session.id)
+        } else {
+            store.uploadStatusBanner = tr("Clipboard has no image or text.", "剪贴板中没有图片或文本。", locale: store.locale)
         }
     }
 }
@@ -1598,7 +1891,24 @@ public struct CodaGitDiffSheet: View {
 
             Divider().background(CodaHerdrTheme.borderHairline)
 
-            CodaGitDiffInteractiveView(store: store, session: session)
+            CodaGitDiffInteractiveView(
+                store: store,
+                session: session,
+                onOpenFilePreview: { relPath in
+                    let rawRepoRoot = store.gitDiffResult?.repoRoot?.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let repoRoot = (rawRepoRoot?.isEmpty == false)
+                        ? rawRepoRoot
+                        : store.matchedRepoRoot(for: session)
+                    dismiss()
+                    Task { @MainActor in
+                        try? await Task.sleep(nanoseconds: 220_000_000)
+                        store.activeSheetSessionID = session.id
+                        store.inspectorSheetMode = .files
+                        store.showRemoteFilesSheet = true
+                        store.previewRemoteFile(relPath, for: session, baseRootOverride: repoRoot)
+                    }
+                }
+            )
         }
         .padding(18)
         .background(CodaHerdrTheme.cardBG)

@@ -1276,138 +1276,189 @@ public struct CodaDuoTabletopControlDeck: View {
     }
 
     public var body: some View {
-        VStack(spacing: 10) {
-            HStack(spacing: 6) {
-                Text(tr("SESSIONS", "会话切换", locale: store.locale))
-                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                    .foregroundStyle(CodaHerdrTheme.textDim)
+        let isVoiceActiveHere = (store.isRecordingVoice || store.isTranscribingVoice)
+            && (store.voiceDictationSessionID == nil || store.voiceDictationSessionID == session?.id)
 
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 6) {
-                        ForEach(store.filteredSessions) { sess in
-                            let selected = store.selectedSessionID == sess.id
-                            Button {
-                                store.selectSession(sess)
-                            } label: {
-                                HStack(spacing: 5) {
-                                    Circle()
-                                        .fill(sess.state == .needsYou ? CodaHerdrTheme.amberNeedsYou : (sess.state == .working ? CodaHerdrTheme.cyanWorking : CodaHerdrTheme.textDim))
-                                        .frame(width: 6, height: 6)
-                                    Text("\(sess.workspaceName)/\(sess.agentName)")
-                                        .font(.system(size: 11, weight: selected ? .semibold : .medium))
-                                        .foregroundStyle(selected ? CodaHerdrTheme.textPrimary : CodaHerdrTheme.textSecondary)
-                                }
-                                .padding(.horizontal, 9)
-                                .padding(.vertical, 5)
-                                .background(
-                                    Capsule()
-                                        .fill(selected ? CodaHerdrTheme.pillActiveBG : CodaHerdrTheme.cardBG)
-                                        .overlay(
-                                            Capsule().strokeBorder(
-                                                selected ? CodaHerdrTheme.cyanWorking.opacity(0.5) : CodaHerdrTheme.borderHairline,
-                                                lineWidth: 1
+        return ScrollView(.vertical, showsIndicators: false) {
+            VStack(spacing: 10) {
+                HStack(spacing: 6) {
+                    Text(tr("SESSIONS", "会话切换", locale: store.locale))
+                        .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                        .foregroundStyle(CodaHerdrTheme.textDim)
+
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 6) {
+                            ForEach(store.filteredSessions) { sess in
+                                let selected = store.selectedSessionID == sess.id
+                                Button {
+                                    store.selectSession(sess)
+                                } label: {
+                                    HStack(spacing: 5) {
+                                        Circle()
+                                            .fill(sess.state == .needsYou ? CodaHerdrTheme.amberNeedsYou : (sess.state == .working ? CodaHerdrTheme.cyanWorking : CodaHerdrTheme.textDim))
+                                            .frame(width: 6, height: 6)
+                                        Text("\(sess.workspaceName)/\(sess.agentName)")
+                                            .font(.system(size: 11, weight: selected ? .semibold : .medium))
+                                            .foregroundStyle(selected ? CodaHerdrTheme.textPrimary : CodaHerdrTheme.textSecondary)
+                                    }
+                                    .padding(.horizontal, 9)
+                                    .padding(.vertical, 5)
+                                    .background(
+                                        Capsule()
+                                            .fill(selected ? CodaHerdrTheme.pillActiveBG : CodaHerdrTheme.cardBG)
+                                            .overlay(
+                                                Capsule().strokeBorder(
+                                                    selected ? CodaHerdrTheme.cyanWorking.opacity(0.5) : CodaHerdrTheme.borderHairline,
+                                                    lineWidth: 1
+                                                )
                                             )
-                                        )
-                                )
+                                    )
+                                }
+                                .buttonStyle(.plain)
                             }
-                            .buttonStyle(.plain)
                         }
+                    }
+
+                    if let active = session {
+                        Button {
+                            store.loadGitDiff(for: active)
+                        } label: {
+                            Image(systemName: "plus.forwardslash.minus")
+                                .font(.system(size: 12, weight: .semibold))
+                                .foregroundStyle(active.diffAdded > 0 ? CodaHerdrTheme.greenDiff : CodaHerdrTheme.textSecondary)
+                                .frame(width: 28, height: 28)
+                                .background(RoundedRectangle(cornerRadius: 7).fill(CodaHerdrTheme.elevatedBG))
+                        }
+                        .buttonStyle(.plain)
                     }
                 }
 
-                if let active = session {
+                if let active = session, active.state == .needsYou {
+                    HStack(spacing: 8) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.system(size: 12))
+                            .foregroundStyle(CodaHerdrTheme.amberNeedsYou)
+                        Text(active.statusMessage ?? tr("Waiting for confirmation", "等待输入确认", locale: store.locale))
+                            .font(.system(size: 11.5, weight: .medium))
+                            .foregroundStyle(CodaHerdrTheme.textPrimary)
+                            .lineLimit(1)
+                        Spacer()
+                        deckApproveButton("1 · Yes") { store.sendDirectText("1", submit: true, to: active) }
+                        deckApproveButton("2 · Always") { store.sendDirectText("2", submit: true, to: active) }
+                        deckApproveButton("Esc") { store.sendQuickKey(.esc, to: active) }
+                        deckApproveButton("^C") { store.interruptSession(active) }
+                    }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 7)
+                    .background(
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            .fill(CodaHerdrTheme.amberNeedsYou.opacity(0.12))
+                            .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(CodaHerdrTheme.amberNeedsYou.opacity(0.45), lineWidth: 1))
+                    )
+                }
+
+                HStack(spacing: 8) {
+                    TextField(
+                        tr("Command or prompt to upper screen (Enter sends)...", "向上半屏发送命令或追问（回车发送）...", locale: store.locale),
+                        text: $local.commandDraft
+                    )
+                    .font(.system(size: 13, design: .monospaced))
+                    .foregroundStyle(CodaHerdrTheme.textPrimary)
+                    .focused($inputFocused)
+                    .codaNoAutocapAndSpelling()
+                    .onSubmit {
+                        submitCommand()
+                    }
+
                     Button {
-                        store.loadGitDiff(for: active)
+                        Task {
+                            await store.toggleVoiceDictation(for: session?.id) { transcript in
+                                if local.commandDraft.isEmpty || local.commandDraft.hasSuffix(" ") {
+                                    local.commandDraft += transcript
+                                } else {
+                                    local.commandDraft += " \(transcript)"
+                                }
+                            }
+                        }
                     } label: {
-                        Image(systemName: "plus.forwardslash.minus")
-                            .font(.system(size: 12, weight: .semibold))
-                            .foregroundStyle(active.diffAdded > 0 ? CodaHerdrTheme.greenDiff : CodaHerdrTheme.textSecondary)
-                            .frame(width: 28, height: 28)
-                            .background(RoundedRectangle(cornerRadius: 7).fill(CodaHerdrTheme.elevatedBG))
+                        HStack(spacing: 4) {
+                            if isVoiceActiveHere && store.isTranscribingVoice {
+                                ProgressView().controlSize(.mini).tint(CodaHerdrTheme.cyanWorking)
+                            } else {
+                                Image(systemName: (isVoiceActiveHere && store.isRecordingVoice) ? "stop.circle.fill" : "mic.fill")
+                                    .font(.system(size: 13, weight: .semibold))
+                            }
+                            if isVoiceActiveHere && store.isRecordingVoice {
+                                Text(String(format: "%d:%02d", store.voiceRecordingSeconds / 60, store.voiceRecordingSeconds % 60))
+                                    .font(.system(size: 10.5, weight: .bold, design: .monospaced))
+                            }
+                        }
+                        .foregroundStyle((isVoiceActiveHere && store.isRecordingVoice) ? .white : CodaHerdrTheme.textPrimary)
+                        .padding(.horizontal, (isVoiceActiveHere && store.isRecordingVoice) ? 8 : 0)
+                        .frame(minWidth: 32, minHeight: 32)
+                        .background(
+                            Capsule().fill((isVoiceActiveHere && store.isRecordingVoice) ? CodaHerdrTheme.redDiff : CodaHerdrTheme.elevatedBG)
+                        )
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(store.isTranscribingVoice)
+
+                    Button {
+                        submitCommand()
+                    } label: {
+                        Image(systemName: "arrow.up.circle.fill")
+                            .font(.system(size: 22))
+                            .foregroundStyle(CodaHerdrTheme.cyanWorking)
+                    }
+                    .buttonStyle(.plain)
+
+                    Button {
+                        if let active = session {
+                            store.openComposeSheet(for: active)
+                        } else {
+                            store.showComposeSheet = true
+                        }
+                    } label: {
+                        Image(systemName: "square.and.pencil")
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundStyle(CodaHerdrTheme.textPrimary)
+                            .frame(width: 32, height: 32)
+                            .background(Circle().fill(CodaHerdrTheme.elevatedBG))
                     }
                     .buttonStyle(.plain)
                 }
-            }
-
-            if let active = session, active.state == .needsYou {
-                HStack(spacing: 8) {
-                    Image(systemName: "exclamationmark.triangle.fill")
-                        .font(.system(size: 12))
-                        .foregroundStyle(CodaHerdrTheme.amberNeedsYou)
-                    Text(active.statusMessage ?? tr("Waiting for confirmation", "等待输入确认", locale: store.locale))
-                        .font(.system(size: 11.5, weight: .medium))
-                        .foregroundStyle(CodaHerdrTheme.textPrimary)
-                        .lineLimit(1)
-                    Spacer()
-                    deckApproveButton("1 · Yes") { store.sendDirectText("1", submit: true, to: active) }
-                    deckApproveButton("2 · Always") { store.sendDirectText("2", submit: true, to: active) }
-                    deckApproveButton("Esc") { store.interruptSession(active) }
-                }
-                .padding(.horizontal, 10)
-                .padding(.vertical, 7)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 9)
                 .background(
-                    RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .fill(CodaHerdrTheme.amberNeedsYou.opacity(0.12))
-                        .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(CodaHerdrTheme.amberNeedsYou.opacity(0.45), lineWidth: 1))
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .fill(CodaHerdrTheme.cardBG)
+                        .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(CodaHerdrTheme.borderHairline, lineWidth: 1))
                 )
+
+                if let voiceErr = store.voiceError {
+                    Text(voiceErr)
+                        .font(.system(size: 11))
+                        .foregroundStyle(CodaHerdrTheme.redDiff)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+
+                CodaDuoTactileTwoRowKeypad(store: store, targetSession: session)
             }
-
-            HStack(spacing: 8) {
-                TextField(
-                    tr("Command or prompt to upper screen (Enter sends)...", "向下半屏发送命令或追问（回车发送）...", locale: store.locale),
-                    text: $local.commandDraft
-                )
-                .font(.system(size: 13, design: .monospaced))
-                .foregroundStyle(CodaHerdrTheme.textPrimary)
-                .focused($inputFocused)
-                .codaNoAutocapAndSpelling()
-                .onSubmit {
-                    submitCommand()
-                }
-
-                Button {
-                    submitCommand()
-                } label: {
-                    Image(systemName: "arrow.up.circle.fill")
-                        .font(.system(size: 22))
-                        .foregroundStyle(CodaHerdrTheme.cyanWorking)
-                }
-                .buttonStyle(.plain)
-
-                Button {
-                    if let active = session {
-                        store.openComposeSheet(for: active)
-                    } else {
-                        store.showComposeSheet = true
-                    }
-                } label: {
-                    Image(systemName: "square.and.pencil")
-                        .font(.system(size: 14, weight: .semibold))
-                        .foregroundStyle(CodaHerdrTheme.textPrimary)
-                        .frame(width: 32, height: 32)
-                        .background(Circle().fill(CodaHerdrTheme.elevatedBG))
-                }
-                .buttonStyle(.plain)
-            }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 9)
-            .background(
-                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    .fill(CodaHerdrTheme.cardBG)
-                    .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(CodaHerdrTheme.borderHairline, lineWidth: 1))
-            )
-
-            CodaDuoTactileTwoRowKeypad(store: store, targetSession: session)
-
-            Spacer(minLength: 0)
+            .padding(.horizontal, 14)
+            .padding(.top, 10)
+            .padding(.bottom, max(12, store.edgeSafeAreas.bottom + 8))
         }
-        .padding(.horizontal, 14)
-        .padding(.top, 10)
-        .padding(.bottom, max(12, store.edgeSafeAreas.bottom + 4))
+        .codaDismissKeyboardInteractively()
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(CodaHerdrTheme.canvasBG)
         .onChange(of: session?.id) { _, _ in
+            store.cancelVoiceDictation()
             local.commandDraft = ""
+        }
+        .onDisappear {
+            if !store.showComposeSheet {
+                store.cancelVoiceDictation()
+            }
         }
     }
 
@@ -1491,7 +1542,20 @@ public struct CodaDuoInlineGitDiffLeaf: View {
 
             Divider().background(CodaHerdrTheme.borderHairline)
 
-            CodaGitDiffInteractiveView(store: store, session: session)
+            CodaGitDiffInteractiveView(
+                store: store,
+                session: session,
+                onOpenFilePreview: { relPath in
+                    let rawRepoRoot = store.gitDiffResult?.repoRoot?.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let repoRoot = (rawRepoRoot?.isEmpty == false)
+                        ? rawRepoRoot
+                        : store.matchedRepoRoot(for: session)
+                    store.activeSheetSessionID = session.id
+                    store.inspectorSheetMode = .files
+                    store.showRemoteFilesSheet = true
+                    store.previewRemoteFile(relPath, for: session, baseRootOverride: repoRoot)
+                }
+            )
                 .padding(10)
         }
         .background(CodaHerdrTheme.canvasBG)

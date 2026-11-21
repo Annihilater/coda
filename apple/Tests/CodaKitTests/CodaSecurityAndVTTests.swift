@@ -498,8 +498,23 @@ final class CodaSecurityAndVTTests: XCTestCase {
         XCTAssertEqual(codaShellQuotePath("/tmp/a b'c.png"), "'/tmp/a b'\\''c.png'")
         XCTAssertEqual(codaShellQuotePath("-flag"), "'-flag'")
 
-        let bp = CodaTerminalTranscriptHelper.encodeBracketedPaste("hi\nthere\u{1B}[201~x")
+        let bp = CodaTerminalTranscriptHelper.encodeBracketedPaste("hi\r\nthere\u{1B}[\u{1B}[201~201~x")
         XCTAssertEqual(bp, Data("\u{1B}[200~hi\ntherex\u{1B}[201~\r".utf8))
+        let plainBp = CodaTerminalTranscriptHelper.encodeBracketedPaste("hi\r\nthere", bracketedModeEnabled: false)
+        XCTAssertEqual(plainBp, Data("hi\nthere\r".utf8))
+
+        XCTAssertThrowsError(try CodaVoiceEndpointValidator.validatedTranscriptionURL(from: "https:///foo"))
+        let queryURL = try CodaVoiceEndpointValidator.validatedTranscriptionURL(from: "https://api.example.com/v1?k=1")
+        XCTAssertEqual(queryURL.absoluteString, "https://api.example.com/v1/audio/transcriptions?k=1")
+
+        XCTAssertEqual(
+            CodaFormFactor.detect(width: 620, height: 834, isHorizontalRegular: true, isVerticalRegular: true),
+            .ipadOrDesktop
+        )
+        XCTAssertEqual(
+            CodaFormFactor.detect(width: 640, height: 960, isHorizontalRegular: true, isVerticalRegular: true),
+            .ipadOrDesktop
+        )
 
         XCTAssertTrue(CodaWorkspaceBootstrapValidator.isValidFolderName("coda-repo"))
         XCTAssertFalse(CodaWorkspaceBootstrapValidator.isValidFolderName("../bad"))

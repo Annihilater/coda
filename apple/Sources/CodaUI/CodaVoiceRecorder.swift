@@ -6,6 +6,8 @@ import Speech
 #endif
 
 public enum CodaVoiceRecorderError: LocalizedError, Sendable {
+    case unbundledMicrophoneRequiresAppBundle
+    case unbundledSpeechRequiresAppBundleOrWhisper
     case permissionDenied
     case speechPermissionDenied
     case invalidEndpoint(String)
@@ -16,6 +18,10 @@ public enum CodaVoiceRecorderError: LocalizedError, Sendable {
 
     public var errorDescription: String? {
         switch self {
+        case .unbundledMicrophoneRequiresAppBundle:
+            return "Voice recording requires running the bundled Coda.app (with Info.plist microphone permission) rather than a bare CLI binary."
+        case .unbundledSpeechRequiresAppBundleOrWhisper:
+            return "Local Apple Speech requires running bundled Coda.app. Launch Coda.app or configure a Whisper API Key (locally or on your paired host)."
         case .permissionDenied:
             return "Microphone permission denied. Enable microphone access in System/App Settings."
         case .speechPermissionDenied:
@@ -137,8 +143,55 @@ private final class SpeechRecognitionOnceBox: @unchecked Sendable {
     }
 }
 
+private final class SpeechCancellationCoordinator: @unchecked Sendable {
+    private let lock = NSLock()
+    private var isCancelled = false
+    private var box: SpeechRecognitionOnceBox?
+    private var recognitionTask: SFSpeechRecognitionTask?
+    private var timeoutTask: Task<Void, Never>?
+
+    func register(
+        box: SpeechRecognitionOnceBox,
+        recognitionTask: SFSpeechRecognitionTask,
+        timeoutTask: Task<Void, Never>
+    ) {
+        lock.lock()
+        let alreadyCancelled = isCancelled
+        if !alreadyCancelled {
+            self.box = box
+            self.recognitionTask = recognitionTask
+            self.timeoutTask = timeoutTask
+        }
+        lock.unlock()
+        if alreadyCancelled {
+            timeoutTask.cancel()
+            recognitionTask.cancel()
+            box.cancelAndFail(CancellationError())
+        }
+    }
+
+    func cancelAll() {
+        lock.lock()
+        isCancelled = true
+        let activeBox = box
+        let activeRec = recognitionTask
+        let activeTimeout = timeoutTask
+        box = nil
+        recognitionTask = nil
+        timeoutTask = nil
+        lock.unlock()
+
+        activeTimeout?.cancel()
+        activeRec?.cancel()
+        activeBox?.cancelAndFail(CancellationError())
+    }
+}
+
 private enum AppleNativeSpeechTranscriber {
-    static func requestAuthorizationIfNeeded() async -> Bool {
+    static func requestAuthorizationIfNeeded() async throws -> Bool {
+        guard CodaVoiceRecorder.hasBundledSpeechUsageDescription else {
+            throw CodaVoiceRecorderError.unbundledSpeechRequiresAppBundleOrWhisper
+        }
         switch SFSpeechRecognizer.authorizationStatus() {
         case .authorized:
             return true
@@ -156,17 +209,21 @@ private enum AppleNativeSpeechTranscriber {
         }
     }
 
-    static func transcribeFile(at fileURL: URL, locale: CodaUILocale) async throws -> String {
-        let authorized = await requestAuthorizationIfNeeded()
+    static func transcribeFile(
+        at fileURL: URL,
+        locale: CodaUILocale,
+        onPartialTranscript: (@Sendable (String) -> Void)? = nil
+    ) async throws -> String {
+        let authorized = try await requestAuthorizationIfNeeded()
         try Task.checkCancellation()
         guard authorized else {
             throw CodaVoiceRecorderError.speechPermissionDenied
         }
 
-        let preferredLocaleID = (locale == .zh) ? "zh-CN" : Locale.current.identifier
+        // Explicitly honor Coda's UI locale (`zh-CN` vs `en-US`) before falling back to OS locale.
+        let preferredLocaleID = (locale == .zh) ? "zh-CN" : "en-US"
         let recognizer = SFSpeechRecognizer(locale: Locale(identifier: preferredLocaleID))
             ?? SFSpeechRecognizer(locale: Locale.current)
-            ?? SFSpeechRecognizer(locale: Locale(identifier: "en-US"))
             ?? SFSpeechRecognizer()
 
         guard let recognizer, recognizer.isAvailable else {
@@ -176,8 +233,10 @@ private enum AppleNativeSpeechTranscriber {
         }
 
         let request = SFSpeechURLRecognitionRequest(url: fileURL)
-        request.shouldReportPartialResults = false
+        request.shouldReportPartialResults = true
         request.addsPunctuation = true
+
+        let coordinator = SpeechCancellationCoordinator()
 
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { (cont: CheckedContinuation<String, Error>) in
@@ -193,6 +252,10 @@ private enum AppleNativeSpeechTranscriber {
                     if let result {
                         let formatted = result.bestTranscription.formattedString
                         box.updatePartial(formatted)
+                        let trimmed = formatted.trimmingCharacters(in: .whitespacesAndNewlines)
+                        if !trimmed.isEmpty {
+                            onPartialTranscript?(trimmed)
+                        }
                         if result.isFinal {
                             timeoutTask.cancel()
                             box.finishFinal(formatted)
@@ -205,23 +268,38 @@ private enum AppleNativeSpeechTranscriber {
                     }
                 }
                 box.attachTask(recTask)
+                coordinator.register(box: box, recognitionTask: recTask, timeoutTask: timeoutTask)
             }
         } onCancel: {
-            // CheckedContinuation inside SpeechRecognitionOnceBox is cleaned up via timeout/task completion.
+            coordinator.cancelAll()
         }
     }
 }
 #endif
 
-/// Real cross-platform (iOS 17+ / macOS 14+) voice recorder with zero-config Apple `Speech`
-/// (`SFSpeechRecognizer`) fallback when `apiKey` is empty, plus Whisper-compatible
-/// `POST <base_url>/audio/transcriptions` client when `apiKey` is configured.
+/// Cross-platform (iOS 17+ / macOS 14+) voice recorder with TCC bundle guards, zero-config Apple `Speech`
+/// (`SFSpeechRecognizer`) fallback, E2EE remote daemon Whisper delegation (`transcribe_audio`), and direct
+/// Whisper-compatible `POST <base_url>/audio/transcriptions` client when a local API key is configured.
 @MainActor
 public final class CodaVoiceRecorder {
     private var recorder: AVAudioRecorder?
     private var recordingURL: URL?
 
-    public static var hasNativeSpeechFallback: Bool {
+    public nonisolated static var hasBundledMicrophoneUsageDescription: Bool {
+        CodaVoiceEndpointValidator.isBundledWithUsageDescription(
+            bundlePathExtension: Bundle.main.bundleURL.pathExtension,
+            usageDescription: Bundle.main.object(forInfoDictionaryKey: "NSMicrophoneUsageDescription") as? String
+        )
+    }
+
+    public nonisolated static var hasBundledSpeechUsageDescription: Bool {
+        CodaVoiceEndpointValidator.isBundledWithUsageDescription(
+            bundlePathExtension: Bundle.main.bundleURL.pathExtension,
+            usageDescription: Bundle.main.object(forInfoDictionaryKey: "NSSpeechRecognitionUsageDescription") as? String
+        )
+    }
+
+    public nonisolated static var hasNativeSpeechFallback: Bool {
         #if canImport(Speech)
         return true
         #else
@@ -229,8 +307,8 @@ public final class CodaVoiceRecorder {
         #endif
     }
 
-    public static func usesNativeSpeechFallback(for config: CodaVoiceModelConfig) -> Bool {
-        config.apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    public nonisolated static func usesNativeSpeechFallback(for config: CodaVoiceModelConfig) -> Bool {
+        !config.hasLocalPlaintextApiKey && !config.hasMaskedDaemonKey
     }
 
     public var isRecording: Bool {
@@ -239,31 +317,31 @@ public final class CodaVoiceRecorder {
 
     public init() {}
 
-    /// Validates that a voice API endpoint uses HTTPS (or localhost HTTP for local Whisper servers).
+    /// Normalized live audio power (0.0...1.0) for live recording waveform indicators.
+    public func currentNormalizedAudioLevel() -> Float {
+        guard let rec = recorder, rec.isRecording else { return 0 }
+        rec.updateMeters()
+        let avgDb = rec.averagePower(forChannel: 0) // -160 .. 0 dBFS
+        let clamped = max(-55.0, min(0.0, avgDb))
+        return (clamped + 55.0) / 55.0
+    }
+
+    /// Validates that a voice API endpoint uses HTTPS (or localhost HTTP for local Whisper servers),
+    /// rejects empty hosts (`https:///foo`), and places `/audio/transcriptions` before query parameters.
     public static func validatedTranscriptionURL(from rawBaseURL: String) throws -> URL {
-        let trimmed = rawBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, let parsed = URL(string: trimmed), let scheme = parsed.scheme?.lowercased() else {
-            throw CodaVoiceRecorderError.invalidEndpoint("Invalid voice API base URL.")
+        do {
+            return try CodaVoiceEndpointValidator.validatedTranscriptionURL(from: rawBaseURL)
+        } catch {
+            throw CodaVoiceRecorderError.invalidEndpoint(error.localizedDescription)
         }
-        let host = (parsed.host ?? "").lowercased()
-        let isLoopback = host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "[::1]"
-        if scheme != "https" && !(scheme == "http" && isLoopback) {
-            throw CodaVoiceRecorderError.invalidEndpoint(
-                "Voice API URL must use https:// (or http://localhost for local Whisper)."
-            )
-        }
-        let cleanStr = trimmed.hasSuffix("/") ? String(trimmed.dropLast()) : trimmed
-        let finalStr = cleanStr.hasSuffix("/audio/transcriptions")
-            ? cleanStr
-            : "\(cleanStr)/audio/transcriptions"
-        guard let endpoint = URL(string: finalStr) else {
-            throw CodaVoiceRecorderError.invalidEndpoint("Could not construct /audio/transcriptions URL.")
-        }
-        return endpoint
     }
 
     public func startRecording() async throws {
         cancelRecording()
+
+        guard Self.hasBundledMicrophoneUsageDescription else {
+            throw CodaVoiceRecorderError.unbundledMicrophoneRequiresAppBundle
+        }
 
         let granted = await requestMicrophonePermission()
         try Task.checkCancellation()
@@ -292,6 +370,7 @@ public final class CodaVoiceRecorder {
         ]
 
         let rec = try AVAudioRecorder(url: tempURL, settings: recordSettings)
+        rec.isMeteringEnabled = true
         rec.prepareToRecord()
         guard rec.record() else {
             try? FileManager.default.removeItem(at: tempURL)
@@ -315,7 +394,9 @@ public final class CodaVoiceRecorder {
 
     public func stopAndTranscribe(
         config: CodaVoiceModelConfig,
-        locale: CodaUILocale = .en
+        locale: CodaUILocale = .en,
+        onPartialTranscript: (@Sendable (String) -> Void)? = nil,
+        daemonWhisperFallback: (@Sendable (Data, String) async throws -> String)? = nil
     ) async throws -> String {
         guard let rec = recorder, let fileURL = recordingURL else {
             throw CodaVoiceRecorderError.noActiveRecording
@@ -337,17 +418,54 @@ public final class CodaVoiceRecorder {
             throw CodaVoiceRecorderError.emptyAudio
         }
 
-        let apiKey = config.apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
-        if apiKey.isEmpty {
+        let langHint = (locale == .zh) ? "zh" : "en"
+
+        // Path 1: Remote host holds a saved Whisper API key (`••••••••`), while local plaintext key is absent
+        if config.hasMaskedDaemonKey, !config.hasLocalPlaintextApiKey {
+            if let daemonWhisperFallback {
+                return try await daemonWhisperFallback(audioData, langHint)
+            }
             #if canImport(Speech)
-            return try await AppleNativeSpeechTranscriber.transcribeFile(at: fileURL, locale: locale)
+            if Self.hasBundledSpeechUsageDescription {
+                return try await AppleNativeSpeechTranscriber.transcribeFile(
+                    at: fileURL,
+                    locale: locale,
+                    onPartialTranscript: onPartialTranscript
+                )
+            }
+            #endif
+            throw CodaVoiceRecorderError.unbundledSpeechRequiresAppBundleOrWhisper
+        }
+
+        // Path 2: Zero-config empty key -> try Apple Native Speech first, with automatic E2EE daemon Whisper fallback
+        if !config.hasLocalPlaintextApiKey {
+            #if canImport(Speech)
+            do {
+                return try await AppleNativeSpeechTranscriber.transcribeFile(
+                    at: fileURL,
+                    locale: locale,
+                    onPartialTranscript: onPartialTranscript
+                )
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                if let daemonWhisperFallback {
+                    return try await daemonWhisperFallback(audioData, langHint)
+                }
+                throw error
+            }
             #else
+            if let daemonWhisperFallback {
+                return try await daemonWhisperFallback(audioData, langHint)
+            }
             throw CodaVoiceRecorderError.transcriptionFailed(
                 "Whisper API Key is empty and Apple Speech framework is unavailable."
             )
             #endif
         }
 
+        // Path 3: Local plaintext Whisper API key configured on device
+        let apiKey = config.apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
         let endpoint = try Self.validatedTranscriptionURL(from: config.baseURL)
         let model = config.model.trimmingCharacters(in: .whitespacesAndNewlines)
         let effectiveModel = model.isEmpty ? "whisper-1" : model
@@ -362,6 +480,7 @@ public final class CodaVoiceRecorder {
         }
 
         appendField(name: "model", value: effectiveModel)
+        appendField(name: "language", value: langHint)
         appendField(name: "response_format", value: "json")
 
         body.append(Data("--\(boundary)\r\n".utf8))
@@ -402,6 +521,9 @@ public final class CodaVoiceRecorder {
     }
 
     private func requestMicrophonePermission() async -> Bool {
+        guard Self.hasBundledMicrophoneUsageDescription else {
+            return false
+        }
         switch AVCaptureDevice.authorizationStatus(for: .audio) {
         case .authorized:
             return true

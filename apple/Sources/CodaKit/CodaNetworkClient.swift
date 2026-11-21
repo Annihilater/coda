@@ -136,6 +136,7 @@ public actor CodaNetworkClient {
     private var relayReaderTask: Task<Void, Never>?
     private var relayKeepAliveTask: Task<Void, Never>?
     private var activeRelayRouteMode: SmartPathRouteMode?
+    private var relayBoundPeerDeviceId: UUID?
     private var directP2PPeers: [UUID: DirectP2PPeerState] = [:]
     private var p2pPeerDeviceId: UUID?
     private var relayPeerSessions: [UUID: RelayPeerSessionState] = [:]
@@ -292,6 +293,15 @@ public actor CodaNetworkClient {
         if p2pPeerDeviceId == peerDeviceId {
             p2pPeerDeviceId = nil
         }
+        if connectedPeerDeviceId == peerDeviceId {
+            connectedPeerDeviceId = nil
+        }
+        failPendingRequests(forPeer: peerDeviceId, error: URLError(.cancelled))
+        if relayBoundPeerDeviceId == peerDeviceId {
+            let activeGen = rawTCPConnection != nil ? rawTCPGeneration : wsGeneration
+            relayBoundPeerDeviceId = nil
+            handleRelayDisconnect(gen: activeGen)
+        }
     }
 
     public func disconnectTransport() {
@@ -323,6 +333,7 @@ public actor CodaNetworkClient {
         wsTask = nil
         wsGeneration &+= 1
         activeRelayRouteMode = nil
+        relayBoundPeerDeviceId = nil
         relayPeerSessions.removeAll()
         connectedPeerDeviceId = nil
         failAllPendingRequests(error: URLError(.cancelled))
@@ -454,7 +465,10 @@ public actor CodaNetworkClient {
         invalidatePeerSession(peerDeviceId: deviceId)
     }
 
-    public func pruneStaleDevices(maxIdleDays: Int = 0) async throws -> CodaPruneStaleDevicesResult {
+    public func pruneStaleDevices(
+        maxIdleDays: Int = 0,
+        excludeDeviceId: UUID? = nil
+    ) async throws -> CodaPruneStaleDevicesResult {
         let url = serverBaseURL.appendingPathComponent("api/v1/devices/prune-stale")
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
@@ -462,9 +476,13 @@ public actor CodaNetworkClient {
         if let token = bearerToken {
             req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         }
-        req.httpBody = try JSONSerialization.data(withJSONObject: [
+        var body: [String: Any] = [
             "max_idle_days": max(0, maxIdleDays),
-        ])
+        ]
+        if let excludeDeviceId {
+            body["exclude_device_id"] = excludeDeviceId.uuidString.lowercased()
+        }
+        req.httpBody = try JSONSerialization.data(withJSONObject: body)
         let (data, resp) = try await URLSession.shared.data(for: req)
         guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
             throw CodaAPIError.fromResponse(data: data, response: resp, fallback: "Prune stale web devices failed")
@@ -1373,7 +1391,8 @@ public actor CodaNetworkClient {
         relayRawTCP: (host: String, port: UInt16)? = nil,
         relayWSS: URL? = nil,
         relayTicket: String? = nil,
-        relayCandidates: [CodaRelayNodeInfo] = []
+        relayCandidates: [CodaRelayNodeInfo] = [],
+        relayTicketBoundPeerId: UUID? = nil
     ) async throws -> SmartPathRouteMode {
         var candidates: [(host: String, port: UInt16)] = []
         let targetId = targetDevice.id
@@ -1420,7 +1439,10 @@ public actor CodaNetworkClient {
             clientIdentity: clientIdentity,
             clientDeviceId: clientDeviceId
         )
-        if let relayMode = self.activeRelayRouteMode, (self.wsTask != nil || self.rawTCPConnection != nil) {
+        let canReuseSharedRelay = (self.relayBoundPeerDeviceId == nil || self.relayBoundPeerDeviceId == targetId)
+        if canReuseSharedRelay,
+           let relayMode = self.activeRelayRouteMode,
+           (self.wsTask != nil || self.rawTCPConnection != nil) {
             self.connectedPeerDeviceId = targetId
             self.activeRouteMode = relayMode
             startWiFiPathMonitor(
@@ -1485,6 +1507,7 @@ public actor CodaNetworkClient {
                     try await connectOverseasCDNWSS(wssURL: url, relayTicket: ticket)
                     self.activeRouteMode = .globalCDNWSS
                 }
+                self.relayBoundPeerDeviceId = relayTicketBoundPeerId
                 connected = true
                 break
             } catch {
@@ -1511,7 +1534,8 @@ public actor CodaNetworkClient {
         return self.activeRouteMode
     }
 
-    /// High-level SmartPath helper that mints relay tickets and connects to `targetDevice` automatically.
+    /// High-level SmartPath helper that mints an unpinned user-scoped relay ticket (`peerDeviceId: nil`)
+    /// so a single shared Relay WebSocket / Raw TCP transport routes seamlessly to ALL paired hosts (`Host A..N`).
     public func connectBestAvailable(
         sessionToken: String,
         targetDevice: CodaRemoteDevice,
@@ -1534,9 +1558,11 @@ public actor CodaNetworkClient {
             self.activeRouteMode = peerState.routeMode
             return peerState.routeMode
         }
+        let hasReusableSharedRelay = (wsTask != nil || rawTCPConnection != nil)
+            && (relayBoundPeerDeviceId == nil || relayBoundPeerDeviceId == targetDevice.id)
         // Only reuse the shared Relay shortcut when `targetDevice` has already been probed and
         // enrolled in the SmartPath background reprobe loop; brand-new LAN peers must probe Direct first.
-        if (wsTask != nil || rawTCPConnection != nil), let existingTarget = trackedSmartPathPeers[targetDevice.id] {
+        if hasReusableSharedRelay, let existingTarget = trackedSmartPathPeers[targetDevice.id] {
             trackedSmartPathPeers[targetDevice.id] = SmartPathTarget(
                 targetDevice: targetDevice,
                 clientIdentity: clientIdentity,
@@ -1554,7 +1580,7 @@ public actor CodaNetworkClient {
             self.activeRouteMode = relayMode
             return relayMode
         }
-        if (wsTask != nil || rawTCPConnection != nil), trackedSmartPathPeers[targetDevice.id] == nil {
+        if hasReusableSharedRelay, trackedSmartPathPeers[targetDevice.id] == nil {
             if let fastRoute = try? await connectAutoSmartPath(
                 targetDevice: targetDevice,
                 clientIdentity: clientIdentity,
@@ -1562,13 +1588,14 @@ public actor CodaNetworkClient {
                 relayRawTCP: nil,
                 relayWSS: nil,
                 relayTicket: nil,
-                relayCandidates: []
+                relayCandidates: [],
+                relayTicketBoundPeerId: nil
             ) {
                 return fastRoute
             }
         }
 
-        let ticketResp = try? await mintRelayTicket(deviceId: clientDevId, peerDeviceId: targetDevice.id)
+        let ticketResp = try? await mintRelayTicket(deviceId: clientDevId, peerDeviceId: nil)
         let rawTuple = ticketResp.flatMap { res -> (host: String, port: UInt16)? in
             guard let h = res.rawTCPHost, let p = res.rawTCPPort else { return nil }
             return (h, p)
@@ -1580,7 +1607,8 @@ public actor CodaNetworkClient {
             relayRawTCP: rawTuple,
             relayWSS: ticketResp?.wssURL,
             relayTicket: ticketResp?.ticket,
-            relayCandidates: ticketResp?.relays ?? []
+            relayCandidates: ticketResp?.relays ?? [],
+            relayTicketBoundPeerId: nil
         )
     }
 
@@ -1840,6 +1868,13 @@ public actor CodaNetworkClient {
         }
     }
 
+    private func failPendingRequests(forPeer peerDeviceId: UUID, error: Error) {
+        let doomed = pendingRequests.filter { $0.value.peerDeviceId == peerDeviceId }.map(\.key)
+        for reqId in doomed {
+            failPendingRequest(reqId: reqId, error: error)
+        }
+    }
+
     private func failPendingRequests(forPeer peerDeviceId: UUID, transportGen: UInt64, error: Error) {
         let doomed = pendingRequests.filter {
             $0.value.peerDeviceId == peerDeviceId && $0.value.transportGen == transportGen
@@ -1877,7 +1912,12 @@ public actor CodaNetworkClient {
             return
         }
         if let reqId = obj["req_id"] as? String, !reqId.isEmpty,
-           let pending = pendingRequests.removeValue(forKey: reqId) {
+           let pending = pendingRequests[reqId] {
+            guard pending.peerDeviceId == sourceDeviceId else {
+                // Reject cross-peer req_id spoofing / collision without consuming the legitimate pending request.
+                return
+            }
+            pendingRequests.removeValue(forKey: reqId)
             pending.timeoutTask.cancel()
             pending.continuation.yield(pt)
             pending.continuation.finish()
@@ -1962,9 +2002,13 @@ public actor CodaNetworkClient {
                   let devStr = frame["device_id"] as? String,
                   let devUUID = UUID(uuidString: devStr) {
             let isOnline = (frame["is_online"] as? Bool) ?? false
+            relayPeerSessions.removeValue(forKey: devUUID)
+            failPendingRequests(forPeer: devUUID, transportGen: gen, error: URLError(.networkConnectionLost))
             if isOnline {
-                relayPeerSessions.removeValue(forKey: devUUID)
                 enqueueAsyncEvent(CodaAsyncEvent(op: "peer_session_reset", sourceDeviceId: devUUID, payloadData: Data()))
+            } else if directP2PPeers[devUUID] == nil {
+                failPendingRequests(forPeer: devUUID, error: URLError(.networkConnectionLost))
+                enqueueAsyncEvent(CodaAsyncEvent(op: "peer_offline", sourceDeviceId: devUUID, payloadData: Data()))
             }
         } else if frameType == "auth_ack" {
             if (frame["ok"] as? Bool) == false {
@@ -1989,6 +2033,7 @@ public actor CodaNetworkClient {
             rawTCPConnection?.cancel()
             rawTCPConnection = nil
             activeRelayRouteMode = nil
+            relayBoundPeerDeviceId = nil
             didDropRelay = true
         }
         if wsGeneration == gen {
@@ -1997,6 +2042,7 @@ public actor CodaNetworkClient {
             wsTask?.cancel(with: .normalClosure, reason: nil)
             wsTask = nil
             activeRelayRouteMode = nil
+            relayBoundPeerDeviceId = nil
             didDropRelay = true
         }
         failPendingRequests(forTransportGen: gen, error: URLError(.networkConnectionLost))
@@ -2909,6 +2955,37 @@ public actor CodaNetworkClient {
         )
     }
 
+    public func transcribeAudio(
+        on device: CodaRemoteDevice,
+        clientIdentity: CodaDeviceIdentity,
+        clientDeviceId: UUID,
+        audioData: Data,
+        mimeType: String = "audio/m4a",
+        filename: String = "dictation.m4a",
+        language: String? = nil
+    ) async throws -> CodaTranscribeAudioResult {
+        var reqObj: [String: Any] = [
+            "op": "transcribe_audio",
+            "req_id": nextRequestID(),
+            "audio_b64": audioData.base64EncodedString(),
+            "mime_type": mimeType,
+            "filename": filename,
+        ]
+        if let language, !language.isEmpty {
+            reqObj["language"] = language
+        }
+        let reqData = try JSONSerialization.data(withJSONObject: reqObj)
+        let respData = try await sendPeerMessageData(
+            reqData,
+            to: device,
+            clientIdentity: clientIdentity,
+            clientDeviceId: clientDeviceId,
+            lane: "bulk_p1",
+            timeoutSeconds: 45
+        )
+        return try JSONDecoder().decode(CodaTranscribeAudioResult.self, from: respData)
+    }
+
     public func readRemoteFilePreview(
         on device: CodaRemoteDevice,
         clientIdentity: CodaDeviceIdentity,
@@ -2933,9 +3010,15 @@ public actor CodaNetworkClient {
             let path: String
             let content: String
             let error: String?
+            let truncated: Bool?
         }
         let decoded = try JSONDecoder().decode(Resp.self, from: respData)
-        return CodaFilePreviewResult(path: decoded.path, content: decoded.content, error: decoded.error)
+        return CodaFilePreviewResult(
+            path: decoded.path,
+            content: decoded.content,
+            error: decoded.error,
+            truncated: decoded.truncated ?? false
+        )
     }
 
     public func fetchLocalPortPreview(
@@ -2964,20 +3047,26 @@ public actor CodaNetworkClient {
             let statusCode: Int
             let contentType: String
             let bodyB64: String
+            let truncated: Bool?
             enum CodingKeys: String, CodingKey {
                 case statusCode = "status_code"
                 case contentType = "content_type"
                 case bodyB64 = "body_b64"
+                case truncated
             }
         }
         let decoded = try JSONDecoder().decode(Resp.self, from: respData)
         let rawBytes = Data(base64Encoded: decoded.bodyB64) ?? Data()
         let ctLower = decoded.contentType.lowercased()
+        let isHtmlPayload = ctLower.contains("text/html") || ctLower.contains("application/xhtml")
         let text: String
+        let rawHTML: String?
         if ctLower.hasPrefix("image/") || ctLower.hasPrefix("audio/") || ctLower.hasPrefix("video/") {
             text = "(Binary payload: \(rawBytes.count) bytes, Content-Type: \(decoded.contentType))"
+            rawHTML = nil
         } else {
             let utf8 = String(decoding: rawBytes, as: UTF8.self)
+            rawHTML = isHtmlPayload ? utf8 : nil
             if ctLower.contains("json"),
                let jsonObj = try? JSONSerialization.jsonObject(with: rawBytes),
                let pretty = try? JSONSerialization.data(withJSONObject: jsonObj, options: [.prettyPrinted, .sortedKeys]) {
@@ -2989,7 +3078,9 @@ public actor CodaNetworkClient {
         return CodaPortPreviewResult(
             statusCode: decoded.statusCode,
             contentType: decoded.contentType,
-            bodyText: text
+            bodyText: text,
+            rawHTML: rawHTML,
+            truncated: decoded.truncated ?? (rawBytes.count > 65536)
         )
     }
 }

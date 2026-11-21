@@ -1,5 +1,8 @@
 import CodaKit
 import SwiftUI
+#if os(iOS)
+import UIKit
+#endif
 
 // MARK: - Adaptive Root View (`iPhone` Compact Tab/Stack <-> `iPadOS` / `Mac` Split View)
 
@@ -31,6 +34,30 @@ public struct CodaAdaptiveRootView: View {
 #endif
     }
 
+    private var hardwareScreenSize: CGSize? {
+#if os(iOS)
+        if let scene = UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene }).first {
+            return scene.screen.bounds.size
+        }
+        return nil
+#else
+        return nil
+#endif
+    }
+
+    private func isPadOrMacHardware(safeAreas: CodaEdgeSafeAreas) -> Bool {
+#if os(macOS)
+        return true
+#elseif os(iOS)
+        if UIDevice.current.userInterfaceIdiom == .pad {
+            return !(safeAreas.trailing >= 64 && safeAreas.isHorizontallyAsymmetric)
+        }
+        return false
+#else
+        return true
+#endif
+    }
+
     private func edgeSafeAreas(from insets: EdgeInsets) -> CodaEdgeSafeAreas {
         CodaEdgeSafeAreas(
             top: insets.top,
@@ -47,31 +74,31 @@ public struct CodaAdaptiveRootView: View {
         )
     }
 
+    private func syncViewport(geoSize: CGSize, insets: EdgeInsets) {
+        let safeAreas = edgeSafeAreas(from: insets)
+        let displaySize = fullDisplaySize(geoSize: geoSize, safeAreas: safeAreas)
+        store.updateViewportGeometry(
+            size: displaySize,
+            safeAreas: safeAreas,
+            isHorizontalRegular: isHorizontalRegular,
+            isVerticalRegular: isVerticalRegular,
+            hardwareScreenSize: hardwareScreenSize,
+            isPadOrMacHardware: isPadOrMacHardware(safeAreas: safeAreas)
+        )
+    }
+
     @ViewBuilder
     private func applyingSizeClassObservers<Content: View>(
         geo: GeometryProxy,
-        safeAreas: CodaEdgeSafeAreas,
         @ViewBuilder content: () -> Content
     ) -> some View {
 #if os(iOS)
         content()
             .onChange(of: horizontalSizeClass) { _, _ in
-                let displaySize = fullDisplaySize(geoSize: geo.size, safeAreas: safeAreas)
-                store.updateViewportGeometry(
-                    size: displaySize,
-                    safeAreas: safeAreas,
-                    isHorizontalRegular: isHorizontalRegular,
-                    isVerticalRegular: isVerticalRegular
-                )
+                syncViewport(geoSize: geo.size, insets: geo.safeAreaInsets)
             }
             .onChange(of: verticalSizeClass) { _, _ in
-                let displaySize = fullDisplaySize(geoSize: geo.size, safeAreas: safeAreas)
-                store.updateViewportGeometry(
-                    size: displaySize,
-                    safeAreas: safeAreas,
-                    isHorizontalRegular: isHorizontalRegular,
-                    isVerticalRegular: isVerticalRegular
-                )
+                syncViewport(geoSize: geo.size, insets: geo.safeAreaInsets)
             }
 #else
         content()
@@ -79,100 +106,84 @@ public struct CodaAdaptiveRootView: View {
     }
 
     public var body: some View {
-        GeometryReader { geo in
-            let safeAreas = edgeSafeAreas(from: geo.safeAreaInsets)
-            let displaySize = fullDisplaySize(geoSize: geo.size, safeAreas: safeAreas)
-            let isHReg = isHorizontalRegular
-            let isVReg = isVerticalRegular
-            let factor = CodaFormFactor.detect(
-                width: displaySize.width,
-                height: displaySize.height,
-                isHorizontalRegular: isHReg,
-                isVerticalRegular: isVReg
-            )
+        let factor = store.formFactor
+        ZStack(alignment: .top) {
+            switch factor {
+            case .iphonePortrait:
+                compactPhoneLayout
+            case .iphoneLandscape:
+                CodaCompactLandscapeSideRailLayout(store: store)
+            case .iphoneDuoCoverPortrait, .iphoneDuoCoverLandscape:
+                CodaDuoCoverLayout(store: store)
+            case .iphoneDuoInnerLandscape:
+                CodaDuoInnerLandscapeWorkbenchView(store: store)
+            case .iphoneDuoInnerPortrait:
+                CodaDuoInnerPortraitWorkbenchView(store: store)
+            case .ipadOrDesktop:
+                regularIPadSplitLayout
+            }
 
-            applyingSizeClassObservers(geo: geo, safeAreas: safeAreas) {
-                ZStack(alignment: .top) {
-                    switch factor {
-                    case .iphonePortrait:
-                        compactPhoneLayout
-                    case .iphoneLandscape:
-                        CodaCompactLandscapeSideRailLayout(store: store)
-                    case .iphoneDuoCoverPortrait, .iphoneDuoCoverLandscape:
-                        CodaDuoCoverLayout(store: store)
-                    case .iphoneDuoInnerLandscape:
-                        CodaDuoInnerLandscapeWorkbenchView(store: store)
-                    case .iphoneDuoInnerPortrait:
-                        CodaDuoInnerPortraitWorkbenchView(store: store)
-                    case .ipadOrDesktop:
-                        regularIPadSplitLayout
-                    }
-
-                if let toast = store.activeToast {
-                    CodaToastBannerView(
-                        toast: toast,
-                        locale: store.locale,
-                        onTap: {
-                            if let match = store.sessions.first(where: { $0.id == toast.sessionId }) {
-                                store.selectSession(match)
-                            }
-                            store.activeToast = nil
-                        },
-                        onDismiss: {
-                            store.activeToast = nil
+            if let toast = store.activeToast {
+                CodaToastBannerView(
+                    toast: toast,
+                    locale: store.locale,
+                    onTap: {
+                        if let match = store.sessions.first(where: { $0.id == toast.sessionId }) {
+                            store.selectSession(match)
                         }
-                    )
-                    .padding(.top, 10)
-                    .padding(.horizontal, 16)
-                    .transition(.move(edge: .top).combined(with: .opacity))
-                    .zIndex(50)
-                }
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .background(CodaHerdrTheme.canvasBG.ignoresSafeArea())
-            .onAppear {
-                store.updateViewportGeometry(
-                    size: displaySize,
-                    safeAreas: safeAreas,
-                    isHorizontalRegular: isHReg,
-                    isVerticalRegular: isVReg
+                        store.activeToast = nil
+                    },
+                    onDismiss: {
+                        store.activeToast = nil
+                    }
                 )
-                store.startLiveSync()
-                if !factor.isCompact, store.selectedSessionID == nil, let first = store.filteredSessions.first {
-                    store.selectSession(first)
-                }
-            }
-            .onChange(of: geo.size) { _, next in
-                store.updateViewportGeometry(
-                    size: fullDisplaySize(geoSize: next, safeAreas: safeAreas),
-                    safeAreas: safeAreas,
-                    isHorizontalRegular: isHReg,
-                    isVerticalRegular: isVReg
-                )
-            }
-            .onChange(of: store.showSidebar) { _, _ in
-                store.updateViewportGeometry(
-                    size: displaySize,
-                    safeAreas: safeAreas,
-                    isHorizontalRegular: isHReg,
-                    isVerticalRegular: isVReg
-                )
-            }
-            .onChange(of: store.sessions.count) { _, _ in
-                if !factor.isCompact, store.selectedSessionID == nil, let first = store.filteredSessions.first {
-                    store.selectSession(first)
-                }
-                if !factor.isCompact {
-                    store.updateViewportGeometry(
-                        size: displaySize,
-                        safeAreas: safeAreas,
-                        isHorizontalRegular: isHReg,
-                        isVerticalRegular: isVReg
-                    )
-                }
-            }
+                .padding(.top, 10)
+                .padding(.horizontal, 16)
+                .transition(.move(edge: .top).combined(with: .opacity))
+                .zIndex(50)
             }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background {
+            // Measure window/hardware geometry with `.ignoresSafeArea(.keyboard)` so showing/hiding
+            // the software keyboard NEVER shrinks `terminalRows` (`SIGWINCH` thrashing) or flips
+            // Duo Cover Portrait into Landscape, while keeping foreground keyboard avoidance intact!
+            GeometryReader { kbGeo in
+                applyingSizeClassObservers(geo: kbGeo) {
+                    Color.clear
+                        .onAppear {
+                            syncViewport(geoSize: kbGeo.size, insets: kbGeo.safeAreaInsets)
+                            store.startLiveSync()
+                            if !store.formFactor.isCompact,
+                               store.selectedSessionID == nil,
+                               let first = store.filteredSessions.first {
+                                store.selectSession(first)
+                            }
+                        }
+                        .onChange(of: kbGeo.size) { _, nextSize in
+                            syncViewport(geoSize: nextSize, insets: kbGeo.safeAreaInsets)
+                        }
+                        .onChange(of: kbGeo.safeAreaInsets) { _, nextInsets in
+                            syncViewport(geoSize: kbGeo.size, insets: nextInsets)
+                        }
+                        .onChange(of: store.showSidebar) { _, _ in
+                            syncViewport(geoSize: kbGeo.size, insets: kbGeo.safeAreaInsets)
+                        }
+                        .onChange(of: store.sessions.count) { _, _ in
+                            if !store.formFactor.isCompact,
+                               store.selectedSessionID == nil,
+                               let first = store.filteredSessions.first {
+                                store.selectSession(first)
+                            }
+                            if !store.formFactor.isCompact {
+                                syncViewport(geoSize: kbGeo.size, insets: kbGeo.safeAreaInsets)
+                            }
+                        }
+                }
+            }
+            .ignoresSafeArea(.keyboard)
+        }
+        .background(CodaHerdrTheme.canvasBG.ignoresSafeArea())
         .sheet(isPresented: $store.showSettingsSheet) {
             CodaSettingsAndPairingSheet(store: store)
         }

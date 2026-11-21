@@ -69,11 +69,13 @@ public final class CodaWorkspaceStore: ObservableObject {
     @Published public var showGitDiffSheet: Bool = false
     @Published public var showRemoteFilesSheet: Bool = false
     @Published public var inspectorSheetMode: CodaInspectorSheetMode = .files
+    @Published public private(set) var inspectorSessionId: String? = nil
     @Published public var remoteFileRootPath: String = ""
     @Published public var remoteFileSubPath: String = ""
     @Published public var remoteFileEntries: [CodaRemoteFileEntry] = []
     @Published public var remoteFileSelectedRel: String? = nil
     @Published public var remoteFilePreviewText: String = ""
+    @Published public var remoteFileTruncated: Bool = false
     @Published public var remoteFileLoading: Bool = false
     @Published public var remoteFileError: String? = nil
     @Published public var portPreviewResult: CodaPortPreviewResult? = nil
@@ -86,6 +88,7 @@ public final class CodaWorkspaceStore: ObservableObject {
     @Published public var remoteMachines: [CodaRemoteDevice] = []
     @Published public var workspacesByDevice: [UUID: [CodaRepoWorkspaceSummary]] = [:]
     @Published public var hostHealthByDevice: [UUID: CodaHostHealthSnapshot] = [:]
+    @Published public private(set) var daemonVoiceConfigsByDevice: [UUID: CodaVoiceModelConfig] = [:]
     @Published public var machineRouteModes: [UUID: SmartPathRouteMode] = [:]
     @Published public var terminalLinesBySession: [String: [GhosttyStyledLine]] = [:]
     @Published public var rawScreenTextBySession: [String: String] = [:]
@@ -114,6 +117,8 @@ public final class CodaWorkspaceStore: ObservableObject {
     @Published public var altActive: Bool = false
     @Published public var dpadVisible: Bool = false
     @Published public var composeText: String = ""
+    @Published public var composeTextBySession: [String: String] = [:]
+    @Published public private(set) var uploadingAttachmentCount: Int = 0
     @Published public var uploadStatusBanner: String? = nil
     @Published public var isSendingAction: Bool = false
 
@@ -136,6 +141,10 @@ public final class CodaWorkspaceStore: ObservableObject {
     @Published public var voiceConfigSyncMessage: String? = nil
     @Published public var isRecordingVoice: Bool = false
     @Published public var isTranscribingVoice: Bool = false
+    @Published public private(set) var voiceDictationSessionID: String? = nil
+    @Published public private(set) var voiceRecordingSeconds: Int = 0
+    @Published public private(set) var voiceAudioLevel: Float = 0
+    @Published public private(set) var voicePartialTranscript: String = ""
     @Published public var voiceError: String? = nil
     @Published public var accountStatusMessage: String? = nil
 
@@ -149,11 +158,14 @@ public final class CodaWorkspaceStore: ObservableObject {
     private var deviceAuthTask: Task<Void, Never>?
     private var screenRefreshTask: Task<Void, Never>?
     private var voiceTask: Task<Void, Never>?
+    private var voiceMeterTask: Task<Void, Never>?
     private var pendingVoiceTranscriptHandler: ((String) -> Void)? = nil
     private var isStartingVoice: Bool = false
     private var workspaceEpoch: UInt64 = 0
     private var voiceGeneration: UInt64 = 0
     private var gitDiffGeneration: UInt64 = 0
+    private var remoteFileRequestGeneration: UInt64 = 0
+    private var portPreviewGeneration: UInt64 = 0
     private var pendingSelectSessionID: String? = nil
     private var readCompletedIDs: Set<String> = []
     private var attachedSessionIDs: Set<String> = []
@@ -164,8 +176,14 @@ public final class CodaWorkspaceStore: ObservableObject {
     private var notificationTracker = CodaNotificationTracker(cooldown: 20.0)
     private var lastToastAt: Date = .distantPast
     private var lastViewportSize: CGSize = .zero
+    private var lastHardwareScreenSize: CGSize? = nil
+    private var lastIsPadOrMacHardware: Bool = false
     private var lastIsHorizontalRegular: Bool? = nil
     private var lastIsVerticalRegular: Bool? = nil
+
+    public var isUploadingAttachment: Bool {
+        uploadingAttachmentCount > 0
+    }
 
     public var onlineMachineCount: Int {
         remoteMachines.filter(\.isOnline).count
@@ -179,6 +197,7 @@ public final class CodaWorkspaceStore: ObservableObject {
         let defaultName = "iOS-Client"
         #else
         let defaultName = "Mac-Client"
+        self.formFactor = .ipadOrDesktop
         #endif
         var loadedIdentity = CodaDeviceIdentity.loadOrCreatePersisted(defaultName: defaultName)
         let regKey = CodaPersistedSettings.registrationKey(
@@ -295,6 +314,8 @@ public final class CodaWorkspaceStore: ObservableObject {
         accountStatusMessage = nil
         workspaceEpoch &+= 1
         gitDiffGeneration &+= 1
+        remoteFileRequestGeneration &+= 1
+        portPreviewGeneration &+= 1
         let oldClient = self.networkClient
         let wasSignedIn = isSignedIn
         if originChanged && wasSignedIn {
@@ -330,6 +351,8 @@ public final class CodaWorkspaceStore: ObservableObject {
         self.sessions.removeAll()
         self.remoteMachines.removeAll()
         self.workspacesByDevice.removeAll()
+        self.hostHealthByDevice.removeAll()
+        self.daemonVoiceConfigsByDevice.removeAll()
         self.machineRouteModes.removeAll()
         self.rawScreenTextBySession.removeAll()
         self.terminalLinesBySession.removeAll()
@@ -342,6 +365,17 @@ public final class CodaWorkspaceStore: ObservableObject {
         self.activeSheetIsSecondary = false
         self.secondarySessionID = nil
         self.selectedSessionID = nil
+        self.inspectorSessionId = nil
+        self.remoteFileEntries = []
+        self.remoteFileSubPath = ""
+        self.remoteFileSelectedRel = nil
+        self.remoteFilePreviewText = ""
+        self.remoteFileTruncated = false
+        self.remoteFileLoading = false
+        self.remoteFileError = nil
+        self.portPreviewResult = nil
+        self.portPreviewLoading = false
+        self.portPreviewError = nil
         self.gitDiffResult = nil
         self.gitDiffLoading = false
         self.gitDiffError = nil
@@ -352,6 +386,8 @@ public final class CodaWorkspaceStore: ObservableObject {
         self.bootstrapStatusMessage = nil
         self.showBootstrapWorkspaceSheet = false
         self.composeText = ""
+        self.composeTextBySession.removeAll()
+        self.uploadingAttachmentCount = 0
         self.activeToast = nil
         self.uploadStatusBanner = nil
         self.voiceConfigSyncMessage = nil
@@ -511,9 +547,63 @@ public final class CodaWorkspaceStore: ObservableObject {
     }
 
     public func openComposeSheet(for session: CodaAgentSession, isSecondary: Bool = false) {
+        if let prevSid = activeSheetSessionID ?? selectedSessionID {
+            composeTextBySession[prevSid] = composeText
+        }
         activeSheetSessionID = session.id
         activeSheetIsSecondary = isSecondary
+        composeText = composeTextBySession[session.id] ?? ""
         showComposeSheet = true
+    }
+
+    public func composeDraft(for sessionID: String) -> String {
+        if let saved = composeTextBySession[sessionID] {
+            return saved
+        }
+        if (activeSheetSessionID ?? selectedSessionID) == sessionID {
+            return composeText
+        }
+        return ""
+    }
+
+    public func setComposeDraft(_ text: String, for sessionID: String) {
+        composeTextBySession[sessionID] = text
+        if (activeSheetSessionID ?? selectedSessionID) == sessionID {
+            composeText = text
+        }
+    }
+
+    public func appendComposeDraft(_ segment: String, for sessionID: String, padTrailingSpace: Bool = false) {
+        guard !segment.isEmpty else { return }
+        var cur = composeDraft(for: sessionID)
+        if cur.isEmpty || cur.hasSuffix(" ") || cur.hasSuffix("\n") {
+            cur += segment + (padTrailingSpace ? " " : "")
+        } else {
+            cur += " " + segment + (padTrailingSpace ? " " : "")
+        }
+        setComposeDraft(cur, for: sessionID)
+    }
+
+    public func isSessionInAltScreen(_ sessionID: String) -> Bool {
+        surfaceEngines[sessionID]?.inAltScreen == true
+    }
+
+    public func matchedRepoRoot(for session: CodaAgentSession) -> String? {
+        if inspectorSessionId == session.id, let root = gitDiffResult?.repoRoot?.nilIfEmpty {
+            return root
+        }
+        if let devId = session.deviceId, let repos = workspacesByDevice[devId] {
+            if let matched = repos.first(where: { repo in
+                codaPathWithinRoot(session.cwd, root: repo.rootPath)
+                    || repo.branches.contains(where: { codaPathWithinRoot(session.cwd, root: $0.worktreePath) })
+            }) {
+                if let branchWt = matched.branches.first(where: { codaPathWithinRoot(session.cwd, root: $0.worktreePath) })?.worktreePath.nilIfEmpty {
+                    return branchWt
+                }
+                return matched.rootPath.nilIfEmpty
+            }
+        }
+        return nil
     }
 
     public func openMinimapSheet(for session: CodaAgentSession, isSecondary: Bool = false) {
@@ -757,6 +847,17 @@ public final class CodaWorkspaceStore: ObservableObject {
             return
         }
 
+        if event.op == "peer_offline" {
+            let epoch = self.workspaceEpoch
+            let prefixWithSlash = "\(hostPrefix)/"
+            attachedSessionIDs = attachedSessionIDs.filter { !$0.hasPrefix(prefixWithSlash) }
+            Task { [weak self] in
+                guard let self, self.workspaceEpoch == epoch else { return }
+                await self.refreshMachinesAndSessions()
+            }
+            return
+        }
+
         if event.op == "peer_session_reset" {
             let epoch = self.workspaceEpoch
             let prefixWithSlash = "\(hostPrefix)/"
@@ -789,6 +890,11 @@ public final class CodaWorkspaceStore: ObservableObject {
            let b64 = obj["data_b64"] as? String,
            let rawBytes = Data(base64Encoded: b64) {
             let sid = "\(hostPrefix)/\(terminal)"
+            let isDisplayed = (sid == selectedSessionID)
+                || (duoSplitMode == .dualTerminalSplit && sid == secondarySession?.id)
+            guard attachedSessionIDs.contains(sid) || isDisplayed else {
+                return
+            }
             var engine = surfaceEngines[sid] ?? GhosttyReflowEngine(
                 columns: terminalColumns,
                 rows: terminalRows,
@@ -1145,6 +1251,7 @@ public final class CodaWorkspaceStore: ObservableObject {
         let defaultName = "iOS-Client"
         #else
         let defaultName = "Mac-Client"
+        self.formFactor = .ipadOrDesktop
         #endif
         let fresh = CodaDeviceIdentity.resetPersisted(defaultName: defaultName)
         self.localIdentity = fresh
@@ -1204,6 +1311,8 @@ public final class CodaWorkspaceStore: ObservableObject {
     public func signOut() {
         workspaceEpoch &+= 1
         gitDiffGeneration &+= 1
+        remoteFileRequestGeneration &+= 1
+        portPreviewGeneration &+= 1
         let oldClient = networkClient
         cancelVoiceDictation()
         voiceError = nil
@@ -1227,6 +1336,7 @@ public final class CodaWorkspaceStore: ObservableObject {
         remoteMachines = []
         workspacesByDevice = [:]
         hostHealthByDevice = [:]
+        daemonVoiceConfigsByDevice = [:]
         machineRouteModes = [:]
         rawScreenTextBySession = [:]
         terminalLinesBySession = [:]
@@ -1238,6 +1348,7 @@ public final class CodaWorkspaceStore: ObservableObject {
         activeSheetSessionID = nil
         activeSheetIsSecondary = false
         secondarySessionID = nil
+        inspectorSessionId = nil
         gitDiffResult = nil
         gitDiffLoading = false
         gitDiffError = nil
@@ -1250,12 +1361,18 @@ public final class CodaWorkspaceStore: ObservableObject {
         showBootstrapWorkspaceSheet = false
         showRemoteFilesSheet = false
         remoteFileEntries = []
+        remoteFileSubPath = ""
         remoteFileSelectedRel = nil
         remoteFilePreviewText = ""
+        remoteFileTruncated = false
+        remoteFileLoading = false
         remoteFileError = nil
         portPreviewResult = nil
+        portPreviewLoading = false
         portPreviewError = nil
         composeText = ""
+        composeTextBySession = [:]
+        uploadingAttachmentCount = 0
         activeToast = nil
         voiceConfigSyncMessage = nil
         uploadStatusBanner = nil
@@ -1350,9 +1467,21 @@ public final class CodaWorkspaceStore: ObservableObject {
                         if let hh = wsRes?.hostHealth {
                             hostHealthByDevice[host.id] = hh
                         }
-                        if let vc = wsRes?.voiceConfig, settings.voiceConfig.apiKey.isEmpty, !vc.apiKey.isEmpty {
-                            settings.voiceConfig = vc
-                            settings.save()
+                        if let vc = wsRes?.voiceConfig {
+                            daemonVoiceConfigsByDevice[host.id] = vc
+                            if settings.voiceConfig.apiKey.isEmpty {
+                                if vc.hasLocalPlaintextApiKey {
+                                    settings.voiceConfig = vc
+                                    settings.save()
+                                } else if vc.hasMaskedDaemonKey {
+                                    // Preserve daemon's non-secret provider/baseURL/model metadata without
+                                    // writing "••••••••" into local plaintext key storage.
+                                    settings.voiceConfig.provider = vc.provider
+                                    settings.voiceConfig.baseURL = vc.baseURL
+                                    settings.voiceConfig.model = vc.model
+                                    settings.save()
+                                }
+                            }
                         }
                     } else {
                         repos = workspacesByDevice[host.id] ?? []
@@ -1396,8 +1525,33 @@ public final class CodaWorkspaceStore: ObservableObject {
 
             emitTransitionToastsIfNeeded(newSessions: discoveredSessions)
             self.sessions = discoveredSessions.sorted(by: CodaAgentSession.inboxOrder)
+            let activeSessionIDs = Set(self.sessions.map(\.id))
+            // Prune exited sessions from VT engines, screen buffers, and draft caches so memory stays bounded.
+            self.attachedSessionIDs = self.attachedSessionIDs.intersection(activeSessionIDs)
+            for key in Array(self.surfaceEngines.keys) where !activeSessionIDs.contains(key) {
+                self.surfaceEngines.removeValue(forKey: key)
+            }
+            for key in Array(self.terminalLinesBySession.keys) where !activeSessionIDs.contains(key) {
+                self.terminalLinesBySession.removeValue(forKey: key)
+            }
+            for key in Array(self.rawScreenTextBySession.keys) where !activeSessionIDs.contains(key) {
+                self.rawScreenTextBySession.removeValue(forKey: key)
+            }
+            for key in Array(self.terminalRenderRevisionBySession.keys) where !activeSessionIDs.contains(key) {
+                self.terminalRenderRevisionBySession.removeValue(forKey: key)
+            }
+            for key in Array(self.previousStates.keys) where !activeSessionIDs.contains(key) {
+                self.previousStates.removeValue(forKey: key)
+            }
+            self.readCompletedIDs = self.readCompletedIDs.intersection(activeSessionIDs)
+            for key in Array(self.composeTextBySession.keys) where !activeSessionIDs.contains(key) {
+                self.composeTextBySession.removeValue(forKey: key)
+            }
+
             let validHostIDs = Set(hosts.map(\.id))
             self.workspacesByDevice = self.workspacesByDevice.filter { validHostIDs.contains($0.key) }
+            self.hostHealthByDevice = self.hostHealthByDevice.filter { validHostIDs.contains($0.key) }
+            self.daemonVoiceConfigsByDevice = self.daemonVoiceConfigsByDevice.filter { validHostIDs.contains($0.key) }
             for (k, v) in nextWorkspaces {
                 self.workspacesByDevice[k] = v
             }
@@ -1588,6 +1742,7 @@ public final class CodaWorkspaceStore: ObservableObject {
                 // keep the fresher live stream instead of clobbering it with an older snapshot.
                 let revAfter = terminalRenderRevisionBySession[session.id] ?? 0
                 if forceSnapshot || !attachedSessionIDs.contains(session.id) || revAfter == revBefore {
+                    let priorEngine = surfaceEngines[session.id]
                     var engine = GhosttyReflowEngine(
                         columns: terminalColumns,
                         rows: terminalRows,
@@ -1596,8 +1751,13 @@ public final class CodaWorkspaceStore: ObservableObject {
                     )
                     engine.feed(Data(res.text.utf8))
                     // Immediately disable LF->CRLF translation after feeding static snapshot text
-                    // so subsequent live PTY streams preserve cursor column on bare LF (`\n`).
+                    // so subsequent live PTY streams preserve cursor column on bare LF (`\n`),
+                    // and preserve prior private modes (`?2004h`/`?2004l`, mouse reporting) if
+                    // the plain-text snapshot itself didn't explicitly emit them.
                     engine.treatLFAsCRLF = false
+                    if let priorEngine {
+                        engine.restoreModeFlagsIfUnset(from: priorEngine)
+                    }
                     surfaceEngines[session.id] = engine
                     let visiblePlain = engine.plainVisibleText
                     rawScreenTextBySession[session.id] = visiblePlain
@@ -1643,18 +1803,87 @@ public final class CodaWorkspaceStore: ObservableObject {
 
     // MARK: - Interactive Controls (Selection, Swipe, Quick Bar, Compose, Launch, Diff)
 
+    private func detachIfNoLongerDisplayed(_ candidate: CodaAgentSession?) {
+        guard let closing = candidate else { return }
+        let stillDisplayed = (closing.id == selectedSessionID)
+            || (duoSplitMode == .dualTerminalSplit && closing.id == secondarySession?.id)
+        guard !stillDisplayed else { return }
+        guard attachedSessionIDs.remove(closing.id) != nil else { return }
+        guard let client = networkClient,
+              let devId = closing.deviceId,
+              let dev = remoteMachines.first(where: { $0.id == devId }),
+              let clientDevId = localIdentity.deviceId else { return }
+        let ident = localIdentity
+        Task {
+            try? await client.detachTerminalPty(
+                on: dev,
+                clientIdentity: ident,
+                clientDeviceId: clientDevId,
+                terminal: closing.terminalAddress
+            )
+        }
+    }
+
+    private func resetInspectorStateIfSessionChanged(to session: CodaAgentSession) {
+        guard inspectorSessionId != session.id else { return }
+        inspectorSessionId = session.id
+        gitDiffGeneration &+= 1
+        remoteFileRequestGeneration &+= 1
+        portPreviewGeneration &+= 1
+        let root = session.cwd.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "." : session.cwd
+        remoteFileRootPath = root
+        remoteFileSubPath = ""
+        remoteFileEntries = []
+        remoteFileSelectedRel = nil
+        remoteFilePreviewText = ""
+        remoteFileTruncated = false
+        remoteFileLoading = false
+        remoteFileError = nil
+        gitDiffResult = nil
+        gitDiffLoading = false
+        gitDiffError = nil
+        gitDiffSelectedFile = nil
+        portPreviewResult = nil
+        portPreviewLoading = false
+        portPreviewError = nil
+    }
+
     public func selectSession(_ session: CodaAgentSession) {
+        let previousSelected = selectedSession
         let changedSession = (selectedSessionID != session.id)
+        if changedSession {
+            if let prevId = selectedSessionID, !showComposeSheet {
+                composeTextBySession[prevId] = composeText
+            }
+            cancelVoiceDictation()
+            ctrlActive = false
+            altActive = false
+            resetInspectorStateIfSessionChanged(to: session)
+        }
         pendingSelectSessionID = nil
         selectedSessionID = session.id
+        if !showComposeSheet {
+            composeText = composeTextBySession[session.id] ?? ""
+        }
+        if changedSession {
+            detachIfNoLongerDisplayed(previousSelected)
+        }
         if let idx = sessions.firstIndex(where: { $0.id == session.id }) {
             if sessions[idx].unreadCompletion {
                 sessions[idx].unreadCompletion = false
                 readCompletedIDs.insert(session.id)
             }
         }
-        if changedSession && formFactor == .iphoneDuoInnerLandscape && duoSplitMode == .studioDiffSplit {
-            loadGitDiff(for: session, presentModal: false)
+        if changedSession {
+            let needsInlineDiff = (formFactor == .iphoneDuoInnerLandscape && duoSplitMode == .studioDiffSplit)
+                || showGitDiffSheet
+                || (showRemoteFilesSheet && inspectorSheetMode == .changes)
+            if needsInlineDiff {
+                loadGitDiff(for: session, presentModal: false)
+            }
+            if showRemoteFilesSheet && inspectorSheetMode == .files {
+                browseRemoteSubPath("", for: session)
+            }
         }
         screenRefreshTask?.cancel()
         let needSnapshot = !attachedSessionIDs.contains(session.id) || surfaceEngines[session.id] == nil
@@ -1678,7 +1907,15 @@ public final class CodaWorkspaceStore: ObservableObject {
     }
 
     public func selectSecondarySession(_ session: CodaAgentSession) {
+        let previousSecondary = secondarySession
+        let changedSecondary = (secondarySessionID != session.id)
+        if changedSecondary, let prevSecId = previousSecondary?.id, voiceDictationSessionID == prevSecId {
+            cancelVoiceDictation()
+        }
         secondarySessionID = session.id
+        if changedSecondary {
+            detachIfNoLongerDisplayed(previousSecondary)
+        }
         if let idx = sessions.firstIndex(where: { $0.id == session.id }) {
             if sessions[idx].unreadCompletion {
                 sessions[idx].unreadCompletion = false
@@ -1692,19 +1929,28 @@ public final class CodaWorkspaceStore: ObservableObject {
     }
 
     public func setDuoSplitMode(_ mode: CodaDuoSplitMode) {
+        let prevSecondary = secondarySession
+        let wasDual = (duoSplitMode == .dualTerminalSplit)
         duoSplitMode = mode
+        if wasDual && mode != .dualTerminalSplit {
+            detachIfNoLongerDisplayed(prevSecondary)
+        }
         if mode == .dualTerminalSplit && (secondarySessionID == nil || secondarySessionID == selectedSessionID) {
             secondarySessionID = filteredSessions.first(where: { $0.id != selectedSessionID })?.id ?? selectedSessionID
         }
-        if mode == .studioDiffSplit && gitDiffResult == nil {
-            loadGitDiffForSelected(presentModal: false)
+        if mode == .studioDiffSplit, let selected = selectedSession {
+            if inspectorSessionId != selected.id || gitDiffResult == nil {
+                loadGitDiff(for: selected, presentModal: false)
+            }
         }
         if lastViewportSize.width > 0 && lastViewportSize.height > 0 {
             updateViewportGeometry(
                 size: lastViewportSize,
                 safeAreas: edgeSafeAreas,
                 isHorizontalRegular: lastIsHorizontalRegular,
-                isVerticalRegular: lastIsVerticalRegular
+                isVerticalRegular: lastIsVerticalRegular,
+                hardwareScreenSize: lastHardwareScreenSize,
+                isPadOrMacHardware: lastIsPadOrMacHardware
             )
         }
     }
@@ -1716,7 +1962,9 @@ public final class CodaWorkspaceStore: ObservableObject {
                 size: lastViewportSize,
                 safeAreas: edgeSafeAreas,
                 isHorizontalRegular: lastIsHorizontalRegular,
-                isVerticalRegular: lastIsVerticalRegular
+                isVerticalRegular: lastIsVerticalRegular,
+                hardwareScreenSize: lastHardwareScreenSize,
+                isPadOrMacHardware: lastIsPadOrMacHardware
             )
         }
     }
@@ -1725,19 +1973,27 @@ public final class CodaWorkspaceStore: ObservableObject {
         size: CGSize,
         safeAreas: CodaEdgeSafeAreas = .zero,
         isHorizontalRegular: Bool? = nil,
-        isVerticalRegular: Bool? = nil
+        isVerticalRegular: Bool? = nil,
+        hardwareScreenSize: CGSize? = nil,
+        isPadOrMacHardware: Bool = false
     ) {
         guard size.width > 0 && size.height > 0 else { return }
         lastViewportSize = size
         lastIsHorizontalRegular = isHorizontalRegular
         lastIsVerticalRegular = isVerticalRegular
+        lastHardwareScreenSize = hardwareScreenSize
+        lastIsPadOrMacHardware = isPadOrMacHardware
         edgeSafeAreas = safeAreas
 
+        let duoRailHint: Bool? = (safeAreas.trailing >= 64 && safeAreas.isHorizontallyAsymmetric) ? true : nil
         let nextFactor = CodaFormFactor.detect(
             width: size.width,
             height: size.height,
             isHorizontalRegular: isHorizontalRegular,
-            isVerticalRegular: isVerticalRegular
+            isVerticalRegular: isVerticalRegular,
+            hardwareScreenSize: hardwareScreenSize,
+            isPadOrMacHardware: isPadOrMacHardware,
+            hasAsymmetricDuoRail: duoRailHint
         )
         formFactor = nextFactor
 
@@ -1862,34 +2118,25 @@ public final class CodaWorkspaceStore: ObservableObject {
             size: lastViewportSize,
             safeAreas: edgeSafeAreas,
             isHorizontalRegular: lastIsHorizontalRegular,
-            isVerticalRegular: lastIsVerticalRegular
+            isVerticalRegular: lastIsVerticalRegular,
+            hardwareScreenSize: lastHardwareScreenSize,
+            isPadOrMacHardware: lastIsPadOrMacHardware
         )
     }
 
     public func closeTerminalToInbox() {
+        cancelVoiceDictation()
         let closing = selectedSession
+        if let prevId = closing?.id, !showComposeSheet {
+            composeTextBySession[prevId] = composeText
+        }
         screenRefreshTask?.cancel()
         screenRefreshTask = nil
         selectedSessionID = nil
         dpadVisible = false
         ctrlActive = false
         altActive = false
-        if let closing {
-            attachedSessionIDs.remove(closing.id)
-            if let client = networkClient,
-               let devId = closing.deviceId,
-               let dev = remoteMachines.first(where: { $0.id == devId }),
-               let clientDevId = localIdentity.deviceId {
-                Task {
-                    try? await client.detachTerminalPty(
-                        on: dev,
-                        clientIdentity: localIdentity,
-                        clientDeviceId: clientDevId,
-                        terminal: closing.terminalAddress
-                    )
-                }
-            }
-        }
+        detachIfNoLongerDisplayed(closing)
     }
 
     public func switchSibling(delta: Int, for targetSession: CodaAgentSession? = nil, isSecondary: Bool = false) {
@@ -1963,16 +2210,29 @@ public final class CodaWorkspaceStore: ObservableObject {
               let dev = remoteMachines.first(where: { $0.id == devId }),
               let clientDevId = localIdentity.deviceId else { return }
         let sid = session.id
+        if voiceDictationSessionID == nil || voiceDictationSessionID == sid {
+            cancelVoiceDictation()
+        }
         attachedSessionIDs.remove(sid)
         surfaceEngines.removeValue(forKey: sid)
         terminalLinesBySession.removeValue(forKey: sid)
         rawScreenTextBySession.removeValue(forKey: sid)
+        terminalRenderRevisionBySession.removeValue(forKey: sid)
+        composeTextBySession.removeValue(forKey: sid)
         sessions.removeAll { $0.id == sid }
         if selectedSessionID == sid {
             selectedSessionID = nil
+            ctrlActive = false
+            altActive = false
         }
         if secondarySessionID == sid {
             secondarySessionID = nil
+        }
+        if activeSheetSessionID == sid {
+            activeSheetSessionID = nil
+            showComposeSheet = false
+            showRemoteFilesSheet = false
+            showGitDiffSheet = false
         }
         Task {
             try? await client.killTerminal(
@@ -2080,6 +2340,52 @@ public final class CodaWorkspaceStore: ObservableObject {
         }
     }
 
+    public func sendTerminalScroll(up: Bool, lines: Int = 3, to targetSession: CodaAgentSession? = nil) {
+        guard let session = targetSession ?? selectedSession,
+              let client = networkClient,
+              let devId = session.deviceId,
+              let dev = remoteMachines.first(where: { $0.id == devId }),
+              let clientDevId = localIdentity.deviceId else { return }
+        let engine = surfaceEngines[session.id]
+        guard engine?.inAltScreen == true else { return }
+        let count = max(1, min(10, lines))
+        var bytes = Data()
+        if let eng = engine, eng.mouseTrackingMode != 0 {
+            let wheel = GhosttyReflowEngine.encodeMouseWheel(
+                up: up,
+                column: max(1, terminalColumns / 2),
+                row: max(1, terminalRows / 2),
+                sgrEncoding: eng.sgrMouseEncoding
+            )
+            for _ in 0..<count {
+                bytes.append(wheel)
+            }
+        } else {
+            let arrow = GhosttyReflowEngine.encodeKey(up ? .up : .down)
+            for _ in 0..<count {
+                bytes.append(arrow)
+            }
+        }
+        Task {
+            try? await client.sendPtyInput(
+                on: dev,
+                clientIdentity: localIdentity,
+                clientDeviceId: clientDevId,
+                terminal: session.terminalAddress,
+                data: bytes
+            )
+        }
+    }
+
+    private func effectiveBracketedPaste(for session: CodaAgentSession) -> Bool {
+        let eng = surfaceEngines[session.id]
+        return CodaTerminalTranscriptHelper.resolveEffectiveBracketedPaste(
+            explicitSeen: eng?.bracketedPasteExplicit ?? false,
+            engineEnabled: eng?.bracketedPasteEnabled ?? false,
+            agentName: session.agentName
+        )
+    }
+
     public func sendBracketedPastePrompt(_ rawPrompt: String, to targetSession: CodaAgentSession? = nil) {
         let trimmed = rawPrompt.trimmingCharacters(in: .newlines)
         guard !trimmed.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
@@ -2090,8 +2396,15 @@ public final class CodaWorkspaceStore: ObservableObject {
               let clientDevId = localIdentity.deviceId else { return }
 
         CodaHaptics.mediumTap()
+        ctrlActive = false
+        altActive = false
         optimisticallyClearNeedsYou(for: session)
-        let bytes = CodaTerminalTranscriptHelper.encodeBracketedPaste(trimmed, appendCarriageReturn: true)
+        let useBracketed = effectiveBracketedPaste(for: session)
+        let bytes = CodaTerminalTranscriptHelper.encodeBracketedPaste(
+            trimmed,
+            appendCarriageReturn: true,
+            bracketedModeEnabled: useBracketed
+        )
         let isAttached = attachedSessionIDs.contains(session.id)
 
         Task {
@@ -2110,24 +2423,33 @@ public final class CodaWorkspaceStore: ObservableObject {
     }
 
     public func submitComposePrompt(for targetSession: CodaAgentSession? = nil) {
-        let trimmed = composeText.trimmingCharacters(in: .newlines)
+        guard let session = targetSession ?? activeSheetSession ?? selectedSession else { return }
+        let draft = composeDraft(for: session.id)
+        let trimmed = draft.trimmingCharacters(in: .newlines)
         guard !trimmed.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-              let session = targetSession ?? activeSheetSession ?? selectedSession,
               let client = networkClient,
               let devId = session.deviceId,
               let dev = remoteMachines.first(where: { $0.id == devId }),
               let clientDevId = localIdentity.deviceId else { return }
 
+        ctrlActive = false
+        altActive = false
         optimisticallyClearNeedsYou(for: session)
         isSendingAction = true
         let toSend = trimmed
+        let useBracketed = effectiveBracketedPaste(for: session)
         let isAttached = attachedSessionIDs.contains(session.id)
+        setComposeDraft("", for: session.id)
         composeText = ""
         showComposeSheet = false
 
         Task {
             defer { self.isSendingAction = false }
-            let bytes = CodaTerminalTranscriptHelper.encodeBracketedPaste(toSend, appendCarriageReturn: true)
+            let bytes = CodaTerminalTranscriptHelper.encodeBracketedPaste(
+                toSend,
+                appendCarriageReturn: true,
+                bracketedModeEnabled: useBracketed
+            )
             try? await client.sendPtyInput(
                 on: dev,
                 clientIdentity: localIdentity,
@@ -2142,14 +2464,12 @@ public final class CodaWorkspaceStore: ObservableObject {
         }
     }
 
-    public func uploadAttachment(fileURL: URL, for targetSession: CodaAgentSession? = nil) {
-        guard let session = targetSession ?? activeSheetSession ?? selectedSession,
-              let client = networkClient,
-              let devId = session.deviceId,
-              let dev = remoteMachines.first(where: { $0.id == devId }),
-              let clientDevId = localIdentity.deviceId else { return }
-
-        // Keep raw upload under 4 MiB so double-Base64 inside encrypted RelayWireFrame stays below 8 MiB.
+    public func uploadAttachment(
+        fileURL: URL,
+        for targetSession: CodaAgentSession? = nil,
+        onUploadedToken: ((String) -> Void)? = nil
+    ) {
+        guard let session = targetSession ?? activeSheetSession ?? selectedSession else { return }
         let maxUploadBytes = 4 * 1024 * 1024
         Task {
             let granted = fileURL.startAccessingSecurityScopedResource()
@@ -2169,72 +2489,146 @@ public final class CodaWorkspaceStore: ObservableObject {
                 uploadStatusBanner = tr("Could not read selected file.", "读取文件失败。", locale: locale)
                 return
             }
-            guard data.count <= maxUploadBytes else {
-                uploadStatusBanner = tr(
-                    "File exceeds 4 MiB upload limit.",
-                    "文件超过 4 MiB 上传限制。",
-                    locale: locale
-                )
-                return
+            uploadAttachmentData(
+                data: data,
+                filename: fileURL.lastPathComponent,
+                for: session,
+                onUploadedToken: onUploadedToken
+            )
+        }
+    }
+
+    public func uploadAttachmentData(
+        data: Data,
+        filename: String,
+        for targetSession: CodaAgentSession? = nil,
+        onUploadedToken: ((String) -> Void)? = nil
+    ) {
+        guard let session = targetSession ?? activeSheetSession ?? selectedSession,
+              let client = networkClient,
+              let devId = session.deviceId,
+              let dev = remoteMachines.first(where: { $0.id == devId }),
+              let clientDevId = localIdentity.deviceId else { return }
+
+        // Keep raw upload under 4 MiB so double-Base64 inside encrypted RelayWireFrame stays below 8 MiB.
+        let maxUploadBytes = 4 * 1024 * 1024
+        guard data.count <= maxUploadBytes else {
+            uploadStatusBanner = tr(
+                "File exceeds 4 MiB upload limit.",
+                "文件超过 4 MiB 上传限制。",
+                locale: locale
+            )
+            return
+        }
+
+        let targetSid = session.id
+        let epoch = workspaceEpoch
+        uploadingAttachmentCount += 1
+        uploadStatusBanner = tr("Uploading \(filename)...", "正在上传 \(filename)...", locale: locale)
+        Task { [weak self] in
+            guard let self else { return }
+            defer {
+                if self.workspaceEpoch == epoch {
+                    self.uploadingAttachmentCount = max(0, self.uploadingAttachmentCount - 1)
+                }
             }
-            uploadStatusBanner = tr("Uploading \(fileURL.lastPathComponent)...", "正在上传 \(fileURL.lastPathComponent)...", locale: locale)
             do {
                 let remotePath = try await client.uploadTerminalFile(
                     on: dev,
-                    clientIdentity: localIdentity,
+                    clientIdentity: self.localIdentity,
                     clientDeviceId: clientDevId,
                     terminal: session.terminalAddress,
-                    filename: fileURL.lastPathComponent,
+                    filename: filename,
                     data: data
                 )
-                let inserted = codaShellQuotePath(remotePath ?? fileURL.lastPathComponent)
-                if composeText.isEmpty {
-                    composeText = inserted + " "
+                guard self.workspaceEpoch == epoch else { return }
+                let inserted = codaShellQuotePath(remotePath ?? filename)
+                if let onUploadedToken {
+                    onUploadedToken(inserted)
                 } else {
-                    composeText += " \(inserted) "
+                    self.appendComposeDraft(inserted, for: targetSid, padTrailingSpace: true)
                 }
-                uploadStatusBanner = tr("Attached \(inserted)", "已附加 \(inserted)", locale: locale)
+                self.uploadStatusBanner = tr("Attached \(inserted)", "已附加 \(inserted)", locale: self.locale)
             } catch {
-                uploadStatusBanner = tr("Upload failed: \(error.localizedDescription)", "上传失败：\(error.localizedDescription)", locale: locale)
+                guard self.workspaceEpoch == epoch else { return }
+                self.uploadStatusBanner = tr(
+                    "Upload failed: \(error.localizedDescription)",
+                    "上传失败：\(error.localizedDescription)",
+                    locale: self.locale
+                )
             }
         }
     }
 
-    public func toggleVoiceDictation(onTranscribed: ((String) -> Void)? = nil) async {
+    public func toggleVoiceDictation(
+        for targetSessionID: String? = nil,
+        onTranscribed: ((String) -> Void)? = nil
+    ) async {
         voiceError = nil
         if isTranscribingVoice || isStartingVoice { return }
 
         if isRecordingVoice {
+            voiceMeterTask?.cancel()
+            voiceMeterTask = nil
             voiceGeneration &+= 1
             let gen = voiceGeneration
             let epoch = workspaceEpoch
+            let originSid = voiceDictationSessionID ?? targetSessionID ?? activeSheetSessionID ?? selectedSessionID
             let customHandler = pendingVoiceTranscriptHandler ?? onTranscribed
             pendingVoiceTranscriptHandler = nil
             isRecordingVoice = false
             isTranscribingVoice = true
+            voicePartialTranscript = ""
+
+            let daemonFallback: (@Sendable (Data, String) async throws -> String)? = buildDaemonWhisperFallback(forSessionID: originSid)
+
             let task = Task { @MainActor [weak self] in
                 guard let self else { return }
                 defer {
                     if self.voiceGeneration == gen {
                         self.isTranscribingVoice = false
+                        self.voiceDictationSessionID = nil
+                        self.voiceRecordingSeconds = 0
+                        self.voiceAudioLevel = 0
+                        self.voicePartialTranscript = ""
                         self.voiceTask = nil
                     }
                 }
                 do {
                     let transcript = try await self.voiceRecorder.stopAndTranscribe(
                         config: self.settings.voiceConfig,
-                        locale: self.locale
+                        locale: self.locale,
+                        onPartialTranscript: { [weak self] partial in
+                            Task { @MainActor in
+                                guard let self, self.voiceGeneration == gen, self.workspaceEpoch == epoch else { return }
+                                self.voicePartialTranscript = partial
+                            }
+                        },
+                        daemonWhisperFallback: daemonFallback
                     )
                     guard !Task.isCancelled, self.voiceGeneration == gen, self.workspaceEpoch == epoch else { return }
                     if !transcript.isEmpty {
                         if let customHandler {
-                            customHandler(transcript)
+                            // Only invoke view-scoped handler if the originating session is still active!
+                            let originStillVisible = originSid == nil
+                                || originSid == self.selectedSessionID
+                                || (self.duoSplitMode == .dualTerminalSplit && originSid == self.secondarySession?.id)
+                                || originSid == self.activeSheetSessionID
+                            if originStillVisible {
+                                customHandler(transcript)
+                            } else if let originSid {
+                                self.appendComposeDraft(transcript, for: originSid)
+                            }
+                        } else if let originSid {
+                            self.appendComposeDraft(transcript, for: originSid)
                         } else if self.composeText.isEmpty || self.composeText.hasSuffix(" ") || self.composeText.hasSuffix("\n") {
                             self.composeText += transcript
                         } else {
                             self.composeText += " \(transcript)"
                         }
                     }
+                } catch is CancellationError {
+                    return
                 } catch {
                     guard !Task.isCancelled, self.voiceGeneration == gen, self.workspaceEpoch == epoch else { return }
                     self.voiceError = error.localizedDescription
@@ -2248,6 +2642,11 @@ public final class CodaWorkspaceStore: ObservableObject {
         voiceGeneration &+= 1
         let gen = voiceGeneration
         let epoch = workspaceEpoch
+        let originSid = targetSessionID ?? activeSheetSessionID ?? selectedSessionID
+        voiceDictationSessionID = originSid
+        voiceRecordingSeconds = 0
+        voiceAudioLevel = 0
+        voicePartialTranscript = ""
         pendingVoiceTranscriptHandler = onTranscribed
         isStartingVoice = true
         let task = Task { @MainActor [weak self] in
@@ -2259,7 +2658,7 @@ public final class CodaWorkspaceStore: ObservableObject {
                 }
             }
             do {
-                if !CodaVoiceRecorder.usesNativeSpeechFallback(for: self.settings.voiceConfig) {
+                if self.settings.voiceConfig.hasLocalPlaintextApiKey {
                     _ = try CodaVoiceRecorder.validatedTranscriptionURL(from: self.settings.voiceConfig.baseURL)
                 }
                 try await self.voiceRecorder.startRecording()
@@ -2267,15 +2666,27 @@ public final class CodaWorkspaceStore: ObservableObject {
                     if self.voiceGeneration == gen {
                         self.voiceRecorder.cancelRecording()
                         self.pendingVoiceTranscriptHandler = nil
+                        self.voiceDictationSessionID = nil
                         self.isRecordingVoice = false
                     }
                     return
                 }
                 self.isRecordingVoice = true
+                let startedAt = Date()
+                self.voiceMeterTask?.cancel()
+                self.voiceMeterTask = Task { @MainActor [weak self] in
+                    while !Task.isCancelled {
+                        try? await Task.sleep(nanoseconds: 200_000_000)
+                        guard let self, self.voiceGeneration == gen, self.isRecordingVoice else { return }
+                        self.voiceRecordingSeconds = max(0, Int(Date().timeIntervalSince(startedAt)))
+                        self.voiceAudioLevel = self.voiceRecorder.currentNormalizedAudioLevel()
+                    }
+                }
             } catch {
                 guard self.voiceGeneration == gen else { return }
                 self.voiceRecorder.cancelRecording()
                 self.pendingVoiceTranscriptHandler = nil
+                self.voiceDictationSessionID = nil
                 self.isRecordingVoice = false
                 guard !Task.isCancelled, self.workspaceEpoch == epoch else { return }
                 self.voiceError = error.localizedDescription
@@ -2285,11 +2696,55 @@ public final class CodaWorkspaceStore: ObservableObject {
         await task.value
     }
 
+    private func buildDaemonWhisperFallback(
+        forSessionID sessionID: String?
+    ) -> (@Sendable (Data, String) async throws -> String)? {
+        guard let client = networkClient, let clientDevId = localIdentity.deviceId else { return nil }
+        let targetSession = sessionID.flatMap { sid in sessions.first(where: { $0.id == sid }) } ?? selectedSession
+        let candidateDev: CodaRemoteDevice?
+        if let devId = targetSession?.deviceId, let dev = remoteMachines.first(where: { $0.id == devId && $0.isOnline }) {
+            candidateDev = dev
+        } else {
+            candidateDev = remoteMachines.first(where: { $0.isOnline })
+        }
+        guard let dev = candidateDev else { return nil }
+        let daemonHasKey = settings.voiceConfig.hasMaskedDaemonKey
+            || (daemonVoiceConfigsByDevice[dev.id]?.apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
+        guard daemonHasKey else { return nil }
+        let ident = localIdentity
+        return { audioData, language in
+            let res = try await client.transcribeAudio(
+                on: dev,
+                clientIdentity: ident,
+                clientDeviceId: clientDevId,
+                audioData: audioData,
+                mimeType: "audio/m4a",
+                filename: "dictation.m4a",
+                language: language
+            )
+            if res.ok {
+                let clean = res.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !clean.isEmpty {
+                    return clean
+                }
+            }
+            throw CodaVoiceRecorderError.transcriptionFailed(
+                res.error ?? "Remote host Whisper transcription returned no speech."
+            )
+        }
+    }
+
     public func cancelVoiceDictation() {
         voiceGeneration &+= 1
+        voiceMeterTask?.cancel()
+        voiceMeterTask = nil
         voiceTask?.cancel()
         voiceTask = nil
         pendingVoiceTranscriptHandler = nil
+        voiceDictationSessionID = nil
+        voiceRecordingSeconds = 0
+        voiceAudioLevel = 0
+        voicePartialTranscript = ""
         voiceRecorder.cancelRecording()
         isStartingVoice = false
         isRecordingVoice = false
@@ -2297,6 +2752,9 @@ public final class CodaWorkspaceStore: ObservableObject {
     }
 
     public func saveVoiceConfig() async {
+        if settings.voiceConfig.hasMaskedDaemonKey {
+            settings.voiceConfig.apiKey = ""
+        }
         let usesNativeFallback = CodaVoiceRecorder.usesNativeSpeechFallback(for: settings.voiceConfig)
         if !usesNativeFallback || !settings.voiceConfig.baseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             do {
@@ -2323,8 +2781,9 @@ public final class CodaWorkspaceStore: ObservableObject {
                 clientDeviceId: clientDevId,
                 config: settings.voiceConfig
             ) {
+                daemonVoiceConfigsByDevice[host.id] = synced
                 var merged = synced
-                if merged.apiKey.isEmpty && !settings.voiceConfig.apiKey.isEmpty {
+                if merged.hasMaskedDaemonKey || merged.apiKey.isEmpty {
                     merged.apiKey = settings.voiceConfig.apiKey
                 }
                 settings.voiceConfig = merged
@@ -2437,7 +2896,10 @@ public final class CodaWorkspaceStore: ObservableObject {
             }
         }
         do {
-            let res = try await client.pruneStaleDevices(maxIdleDays: maxIdleDays)
+            let res = try await client.pruneStaleDevices(
+                maxIdleDays: maxIdleDays,
+                excludeDeviceId: localIdentity.deviceId
+            )
             guard self.workspaceEpoch == epoch else { return }
             accountStatusMessage = tr(
                 "Pruned \(res.prunedCount) offline web device(s).",
@@ -2569,6 +3031,7 @@ public final class CodaWorkspaceStore: ObservableObject {
               let devId = session.deviceId,
               let dev = remoteMachines.first(where: { $0.id == devId }),
               let clientDevId = localIdentity.deviceId else { return }
+        resetInspectorStateIfSessionChanged(to: session)
         gitDiffGeneration &+= 1
         let diffGen = gitDiffGeneration
         let epoch = workspaceEpoch
@@ -2596,6 +3059,9 @@ public final class CodaWorkspaceStore: ObservableObject {
                 )
                 if self.gitDiffGeneration == diffGen && self.workspaceEpoch == epoch {
                     self.gitDiffResult = fetched
+                    if let rpcErr = fetched.error?.nilIfEmpty {
+                        self.gitDiffError = rpcErr
+                    }
                 }
             } catch {
                 if self.gitDiffGeneration == diffGen && self.workspaceEpoch == epoch {
@@ -2632,15 +3098,19 @@ public final class CodaWorkspaceStore: ObservableObject {
         mode: CodaInspectorSheetMode = .files
     ) {
         guard let session = targetSession ?? selectedSession else { return }
+        resetInspectorStateIfSessionChanged(to: session)
         activeSheetSessionID = session.id
         inspectorSheetMode = mode
         showRemoteFilesSheet = true
         let root = session.cwd.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "." : session.cwd
-        remoteFileRootPath = root
+        if remoteFileRootPath.isEmpty {
+            remoteFileRootPath = root
+        }
         remoteFileSelectedRel = nil
         remoteFilePreviewText = ""
+        remoteFileTruncated = false
         if mode == .files {
-            browseRemoteSubPath("", for: session)
+            browseRemoteSubPath(remoteFileSubPath, for: session)
         } else if mode == .changes {
             loadGitDiff(for: session, presentModal: false)
         }
@@ -2651,18 +3121,25 @@ public final class CodaWorkspaceStore: ObservableObject {
               let devId = session.deviceId,
               let dev = remoteMachines.first(where: { $0.id == devId }),
               let clientDevId = localIdentity.deviceId else { return }
+        resetInspectorStateIfSessionChanged(to: session)
+        remoteFileRequestGeneration &+= 1
+        let reqGen = remoteFileRequestGeneration
         let epoch = workspaceEpoch
-        let root = remoteFileRootPath.isEmpty ? (session.cwd.isEmpty ? "." : session.cwd) : remoteFileRootPath
+        let fallbackCwd = session.cwd.trimmingCharacters(in: .whitespacesAndNewlines)
+        let root = remoteFileRootPath.isEmpty ? (fallbackCwd.isEmpty ? "." : fallbackCwd) : remoteFileRootPath
         remoteFileRootPath = root
         remoteFileSubPath = subPath
         remoteFileSelectedRel = nil
         remoteFilePreviewText = ""
+        remoteFileTruncated = false
         remoteFileError = nil
         remoteFileLoading = true
         Task { [weak self] in
             guard let self else { return }
             defer {
-                if self.workspaceEpoch == epoch { self.remoteFileLoading = false }
+                if self.remoteFileRequestGeneration == reqGen && self.workspaceEpoch == epoch {
+                    self.remoteFileLoading = false
+                }
             }
             do {
                 let res = try await client.listRemoteDirectory(
@@ -2672,34 +3149,50 @@ public final class CodaWorkspaceStore: ObservableObject {
                     rootPath: root,
                     subPath: subPath
                 )
-                guard self.workspaceEpoch == epoch else { return }
+                guard self.remoteFileRequestGeneration == reqGen && self.workspaceEpoch == epoch else { return }
                 self.remoteFileRootPath = res.rootPath
                 self.remoteFileSubPath = res.subPath
                 self.remoteFileEntries = res.entries
                 self.remoteFileError = res.error
             } catch {
-                if self.workspaceEpoch == epoch {
+                if self.remoteFileRequestGeneration == reqGen && self.workspaceEpoch == epoch {
                     self.remoteFileError = error.localizedDescription
                 }
             }
         }
     }
 
-    public func previewRemoteFile(_ relPath: String, for session: CodaAgentSession) {
+    public func previewRemoteFile(
+        _ relPath: String,
+        for session: CodaAgentSession,
+        baseRootOverride: String? = nil
+    ) {
         guard let client = networkClient,
               let devId = session.deviceId,
               let dev = remoteMachines.first(where: { $0.id == devId }),
               let clientDevId = localIdentity.deviceId else { return }
+        resetInspectorStateIfSessionChanged(to: session)
+        remoteFileRequestGeneration &+= 1
+        let reqGen = remoteFileRequestGeneration
         let epoch = workspaceEpoch
-        let fullPath = CodaTerminalTranscriptHelper.joinRootAndRel(rootPath: remoteFileRootPath, relPath: relPath)
+        let fallbackCwd = session.cwd.trimmingCharacters(in: .whitespacesAndNewlines)
+        let defaultRoot = remoteFileRootPath.isEmpty ? (fallbackCwd.isEmpty ? "." : fallbackCwd) : remoteFileRootPath
+        if remoteFileRootPath.isEmpty {
+            remoteFileRootPath = defaultRoot
+        }
+        let effectiveRoot = baseRootOverride?.nilIfEmpty ?? defaultRoot
+        let fullPath = CodaTerminalTranscriptHelper.joinRootAndRel(rootPath: effectiveRoot, relPath: relPath)
         remoteFileSelectedRel = relPath
         remoteFilePreviewText = ""
+        remoteFileTruncated = false
         remoteFileError = nil
         remoteFileLoading = true
         Task { [weak self] in
             guard let self else { return }
             defer {
-                if self.workspaceEpoch == epoch { self.remoteFileLoading = false }
+                if self.remoteFileRequestGeneration == reqGen && self.workspaceEpoch == epoch {
+                    self.remoteFileLoading = false
+                }
             }
             do {
                 let res = try await client.readRemoteFilePreview(
@@ -2708,14 +3201,15 @@ public final class CodaWorkspaceStore: ObservableObject {
                     clientDeviceId: clientDevId,
                     path: fullPath
                 )
-                guard self.workspaceEpoch == epoch else { return }
+                guard self.remoteFileRequestGeneration == reqGen && self.workspaceEpoch == epoch else { return }
                 if let err = res.error {
                     self.remoteFileError = err
                 } else {
                     self.remoteFilePreviewText = res.content
+                    self.remoteFileTruncated = res.truncated
                 }
             } catch {
-                if self.workspaceEpoch == epoch {
+                if self.remoteFileRequestGeneration == reqGen && self.workspaceEpoch == epoch {
                     self.remoteFileError = error.localizedDescription
                 }
             }
@@ -2727,13 +3221,18 @@ public final class CodaWorkspaceStore: ObservableObject {
               let devId = session.deviceId,
               let dev = remoteMachines.first(where: { $0.id == devId }),
               let clientDevId = localIdentity.deviceId else { return }
+        resetInspectorStateIfSessionChanged(to: session)
+        portPreviewGeneration &+= 1
+        let previewGen = portPreviewGeneration
         let epoch = workspaceEpoch
         portPreviewError = nil
         portPreviewLoading = true
         Task { [weak self] in
             guard let self else { return }
             defer {
-                if self.workspaceEpoch == epoch { self.portPreviewLoading = false }
+                if self.portPreviewGeneration == previewGen && self.workspaceEpoch == epoch {
+                    self.portPreviewLoading = false
+                }
             }
             do {
                 let res = try await client.fetchLocalPortPreview(
@@ -2743,10 +3242,10 @@ public final class CodaWorkspaceStore: ObservableObject {
                     port: port,
                     path: path
                 )
-                guard self.workspaceEpoch == epoch else { return }
+                guard self.portPreviewGeneration == previewGen && self.workspaceEpoch == epoch else { return }
                 self.portPreviewResult = res
             } catch {
-                if self.workspaceEpoch == epoch {
+                if self.portPreviewGeneration == previewGen && self.workspaceEpoch == epoch {
                     self.portPreviewError = error.localizedDescription
                 }
             }

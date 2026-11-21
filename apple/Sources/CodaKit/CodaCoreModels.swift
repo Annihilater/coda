@@ -390,11 +390,13 @@ public struct CodaFilePreviewResult: Sendable, Equatable {
     public let path: String
     public let content: String
     public let error: String?
+    public let truncated: Bool
 
-    public init(path: String, content: String, error: String?) {
+    public init(path: String, content: String, error: String?, truncated: Bool = false) {
         self.path = path
         self.content = content
         self.error = error
+        self.truncated = truncated
     }
 }
 
@@ -402,11 +404,38 @@ public struct CodaPortPreviewResult: Sendable, Equatable {
     public let statusCode: Int
     public let contentType: String
     public let bodyText: String
+    public let rawHTML: String?
+    public let truncated: Bool
 
-    public init(statusCode: Int, contentType: String, bodyText: String) {
+    public var isHTML: Bool {
+        let lower = contentType.lowercased()
+        return lower.contains("text/html") || lower.contains("application/xhtml")
+    }
+
+    public init(
+        statusCode: Int,
+        contentType: String,
+        bodyText: String,
+        rawHTML: String? = nil,
+        truncated: Bool = false
+    ) {
         self.statusCode = statusCode
         self.contentType = contentType
         self.bodyText = bodyText
+        self.rawHTML = rawHTML
+        self.truncated = truncated
+    }
+}
+
+public struct CodaTranscribeAudioResult: Codable, Sendable, Equatable {
+    public let ok: Bool
+    public let text: String
+    public let error: String?
+
+    public init(ok: Bool, text: String, error: String? = nil) {
+        self.ok = ok
+        self.text = text
+        self.error = error
     }
 }
 
@@ -415,6 +444,14 @@ public struct CodaGitChangedFile: Identifiable, Codable, Sendable, Equatable, Ha
     public let status: String
     public let path: String
     public let previousPath: String?
+
+    public var isDeleted: Bool {
+        status.contains("D")
+    }
+
+    public var isDirectoryEntry: Bool {
+        path.hasSuffix("/")
+    }
 
     public init(status: String, path: String, previousPath: String? = nil) {
         self.status = status
@@ -427,17 +464,43 @@ public struct CodaGitDiffResult: Codable, Sendable, Equatable {
     public let branch: String
     public let statusShort: String
     public let diffUnified: String
+    public let isGitRepo: Bool
+    public let repoRoot: String?
+    public let error: String?
 
     enum CodingKeys: String, CodingKey {
         case branch
         case statusShort = "status_short"
         case diffUnified = "diff_unified"
+        case isGitRepo = "is_git_repo"
+        case repoRoot = "repo_root"
+        case error
     }
 
-    public init(branch: String, statusShort: String, diffUnified: String) {
+    public init(
+        branch: String,
+        statusShort: String,
+        diffUnified: String,
+        isGitRepo: Bool = true,
+        repoRoot: String? = nil,
+        error: String? = nil
+    ) {
         self.branch = branch
         self.statusShort = statusShort
         self.diffUnified = diffUnified
+        self.isGitRepo = isGitRepo
+        self.repoRoot = repoRoot
+        self.error = error
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.branch = (try? c.decodeIfPresent(String.self, forKey: .branch)) ?? ""
+        self.statusShort = (try? c.decodeIfPresent(String.self, forKey: .statusShort)) ?? ""
+        self.diffUnified = (try? c.decodeIfPresent(String.self, forKey: .diffUnified)) ?? ""
+        self.isGitRepo = (try? c.decodeIfPresent(Bool.self, forKey: .isGitRepo)) ?? true
+        self.repoRoot = try? c.decodeIfPresent(String.self, forKey: .repoRoot)
+        self.error = try? c.decodeIfPresent(String.self, forKey: .error)
     }
 
     public var changedFiles: [CodaGitChangedFile] {
@@ -476,7 +539,8 @@ public struct CodaGitDiffResult: Codable, Sendable, Equatable {
             guard !restPath.isEmpty else { continue }
             let previousPath: String?
             let currentPath: String
-            if let arrowRange = restPath.range(of: " -> ") {
+            let isRenameOrCopy = statusCode.contains("R") || statusCode.contains("C")
+            if isRenameOrCopy, let arrowRange = restPath.range(of: " -> ") {
                 previousPath = unquoteGitPath(String(restPath[..<arrowRange.lowerBound]))
                 currentPath = unquoteGitPath(String(restPath[arrowRange.upperBound...]))
             } else {
@@ -489,13 +553,22 @@ public struct CodaGitDiffResult: Codable, Sendable, Equatable {
         return out
     }
 
-    /// Filters a unified `git diff` string down to hunks touching `filePath` (returns full diff when `filePath` is nil/empty).
-    public static func filterDiffByFile(_ diffUnified: String, filePath: String?) -> String {
+    /// Filters a unified `git diff` string down to hunks touching `filePath` (or `previousPath` on split low-similarity renames).
+    public static func filterDiffByFile(
+        _ diffUnified: String,
+        filePath: String?,
+        previousPath: String? = nil
+    ) -> String {
         guard let rawTarget = filePath?.trimmingCharacters(in: .whitespacesAndNewlines),
               !rawTarget.isEmpty else {
             return diffUnified
         }
         let target = rawTarget.hasPrefix("./") ? String(rawTarget.dropFirst(2)) : rawTarget
+        let prevTarget: String? = previousPath.flatMap { rawPrev in
+            let clean = rawPrev.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !clean.isEmpty else { return nil }
+            return clean.hasPrefix("./") ? String(clean.dropFirst(2)) : clean
+        }
         guard !diffUnified.isEmpty else { return "" }
 
         let lines = diffUnified.components(separatedBy: "\n")
@@ -519,7 +592,13 @@ public struct CodaGitDiffResult: Codable, Sendable, Equatable {
         }
 
         let matched = sections.filter { section in
-            sectionMatchesFile(section, target: target)
+            if sectionMatchesFile(section, target: target) {
+                return true
+            }
+            if let prevTarget, sectionMatchesFile(section, target: prevTarget) {
+                return true
+            }
+            return false
         }
         return matched.map { $0.joined(separator: "\n") }.joined(separator: "\n")
     }
@@ -587,16 +666,91 @@ public enum CodaTerminalTranscriptHelper {
         codaShellQuotePath(path)
     }
 
-    /// Encodes a prompt using terminal Bracketed Paste (`\u{001B}[200~<text>\u{001B}[201~\r`),
-    /// stripping any embedded bracketed-paste escape markers to prevent escape injection.
-    public static func encodeBracketedPaste(_ text: String, appendCarriageReturn: Bool = true) -> Data {
-        let sanitized = text
-            .replacingOccurrences(of: "\u{1B}[200~", with: "")
-            .replacingOccurrences(of: "\u{1B}[201~", with: "")
+    /// Sanitizes text for terminal paste: normalizes `\r\n` and `\r` to `\n`, strips NUL bytes,
+    /// and iteratively removes bracketed-paste markers (`\u{1B}[200~`, `\u{1B}[201~`, `\u{9B}200~`, `\u{9B}201~`)
+    /// until fixed-point so nested markers like `\u{1B}[\u{1B}[201~201~` can never break out of paste mode.
+    public static func sanitizeBracketedPasteText(_ text: String) -> String {
+        var sanitized = text
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
             .replacingOccurrences(of: "\0", with: "")
-        var out = Data("\u{1B}[200~".utf8)
-        out.append(Data(sanitized.utf8))
-        out.append(Data("\u{1B}[201~".utf8))
+        while true {
+            let next = sanitized
+                .replacingOccurrences(of: "\u{1B}[200~", with: "")
+                .replacingOccurrences(of: "\u{1B}[201~", with: "")
+                .replacingOccurrences(of: "\u{9B}200~", with: "")
+                .replacingOccurrences(of: "\u{9B}201~", with: "")
+            if next == sanitized {
+                break
+            }
+            sanitized = next
+        }
+        return sanitized
+    }
+
+    /// Resolves whether multi-line prompt submissions should wrap in `\e[200~...\e[201~`:
+    /// - If the terminal explicitly emitted DECSET `?2004h` or DECRST `?2004l` (`explicitSeen == true`),
+    ///   strictly honor `engineEnabled` (so explicit `?2004l` is always respected).
+    /// - Otherwise (`explicitSeen == false`, e.g. attaching to an already-running idle session),
+    ///   default `true` ONLY for known bracketed-paste TUIs/shells (`claude`, `codex`, `gemini`, `agy`,
+    ///   `grok`, `opencode`, `aider`, `cursor`, `goose`, `amp`, `zsh`, `fish`) and `false` for plain
+    ///   shells/REPLs (`sh`, `dash`, `bash`, `python`, `psql`, `ssh`, `cat`, etc.).
+    public static func resolveEffectiveBracketedPaste(
+        explicitSeen: Bool,
+        engineEnabled: Bool,
+        agentName: String
+    ) -> Bool {
+        if explicitSeen {
+            return engineEnabled
+        }
+        if engineEnabled {
+            return true
+        }
+        let rawTrimmed = agentName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !rawTrimmed.isEmpty else { return false }
+        let baseName = URL(fileURLWithPath: rawTrimmed).lastPathComponent.lowercased()
+        let cleaned = baseName.hasPrefix("-") ? String(baseName.dropFirst()) : baseName
+        let exactKnown: Set<String> = [
+            "claude", "claude-code",
+            "codex",
+            "gemini", "gemini-cli",
+            "agy", "antigravity",
+            "grok",
+            "opencode",
+            "aider",
+            "cursor", "cursor-agent",
+            "goose",
+            "amp",
+            "zsh",
+            "fish",
+        ]
+        if exactKnown.contains(cleaned) {
+            return true
+        }
+        for prefix in ["claude-", "codex-", "gemini-", "opencode-", "aider-", "cursor-", "goose-", "amp-"] {
+            if cleaned.hasPrefix(prefix) {
+                return true
+            }
+        }
+        return false
+    }
+
+    /// Encodes a prompt using terminal Bracketed Paste (`\u{001B}[200~<text>\u{001B}[201~\r`) when
+    /// `bracketedModeEnabled` is true (DECSET `?2004h`), or clean newline-normalized UTF-8 when false.
+    public static func encodeBracketedPaste(
+        _ text: String,
+        appendCarriageReturn: Bool = true,
+        bracketedModeEnabled: Bool = true
+    ) -> Data {
+        let sanitized = sanitizeBracketedPasteText(text)
+        var out = Data()
+        if bracketedModeEnabled {
+            out.append(contentsOf: "\u{1B}[200~".utf8)
+            out.append(contentsOf: sanitized.utf8)
+            out.append(contentsOf: "\u{1B}[201~".utf8)
+        } else {
+            out.append(contentsOf: sanitized.utf8)
+        }
         if appendCarriageReturn {
             out.append(0x0D)
         }
@@ -1577,6 +1731,16 @@ public struct CodaVoiceModelConfig: Codable, Sendable, Equatable {
         case model
     }
 
+    public var hasMaskedDaemonKey: Bool {
+        let trimmed = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed == "••••••••" || trimmed == "********"
+    }
+
+    public var hasLocalPlaintextApiKey: Bool {
+        let trimmed = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        return !trimmed.isEmpty && !hasMaskedDaemonKey
+    }
+
     public init(
         provider: String = "openai",
         baseURL: String = "https://api.openai.com/v1",
@@ -1587,6 +1751,71 @@ public struct CodaVoiceModelConfig: Codable, Sendable, Equatable {
         self.baseURL = baseURL
         self.apiKey = apiKey
         self.model = model
+    }
+}
+
+public enum CodaVoiceEndpointValidationError: LocalizedError, Sendable, Equatable {
+    case invalidEndpoint(String)
+
+    public var errorDescription: String? {
+        switch self {
+        case .invalidEndpoint(let msg):
+            return msg
+        }
+    }
+}
+
+public enum CodaVoiceEndpointValidator {
+    /// Verifies that the current process is a `.app` bundle containing a non-empty TCC usage description
+    /// before invoking macOS/iOS TCC APIs (`AVCaptureDevice` / `SFSpeechRecognizer`), preventing `SIGABRT`.
+    public static func isBundledWithUsageDescription(
+        bundlePathExtension: String,
+        usageDescription: String?
+    ) -> Bool {
+        guard bundlePathExtension.lowercased() == "app" else { return false }
+        guard let desc = usageDescription?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !desc.isEmpty else {
+            return false
+        }
+        return true
+    }
+
+    /// Validates that a voice API endpoint uses HTTPS (or loopback HTTP for local Whisper servers),
+    /// rejects empty hosts (`https:///foo`), and inserts `/audio/transcriptions` before any `?query`.
+    public static func validatedTranscriptionURL(from rawBaseURL: String) throws -> URL {
+        let trimmed = rawBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              var comps = URLComponents(string: trimmed),
+              let scheme = comps.scheme?.lowercased(),
+              let rawHost = comps.host?.lowercased(),
+              !rawHost.isEmpty
+        else {
+            throw CodaVoiceEndpointValidationError.invalidEndpoint("Invalid voice API base URL.")
+        }
+        if comps.user != nil || comps.password != nil {
+            throw CodaVoiceEndpointValidationError.invalidEndpoint("Voice API URL must not embed credentials.")
+        }
+        let isLoopback = rawHost == "localhost" || rawHost == "127.0.0.1" || rawHost == "::1" || rawHost == "[::1]"
+        if scheme != "https" && !(scheme == "http" && isLoopback) {
+            throw CodaVoiceEndpointValidationError.invalidEndpoint(
+                "Voice API URL must use https:// (or http://localhost for local Whisper)."
+            )
+        }
+        var path = comps.path
+        while path.count > 1 && path.hasSuffix("/") {
+            path.removeLast()
+        }
+        if path == "/" {
+            path = ""
+        }
+        if !path.hasSuffix("/audio/transcriptions") {
+            path += "/audio/transcriptions"
+        }
+        comps.path = path
+        guard let endpoint = comps.url, let finalHost = endpoint.host, !finalHost.isEmpty else {
+            throw CodaVoiceEndpointValidationError.invalidEndpoint("Could not construct /audio/transcriptions URL.")
+        }
+        return endpoint
     }
 }
 
@@ -2099,7 +2328,10 @@ public enum CodaFormFactor: String, Codable, Sendable, CaseIterable, Equatable {
         width: CGFloat,
         height: CGFloat,
         isHorizontalRegular: Bool? = nil,
-        isVerticalRegular: Bool? = nil
+        isVerticalRegular: Bool? = nil,
+        hardwareScreenSize: CGSize? = nil,
+        isPadOrMacHardware: Bool = false,
+        hasAsymmetricDuoRail: Bool? = nil
     ) -> CodaFormFactor {
         let w = max(1, width)
         let h = max(1, height)
@@ -2107,21 +2339,54 @@ public enum CodaFormFactor: String, Codable, Sendable, CaseIterable, Equatable {
         let maxDim = max(w, h)
         let aspect = maxDim / minDim
 
+        // iPadOS (Split View / Stage Manager / Display Zoom) & macOS windows must NEVER classify as foldable Duo.
+        if isPadOrMacHardware {
+            if minDim < 500 && isHorizontalRegular == false {
+                return .iphonePortrait
+            }
+            return .ipadOrDesktop
+        }
+
+        if let hw = hardwareScreenSize, hw.width > 0, hw.height > 0 {
+            let hwMin = min(hw.width, hw.height)
+            let hwMax = max(hw.width, hw.height)
+            // Full hardware screen >= iPad mini (744x1133) or Desktop -> never foldable Duo
+            if hwMin >= 720 || hwMax >= 1000 {
+                if minDim < 500 && isHorizontalRegular == false {
+                    return .iphonePortrait
+                }
+                return .ipadOrDesktop
+            }
+            // If physical screen is Duo Cover (~466x678) and software keyboard shrank viewport height,
+            // preserve Duo Cover orientation from full hardware screen dimensions instead of flipping!
+            if hwMin >= 449 && hwMin <= 540 && hwMax >= 600 && hwMax <= 755 && (hwMax / hwMin) < 1.70
+                && hasAsymmetricDuoRail != false
+            {
+                return hw.width > hw.height ? .iphoneDuoCoverLandscape : .iphoneDuoCoverPortrait
+            }
+        }
+
         // Mainstream slab iPhones (iPhone 14 .. 18 Pro Max, 375..440pt short edge, ~2.16 aspect)
         if (minDim <= 448 && aspect >= 1.70) || (isVerticalRegular == false && minDim <= 448 && maxDim >= 650) {
             return w > h ? .iphoneLandscape : .iphonePortrait
         }
 
-        // iPhone Duo 5.4" Cover Display (466x678 Portrait, 678x466 Landscape, ~1.455 aspect)
-        if minDim >= 449 && minDim <= 540 && maxDim >= 600 && maxDim <= 755 && aspect < 1.70
-            && (isHorizontalRegular != true || isVerticalRegular == false)
-        {
-            return w > h ? .iphoneDuoCoverLandscape : .iphoneDuoCoverPortrait
-        }
+        if hasAsymmetricDuoRail != false {
+            // iPhone Duo 5.4" Cover Display (466x678 Portrait, 678x466 Landscape, ~1.455 aspect)
+            if minDim >= 449 && minDim <= 540 && maxDim >= 600 && maxDim <= 755 && aspect < 1.70
+                && (isHorizontalRegular != true || isVerticalRegular == false)
+            {
+                return w > h ? .iphoneDuoCoverLandscape : .iphoneDuoCoverPortrait
+            }
 
-        // iPhone Duo 7.6" Unfolded Inner Display (890x626 / 626x890, Zoomed 951x669 / 669x951)
-        if minDim >= 560 && minDim <= 712 && maxDim >= 780 && maxDim <= 975 && aspect >= 1.25 && aspect <= 1.65 {
-            return w > h ? .iphoneDuoInnerLandscape : .iphoneDuoInnerPortrait
+            // iPhone Duo 7.6" Unfolded Inner Display (exact 626x890 or Display-Zoomed 669x951, ~1.4216 aspect).
+            // Tightly bounded so iPad Stage Manager / Split View (620x834, 900x640) & Zoomed iPad mini (640x960)
+            // classify cleanly as `.ipadOrDesktop`!
+            let isStandardDuoInner = abs(minDim - 626) <= 12 && abs(maxDim - 890) <= 16
+            let isZoomedDuoInner = abs(minDim - 669) <= 12 && abs(maxDim - 951) <= 16
+            if isStandardDuoInner || isZoomedDuoInner {
+                return w > h ? .iphoneDuoInnerLandscape : .iphoneDuoInnerPortrait
+            }
         }
 
         if minDim < 540 {

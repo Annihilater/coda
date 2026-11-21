@@ -87,6 +87,60 @@ public func copyTextToClipboard(_ text: String) {
     #endif
 }
 
+public func readTextFromClipboard() -> String? {
+    #if os(iOS)
+    return UIPasteboard.general.string
+    #elseif os(macOS)
+    return NSPasteboard.general.string(forType: .string)
+    #else
+    return nil
+    #endif
+}
+
+public func clipboardHasImage() -> Bool {
+    #if os(iOS)
+    return UIPasteboard.general.hasImages
+        || UIPasteboard.general.contains(pasteboardTypes: ["public.png", "public.jpeg", "public.tiff"])
+    #elseif os(macOS)
+    let pb = NSPasteboard.general
+    return pb.canReadItem(withDataConformingToTypes: [
+        NSPasteboard.PasteboardType.png.rawValue,
+        NSPasteboard.PasteboardType.tiff.rawValue,
+    ])
+    #else
+    return false
+    #endif
+}
+
+public func readImagePNGFromClipboard() -> Data? {
+    #if os(iOS)
+    if let img = UIPasteboard.general.image, let png = img.pngData() {
+        return png
+    }
+    if let raw = UIPasteboard.general.data(forPasteboardType: "public.png") {
+        return raw
+    }
+    if let jpeg = UIPasteboard.general.data(forPasteboardType: "public.jpeg"),
+       let img = UIImage(data: jpeg) {
+        return img.pngData()
+    }
+    return nil
+    #elseif os(macOS)
+    let pb = NSPasteboard.general
+    if let pngData = pb.data(forType: .png) {
+        return pngData
+    }
+    if let tiffData = pb.data(forType: .tiff),
+       let bitmap = NSBitmapImageRep(data: tiffData),
+       let pngData = bitmap.representation(using: .png, properties: [:]) {
+        return pngData
+    }
+    return nil
+    #else
+    return nil
+    #endif
+}
+
 public extension View {
     @ViewBuilder
     func codaNoAutocapAndSpelling() -> some View {

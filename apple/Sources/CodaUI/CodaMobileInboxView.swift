@@ -80,7 +80,10 @@ public struct CodaMobileInboxTabView: View {
                                     Button(role: .destructive) {
                                         store.interruptSession(session)
                                     } label: {
-                                        Label("Esc", systemImage: "xmark.octagon.fill")
+                                        Label(
+                                            tr("Interrupt (^C)", "中断 (^C)", locale: store.locale),
+                                            systemImage: "stop.circle.fill"
+                                        )
                                     }
                                     .tint(CodaHerdrTheme.amberNeedsYou)
                                 }

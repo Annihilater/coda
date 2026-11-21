@@ -573,8 +573,20 @@ struct CodaSelfTest {
             cwd: "/Users/dev/coda"
         )
         precondition(loopbackDiff.branch == "feat/v0.9")
+        precondition(loopbackDiff.isGitRepo && loopbackDiff.repoRoot == "/Users/dev/coda")
         precondition(loopbackDiff.changedFiles.count == 2)
         precondition(loopbackDiff.changedFiles[0].path == "src/main.rs")
+
+        let loopbackTranscribe = try await net.transcribeAudio(
+            on: targetDevice,
+            clientIdentity: clientIdentity,
+            clientDeviceId: clientId,
+            audioData: Data(repeating: 0x42, count: 128),
+            mimeType: "audio/m4a",
+            filename: "dictation.m4a",
+            language: "en"
+        )
+        precondition(loopbackTranscribe.ok && loopbackTranscribe.text == "run cargo test --workspace")
 
         let loopbackBoot = try await net.bootstrapRemoteWorkspace(
             device: targetDevice,
@@ -729,6 +741,19 @@ struct CodaSelfTest {
                     "branch": "feat/v0.9",
                     "status_short": " M src/main.rs\n?? docs/notes.md",
                     "diff_unified": "diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1,1 +1,2 @@\n fn main() {}\n+// v0.9",
+                    "is_git_repo": true,
+                    "repo_root": "/Users/dev/coda",
+                ]
+            case "transcribe_audio":
+                precondition((req["mime_type"] as? String) == "audio/m4a")
+                precondition((req["filename"] as? String) == "dictation.m4a")
+                precondition((req["language"] as? String) == "en")
+                precondition(Data(base64Encoded: (req["audio_b64"] as? String) ?? "")?.count == 128)
+                replyObj = [
+                    "op": "transcribe_audio_result",
+                    "req_id": reqId,
+                    "ok": true,
+                    "text": "run cargo test --workspace",
                 ]
             case "bootstrap_workspace":
                 precondition((req["parent_dir"] as? String) == "~/workspace")
@@ -1214,6 +1239,200 @@ struct CodaSelfTest {
             state: .needsYou
         )
         precondition(statusCheckSession.status == .needsYou)
+
+        // 8m. v1.0.0 Adversarial Regression Guards:
+        // (1) Iterative fixed-point bracketed paste sanitizer + CRLF normalization + DECSET ?2004h/?2004l tracking
+        let nestedPasteAttack = "line1\r\nline2\u{1B}[\u{1B}[201~201~\u{1B}[\u{1B}[200~200~\u{9B}201~safe\0end"
+        let encodedBracketed = CodaTerminalTranscriptHelper.encodeBracketedPaste(
+            nestedPasteAttack,
+            appendCarriageReturn: true,
+            bracketedModeEnabled: true
+        )
+        precondition(
+            encodedBracketed == Data("\u{1B}[200~line1\nline2safeend\u{1B}[201~\r".utf8),
+            "Nested bracketed paste bypass was not iteratively stripped!"
+        )
+        let encodedPlainShell = CodaTerminalTranscriptHelper.encodeBracketedPaste(
+            nestedPasteAttack,
+            appendCarriageReturn: true,
+            bracketedModeEnabled: false
+        )
+        precondition(
+            encodedPlainShell == Data("line1\nline2safeend\r".utf8),
+            "Plain shell paste without ?2004h must not inject CSI 200~/201~"
+        )
+
+        var vtPasteMode = GhosttyReflowEngine(columns: 40, rows: 10)
+        precondition(!vtPasteMode.bracketedPasteEnabled && !vtPasteMode.bracketedPasteExplicit)
+        vtPasteMode.feed(Data("\u{1B}[?2004h\u{1B}[?1000h\u{1B}[?1006h".utf8))
+        precondition(
+            vtPasteMode.bracketedPasteEnabled
+                && vtPasteMode.bracketedPasteExplicit
+                && vtPasteMode.mouseTrackingMode == 1000
+                && vtPasteMode.sgrMouseEncoding
+        )
+
+        // Plain-text snapshot reload (`restoreModeFlagsIfUnset`) must preserve live `?2004h` & mouse modes
+        var snapshotReloaded = GhosttyReflowEngine(columns: 40, rows: 10, treatLFAsCRLF: true)
+        snapshotReloaded.feed(Data("plain snapshot without escape sequences\n".utf8))
+        snapshotReloaded.treatLFAsCRLF = false
+        snapshotReloaded.restoreModeFlagsIfUnset(from: vtPasteMode)
+        precondition(
+            snapshotReloaded.bracketedPasteEnabled
+                && snapshotReloaded.bracketedPasteExplicit
+                && snapshotReloaded.mouseTrackingMode == 1000
+                && snapshotReloaded.sgrMouseEncoding,
+            "Plain-text snapshot reload must preserve prior ?2004h & mouse mode flags"
+        )
+
+        // If snapshot itself explicitly emitted `?2004l`, `restoreModeFlagsIfUnset` must NOT override it
+        var explicitOffSnap = GhosttyReflowEngine(columns: 40, rows: 10, treatLFAsCRLF: true)
+        explicitOffSnap.feed(Data("\u{1B}[?2004lshell prompt $ ".utf8))
+        explicitOffSnap.restoreModeFlagsIfUnset(from: vtPasteMode)
+        precondition(!explicitOffSnap.bracketedPasteEnabled && explicitOffSnap.bracketedPasteExplicit)
+
+        precondition(GhosttyReflowEngine.encodeMouseWheel(up: true, column: 20, row: 5, sgrEncoding: true) == Data("\u{1B}[<64;20;5M".utf8))
+        precondition(GhosttyReflowEngine.encodeMouseWheel(up: false, column: 20, row: 5, sgrEncoding: true) == Data("\u{1B}[<65;20;5M".utf8))
+        vtPasteMode.feed(Data("\u{1B}[?2004l".utf8))
+        precondition(!vtPasteMode.bracketedPasteEnabled && vtPasteMode.bracketedPasteExplicit)
+        vtPasteMode.feed(Data("\u{1B}[?2004h\u{1B}cAFTER_RIS".utf8))
+        precondition(
+            !vtPasteMode.bracketedPasteEnabled
+                && !vtPasteMode.bracketedPasteExplicit
+                && vtPasteMode.mouseTrackingMode == 0
+                && !vtPasteMode.sgrMouseEncoding
+        )
+        precondition(vtPasteMode.plainVisibleText.contains("AFTER_RIS"))
+
+        // Effective bracketed paste resolution for already-running idle TUIs/shells vs plain shells/REPLs
+        precondition(CodaTerminalTranscriptHelper.resolveEffectiveBracketedPaste(explicitSeen: false, engineEnabled: false, agentName: "claude"))
+        precondition(CodaTerminalTranscriptHelper.resolveEffectiveBracketedPaste(explicitSeen: false, engineEnabled: false, agentName: "/opt/homebrew/bin/codex"))
+        precondition(CodaTerminalTranscriptHelper.resolveEffectiveBracketedPaste(explicitSeen: false, engineEnabled: false, agentName: "gemini"))
+        precondition(CodaTerminalTranscriptHelper.resolveEffectiveBracketedPaste(explicitSeen: false, engineEnabled: false, agentName: "-zsh"))
+        precondition(CodaTerminalTranscriptHelper.resolveEffectiveBracketedPaste(explicitSeen: false, engineEnabled: false, agentName: "/usr/local/bin/fish"))
+        precondition(!CodaTerminalTranscriptHelper.resolveEffectiveBracketedPaste(explicitSeen: false, engineEnabled: false, agentName: "/bin/sh"))
+        precondition(!CodaTerminalTranscriptHelper.resolveEffectiveBracketedPaste(explicitSeen: false, engineEnabled: false, agentName: "dash"))
+        precondition(!CodaTerminalTranscriptHelper.resolveEffectiveBracketedPaste(explicitSeen: false, engineEnabled: false, agentName: "bash"))
+        precondition(!CodaTerminalTranscriptHelper.resolveEffectiveBracketedPaste(explicitSeen: false, engineEnabled: false, agentName: "python3"))
+        precondition(!CodaTerminalTranscriptHelper.resolveEffectiveBracketedPaste(explicitSeen: false, engineEnabled: false, agentName: "psql"))
+        precondition(!CodaTerminalTranscriptHelper.resolveEffectiveBracketedPaste(explicitSeen: false, engineEnabled: false, agentName: "ssh"))
+        // Explicit `?2004l` (`explicitSeen: true, engineEnabled: false`) must override even known TUI default
+        precondition(!CodaTerminalTranscriptHelper.resolveEffectiveBracketedPaste(explicitSeen: true, engineEnabled: false, agentName: "claude"))
+        precondition(!CodaTerminalTranscriptHelper.resolveEffectiveBracketedPaste(explicitSeen: true, engineEnabled: false, agentName: "zsh"))
+        // Explicit `?2004h` (`explicitSeen: true, engineEnabled: true`) must enable even on bash/python
+        precondition(CodaTerminalTranscriptHelper.resolveEffectiveBracketedPaste(explicitSeen: true, engineEnabled: true, agentName: "bash"))
+
+        // (2) GitDiffResponse v1.0 wire decoding (`is_git_repo`, `repo_root`, `error`), non-rename arrow guard & split rename filter
+        let legacyDiffWire = Data(#"{"branch":"main","status_short":"","diff_unified":""}"#.utf8)
+        let decodedLegacyDiff = try JSONDecoder().decode(CodaGitDiffResult.self, from: legacyDiffWire)
+        precondition(decodedLegacyDiff.isGitRepo == true && decodedLegacyDiff.repoRoot == nil && decodedLegacyDiff.error == nil)
+
+        let v1DiffWire = Data(#"{"branch":"feat/v1","status_short":" M apple/Sources/App.swift\nD  old.swift\n?? new_dir/\n?? \"a -> b.txt\"\nR  src/a.rs -> src/b.rs","diff_unified":"","is_git_repo":true,"repo_root":"/Users/dev/coda"}"#.utf8)
+        let decodedV1Diff = try JSONDecoder().decode(CodaGitDiffResult.self, from: v1DiffWire)
+        precondition(decodedV1Diff.isGitRepo == true)
+        precondition(decodedV1Diff.repoRoot == "/Users/dev/coda")
+        let v1Files = decodedV1Diff.changedFiles
+        precondition(v1Files.count == 5, "Expected 5 v1 diff files, got \(v1Files.count)")
+        precondition(CodaTerminalTranscriptHelper.joinRootAndRel(rootPath: decodedV1Diff.repoRoot ?? "", relPath: v1Files[0].path) == "/Users/dev/coda/apple/Sources/App.swift")
+        precondition(v1Files[1].isDeleted && !v1Files[0].isDeleted)
+        precondition(v1Files[2].isDirectoryEntry && !v1Files[0].isDirectoryEntry)
+        precondition(v1Files[3].path == "a -> b.txt" && v1Files[3].previousPath == nil, "Untracked file with ' -> ' must not split as rename")
+        precondition(v1Files[4].path == "src/b.rs" && v1Files[4].previousPath == "src/a.rs")
+
+        let nonGitWire = Data(#"{"branch":"","status_short":"","diff_unified":"","is_git_repo":false,"error":"not a git repository"}"#.utf8)
+        let decodedNonGit = try JSONDecoder().decode(CodaGitDiffResult.self, from: nonGitWire)
+        precondition(!decodedNonGit.isGitRepo && decodedNonGit.error == "not a git repository")
+
+        let splitRenameUnified = """
+        diff --git a/src/a.rs b/src/a.rs
+        deleted file mode 100644
+        --- a/src/a.rs
+        +++ /dev/null
+        @@ -1 +0,0 @@
+        -fn old_fn() {}
+        diff --git a/src/b.rs b/src/b.rs
+        new file mode 100644
+        --- /dev/null
+        +++ b/src/b.rs
+        @@ -0,0 +1 @@
+        +fn new_fn() {}
+        """
+        let splitFiltered = CodaGitDiffResult.filterDiffByFile(splitRenameUnified, filePath: "src/b.rs", previousPath: "src/a.rs")
+        precondition(splitFiltered.contains("-fn old_fn()") && splitFiltered.contains("+fn new_fn()"))
+
+        // (3) Voice endpoint URL validation (empty-host bypass, query preservation) & macOS TCC bundle guard
+        var emptyHostRejected = false
+        do {
+            _ = try CodaVoiceEndpointValidator.validatedTranscriptionURL(from: "https:///foo")
+        } catch {
+            emptyHostRejected = true
+        }
+        precondition(emptyHostRejected, "https:///foo empty host must be rejected")
+
+        var insecureHttpRejected = false
+        do {
+            _ = try CodaVoiceEndpointValidator.validatedTranscriptionURL(from: "http://example.com/v1")
+        } catch {
+            insecureHttpRejected = true
+        }
+        precondition(insecureHttpRejected, "Non-loopback http:// must be rejected")
+
+        let azureStyleURL = try CodaVoiceEndpointValidator.validatedTranscriptionURL(
+            from: "https://api.example.com/openai/v1/?api-version=2024-06"
+        )
+        precondition(
+            azureStyleURL.absoluteString == "https://api.example.com/openai/v1/audio/transcriptions?api-version=2024-06",
+            "Query params must stay after /audio/transcriptions, got \(azureStyleURL.absoluteString)"
+        )
+        let localWhisperURL = try CodaVoiceEndpointValidator.validatedTranscriptionURL(from: "http://127.0.0.1:8080/v1")
+        precondition(localWhisperURL.absoluteString == "http://127.0.0.1:8080/v1/audio/transcriptions")
+
+        precondition(!CodaVoiceEndpointValidator.isBundledWithUsageDescription(bundlePathExtension: "", usageDescription: "Mic desc"))
+        precondition(!CodaVoiceEndpointValidator.isBundledWithUsageDescription(bundlePathExtension: "app", usageDescription: nil))
+        precondition(!CodaVoiceEndpointValidator.isBundledWithUsageDescription(bundlePathExtension: "app", usageDescription: "   "))
+        precondition(CodaVoiceEndpointValidator.isBundledWithUsageDescription(bundlePathExtension: "app", usageDescription: "Record voice"))
+
+        let maskedCfg = CodaVoiceModelConfig(apiKey: "••••••••")
+        precondition(maskedCfg.hasMaskedDaemonKey && !maskedCfg.hasLocalPlaintextApiKey)
+        let transcribeDecoded = try JSONDecoder().decode(
+            CodaTranscribeAudioResult.self,
+            from: Data(#"{"ok":true,"text":"ship v1.0.0"}"#.utf8)
+        )
+        precondition(transcribeDecoded.ok && transcribeDecoded.text == "ship v1.0.0")
+
+        // (4) Form-Factor Detection Guards: iPad Stage Manager / Split View, Zoomed iPad mini, Mac window & Duo Cover keyboard shrink
+        precondition(
+            CodaFormFactor.detect(width: 620, height: 834, isHorizontalRegular: true, isVerticalRegular: true) == .ipadOrDesktop,
+            "iPad Split View / Stage Manager 620x834 must NOT misclassify as Duo Inner"
+        )
+        precondition(
+            CodaFormFactor.detect(width: 900, height: 640, isHorizontalRegular: true, isVerticalRegular: true) == .ipadOrDesktop,
+            "iPad Stage Manager / Mac 900x640 must NOT misclassify as Duo Inner"
+        )
+        precondition(
+            CodaFormFactor.detect(width: 640, height: 960, isHorizontalRegular: true, isVerticalRegular: true) == .ipadOrDesktop,
+            "Display-Zoomed iPad mini 640x960 must NOT misclassify as Duo Inner"
+        )
+        precondition(
+            CodaFormFactor.detect(
+                width: 626,
+                height: 890,
+                isHorizontalRegular: true,
+                isVerticalRegular: true,
+                isPadOrMacHardware: true
+            ) == .ipadOrDesktop,
+            "Mac/iPad hardware window at 626x890 must stay .ipadOrDesktop"
+        )
+        precondition(
+            CodaFormFactor.detect(
+                width: 466,
+                height: 421,
+                isHorizontalRegular: false,
+                isVerticalRegular: true,
+                hardwareScreenSize: CGSize(width: 466, height: 678)
+            ) == .iphoneDuoCoverPortrait,
+            "Duo Cover 466x678 with keyboard open must stay .iphoneDuoCoverPortrait instead of flipping to .iphoneLandscape"
+        )
     }
 
     private static func readFramed(conn: NWConnection, completion: @escaping @Sendable ([String: Any]?) -> Void) {

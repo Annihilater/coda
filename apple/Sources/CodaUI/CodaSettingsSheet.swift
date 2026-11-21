@@ -838,18 +838,29 @@ public struct CodaSettingsAndPairingSheet: View {
     // MARK: - Voice Model Configuration
 
     private var voiceModelSection: some View {
-        sectionCard(title: tr("Voice Dictation Model", "语音识别模型", locale: store.locale)) {
+        let hostHasWhisper = store.remoteMachines.contains { dev in
+            dev.isOnline && (store.daemonVoiceConfigsByDevice[dev.id]?.apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
+        }
+        return sectionCard(title: tr("Voice Dictation Model", "语音识别模型", locale: store.locale)) {
             VStack(alignment: .leading, spacing: 10) {
                 if CodaVoiceRecorder.usesNativeSpeechFallback(for: store.settings.voiceConfig) {
                     HStack(spacing: 6) {
                         Image(systemName: "waveform.badge.mic")
                             .font(.system(size: 12, weight: .semibold))
                             .foregroundStyle(CodaHerdrTheme.greenDiff)
-                        Text(tr(
-                            "Zero-config Apple Native Speech (SFSpeechRecognizer) fallback active while API Key is empty.",
-                            "零配置模式已激活：未填 API Key 时自动使用 Apple 原生语音识别 (SFSpeechRecognizer)。",
-                            locale: store.locale
-                        ))
+                        Text(
+                            hostHasWhisper
+                                ? tr(
+                                    "Zero-config Apple Native Speech active (with E2EE remote host Whisper fallback).",
+                                    "零配置 Apple 原生语音已激活（同时支持远端主机 Whisper E2EE 自动回退）。",
+                                    locale: store.locale
+                                )
+                                : tr(
+                                    "Zero-config Apple Native Speech (SFSpeechRecognizer) fallback active while API Key is empty.",
+                                    "零配置模式已激活：未填 API Key 时自动使用 Apple 原生语音识别 (SFSpeechRecognizer)。",
+                                    locale: store.locale
+                                )
+                        )
                         .font(.system(size: 11))
                         .foregroundStyle(CodaHerdrTheme.greenDiff)
                     }
@@ -1004,6 +1015,14 @@ public struct CodaBootstrapWorkspaceSheet: View {
                             placeholder: "my-project",
                             text: $form.folderName
                         )
+                        .onChange(of: form.folderName) { _, next in
+                            if next.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                form.didAutoSuggestFolder = true
+                            } else if let suggested = CodaWorkspaceBootstrapValidator.suggestedFolderName(fromGitCloneURL: form.gitCloneURL),
+                                      next != suggested {
+                                form.didAutoSuggestFolder = false
+                            }
+                        }
 
                         VStack(alignment: .leading, spacing: 6) {
                             Text(tr("Launch Agent Session", "创建后立即启动会话", locale: store.locale))

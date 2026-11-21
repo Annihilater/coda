@@ -269,6 +269,12 @@ public struct GhosttyReflowEngine: GhosttyVTSurface {
     public private(set) var plainVisibleText: String = ""
     public private(set) var title: String = ""
     public private(set) var inAltScreen: Bool = false
+    public private(set) var bracketedPasteEnabled: Bool = false
+    public private(set) var bracketedPasteExplicit: Bool = false
+    public private(set) var mouseTrackingMode: Int = 0
+    public private(set) var mouseTrackingExplicit: Bool = false
+    public private(set) var sgrMouseEncoding: Bool = false
+    public private(set) var sgrMouseExplicit: Bool = false
     public private(set) var latestHerdrStatus: HerdrOSC7501Status?
     /// Monotonically incremented only when a fresh OSC 7501 payload is parsed (or engine resets),
     /// preventing callers from re-applying sticky `latestHerdrStatus` on plain stdout chunks.
@@ -321,6 +327,12 @@ public struct GhosttyReflowEngine: GhosttyVTSurface {
         primaryScrollback = []
         altGrid = (0..<rows).map { _ in ScreenRow(columns: columns) }
         inAltScreen = false
+        bracketedPasteEnabled = false
+        bracketedPasteExplicit = false
+        mouseTrackingMode = 0
+        mouseTrackingExplicit = false
+        sgrMouseEncoding = false
+        sgrMouseExplicit = false
         cursorRow = 0
         cursorCol = 0
         pendingWrap = false
@@ -346,11 +358,13 @@ public struct GhosttyReflowEngine: GhosttyVTSurface {
     public mutating func feed(_ utf8Bytes: Data) {
         guard !utf8Bytes.isEmpty else { return }
         pendingUTF8.append(contentsOf: utf8Bytes)
+        let buf = pendingUTF8
+        pendingUTF8.removeAll(keepingCapacity: true)
 
         var idx = 0
-        let total = pendingUTF8.count
+        let total = buf.count
         while idx < total {
-            let b = pendingUTF8[idx]
+            let b = buf[idx]
             if b < 0x80 {
                 processScalar(UnicodeScalar(b))
                 idx += 1
@@ -376,7 +390,7 @@ public struct GhosttyReflowEngine: GhosttyVTSurface {
                 break
             }
 
-            let slice = pendingUTF8[idx..<(idx + expectedLen)]
+            let slice = buf[idx..<(idx + expectedLen)]
             var decoder = UTF8()
             var iter = slice.makeIterator()
             switch decoder.decode(&iter) {
@@ -389,8 +403,8 @@ public struct GhosttyReflowEngine: GhosttyVTSurface {
             }
         }
 
-        if idx > 0 {
-            pendingUTF8.removeFirst(idx)
+        if idx < total {
+            pendingUTF8.append(contentsOf: buf[idx..<total])
         }
         rebuildDerivedOutputs()
     }
@@ -398,6 +412,23 @@ public struct GhosttyReflowEngine: GhosttyVTSurface {
     public mutating func feedBase64PtyChunk(_ dataB64: String) {
         guard let raw = Data(base64Encoded: dataB64) else { return }
         feed(raw)
+    }
+
+    /// Preserves prior terminal private-mode flags (`?2004h`/`?2004l`, mouse reporting, SGR mouse)
+    /// across plain-text `readTerminalScreen` snapshot reloads when the snapshot itself didn't emit them.
+    public mutating func restoreModeFlagsIfUnset(from prior: GhosttyReflowEngine) {
+        if !bracketedPasteExplicit {
+            bracketedPasteEnabled = prior.bracketedPasteEnabled
+            bracketedPasteExplicit = prior.bracketedPasteExplicit
+        }
+        if !mouseTrackingExplicit {
+            mouseTrackingMode = prior.mouseTrackingMode
+            mouseTrackingExplicit = prior.mouseTrackingExplicit
+        }
+        if !sgrMouseExplicit {
+            sgrMouseEncoding = prior.sgrMouseEncoding
+            sgrMouseExplicit = prior.sgrMouseExplicit
+        }
     }
 
     public mutating func resizeReflow(columns newColsRaw: Int, rows newRowsRaw: Int) {
@@ -457,6 +488,24 @@ public struct GhosttyReflowEngine: GhosttyVTSurface {
         case .ctrlD: return Data([0x04])
         case .ctrlBackslash: return Data([0x1C])
         }
+    }
+
+    public static func encodeMouseWheel(
+        up: Bool,
+        column: Int = 1,
+        row: Int = 1,
+        sgrEncoding: Bool = true
+    ) -> Data {
+        let btn = up ? 64 : 65
+        let col = max(1, min(9999, column))
+        let rw = max(1, min(9999, row))
+        if sgrEncoding {
+            return Data("\u{1B}[<\(btn);\(col);\(rw)M".utf8)
+        }
+        let cb = UInt8(clamping: 32 + btn)
+        let cx = UInt8(clamping: 32 + min(223, col))
+        let cy = UInt8(clamping: 32 + min(223, rw))
+        return Data([0x1B, 0x5B, 0x4D, cb, cx, cy])
     }
 
     public static func encodeModifiedText(_ text: String, ctrl: Bool, alt: Bool) -> Data {
@@ -940,12 +989,32 @@ public struct GhosttyReflowEngine: GhosttyVTSurface {
                 for code in ints {
                     if code == 1049 || code == 1047 || code == 47 {
                         enterAltScreen(saveCursorFirst: code == 1049, clearAlt: true)
+                    } else if code == 2004 {
+                        bracketedPasteEnabled = true
+                        bracketedPasteExplicit = true
+                    } else if code == 1000 || code == 1002 || code == 1003 {
+                        mouseTrackingMode = code
+                        mouseTrackingExplicit = true
+                    } else if code == 1006 {
+                        sgrMouseEncoding = true
+                        sgrMouseExplicit = true
                     }
                 }
             case 0x6C: // 'l' DECRST
                 for code in ints {
                     if code == 1049 || code == 1047 || code == 47 {
                         leaveAltScreen(restoreSavedCursor: code == 1049)
+                    } else if code == 2004 {
+                        bracketedPasteEnabled = false
+                        bracketedPasteExplicit = true
+                    } else if code == 1000 || code == 1002 || code == 1003 {
+                        if mouseTrackingMode == code {
+                            mouseTrackingMode = 0
+                        }
+                        mouseTrackingExplicit = true
+                    } else if code == 1006 {
+                        sgrMouseEncoding = false
+                        sgrMouseExplicit = true
                     }
                 }
             default:
