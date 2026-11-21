@@ -1,8 +1,9 @@
 import { escapeHtml } from "./vt";
 import { svgIcon } from "./icons";
-import type { Device, HerdrTerminal } from "./types";
+import type { Device, HerdrTerminal, PromptSnippet } from "./types";
 import { isNeedsYouState } from "./notify";
 import { sanitizeBracketedPasteText } from "./terminal_keys";
+import { isCustomPromptSnippet } from "./friend_ux";
 
 // ============================================================================
 // 1. Remote E2EE Interactive Git Diff Parser, Filter & Modal Renderer
@@ -763,6 +764,10 @@ export function renderPromptComposerPanel(opts: {
   hasSpeechFallback: boolean;
   hasWhisperKey: boolean;
   useBracketedPaste?: boolean;
+  snippets?: readonly PromptSnippet[];
+  savingSnippetOpen?: boolean;
+  savingSnippetTitle?: string;
+  savingSnippetBusy?: boolean;
   tr: (en: string, zh: string) => string;
 }): string {
   if (!opts.open) return "";
@@ -781,6 +786,7 @@ export function renderPromptComposerPanel(opts: {
         : opts.hasSpeechFallback
           ? tr("Voice (Live)", "语音免配置听写")
           : tr("Voice", "语音");
+  const snippets = opts.snippets || [];
 
   return `
     <section id="prompt-composer-panel" class="composer-drawer" aria-label="${tr("Multi-line Prompt Composer", "多行 Prompt 编排器")}">
@@ -794,6 +800,46 @@ export function renderPromptComposerPanel(opts: {
           <button type="button" id="btn-composer-close" class="circle-btn" style="width:24px;height:24px;" title="${tr("Collapse composer", "收起编排器")}">${svgIcon("close", 12)}</button>
         </div>
       </div>
+      <div class="composer-snippet-strip" role="toolbar" aria-label="${tr("Saved Prompt Snippets", "跨端常用 Prompt 片段")}">
+        ${snippets
+          .map((s) => {
+            const custom = isCustomPromptSnippet(s);
+            return `
+          <span class="snippet-pill-group">
+            <button type="button" class="snippet-pill-btn" data-snippet-insert="${escapeHtml(s.id)}" title="${escapeHtml(s.prompt)}">
+              ${escapeHtml(s.title)}
+            </button>${
+              custom
+                ? `<button type="button" class="snippet-pill-del" data-snippet-delete="${escapeHtml(s.id)}" title="${tr("Delete custom snippet", "删除自定义片段")}" aria-label="${tr("Delete snippet", "删除片段")}">&times;</button>`
+                : ""
+            }
+          </span>`;
+          })
+          .join("")}
+        <button type="button" id="btn-composer-save-snippet-toggle" class="snippet-save-trigger">
+          + ${tr("Save Snippet", "保存常用片段")}
+        </button>
+      </div>
+      ${
+        opts.savingSnippetOpen
+          ? `<div class="composer-save-bar" id="composer-save-snippet-bar">
+              <input
+                id="composer-snippet-title-input"
+                class="pm-input"
+                style="margin:0;height:28px;font-size:12px;flex:1;min-width:160px;"
+                maxlength="60"
+                value="${escapeHtml(opts.savingSnippetTitle || "")}"
+                placeholder="${tr("Snippet title (max 60 chars)…", "输入片段标题（最多 60 字）…")}"
+              />
+              <button type="button" id="btn-composer-save-snippet-confirm" class="pm-btn pm-btn-primary pm-btn-sm" style="height:28px;" ${opts.savingSnippetBusy ? "disabled" : ""}>
+                ${opts.savingSnippetBusy ? tr("Saving…", "保存中…") : tr("Save", "确认保存")}
+              </button>
+              <button type="button" id="btn-composer-save-snippet-cancel" class="pm-btn pm-btn-ghost pm-btn-sm" style="height:28px;">
+                ${tr("Cancel", "取消")}
+              </button>
+            </div>`
+          : ""
+      }
       <textarea
         id="prompt-composer-textarea"
         class="composer-textarea"

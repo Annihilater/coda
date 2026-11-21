@@ -92,6 +92,31 @@ import {
   validateNotificationWebhookSettings,
   validateSingleFolderName,
 } from "./git_diff_composer";
+import { readFileSync } from "node:fs";
+import {
+  DEFAULT_PROMPT_SNIPPETS,
+  IOS_PWA_LOCK_SCREEN_PUSH_TIP_EN,
+  MAX_PROMPT_SNIPPETS,
+  arrayBufferToBase64Url,
+  buildInviteRegistrationUrl,
+  deriveSnippetTitleFromPrompt,
+  extractPushSubscriptionKeys,
+  extractResetTokenFromInput,
+  insertSnippetIntoDraft,
+  isCustomPromptSnippet,
+  isIosNonStandaloneBrowser,
+  normalizePromptSnippetsList,
+  normalizeSwNotificationTargetUrl,
+  parseLocationRouteAndParams,
+  parseSwPushPayload,
+  renderAdminFriendsDirectorySection,
+  renderFriendOnboardingCard,
+  renderWebPushSettingsCard,
+  shouldSwCacheStaticAsset,
+  validatePromptSnippet,
+  validateResetPasswordInputs,
+  vapidBase64UrlToUint8Array,
+} from "./friend_ux";
 
 function makeTestIdentity(name: string): WebDeviceIdentity {
   const edPriv = ed25519.utils.randomPrivateKey();
@@ -1525,5 +1550,461 @@ describe("v1.0.0 Web Console Bug Fixes & UX Hardening", () => {
     expect(modalHtml).toContain('data-pp-follow-path="/dashboard?tab=1"');
     expect(modalHtml).toContain("Client-rendered SPA detected");
     expect(modalHtml).not.toContain("[truncated at 128 KB]");
+  });
+});
+
+describe("v1.1.0 Service Worker Web Push, Invite/Reset Deep-Links, Snippets & Onboarding", () => {
+  test("base64url VAPID public key conversion, PushSubscription key extraction & iOS PWA Web Push UI", () => {
+    // 65-byte uncompressed P-256 public key containing bytes that produce '-' (0xfb) and '_' (0xff)
+    const rawVapidPub = new Uint8Array(65);
+    rawVapidPub[0] = 0x04;
+    for (let i = 1; i < 65; i += 1) {
+      rawVapidPub[i] = i % 3 === 0 ? 0xfb : i % 5 === 0 ? 0xff : (i * 17) & 0xff;
+    }
+
+    const b64url = arrayBufferToBase64Url(rawVapidPub);
+    expect(b64url).not.toContain("+");
+    expect(b64url).not.toContain("/");
+    expect(b64url).not.toContain("=");
+
+    const decoded = vapidBase64UrlToUint8Array(b64url);
+    expect(Array.from(decoded)).toEqual(Array.from(rawVapidPub));
+
+    // Standard padded base64 is also accepted cleanly
+    const stdB64 = toB64(rawVapidPub);
+    expect(Array.from(vapidBase64UrlToUint8Array(stdB64))).toEqual(Array.from(rawVapidPub));
+
+    // Reject empty, malformed length, and invalid characters
+    expect(() => vapidBase64UrlToUint8Array("")).toThrow();
+    expect(() => vapidBase64UrlToUint8Array("abcde")).toThrow();
+    expect(() => vapidBase64UrlToUint8Array("bad$key!")).toThrow();
+
+    // Extract PushSubscription p256dh + auth keys via getKey() and toJSON() fallback
+    const rawAuth = new Uint8Array(16).map((_, i) => (0xf0 + i) & 0xff);
+    const extracted = extractPushSubscriptionKeys({
+      endpoint: "https://fcm.googleapis.com/fcm/send/sub-123",
+      getKey: (name) => (name === "p256dh" ? rawVapidPub.buffer : rawAuth.buffer),
+    });
+    expect(extracted.endpoint).toBe("https://fcm.googleapis.com/fcm/send/sub-123");
+    expect(extracted.p256dh).toBe(b64url);
+    expect(extracted.auth).toBe(arrayBufferToBase64Url(rawAuth));
+
+    const extractedFallback = extractPushSubscriptionKeys({
+      toJSON: () => ({
+        endpoint: "https://web.push.apple.com/Q123",
+        keys: {
+          p256dh: toB64(rawVapidPub),
+          auth: toB64(rawAuth),
+        },
+      }),
+    });
+    expect(extractedFallback.endpoint).toBe("https://web.push.apple.com/Q123");
+    expect(extractedFallback.p256dh).toBe(b64url);
+    expect(extractedFallback.auth).toBe(arrayBufferToBase64Url(rawAuth));
+
+    // iOS Safari non-standalone detection & 1-line Home Screen tip rendering
+    expect(
+      isIosNonStandaloneBrowser(
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 18_1 like Mac OS X) AppleWebKit/605.1.15",
+        false
+      )
+    ).toBe(true);
+    expect(
+      isIosNonStandaloneBrowser(
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 18_1 like Mac OS X) AppleWebKit/605.1.15",
+        true
+      )
+    ).toBe(false);
+    expect(
+      isIosNonStandaloneBrowser("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)", false, 5)
+    ).toBe(true);
+    expect(
+      isIosNonStandaloneBrowser("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)", false, 0)
+    ).toBe(false);
+
+    const cardUnsubHtml = renderWebPushSettingsCard({
+      vapid: { enabled: true, public_key: b64url },
+      vapidLoaded: true,
+      webPushCount: 0,
+      thisDeviceSubscribed: false,
+      busy: false,
+      pushSupported: true,
+      iosNeedsHomeScreenTip: true,
+      tr: (en) => en,
+    });
+    expect(cardUnsubHtml).toContain("Enable Lock-Screen Push (Browser / iOS PWA)");
+    expect(cardUnsubHtml).toContain(IOS_PWA_LOCK_SCREEN_PUSH_TIP_EN);
+
+    const cardSubHtml = renderWebPushSettingsCard({
+      vapid: { enabled: true, public_key: b64url },
+      vapidLoaded: true,
+      webPushCount: 2,
+      thisDeviceSubscribed: true,
+      busy: false,
+      pushSupported: true,
+      iosNeedsHomeScreenTip: false,
+      tr: (en) => en,
+    });
+    expect(cardSubHtml).toContain("Disable on This Device");
+    expect(cardSubHtml).toContain("Subscribed endpoints: 2");
+  });
+
+  test("invite deep-links, /reset-password token query parsing, validation & Admin Friends Directory", () => {
+    expect(parseLocationRouteAndParams("/register", "?invite=CODA-7F29AB")).toEqual({
+      route: "register",
+      inviteCode: "CODA-7F29AB",
+      resetToken: "",
+      activationCode: "",
+    });
+    expect(parseLocationRouteAndParams("/", "?invite=CODA-FRIEND")).toEqual({
+      route: "register",
+      inviteCode: "CODA-FRIEND",
+      resetToken: "",
+      activationCode: "",
+    });
+    expect(
+      parseLocationRouteAndParams("/reset-password", "?token=rst_AbCdEfGh1234567890")
+    ).toEqual({
+      route: "reset-password",
+      inviteCode: "",
+      resetToken: "rst_AbCdEfGh1234567890",
+      activationCode: "",
+    });
+    expect(parseLocationRouteAndParams("/", "?code=abcd-1234")).toEqual({
+      route: "activate",
+      inviteCode: "",
+      resetToken: "",
+      activationCode: "ABCD-1234",
+    });
+
+    // extractResetTokenFromInput handles raw token, full URL, query fragment, and WeChat pasted message
+    expect(extractResetTokenFromInput("  rst_rawTokenValue123456  ")).toBe("rst_rawTokenValue123456");
+    expect(
+      extractResetTokenFromInput(
+        "https://codahub.dev/reset-password?token=rst_fromFullUrl987654321"
+      )
+    ).toBe("rst_fromFullUrl987654321");
+    expect(
+      extractResetTokenFromInput(
+        "Here is your Coda reset link: <https://codahub.dev/reset-password?foo=1&token=rst_wechatMsgToken12345&utm=wechat#top>"
+      )
+    ).toBe("rst_wechatMsgToken12345");
+    expect(extractResetTokenFromInput("https://codahub.dev/reset-password")).toBe("");
+
+    expect(buildInviteRegistrationUrl("https://codahub.dev/", "CODA-999999")).toBe(
+      "https://codahub.dev/register?invite=CODA-999999"
+    );
+
+    const trEn = (en: string) => en;
+    expect(validateResetPasswordInputs("", "validpass123", "validpass123", trEn).ok).toBe(false);
+    expect(validateResetPasswordInputs("rst_123456789", "short", "short", trEn).ok).toBe(false);
+    expect(
+      validateResetPasswordInputs("rst_123456789", "passwordA1", "passwordB2", trEn).ok
+    ).toBe(false);
+    const validReset = validateResetPasswordInputs(
+      "https://codahub.dev/reset-password?token=rst_goodToken12345",
+      "strongPass2026!",
+      "strongPass2026!",
+      trEn
+    );
+    expect(validReset).toEqual({
+      ok: true,
+      token: "rst_goodToken12345",
+      newPassword: "strongPass2026!",
+    });
+
+    // Admin Friends Directory escapes HTML/XSS and renders Copy Reset Link button
+    const friendsHtml = renderAdminFriendsDirectorySection({
+      users: [
+        {
+          id: "u-1",
+          handle: "bob",
+          email: "bob@example.com",
+          display_name: 'Bob <img src=x onerror="alert(1)">',
+          is_admin: false,
+          online_devices: 1,
+          total_devices: 3,
+          last_login_at: "2026-11-21T05:30:00Z",
+          created_at: "2026-11-01T00:00:00Z",
+        },
+      ],
+      busyUserId: null,
+      latestResetLink: null,
+      tr: trEn,
+    });
+    expect(friendsHtml).toContain("@bob");
+    expect(friendsHtml).toContain("1/3 devices");
+    expect(friendsHtml).toContain('data-admin-reset-user="u-1"');
+    expect(friendsHtml).toContain("Copy Reset Link");
+    expect(friendsHtml).not.toContain("<img src=x");
+  });
+
+  test("cross-device saved prompt snippets validation/rendering & 3-step onboarding card", () => {
+    expect(DEFAULT_PROMPT_SNIPPETS.length).toBe(4);
+    expect(isCustomPromptSnippet(DEFAULT_PROMPT_SNIPPETS[0])).toBe(false);
+    expect(isCustomPromptSnippet({ id: "custom-1" })).toBe(true);
+
+    expect(deriveSnippetTitleFromPrompt("  Check git diff and run cargo test --workspace\nMore")).toBe(
+      "Check git diff and run cargo test -…"
+    );
+
+    expect(validatePromptSnippet({ title: "", prompt: "hello" }).ok).toBe(false);
+    expect(validatePromptSnippet({ title: "x".repeat(61), prompt: "hello" }).ok).toBe(false);
+    expect(validatePromptSnippet({ title: "ok", prompt: "" }).ok).toBe(false);
+    expect(validatePromptSnippet({ title: "ok", prompt: "p".repeat(4001) }).ok).toBe(false);
+
+    const validSnip = validatePromptSnippet({
+      id: "c-1",
+      title: 'Fix <script> & "Verify"',
+      prompt: "Run bun test && cargo test",
+    });
+    expect(validSnip.ok).toBe(true);
+
+    // normalizePromptSnippetsList enforces 24-item cap and deduplicates IDs
+    const rawMany = Array.from({ length: 30 }, (_, idx) => ({
+      id: idx === 1 ? "dup-0" : `dup-${idx}`,
+      title: `Title ${idx}`,
+      prompt: `Prompt ${idx}`,
+    }));
+    const normalized = normalizePromptSnippetsList(rawMany);
+    expect(normalized.length).toBe(MAX_PROMPT_SNIPPETS);
+
+    expect(insertSnippetIntoDraft("", "Run tests")).toBe("Run tests");
+    expect(insertSnippetIntoDraft("First line", "Second line")).toBe("First line\nSecond line");
+
+    const composerHtml = renderPromptComposerPanel({
+      open: true,
+      draft: "",
+      isRecordingVoice: false,
+      isTranscribingVoice: false,
+      hasSpeechFallback: true,
+      hasWhisperKey: false,
+      snippets: [
+        DEFAULT_PROMPT_SNIPPETS[0],
+        { id: "custom-xss", title: "<b>Audit</b>", prompt: 'Check "security"' },
+      ],
+      savingSnippetOpen: true,
+      savingSnippetTitle: "My Snippet",
+      tr: (en) => en,
+    });
+    expect(composerHtml).toContain('data-snippet-insert="s1"');
+    expect(composerHtml).not.toContain('data-snippet-delete="s1"');
+    expect(composerHtml).toContain('data-snippet-insert="custom-xss"');
+    expect(composerHtml).toContain('data-snippet-delete="custom-xss"');
+    expect(composerHtml).toContain("&lt;b&gt;Audit&lt;/b&gt;");
+    expect(composerHtml).toContain('id="btn-composer-save-snippet-toggle"');
+    expect(composerHtml).toContain('id="composer-snippet-title-input"');
+
+    const onboardingHtml = renderFriendOnboardingCard({
+      installCmd: "curl -fsSL https://codahub.dev/install.sh | sh",
+      copiedInstall: false,
+      thisDevicePushSubscribed: false,
+      webPushCount: 0,
+      webPushBusy: false,
+      iosNeedsHomeScreenTip: true,
+      userHandle: "alice",
+      tr: (en) => en,
+    });
+    expect(onboardingHtml).toContain("Step 1");
+    expect(onboardingHtml).toContain("Step 2");
+    expect(onboardingHtml).toContain("Step 3");
+    expect(onboardingHtml).toContain("Claude Code / Codex / Grok / AGY");
+    expect(onboardingHtml).toContain("Enable Lock-Screen Push");
+    expect(onboardingHtml).toContain(IOS_PWA_LOCK_SCREEN_PUSH_TIP_EN);
+  });
+
+  test("Service Worker (/sw.js) CSP, fetch bypass rules, push/notificationclick handlers & build output", async () => {
+    const origin = "https://codahub.dev";
+    // NEVER intercept /api/, /v1/, /download/, /install.sh, /sw.js, non-GET, or cross-origin
+    expect(shouldSwCacheStaticAsset(`${origin}/api/v1/auth/me`, origin, "GET")).toBe(false);
+    expect(shouldSwCacheStaticAsset(`${origin}/v1/tunnel/ws`, origin, "GET")).toBe(false);
+    expect(shouldSwCacheStaticAsset(`${origin}/download/desktop-macos.dmg`, origin, "GET")).toBe(
+      false
+    );
+    expect(shouldSwCacheStaticAsset(`${origin}/install.sh`, origin, "GET")).toBe(false);
+    expect(shouldSwCacheStaticAsset(`${origin}/sw.js`, origin, "GET")).toBe(false);
+    expect(shouldSwCacheStaticAsset(`${origin}/console`, origin, "GET")).toBe(false);
+    expect(shouldSwCacheStaticAsset(`${origin}/app.78e23166ea.js`, origin, "POST")).toBe(false);
+    expect(shouldSwCacheStaticAsset("https://cdn.other.dev/app.78e23166ea.js", origin, "GET")).toBe(
+      false
+    );
+
+    // Cache hashed bundle and icons
+    expect(shouldSwCacheStaticAsset(`${origin}/app.78e23166ea.js`, origin, "GET")).toBe(true);
+    expect(shouldSwCacheStaticAsset(`${origin}/logo.svg?v=78e23166ea`, origin, "GET")).toBe(true);
+    expect(
+      shouldSwCacheStaticAsset(`${origin}/apple-touch-icon.png?v=78e23166ea`, origin, "GET")
+    ).toBe(true);
+
+    // Push JSON parsing, plain-text fallback & safe target URL normalization
+    expect(
+      parseSwPushPayload(
+        JSON.stringify({
+          title: "Needs Approval · claude",
+          body: "Waiting on Mac-Studio",
+          url: "/console",
+          tag: "coda-needs-you",
+        }),
+        origin
+      )
+    ).toEqual({
+      title: "Needs Approval · claude",
+      body: "Waiting on Mac-Studio",
+      url: "/console",
+      tag: "coda-needs-you",
+    });
+    expect(parseSwPushPayload("Plain alert message", origin)).toEqual({
+      title: "Coda Agent Alert",
+      body: "Plain alert message",
+      url: "/console",
+      tag: "coda-alert",
+    });
+    expect(normalizeSwNotificationTargetUrl("javascript:alert(1)", origin)).toBe("/console");
+    expect(normalizeSwNotificationTargetUrl("https://evil.example/phish", origin)).toBe("/console");
+    expect(normalizeSwNotificationTargetUrl("https://codahub.dev/console?tab=1", origin)).toBe(
+      "/console?tab=1"
+    );
+
+    // Verify web/index.html CSP allows worker-src 'self'
+    const indexHtml = readFileSync(new URL("../index.html", import.meta.url), "utf8");
+    expect(indexHtml).toContain("worker-src 'self'");
+
+    // Compile src/sw.ts via Bun.build IIFE (matching web/build.ts) and execute in a mock SW scope
+    const swEntry = new URL("./sw.ts", import.meta.url).pathname;
+    const buildRes = await Bun.build({
+      entrypoints: [swEntry],
+      minify: true,
+      target: "browser",
+      format: "iife",
+    });
+    expect(buildRes.success).toBe(true);
+    const rawSwJs = (await buildRes.outputs[0].text()).replaceAll(
+      "__CODA_SW_CACHE_VERSION__",
+      "testhash01"
+    );
+    expect(rawSwJs).toContain("coda-static-testhash01");
+    expect(rawSwJs).not.toContain("__CODA_SW_CACHE_VERSION__");
+    expect(rawSwJs).not.toMatch(/\bexport\s*\{/);
+
+    const listeners = new Map<string, (ev: any) => void>();
+    const shownNotifications: Array<{ title: string; opts: any }> = [];
+    let skippedWaiting = false;
+    let claimedClients = false;
+    let focusedConsoleClient = false;
+    const deletedCaches: string[] = [];
+
+    const mockSelf = {
+      location: { origin },
+      skipWaiting: async () => {
+        skippedWaiting = true;
+      },
+      clients: {
+        claim: async () => {
+          claimedClients = true;
+        },
+        matchAll: async () => [
+          {
+            url: `${origin}/console`,
+            focus: async () => {
+              focusedConsoleClient = true;
+              return {};
+            },
+          },
+        ],
+        openWindow: async () => null,
+      },
+      registration: {
+        showNotification: async (title: string, opts: any) => {
+          shownNotifications.push({ title, opts });
+        },
+      },
+      addEventListener: (type: string, fn: (ev: any) => void) => {
+        listeners.set(type, fn);
+      },
+    };
+    const mockCaches = {
+      keys: async () => ["coda-static-old000", "coda-static-testhash01"],
+      delete: async (k: string) => {
+        deletedCaches.push(k);
+        return true;
+      },
+      open: async () => ({
+        match: async () => undefined,
+        put: async () => {},
+      }),
+    };
+
+    const runSw = new Function("self", "caches", rawSwJs);
+    runSw(mockSelf, mockCaches);
+
+    expect(Array.from(listeners.keys()).sort()).toEqual([
+      "activate",
+      "fetch",
+      "install",
+      "notificationclick",
+      "push",
+    ]);
+
+    let pendingPromise: Promise<unknown> = Promise.resolve();
+    listeners.get("install")!({
+      waitUntil: (p: Promise<unknown>) => {
+        pendingPromise = p;
+      },
+    });
+    await pendingPromise;
+    expect(skippedWaiting).toBe(true);
+
+    listeners.get("activate")!({
+      waitUntil: (p: Promise<unknown>) => {
+        pendingPromise = p;
+      },
+    });
+    await pendingPromise;
+    expect(deletedCaches).toEqual(["coda-static-old000"]);
+    expect(claimedClients).toBe(true);
+
+    listeners.get("push")!({
+      data: {
+        text: () =>
+          JSON.stringify({
+            title: "Action Needed · Codex",
+            body: "Approval requested",
+            url: "/console",
+            tag: "coda-t1",
+          }),
+      },
+      waitUntil: (p: Promise<unknown>) => {
+        pendingPromise = p;
+      },
+    });
+    await pendingPromise;
+    expect(shownNotifications).toEqual([
+      {
+        title: "Action Needed · Codex",
+        opts: {
+          body: "Approval requested",
+          icon: "/apple-touch-icon.png",
+          badge: "/logo.svg",
+          tag: "coda-t1",
+          data: { url: "/console" },
+        },
+      },
+    ]);
+
+    let closedNotif = false;
+    listeners.get("notificationclick")!({
+      notification: {
+        close: () => {
+          closedNotif = true;
+        },
+        data: { url: "/console" },
+      },
+      waitUntil: (p: Promise<unknown>) => {
+        pendingPromise = p;
+      },
+    });
+    await pendingPromise;
+    expect(closedNotif).toBe(true);
+    expect(focusedConsoleClient).toBe(true);
   });
 });

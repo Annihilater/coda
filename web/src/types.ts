@@ -92,6 +92,29 @@ export interface InviteCodeInfo {
   created_at: string;
 }
 
+export interface AdminUserSummary {
+  id: string;
+  handle: string;
+  email: string;
+  display_name: string;
+  is_admin: boolean;
+  online_devices: number;
+  total_devices: number;
+  last_login_at?: string | null;
+  created_at: string;
+}
+
+export interface PromptSnippet {
+  id: string;
+  title: string;
+  prompt: string;
+}
+
+export interface VapidPublicKeyInfo {
+  enabled: boolean;
+  public_key: string;
+}
+
 export interface SiteInfo {
   version: string;
   open_registration: boolean;
@@ -124,7 +147,7 @@ export interface DeviceAuthPublicInfo {
 
 export type ThemePreference = "light" | "dark" | "system";
 export type Locale = "en" | "zh";
-export type AppRoute = "home" | "login" | "register" | "activate" | "console";
+export type AppRoute = "home" | "login" | "register" | "activate" | "reset-password" | "console";
 export type TransportMode = "lan_ws" | "relay_ws";
 
 export function readSessionOrLegacyToken(): string | null {

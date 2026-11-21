@@ -16,6 +16,7 @@ import {
 } from "./crypto";
 import { WebVtTerminal, escapeHtml, safeHref } from "./vt";
 import {
+  type AdminUserSummary,
   type AppRoute,
   type AuthSessionInfo,
   type BranchWorktreeItem,
@@ -24,12 +25,14 @@ import {
   type HerdrTerminal,
   type InviteCodeInfo,
   type Locale,
+  type PromptSnippet,
   type RelayNodeInfo,
   type RepoWorkspaceSummary,
   type SiteInfo,
   type ThemePreference,
   type TransportMode,
   type User,
+  type VapidPublicKeyInfo,
   type VoiceModelConfig,
   clearSessionToken,
   readLocalPref,
@@ -114,6 +117,23 @@ import {
   validateNotificationWebhookSettings,
   validateSingleFolderName,
 } from "./git_diff_composer";
+import {
+  DEFAULT_PROMPT_SNIPPETS,
+  MAX_PROMPT_SNIPPETS,
+  buildInviteRegistrationUrl,
+  deriveSnippetTitleFromPrompt,
+  detectBrowserIosNonStandalone,
+  extractPushSubscriptionKeys,
+  insertSnippetIntoDraft,
+  normalizePromptSnippetsList,
+  parseLocationRouteAndParams,
+  renderAdminFriendsDirectorySection,
+  renderFriendOnboardingCard,
+  renderWebPushSettingsCard,
+  validatePromptSnippet,
+  validateResetPasswordInputs,
+  vapidBase64UrlToUint8Array,
+} from "./friend_ux";
 
 if (typeof window !== "undefined" && typeof document !== "undefined") {
   try {
@@ -290,24 +310,61 @@ export class CodaTerminalWebApp {
   private lastWorkspacesQueryAt = 0;
   private webIdentity = loadOrCreateWebIdentity();
   private errorMsg = "";
+  private authInviteCode = "";
+  private authPrefillHandle = "";
+  private authSuccessMsg = "";
+  private resetPasswordToken = "";
+  private resetPasswordSubmitting = false;
+  private showResetPassword = false;
+  private swRegistration: ServiceWorkerRegistration | null = null;
+  private vapidInfo: VapidPublicKeyInfo = { enabled: false, public_key: "" };
+  private vapidLoaded = false;
+  private webPushCount = 0;
+  private webPushThisDeviceSubscribed = false;
+  private webPushEndpoint: string | null = null;
+  private webPushBusy = false;
+  private adminUsers: AdminUserSummary[] = [];
+  private adminResetBusyUserId: string | null = null;
+  private latestAdminResetLink: { handle: string; resetUrl: string } | null = null;
+  private onboardingDismissed: boolean = readLocalPref("coda_onboarding_dismissed", "0") === "1";
+  private onboardingCopiedInstall = false;
+  private promptSnippets: PromptSnippet[] = this.loadInitialCachedSnippets();
+  private savingSnippetOpen = false;
+  private savingSnippetTitle = "";
+  private savingSnippetBusy = false;
 
   // Bento motion scheduler state (never triggers full DOM re-render per frame)
   private bento = new BentoMotionController();
 
   private resolveRouteFromLocation(): AppRoute {
-    const pathname = window.location.pathname.replace(/\/+$/, "") || "/";
-    if (pathname === "/login") return "login";
-    if (pathname === "/register") return "register";
-    if (pathname === "/activate") return "activate";
-    if (pathname === "/console") return "console";
-    const codeParam = new URLSearchParams(window.location.search).get("code");
-    if (pathname === "/" && codeParam && codeParam.trim().length > 0) {
-      return "activate";
-    }
-    return "home";
+    return parseLocationRouteAndParams(window.location.pathname, window.location.search).route;
   }
 
-  private navigate(target: string, replace = false) {
+  private syncLocationRouteAndParams(pathname: string, search: string): {
+    route: AppRoute;
+    inviteCode: string;
+    resetToken: string;
+    activationCode: string;
+  } {
+    const parsed = parseLocationRouteAndParams(pathname, search);
+    this.route = parsed.route;
+    if (parsed.inviteCode) {
+      this.authInviteCode = parsed.inviteCode;
+      this.authMode = "register";
+      const cleanPath = (pathname || "/").replace(/\/+$/, "") || "/";
+      if (cleanPath === "/" && !this.user) {
+        window.history.replaceState({}, "", `/register${search}`);
+      }
+    }
+    if (parsed.resetToken) {
+      this.resetPasswordToken = parsed.resetToken;
+    }
+    if (this.route === "login") this.authMode = "login";
+    if (this.route === "register") this.authMode = "register";
+    return parsed;
+  }
+
+  private navigate(target: string, replace = false, preserveAuthSuccess = false) {
     const url = new URL(target, window.location.origin);
     const nextUrl = `${url.pathname}${url.search}${url.hash}`;
     if (replace) {
@@ -316,13 +373,14 @@ export class CodaTerminalWebApp {
       window.history.pushState({}, "", nextUrl);
     }
 
-    this.route = this.resolveRouteFromLocation();
-    if (this.route === "login") this.authMode = "login";
-    if (this.route === "register") this.authMode = "register";
+    const parsed = this.syncLocationRouteAndParams(url.pathname, url.search);
     this.errorMsg = "";
+    if (!preserveAuthSuccess) {
+      this.authSuccessMsg = "";
+    }
     this.showCmdPalette = false;
 
-    const codeParam = (url.searchParams.get("code") || "").trim().toUpperCase();
+    const codeParam = parsed.activationCode;
     if (codeParam && codeParam !== this.pendingActivationCode) {
       this.pendingActivationCode = codeParam;
       void this.lookupActivationCode(codeParam).then(() => this.render());
@@ -389,6 +447,9 @@ export class CodaTerminalWebApp {
     document.querySelectorAll<HTMLInputElement>("#auth-form input[name]").forEach((inp) => {
       if (inp.name) draftValues[`auth:${inp.name}`] = inp.value;
     });
+    document.querySelectorAll<HTMLInputElement>("#reset-pw-form input[name]").forEach((inp) => {
+      if (inp.name) draftValues[`reset:${inp.name}`] = inp.value;
+    });
     const activateInp = document.querySelector<HTMLInputElement>('#activate-lookup-form input[name="code"]');
     if (activateInp) {
       draftValues["activate:code"] = activateInp.value;
@@ -405,6 +466,10 @@ export class CodaTerminalWebApp {
       const k = `auth:${inp.name}`;
       if (inp.name && k in draftValues) inp.value = draftValues[k];
     });
+    document.querySelectorAll<HTMLInputElement>("#reset-pw-form input[name]").forEach((inp) => {
+      const k = `reset:${inp.name}`;
+      if (inp.name && k in draftValues) inp.value = draftValues[k];
+    });
     const nextActivateInp = document.querySelector<HTMLInputElement>('#activate-lookup-form input[name="code"]');
     if (nextActivateInp && "activate:code" in draftValues) {
       nextActivateInp.value = draftValues["activate:code"];
@@ -414,12 +479,8 @@ export class CodaTerminalWebApp {
   async init() {
     this.syncDocumentLocaleMeta();
     this.applyTheme(this.themePref, false);
-    this.route = this.resolveRouteFromLocation();
-    if (this.route === "register") {
-      this.authMode = "register";
-    } else if (this.route === "login") {
-      this.authMode = "login";
-    }
+    this.syncLocationRouteAndParams(window.location.pathname, window.location.search);
+    void this.registerServiceWorkerIfSupported();
 
     window.matchMedia?.("(prefers-color-scheme: light)")?.addEventListener("change", () => {
       if (this.themePref === "system") {
@@ -428,12 +489,14 @@ export class CodaTerminalWebApp {
     });
 
     window.addEventListener("popstate", () => {
-      this.route = this.resolveRouteFromLocation();
-      if (this.route === "login") this.authMode = "login";
-      if (this.route === "register") this.authMode = "register";
+      const parsed = this.syncLocationRouteAndParams(
+        window.location.pathname,
+        window.location.search
+      );
       this.errorMsg = "";
+      this.authSuccessMsg = "";
       this.showCmdPalette = false;
-      const codeParam = (new URLSearchParams(window.location.search).get("code") || "").trim().toUpperCase();
+      const codeParam = parsed.activationCode;
       if (codeParam && codeParam !== this.pendingActivationCode) {
         this.pendingActivationCode = codeParam;
         void this.lookupActivationCode(codeParam).then(() => this.render());
@@ -1343,6 +1406,329 @@ export class CodaTerminalWebApp {
     }
   }
 
+  private loadInitialCachedSnippets(): PromptSnippet[] {
+    try {
+      const raw = readLocalPref("coda_snippets_cache", "");
+      if (raw) {
+        const parsedJson = JSON.parse(raw);
+        if (Array.isArray(parsedJson)) {
+          return normalizePromptSnippetsList(parsedJson);
+        }
+      }
+    } catch {
+      // ignore cache parse errors
+    }
+    return [...DEFAULT_PROMPT_SNIPPETS];
+  }
+
+  private cacheSnippetsLocally(snippets: readonly PromptSnippet[]) {
+    try {
+      writeLocalPref("coda_snippets_cache", JSON.stringify(snippets));
+    } catch {
+      // ignore storage errors
+    }
+  }
+
+  private isWebPushApiSupported(): boolean {
+    if (typeof window === "undefined" || typeof navigator === "undefined") {
+      return false;
+    }
+    return Boolean(
+      "serviceWorker" in navigator &&
+        typeof navigator.serviceWorker?.register === "function" &&
+        "PushManager" in window &&
+        typeof Notification !== "undefined"
+    );
+  }
+
+  private async registerServiceWorkerIfSupported(): Promise<ServiceWorkerRegistration | null> {
+    if (typeof navigator === "undefined" || typeof navigator.serviceWorker?.register !== "function") {
+      return null;
+    }
+    try {
+      const reg = await navigator.serviceWorker.register("/sw.js", { scope: "/" });
+      this.swRegistration = reg;
+      await this.syncLocalPushSubscriptionState(reg);
+      return reg;
+    } catch {
+      return null;
+    }
+  }
+
+  private async syncLocalPushSubscriptionState(
+    regHint?: ServiceWorkerRegistration | null
+  ): Promise<void> {
+    if (!this.isWebPushApiSupported()) {
+      this.webPushThisDeviceSubscribed = false;
+      this.webPushEndpoint = null;
+      return;
+    }
+    try {
+      const reg =
+        regHint ??
+        this.swRegistration ??
+        (await navigator.serviceWorker.getRegistration("/sw.js")) ??
+        (await navigator.serviceWorker.getRegistration("/")) ??
+        null;
+      if (reg) this.swRegistration = reg;
+      const sub = await reg?.pushManager?.getSubscription();
+      this.webPushThisDeviceSubscribed = Boolean(sub);
+      this.webPushEndpoint = sub?.endpoint || null;
+    } catch {
+      this.webPushThisDeviceSubscribed = false;
+      this.webPushEndpoint = null;
+    }
+  }
+
+  private async refreshWebPushMetadata(): Promise<void> {
+    const reqToken = this.token;
+    const tasks: Array<Promise<void>> = [
+      this.syncLocalPushSubscriptionState(),
+      this.api("/api/v1/push/vapid-public-key")
+        .then((res) => {
+          if (res && typeof res === "object") {
+            this.vapidInfo = {
+              enabled: Boolean(res.enabled),
+              public_key: String(res.public_key || ""),
+            };
+            this.vapidLoaded = true;
+          }
+        })
+        .catch(() => {
+          // ignore transient error
+        }),
+    ];
+    if (reqToken) {
+      tasks.push(
+        this.api("/api/v1/me/notifications")
+          .then((notif) => {
+            if (this.token === reqToken && notif && typeof notif === "object") {
+              if (typeof notif.web_push_count === "number") {
+                this.webPushCount = notif.web_push_count;
+              }
+            }
+          })
+          .catch(() => {
+            // ignore
+          })
+      );
+    }
+    await Promise.allSettled(tasks);
+  }
+
+  private async enableLockScreenWebPush(): Promise<void> {
+    if (this.webPushBusy || !this.token) return;
+    if (!this.isWebPushApiSupported()) {
+      const msg = detectBrowserIosNonStandalone()
+        ? this.tr(
+            "On iPhone, tap Share → Add to Home Screen first, then open Coda from your Home Screen to enable lock-screen push.",
+            "在 iPhone 上请先轻点「分享 → 添加到主屏幕」，再从桌面图标打开 Coda 开启锁屏推送。"
+          )
+        : this.tr(
+            "This browser context does not support Service Worker Web Push (HTTPS or localhost required).",
+            "当前浏览器上下文不支持 Service Worker Web Push（需使用 HTTPS 或 localhost）。"
+          );
+      this.settingsFeedback = { kind: "err", text: msg };
+      this.showToastNotice("err", msg);
+      this.render();
+      return;
+    }
+
+    this.webPushBusy = true;
+    this.render();
+
+    try {
+      if (!this.vapidLoaded || !this.vapidInfo.public_key) {
+        const vRes = await this.api("/api/v1/push/vapid-public-key");
+        this.vapidInfo = {
+          enabled: Boolean(vRes?.enabled),
+          public_key: String(vRes?.public_key || ""),
+        };
+        this.vapidLoaded = true;
+      }
+      if (!this.vapidInfo.enabled || !this.vapidInfo.public_key) {
+        throw new Error(
+          this.tr(
+            "Server VAPID Web Push is not enabled on this coordinator.",
+            "当前主控服务端未启用 VAPID Web Push。"
+          )
+        );
+      }
+
+      const applicationServerKey = vapidBase64UrlToUint8Array(this.vapidInfo.public_key);
+      const perm = await requestBrowserNotificationPermission();
+      if (perm !== "granted") {
+        throw new Error(
+          this.tr(
+            "Notification permission was not granted in browser settings.",
+            "未授予浏览器系统通知权限，请在地址栏权限设置中允许通知。"
+          )
+        );
+      }
+
+      let reg = this.swRegistration ?? (await this.registerServiceWorkerIfSupported());
+      if (navigator.serviceWorker?.ready) {
+        reg = await navigator.serviceWorker.ready;
+        this.swRegistration = reg;
+      }
+      if (!reg?.pushManager) {
+        throw new Error(
+          this.tr("Service Worker PushManager unavailable.", "Service Worker PushManager 不可用。")
+        );
+      }
+
+      let pushSub = await reg.pushManager.getSubscription();
+      if (!pushSub) {
+        try {
+          pushSub = await reg.pushManager.subscribe({
+            userVisibleOnly: true,
+            applicationServerKey,
+          });
+        } catch {
+          const stale = await reg.pushManager.getSubscription();
+          if (stale) {
+            await stale.unsubscribe().catch(() => false);
+          }
+          pushSub = await reg.pushManager.subscribe({
+            userVisibleOnly: true,
+            applicationServerKey,
+          });
+        }
+      }
+
+      const { endpoint, p256dh, auth } = extractPushSubscriptionKeys(pushSub);
+      const subRes = await this.api("/api/v1/me/web-push/subscribe", "POST", {
+        endpoint,
+        keys: { p256dh, auth },
+        user_agent: typeof navigator !== "undefined" ? navigator.userAgent || "" : "",
+      });
+
+      this.webPushThisDeviceSubscribed = true;
+      this.webPushEndpoint = endpoint;
+      this.webPushCount = Number(subRes?.web_push_count ?? Math.max(1, this.webPushCount));
+      this.notificationsEnabled = true;
+      writeLocalPref("coda_notify_enabled", "1");
+
+      const okText = this.tr(
+        `Lock-screen push enabled (${this.webPushCount} active device(s)).`,
+        `已开启锁屏系统推送（当前共 ${this.webPushCount} 台订阅设备）。`
+      );
+      this.settingsFeedback = { kind: "ok", text: okText };
+      this.showToastNotice("ok", okText);
+    } catch (err: any) {
+      const errText = String(
+        err?.message || this.tr("Failed enabling lock-screen push", "开启锁屏推送失败")
+      );
+      this.settingsFeedback = { kind: "err", text: errText };
+      this.showToastNotice("err", errText);
+    } finally {
+      this.webPushBusy = false;
+      this.renderSettingsPreservingInputs();
+      if (!this.showSettingsModal) {
+        this.render();
+      }
+    }
+  }
+
+  private async disableLockScreenWebPush(): Promise<void> {
+    if (this.webPushBusy || !this.token) return;
+    this.webPushBusy = true;
+    this.render();
+
+    try {
+      const reg =
+        this.swRegistration ??
+        (typeof navigator !== "undefined"
+          ? await navigator.serviceWorker?.getRegistration("/sw.js")
+          : null) ??
+        null;
+      const pushSub = await reg?.pushManager?.getSubscription();
+      const endpoint = String(pushSub?.endpoint || this.webPushEndpoint || "");
+      if (pushSub) {
+        await pushSub.unsubscribe().catch(() => false);
+      }
+      const res = await this.api("/api/v1/me/web-push/unsubscribe", "POST", {
+        endpoint,
+      });
+      this.webPushThisDeviceSubscribed = false;
+      this.webPushEndpoint = null;
+      this.webPushCount = Number(res?.web_push_count ?? 0);
+      const msg = this.tr(
+        "Disabled lock-screen push on this device.",
+        "已在当前设备停用锁屏推送。"
+      );
+      this.settingsFeedback = { kind: "ok", text: msg };
+      this.showToastNotice("ok", msg);
+    } catch (err: any) {
+      const errText = String(
+        err?.message || this.tr("Failed disabling lock-screen push", "停用锁屏推送失败")
+      );
+      this.settingsFeedback = { kind: "err", text: errText };
+      this.showToastNotice("err", errText);
+    } finally {
+      this.webPushBusy = false;
+      this.renderSettingsPreservingInputs();
+      if (!this.showSettingsModal) {
+        this.render();
+      }
+    }
+  }
+
+  private async loadPromptSnippets(): Promise<void> {
+    const reqToken = this.token;
+    if (!reqToken) return;
+    try {
+      const res = await this.api("/api/v1/me/snippets");
+      if (!this.token || this.token !== reqToken) return;
+      if (Array.isArray(res?.snippets)) {
+        this.promptSnippets = normalizePromptSnippetsList(res.snippets);
+        this.cacheSnippetsLocally(this.promptSnippets);
+      }
+    } catch {
+      // keep cached/default snippets on offline/error
+    }
+  }
+
+  private async savePromptSnippetsToServer(nextSnippets: PromptSnippet[]): Promise<boolean> {
+    if (!this.token) return false;
+    const reqToken = this.token;
+    const res = await this.api("/api/v1/me/snippets", "PUT", {
+      snippets: nextSnippets,
+    });
+    if (!this.token || this.token !== reqToken) return false;
+    const saved = normalizePromptSnippetsList(res?.snippets);
+    this.promptSnippets = saved.length > 0 || nextSnippets.length === 0 ? saved : nextSnippets;
+    this.cacheSnippetsLocally(this.promptSnippets);
+    return true;
+  }
+
+  private async copyTextWithFallback(text: string): Promise<boolean> {
+    try {
+      if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(text);
+        return true;
+      }
+    } catch {
+      // fall through to execCommand fallback
+    }
+    if (typeof document !== "undefined") {
+      try {
+        const ta = document.createElement("textarea");
+        ta.value = text;
+        ta.style.cssText = "position:fixed;left:-9999px;top:-9999px;opacity:0;";
+        document.body.appendChild(ta);
+        ta.focus();
+        ta.select();
+        const ok = document.execCommand("copy");
+        document.body.removeChild(ta);
+        return Boolean(ok);
+      } catch {
+        return false;
+      }
+    }
+    return false;
+  }
+
   private async bootstrapMesh() {
     this.myClientDevice = await this.api("/api/v1/devices/register-client", "POST", {
       name: this.webIdentity.name,
@@ -1351,6 +1737,21 @@ export class CodaTerminalWebApp {
       x25519_pubkey: this.webIdentity.x25519PublicB64,
     });
     await this.refreshDevices();
+    void this.refreshWebPushMetadata().then(() => {
+      if (this.route === "console" && !this.isTypingIntoInput() && !this.isAnyModalOpen()) {
+        this.render();
+      }
+    });
+    void this.loadPromptSnippets().then(() => {
+      if (
+        this.route === "console" &&
+        this.showPromptComposer &&
+        !this.isTypingIntoInput() &&
+        !this.isAnyModalOpen()
+      ) {
+        this.render();
+      }
+    });
     this.connectAccountEventsWebSocket();
     await this.connectRelayWebSocket();
   }
@@ -1388,6 +1789,8 @@ export class CodaTerminalWebApp {
       this.refreshDevices().catch(() => {
         // ignore transient error
       }),
+      this.refreshWebPushMetadata(),
+      this.loadPromptSnippets(),
       this.api("/api/v1/auth/sessions")
         .then((sessions) => {
           if (this.token === reqToken) {
@@ -1399,22 +1802,22 @@ export class CodaTerminalWebApp {
         }),
       this.api("/api/v1/me/notifications")
         .then((notif) => {
-          if (
-            this.token === reqToken &&
-            notif &&
-            typeof notif === "object" &&
-            !this.settingsDirtyFields.has("webhooks")
-          ) {
-            this.notificationSettings = {
-              bark_url: String(notif.bark_url || ""),
-              telegram_bot_token: String(notif.telegram_bot_token || ""),
-              telegram_chat_id: String(notif.telegram_chat_id || ""),
-              feishu_webhook_url: String(notif.feishu_webhook_url || ""),
-              discord_webhook_url: String(notif.discord_webhook_url || ""),
-              generic_webhook_url: String(notif.generic_webhook_url || ""),
-              notify_on_needs_you: notif.notify_on_needs_you !== false,
-              notify_on_finished: notif.notify_on_finished !== false,
-            };
+          if (this.token === reqToken && notif && typeof notif === "object") {
+            if (typeof notif.web_push_count === "number") {
+              this.webPushCount = notif.web_push_count;
+            }
+            if (!this.settingsDirtyFields.has("webhooks")) {
+              this.notificationSettings = {
+                bark_url: String(notif.bark_url || ""),
+                telegram_bot_token: String(notif.telegram_bot_token || ""),
+                telegram_chat_id: String(notif.telegram_chat_id || ""),
+                feishu_webhook_url: String(notif.feishu_webhook_url || ""),
+                discord_webhook_url: String(notif.discord_webhook_url || ""),
+                generic_webhook_url: String(notif.generic_webhook_url || ""),
+                notify_on_needs_you: notif.notify_on_needs_you !== false,
+                notify_on_finished: notif.notify_on_finished !== false,
+              };
+            }
           }
         })
         .catch(() => {
@@ -1431,6 +1834,19 @@ export class CodaTerminalWebApp {
           })
           .catch(() => {
             if (this.token === reqToken) this.invitesList = [];
+          }),
+        this.api("/api/v1/admin/users")
+          .then((res) => {
+            if (this.token === reqToken) {
+              this.adminUsers = Array.isArray(res?.users)
+                ? res.users
+                : Array.isArray(res)
+                  ? res
+                  : [];
+            }
+          })
+          .catch(() => {
+            if (this.token === reqToken) this.adminUsers = [];
           })
       );
     }
@@ -3745,7 +4161,56 @@ export class CodaTerminalWebApp {
       );
     }
 
+    for (const snip of this.promptSnippets) {
+      const compactPrompt = snip.prompt.replace(/\s+/g, " ").trim();
+      items.push({
+        id: `snippet:${snip.id}`,
+        group: this.tr("Snippets", "常用片段"),
+        label: `${this.tr("Snippet", "片段")}: ${snip.title}`,
+        hint: compactPrompt.length > 40 ? `${compactPrompt.slice(0, 39)}…` : compactPrompt,
+        action: () => {
+          const targetAddr = this.getFocusedTerminalAddr();
+          if (this.selectedDaemon?.is_online && targetAddr && !this.showPromptComposer) {
+            const targetVt = this.vtTerminals.get(this.vtKey(this.selectedDaemon.id, targetAddr));
+            const targetTerm = this.terminals.find((t) => t.address === targetAddr);
+            const useBp = resolveEffectiveBracketedPaste({
+              bracketedPaste: targetVt?.bracketedPaste,
+              bracketedPasteExplicit: targetVt?.bracketedPasteExplicit,
+              term: targetTerm,
+            });
+            this.sendPtyInputBytesTo(targetAddr, encodeComposerSubmit(snip.prompt, useBp));
+            this.showToastNotice(
+              "ok",
+              this.tr(`Sent snippet "${snip.title}"`, `已发送常用片段「${snip.title}」`)
+            );
+          } else {
+            this.showPromptComposer = true;
+            this.draftInput = insertSnippetIntoDraft(this.draftInput, snip.prompt);
+            this.showToastNotice(
+              "ok",
+              this.tr(
+                `Inserted snippet "${snip.title}" into composer`,
+                `已将片段「${snip.title}」插入编排器`
+              )
+            );
+          }
+        },
+      });
+    }
+
     items.push(
+      {
+        id: "action:web-push",
+        group: this.tr("Actions", "快捷操作"),
+        label: this.tr(
+          "Enable 1-Click Lock-Screen Push (Browser / iOS PWA)",
+          "一键开启锁屏推送通知 (浏览器 / iOS PWA)"
+        ),
+        hint: this.webPushThisDeviceSubscribed ? "Active · VAPID" : "W3C VAPID",
+        action: () => {
+          void this.enableLockScreenWebPush();
+        },
+      },
       {
         id: "action:webhooks",
         group: this.tr("Actions", "快捷操作"),
@@ -4495,12 +4960,12 @@ export class CodaTerminalWebApp {
               </div>
               <div class="pm-wb-kicker" style="margin-top:12px;">INPUT STACK</div>
               <div class="pm-wb-tree-row">
-                <span>Thumb Keypad</span>
-                <span style="color:var(--emerald);">2-row</span>
+                <span>Lock-Screen Push</span>
+                <span style="color:var(--emerald);">VAPID</span>
               </div>
               <div class="pm-wb-tree-row">
-                <span>Whisper ASR</span>
-                <span>doc.set</span>
+                <span>Voice + ⌘V Paste</span>
+                <span>Snippets</span>
               </div>
             </div>
             <div class="bento-well coda-mono" style="font-size:10.5px;color:var(--text-tertiary);">
@@ -4529,7 +4994,7 @@ export class CodaTerminalWebApp {
           <div class="pm-wb-pane">
             <div class="pm-pty-box">
               <div>
-                <div style="color:#a1a1aa;margin-bottom:6px;">Voice-to-Terminal · Whisper</div>
+                <div style="color:#a1a1aa;margin-bottom:6px;">Voice + Saved Snippets + ⌘V Screenshot</div>
                 <div style="color:#22c55e;">[ASR] &quot;${this.tr("Run full integration tests for coda-server", "运行 coda-server 的全量集成测试")}&quot;</div>
                 <div>&gt; cargo test -p coda-server</div>
                 <div style="color:#22c55e;">test result: ok. 7 passed; 0 failed</div>
@@ -4559,23 +5024,23 @@ export class CodaTerminalWebApp {
             </div>
             <div class="pm-wb-kicker" style="margin-top:12px;">ACTIVE AGENTS</div>
             <div class="pm-wb-tree-row">
-              <span>Claude Code</span>
+              <span>Claude Code · Codex</span>
               <span style="color:var(--emerald);">live</span>
             </div>
             <div class="pm-wb-tree-row">
-              <span>Codex CLI</span>
-              <span>idle</span>
+              <span>Grok · AGY · Gemini</span>
+              <span>ready</span>
             </div>
           </div>
           <div class="bento-well coda-mono" style="font-size:10.5px;color:var(--text-tertiary);">
-            GPUI 120Hz · Hybrid Node
+            GPUI 120Hz · Self-Update OTA
           </div>
         </div>
 
         <div class="pm-wb-pane">
           <div class="pm-diff-box">
             <div class="pm-diff-head">
-              <span>crates/coda-protocol/src/e2ee.rs</span>
+              <span>E2EE Git Diff · File Tree · Port Preview</span>
               <span class="coda-mono pm-num"><span style="color:var(--emerald);">+1,233</span> <span style="color:var(--rose);">-116</span></span>
             </div>
             <div class="pm-diff-line ctx"><span class="pm-diff-ln">42</span><span>  pub fn seal_frame(&amp;mut self, msg: &amp;PeerMessage) -&gt; Envelope {</span></div>
@@ -4585,7 +5050,7 @@ export class CodaTerminalWebApp {
             <div class="pm-diff-line ctx"><span class="pm-diff-ln">45</span><span>    Envelope { ephem_pub, nonce, ciphertext: cipher }</span></div>
           </div>
           <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;font-size:11.5px;color:var(--text-secondary);">
-            <span class="coda-mono">X25519 + ChaCha20-Poly1305 · HKDF-SHA256</span>
+            <span class="coda-mono">X25519 + ChaCha20-Poly1305 · 127.0.0.1 Preview</span>
             <span class="pm-badge green">Zero Server Plaintext</span>
           </div>
         </div>
@@ -4594,9 +5059,9 @@ export class CodaTerminalWebApp {
           <div class="pm-pty-box">
             <div>
               <div style="color:#a1a1aa;margin-bottom:6px;">Claude Code &middot; hc attach @mac/main</div>
-              <div>&bull; Verified E2EE relay ticket &amp; direct LAN probe</div>
-              <div style="color:#22c55e;">&bull; Web routes /login /register /activate -&gt; 200 OK</div>
-              <div style="color:#3b82f6;">&bull; Waiting for next instruction on main...</div>
+              <div>&bull; Verified E2EE Git Diff, File Tree &amp; Port Preview</div>
+              <div style="color:#22c55e;">&bull; 1-Click Lock-Screen Push &amp; Zero-Downtime OTA active</div>
+              <div style="color:#3b82f6;">&bull; Voice + ⌘V screenshot paste + Saved Snippets ready</div>
             </div>
             <div style="display:flex;justify-content:space-between;align-items:center;border-top:1px solid #222226;padding-top:8px;">
               <span style="color:#22c55e;">&gt; Ready &middot; 0.8 ms</span>
@@ -4613,11 +5078,11 @@ export class CodaTerminalWebApp {
       return `
         <div class="bento-well" style="display:flex;justify-content:space-between;align-items:center;">
           <span class="coda-mono" style="font-size:11.5px;font-weight:600;">atlas-core-01 · Ubuntu ARM64</span>
-          <span class="pm-badge green"><span class="pm-status-dot"></span>Coordinator</span>
+          <span class="pm-badge green"><span class="pm-status-dot"></span>Zero-Downtime OTA</span>
         </div>
         <div class="coda-mono bento-muted" style="font-size:11px;line-height:1.65;">
           <div>&bull; 127.0.0.1:8080 &rarr; wss://codahub.dev/v1/tunnel/ws</div>
-          <div>&bull; PostgreSQL 18 healthy · Zero-SNI Relay :24443</div>
+          <div>&bull; W3C VAPID Web Push + PostgreSQL 18 · Relay :24443</div>
           <div>&bull; Endpoint: ${this.escapeHtml(baseUrl)}</div>
         </div>
       `;
@@ -4625,24 +5090,24 @@ export class CodaTerminalWebApp {
     if (this.previewTab === "ios") {
       return `
         <div class="bento-well" style="display:flex;justify-content:space-between;align-items:center;">
-          <span class="coda-mono" style="font-size:11.5px;font-weight:600;">iPhone Safari / TestFlight</span>
-          <span class="pm-badge blue"><span class="pm-status-dot"></span>LAN 0.8 ms</span>
+          <span class="coda-mono" style="font-size:11.5px;font-weight:600;">iPhone Safari PWA / Swift 6 App</span>
+          <span class="pm-badge blue"><span class="pm-status-dot"></span>Lock-Screen Push</span>
         </div>
         <div class="coda-mono bento-muted" style="font-size:11px;line-height:1.65;">
           <div>&bull; Happy Eyeballs 250ms &rarr; ws://192.168.1.20:24444</div>
-          <div>&bull; 2-Row Thumb Keypad + Whisper Voice Composer</div>
-          <div>&bull; Attached to MacBook-Pro · coda/main</div>
+          <div>&bull; Saved Snippets + Voice Dictation + Screenshot Paste</div>
+          <div>&bull; E2EE Git Diff, File Tree &amp; Localhost Port Preview</div>
         </div>
       `;
     }
     return `
       <div class="bento-well" style="display:flex;justify-content:space-between;align-items:center;">
         <span class="coda-mono" style="font-size:11.5px;font-weight:600;">MacBook-Pro · GPUI 120Hz</span>
-        <span class="pm-badge green"><span class="pm-status-dot"></span>3-Pane Live</span>
+        <span class="pm-badge green"><span class="pm-status-dot"></span>3-Pane + Self-Update</span>
       </div>
       <div class="coda-mono bento-muted" style="font-size:11px;line-height:1.65;">
-        <div>&bull; PROJECTS: Services (herdr-core) · Agents · Actions</div>
-        <div>&bull; Worktree Diff: <span style="color:var(--emerald);">+1,233</span> <span style="color:var(--rose);">-116</span></div>
+        <div>&bull; Claude Code · Codex · Grok CLI · AGY · Gemini CLI</div>
+        <div>&bull; E2EE Git Diff (<span style="color:var(--emerald);">+1,233</span> <span style="color:var(--rose);">-116</span>) &amp; Live 127.0.0.1 Tunnel</div>
         <div>&bull; Hybrid Mode: Control remote Linux + accept mobile</div>
       </div>
     `;
@@ -4745,6 +5210,12 @@ export class CodaTerminalWebApp {
       this.route = this.resolveRouteFromLocation();
     }
 
+    if (this.route === "reset-password") {
+      this.stopBentoLoop();
+      this.renderResetPasswordView(root, baseUrl, ver);
+      return;
+    }
+
     if (this.route === "login" || this.route === "register") {
       this.stopBentoLoop();
       this.renderAuthView(root, baseUrl, ver);
@@ -4826,14 +5297,17 @@ export class CodaTerminalWebApp {
             <div class="pm-hero-center">
               <a href="#architecture" class="pm-announce-pill">
                 <span class="pm-badge green"><span class="pm-status-dot"></span>${this.escapeHtml(ver)} Ready</span>
-                <span>${this.tr("SmartPath Sub-ms LAN Direct & RFC 8628 Device Auth", "SmartPath 局域网毫秒直连 & RFC 8628 设备授权")}</span>
+                <span>${this.tr("1-Click Lock-Screen Push · Zero-Downtime OTA · SmartPath <1ms LAN", "一键锁屏推送 (Web Push) · 无感守护进程 OTA · 局域网毫秒直连")}</span>
                 ${svgIcon("arrowRight", 13)}
               </a>
+              <div class="pm-hero-meta">
+                <span class="pm-badge blue coda-mono">Claude Code · Codex · Grok CLI · Antigravity (AGY) · Gemini CLI</span>
+              </div>
               <h1 class="pm-h1">${this.tr("The zero-knowledge control plane<br />for cross-device AI coding.", "跨设备 AI 编程的<br />零知识控制面。")}</h1>
               <p class="pm-hero-sub">
                 ${this.tr(
-                  "Weave your Linux cloud hosts, native 3-pane macOS desktop app, and mobile browser into one end-to-end encrypted mesh. Persistent PTYs run on local <code>herdr-core</code> with sub-millisecond Wi-Fi P2P and zero-trust Cloudflare Tunnel relay.",
-                  "把常驻的 Linux 云主机、Mac 原生三栏桌面端与随身浏览器编织进同一张端到端加密网。终端进程托管于本机 <code>herdr-core</code>，同局域网亚毫秒直连，跨网经 Cloudflare Tunnel 自动盲转发。"
+                  "Orchestrate <strong>Claude Code · Codex · Grok CLI · Antigravity (AGY) · Gemini CLI</strong> across your Linux servers, 120Hz macOS GPUI desktop, and iPhone PWA. Inspect <strong>E2EE Git Diff &amp; File Tree</strong>, <strong>Localhost Port Preview</strong>, <strong>Voice + <code>⌘V</code> Screenshot Paste</strong>, and <strong>1-Click Lock-Screen Push &amp; Zero-Downtime OTA</strong>.",
+                  "在同一张零知识加密网中统筹 Linux 云主机、Mac 原生 120Hz 桌面端与手机 PWA 上的 <strong>Claude Code · Codex · Grok CLI · Antigravity (AGY) · Gemini CLI</strong>。内置 <strong>端到端 Git Diff 与文件树</strong>、<strong>Localhost 端口预览</strong>、<strong>语音输入 + <code>⌘V</code> 粘贴截图直传</strong> 与 <strong>一键锁屏推送 &amp; 无感 OTA 升级</strong>。"
                 )}
               </p>
               <div class="pm-hero-actions">
@@ -4950,16 +5424,16 @@ export class CodaTerminalWebApp {
                   </div>
                   <div style="display:flex;flex-direction:column;gap:4px;">
                     <div class="bento-pty-line" data-pty-idx="0">
-                      <span>Claude Code &middot; refactor auth</span>
+                      <span>Claude Code &middot; E2EE Git Diff</span>
                       <span class="pm-num" style="color:var(--emerald);">+412 -38</span>
                     </div>
                     <div class="bento-pty-line" data-pty-idx="1">
-                      <span>Codex &middot; tunnel metrics</span>
+                      <span>Codex &middot; Grok CLI &middot; AGY &middot; Gemini</span>
                       <span class="pm-num" style="color:var(--signal-blue);">+821 -78</span>
                     </div>
                     <div class="bento-pty-line" data-pty-idx="2">
-                      <span>cargo test --workspace</span>
-                      <span style="color:var(--emerald);">exit 0</span>
+                      <span>127.0.0.1 Port Preview &middot; OTA</span>
+                      <span style="color:var(--emerald);">200 OK</span>
                     </div>
                   </div>
                   <div class="bento-well coda-mono" style="display:flex;justify-content:space-between;align-items:center;font-size:11.5px;">
@@ -5090,14 +5564,14 @@ export class CodaTerminalWebApp {
                   </div>
                 </article>
 
-                <!-- Card 6: Voice-to-Terminal (Dark Contrast) -->
+                <!-- Card 6: Voice + Screenshot Paste + Lock-Screen Push (Dark Contrast) -->
                 <article class="bento-card is-dark bento-span-3">
                   <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
                     <div style="display:flex;align-items:center;gap:7px;">
                       ${svgIcon("mic", 14)}
-                      <span class="bento-kicker">${this.tr("Voice-to-Terminal", "语音转终端指令")}</span>
+                      <span class="bento-kicker">${this.tr("Voice · ⌘V Paste · Push", "语音 · ⌘V 截图 · 锁屏推送")}</span>
                     </div>
-                    <span class="pm-badge coda-mono">Whisper</span>
+                    <span class="pm-badge coda-mono">VAPID</span>
                   </div>
                   <div class="bento-wave">
                     ${[0, 1, 2, 3, 4, 5, 6, 7, 8]
@@ -5105,8 +5579,8 @@ export class CodaTerminalWebApp {
                       .join("")}
                   </div>
                   <div class="bento-well coda-mono" style="font-size:10.5px;display:flex;justify-content:space-between;align-items:center;gap:6px;white-space:nowrap;">
-                    <span><span style="color:var(--emerald);">&gt;</span> coda-daemon</span>
-                    <span style="color:var(--emerald);">hc doc.set</span>
+                    <span><span style="color:var(--emerald);">&gt;</span> Snippets + ASR</span>
+                    <span style="color:var(--emerald);">⌘V Upload</span>
                   </div>
                 </article>
               </div>
@@ -5171,27 +5645,27 @@ export class CodaTerminalWebApp {
               <div class="pm-hairline-grid cols-3">
                 <div class="pm-grid-cell">
                   <div>
-                    <div class="coda-mono" style="font-size:11px;color:var(--text-tertiary);margin-bottom:8px;">01 / DAEMON</div>
-                    <div style="font-size:15px;font-weight:600;margin-bottom:6px;">${this.tr("Persistent Herdr Daemon", "常驻 Herdr 进程守护")}</div>
-                    <p style="font-size:13px;color:var(--text-secondary);line-height:1.6;">${this.tr("Close your laptop, drop offline, or switch to your phone—remote agents and builds keep running and replay full PTY buffers &amp; Git diffs on reconnect.", "合盖、断网或切到手机时，远端 Agent 与编译任务零中断运行，重连即回放完整 PTY 输出与 Git Worktree Diff。")}</p>
+                    <div class="coda-mono" style="font-size:11px;color:var(--text-tertiary);margin-bottom:8px;">01 / WORKBENCH &amp; OTA</div>
+                    <div style="font-size:15px;font-weight:600;margin-bottom:6px;">${this.tr("5 AI Agents &middot; Zero-Downtime OTA", "五大 Agent 引擎 · 无感热升级")}</div>
+                    <p style="font-size:13px;color:var(--text-secondary);line-height:1.6;">${this.tr("Run <code>Claude Code</code>, <code>Codex</code>, <code>Grok CLI</code>, <code>Antigravity (AGY)</code>, and <code>Gemini CLI</code> on persistent <code>herdr-core</code> PTYs with E2EE Git Diff, File Tree, Localhost Port Preview, and 1-click OTA.", "常驻托管 <code>Claude Code</code>、<code>Codex</code>、<code>Grok CLI</code>、<code>Antigravity (AGY)</code> 与 <code>Gemini CLI</code>，内置端到端 Git Diff、文件树、Localhost 端口预览与无感守护进程 OTA。")}</p>
                   </div>
-                  <span class="coda-mono" style="font-size:11px;color:var(--text-tertiary);">herdr-core · full-duplex PTY</span>
+                  <span class="coda-mono" style="font-size:11px;color:var(--text-tertiary);">herdr-core · Git Diff · Port Preview</span>
                 </div>
                 <div class="pm-grid-cell">
                   <div>
-                    <div class="coda-mono" style="font-size:11px;color:var(--text-tertiary);margin-bottom:8px;">02 / CRYPTO</div>
-                    <div style="font-size:15px;font-weight:600;margin-bottom:6px;">${this.tr("End-to-End Zero-Knowledge", "端到端零知识加密")}</div>
-                    <p style="font-size:13px;color:var(--text-secondary);line-height:1.6;">${this.tr("Every node holds its own local <code>Ed25519 + X25519</code> keys. Streams are compressed with <code>zstd</code> and sealed via <code>ChaCha20-Poly1305</code>; relays see only ciphertext.", "每台节点在本地保管 <code>Ed25519 + X25519</code> 私钥，流量先经 <code>zstd</code> 压缩再由 <code>ChaCha20-Poly1305</code> 密封，服务器不可解密。")}</p>
+                    <div class="coda-mono" style="font-size:11px;color:var(--text-tertiary);margin-bottom:8px;">02 / CRYPTO &amp; INPUT</div>
+                    <div style="font-size:15px;font-weight:600;margin-bottom:6px;">${this.tr("Zero-Knowledge E2EE &middot; Voice + ⌘V Paste", "零知识加密 · 语音 + ⌘V 截图 + 片段")}</div>
+                    <p style="font-size:13px;color:var(--text-secondary);line-height:1.6;">${this.tr("Streams, <code>⌘V</code> clipboard screenshots, voice dictation, and cross-device Prompt Snippets stay sealed end-to-end with <code>X25519 + ChaCha20-Poly1305</code>; relays see 0 plaintext.", "终端流、<code>⌘V</code> 剪贴板截图直传、实时语音听写与跨端同步的常用 Prompt 片段全程经 <code>X25519 + ChaCha20-Poly1305</code> 端到端加密，服务器零明文。")}</p>
                   </div>
                   <span class="coda-mono" style="font-size:11px;color:var(--text-tertiary);">HKDF-SHA256 · Blind Relay</span>
                 </div>
                 <div class="pm-grid-cell">
                   <div>
-                    <div class="coda-mono" style="font-size:11px;color:var(--text-tertiary);margin-bottom:8px;">03 / ROUTING</div>
-                    <div style="font-size:15px;font-weight:600;margin-bottom:6px;">${this.tr("LAN Direct &middot; Zero Open Ports", "同网直连 · 零端口暴露")}</div>
-                    <p style="font-size:13px;color:var(--text-secondary);line-height:1.6;">${this.tr("Happy Eyeballs switches to <code>:24444</code> LAN direct (&lt;1ms) on shared Wi-Fi, while the coordinator binds strictly to <code>127.0.0.1</code> behind Cloudflare Tunnel.", "同 Wi-Fi 下通过 Happy Eyeballs 秒切至 <code>:24444</code> 局域网直连（&lt;1ms），主控容器仅监听 <code>127.0.0.1</code> 由 Cloudflare Tunnel 接管 HTTPS。")}</p>
+                    <div class="coda-mono" style="font-size:11px;color:var(--text-tertiary);margin-bottom:8px;">03 / PUSH &amp; ROUTING</div>
+                    <div style="font-size:15px;font-weight:600;margin-bottom:6px;">${this.tr("1-Click Lock-Screen Push &middot; &lt;1ms LAN", "一键锁屏推送 · 同网亚毫秒直连")}</div>
+                    <p style="font-size:13px;color:var(--text-secondary);line-height:1.6;">${this.tr("Enable standard W3C VAPID Web Push on Browser / iOS PWA (or Bark / Telegram / Feishu / Discord) for instant Needs-You alerts, with automatic <code>:24444</code> LAN direct cutover.", "一键开启标准 W3C VAPID 浏览器 / iOS PWA 锁屏推送（兼容 Bark / Telegram / 飞书 / Discord），同 Wi-Fi 秒切 <code>:24444</code> 局域网直连（&lt;1ms）。")}</p>
                   </div>
-                  <span class="coda-mono" style="font-size:11px;color:var(--text-tertiary);">SmartPath · CF Tunnel WSS</span>
+                  <span class="coda-mono" style="font-size:11px;color:var(--text-tertiary);">W3C VAPID · SmartPath · CF WSS</span>
                 </div>
               </div>
             </div>
@@ -5606,6 +6080,14 @@ export class CodaTerminalWebApp {
     const codeSuffix = this.pendingActivationCode
       ? `?code=${encodeURIComponent(this.pendingActivationCode)}`
       : "";
+    const regQueryParts: string[] = [];
+    if (this.authInviteCode) {
+      regQueryParts.push(`invite=${encodeURIComponent(this.authInviteCode)}`);
+    }
+    if (this.pendingActivationCode) {
+      regQueryParts.push(`code=${encodeURIComponent(this.pendingActivationCode)}`);
+    }
+    const regSuffix = regQueryParts.length > 0 ? `?${regQueryParts.join("&")}` : "";
 
     root.innerHTML = `
       <div class="pm-auth-shell">
@@ -5654,6 +6136,11 @@ export class CodaTerminalWebApp {
             </div>
 
             ${
+              this.authSuccessMsg
+                ? `<div style="margin-bottom:14px;padding:10px 12px;border-radius:8px;background:var(--emerald-bg);border:1px solid var(--emerald-bd);color:var(--emerald);font-size:12.5px;">${this.escapeHtml(this.authSuccessMsg)}</div>`
+                : ""
+            }
+            ${
               this.errorMsg
                 ? `<div style="margin-bottom:14px;padding:10px 12px;border-radius:8px;background:var(--rose-bg);border:1px solid var(--rose-bd);color:var(--rose);font-size:12.5px;">${this.escapeHtml(this.errorMsg)}</div>`
                 : ""
@@ -5695,13 +6182,17 @@ export class CodaTerminalWebApp {
                   </div>
                 </div>
                 ${
-                  openReg
+                  openReg && !this.authInviteCode
                     ? `<div style="font-size:12px;color:var(--emerald);margin-bottom:14px;display:flex;align-items:center;gap:6px;">${svgIcon("check", 13)} ${this.tr("Open registration is enabled &mdash; no invite code required.", "当前站点已开放自由注册，无需填写邀请码。")}</div>`
                     : `<div class="pm-field">
-                        <label class="pm-field-label">${this.tr("Invite Code", "邀请码")} <span>${this.tr("Leave blank for first admin", "首位管理员留空")}</span></label>
+                        <label class="pm-field-label">${this.tr("Invite Code", "邀请码")} <span>${
+                          this.authInviteCode
+                            ? this.tr("Pre-filled from invite link", "已从邀请链接自动填入")
+                            : this.tr("Leave blank for first admin", "首位管理员留空")
+                        }</span></label>
                         <div class="pm-input-wrap">
                           <span class="pm-input-icon">${svgIcon("key", 14)}</span>
-                          <input name="invite_code" class="pm-input" placeholder="CODA-XXXXXX" />
+                          <input id="auth-invite-input" name="invite_code" class="pm-input coda-mono" value="${this.escapeHtml(this.authInviteCode)}" placeholder="CODA-XXXXXX" />
                         </div>
                       </div>`
                 }
@@ -5711,15 +6202,24 @@ export class CodaTerminalWebApp {
                   <label class="pm-field-label">${this.tr("Email or Handle", "邮箱或用户名")}</label>
                   <div class="pm-input-wrap">
                     <span class="pm-input-icon">${svgIcon("mail", 14)}</span>
-                    <input name="email_or_handle" class="pm-input" required placeholder="${this.tr("alice or dev@example.com", "alice 或 dev@example.com")}" autocomplete="username" />
+                    <input id="auth-login-handle" name="email_or_handle" class="pm-input" value="${this.escapeHtml(this.authPrefillHandle)}" required placeholder="${this.tr("alice or dev@example.com", "alice 或 dev@example.com")}" autocomplete="username" />
                   </div>
                 </div>
                 <div class="pm-field">
-                  <label class="pm-field-label">${this.tr("Password", "密码")}</label>
+                  <label class="pm-field-label">
+                    <span>${this.tr("Password", "密码")}</span>
+                    <a href="/reset-password" data-nav="/reset-password" id="link-forgot-password" style="color:var(--signal-blue);font-size:11.5px;font-weight:500;">${this.tr("Forgot password?", "忘记密码？")}</a>
+                  </label>
                   <div class="pm-input-wrap has-right">
                     <span class="pm-input-icon">${svgIcon("lock", 14)}</span>
                     <input id="auth-password-input" type="${this.showPassword ? "text" : "password"}" name="password" class="pm-input" required autocomplete="current-password" />
                     <button id="btn-toggle-pw" type="button" class="pm-pw-toggle" title="${this.tr("Show or hide password", "显示或隐藏密码")}">${svgIcon(this.showPassword ? "eyeOff" : "eye", 14)}</button>
+                  </div>
+                  <div style="font-size:11px;color:var(--text-tertiary);margin-top:5px;">
+                    ${this.tr(
+                      "Forgot your password? Ask the site admin for a one-time reset link/token and paste it on /reset-password.",
+                      "忘记密码？可让站点管理员一键复制单次重置链接或令牌，前往 /reset-password 重置。"
+                    )}
                   </div>
                 </div>
               `
@@ -5750,13 +6250,22 @@ export class CodaTerminalWebApp {
 
     this.bindCommonNavigation(root);
 
+    const inviteInp = document.getElementById("auth-invite-input") as HTMLInputElement | null;
+    inviteInp?.addEventListener("input", () => {
+      this.authInviteCode = inviteInp.value.trim();
+    });
+    const loginHandleInp = document.getElementById("auth-login-handle") as HTMLInputElement | null;
+    loginHandleInp?.addEventListener("input", () => {
+      this.authPrefillHandle = loginHandleInp.value;
+    });
+
     document.getElementById("tab-auth-login")?.addEventListener("click", () => {
       this.authMode = "login";
       this.navigate(`/login${codeSuffix}`);
     });
     document.getElementById("tab-auth-register")?.addEventListener("click", () => {
       this.authMode = "register";
-      this.navigate(`/register${codeSuffix}`);
+      this.navigate(`/register${regSuffix}`);
     });
     document.getElementById("btn-toggle-pw")?.addEventListener("click", () => {
       this.showPassword = !this.showPassword;
@@ -5776,6 +6285,8 @@ export class CodaTerminalWebApp {
         this.token = res.token;
         this.user = res.user;
         this.errorMsg = "";
+        this.authSuccessMsg = "";
+        this.authInviteCode = "";
         saveSessionToken(res.token);
         await this.bootstrapMesh();
         if (this.pendingActivationCode) {
@@ -5785,6 +6296,185 @@ export class CodaTerminalWebApp {
         }
       } catch (err: any) {
         this.errorMsg = err.message;
+        this.render();
+      }
+    });
+  }
+
+  private renderResetPasswordView(root: HTMLElement, baseUrl: string, ver: string) {
+    root.innerHTML = `
+      <div class="pm-auth-shell">
+        <div class="pm-auth-main">
+          <div class="pm-auth-topbar">
+            <a href="/login" data-nav="/login" class="pm-btn pm-btn-ghost pm-btn-sm">
+              ${svgIcon("arrowLeft", 14)} ${this.tr("Back to Sign In", "返回账号登录")}
+            </a>
+            <div style="display:flex;align-items:center;gap:8px;">
+              ${this.renderLangSwitcher()}
+              ${this.renderThemeSwitcher()}
+            </div>
+          </div>
+
+          <div class="pm-auth-box" style="max-width:430px;">
+            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;">
+              <span class="pm-badge blue">${svgIcon("key", 12)} ${this.tr("One-Time Reset Link", "单次密码重置令牌")}</span>
+              <span class="coda-mono" style="font-size:11px;color:var(--text-tertiary);">SHA-256 · 24h</span>
+            </div>
+
+            <h1 style="font-size:24px;font-weight:600;letter-spacing:-0.025em;margin-bottom:8px;">
+              ${this.tr("Reset Forgotten Password", "重置你的 Coda 登录密码")}
+            </h1>
+            <p style="font-size:13px;color:var(--text-secondary);line-height:1.65;margin-bottom:18px;">
+              ${this.tr(
+                "Paste the one-time reset link or <code>rst_...</code> token sent by your site admin, then set a new password (paired host daemons stay intact).",
+                "粘贴站点管理员发给你的一次性重置链接或 <code>rst_...</code> 令牌，并设置新密码（已绑定的远端主机守护进程不受影响）。"
+              )}
+            </p>
+
+            ${
+              this.errorMsg
+                ? `<div style="margin-bottom:14px;padding:10px 12px;border-radius:8px;background:var(--rose-bg);border:1px solid var(--rose-bd);color:var(--rose);font-size:12.5px;">${this.escapeHtml(this.errorMsg)}</div>`
+                : ""
+            }
+
+            <form id="reset-pw-form">
+              <div class="pm-field">
+                <label class="pm-field-label">${this.tr("Reset Token or Link", "重置令牌或完整链接")}</label>
+                <div class="pm-input-wrap">
+                  <span class="pm-input-icon">${svgIcon("key", 14)}</span>
+                  <input
+                    id="reset-token-input"
+                    name="token"
+                    class="pm-input coda-mono"
+                    value="${this.escapeHtml(this.resetPasswordToken)}"
+                    required
+                    placeholder="rst_... / https://.../reset-password?token=rst_..."
+                    autocomplete="off"
+                  />
+                </div>
+              </div>
+              <div class="pm-field">
+                <label class="pm-field-label">${this.tr("New Password", "新密码")} <span>${this.tr("At least 8 characters", "至少 8 位")}</span></label>
+                <div class="pm-input-wrap has-right">
+                  <span class="pm-input-icon">${svgIcon("lock", 14)}</span>
+                  <input
+                    id="reset-new-pw"
+                    type="${this.showResetPassword ? "text" : "password"}"
+                    name="new_password"
+                    class="pm-input"
+                    minlength="8"
+                    maxlength="256"
+                    required
+                    autocomplete="new-password"
+                  />
+                  <button id="btn-toggle-reset-pw" type="button" class="pm-pw-toggle" title="${this.tr("Show or hide password", "显示或隐藏密码")}">${svgIcon(this.showResetPassword ? "eyeOff" : "eye", 14)}</button>
+                </div>
+              </div>
+              <div class="pm-field">
+                <label class="pm-field-label">${this.tr("Confirm Password", "确认新密码")}</label>
+                <div class="pm-input-wrap">
+                  <span class="pm-input-icon">${svgIcon("lock", 14)}</span>
+                  <input
+                    id="reset-confirm-pw"
+                    type="${this.showResetPassword ? "text" : "password"}"
+                    name="confirm_password"
+                    class="pm-input"
+                    minlength="8"
+                    maxlength="256"
+                    required
+                    autocomplete="new-password"
+                  />
+                </div>
+              </div>
+              <button type="submit" class="pm-btn pm-btn-primary pm-btn-lg" style="width:100%;margin-top:4px;" ${this.resetPasswordSubmitting ? "disabled" : ""}>
+                ${
+                  this.resetPasswordSubmitting
+                    ? this.tr("Resetting Password…", "正在重置密码…")
+                    : `${this.tr("Reset Password & Continue to Sign In", "确认重置并前往登录")} ${svgIcon("arrowRight", 14)}`
+                }
+              </button>
+            </form>
+          </div>
+        </div>
+
+        ${this.renderAuthShowcasePanel(baseUrl, ver, false)}
+      </div>
+    `;
+
+    this.bindCommonNavigation(root);
+
+    const tokenInp = document.getElementById("reset-token-input") as HTMLInputElement | null;
+    tokenInp?.addEventListener("input", () => {
+      this.resetPasswordToken = tokenInp.value;
+    });
+
+    document.getElementById("btn-toggle-reset-pw")?.addEventListener("click", () => {
+      this.showResetPassword = !this.showResetPassword;
+      const newInp = document.getElementById("reset-new-pw") as HTMLInputElement | null;
+      const confInp = document.getElementById("reset-confirm-pw") as HTMLInputElement | null;
+      const btn = document.getElementById("btn-toggle-reset-pw");
+      const nextType = this.showResetPassword ? "text" : "password";
+      if (newInp) newInp.type = nextType;
+      if (confInp) confInp.type = nextType;
+      if (btn) btn.innerHTML = svgIcon(this.showResetPassword ? "eyeOff" : "eye", 14);
+    });
+
+    document.getElementById("reset-pw-form")?.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      if (this.resetPasswordSubmitting) return;
+      const fd = new FormData(e.target as HTMLFormElement);
+      const rawToken = String(fd.get("token") || "");
+      const newPw = String(fd.get("new_password") || "");
+      const confirmPw = String(fd.get("confirm_password") || "");
+
+      const validated = validateResetPasswordInputs(rawToken, newPw, confirmPw, (en, zh) =>
+        this.tr(en, zh)
+      );
+      if (!validated.ok) {
+        this.errorMsg = validated.error;
+        this.render();
+        return;
+      }
+
+      this.resetPasswordSubmitting = true;
+      this.errorMsg = "";
+      this.render();
+
+      try {
+        const res = await this.api("/api/v1/auth/reset-password", "POST", {
+          token: validated.token,
+          new_password: validated.newPassword,
+        });
+        const handle = String(res?.handle || "").trim();
+        if (this.user && (!handle || this.user.handle === handle)) {
+          this.stopAllTransportsAndTimers();
+          clearSessionToken();
+          this.token = null;
+          this.user = null;
+        }
+        this.resetPasswordToken = "";
+        this.authPrefillHandle = handle;
+        const okMsg = handle
+          ? this.tr(
+              `Password reset for @${handle}! Please sign in with your new password.`,
+              `已成功重置 @${handle} 的登录密码，请使用新密码登录。`
+            )
+          : this.tr(
+              "Password reset! Please sign in with your new password.",
+              "密码已重置，请使用新密码登录。"
+            );
+        this.authSuccessMsg = okMsg;
+        this.showToastNotice("ok", okMsg);
+        this.resetPasswordSubmitting = false;
+        this.navigate("/login", false, true);
+        setTimeout(() => {
+          (document.getElementById("auth-password-input") as HTMLInputElement | null)?.focus();
+        }, 0);
+      } catch (err: any) {
+        this.resetPasswordSubmitting = false;
+        this.errorMsg = String(
+          err?.message || this.tr("Failed resetting password", "重置密码失败，请检查令牌是否过期")
+        );
         this.render();
       }
     });
@@ -6098,6 +6788,11 @@ export class CodaTerminalWebApp {
                       ${this.tr("Run on any Linux or macOS host:", "在任意 Linux / Mac 运行：")}<br/>
                       <code class="coda-mono" style="color:var(--emerald);word-break:break-all;">${this.escapeHtml(installCmd)}</code><br/><br/>
                       ${this.tr("Open the printed activation URL or click Settings at the top-right to approve.", "打开终端输出的激活链接即可接入，或点击右上角设置按钮手动授权。")}
+                      ${
+                        this.onboardingDismissed
+                          ? `<div style="margin-top:10px;"><button type="button" id="btn-sidebar-show-onboarding" class="pm-btn pm-btn-secondary pm-btn-sm">${this.tr("Show 3-Step Quickstart", "重新展开三步新手引导")}</button></div>`
+                          : ""
+                      }
                     </div>`
                   : this.devices
                       .map(
@@ -6252,6 +6947,21 @@ export class CodaTerminalWebApp {
           </div>
 
           ${
+            this.devices.length === 0 && !this.onboardingDismissed
+              ? renderFriendOnboardingCard({
+                  installCmd,
+                  copiedInstall: this.onboardingCopiedInstall,
+                  thisDevicePushSubscribed: this.webPushThisDeviceSubscribed,
+                  webPushCount: this.webPushCount,
+                  webPushBusy: this.webPushBusy,
+                  iosNeedsHomeScreenTip: detectBrowserIosNonStandalone(),
+                  userHandle: this.user.handle,
+                  tr: (en, zh) => this.tr(en, zh),
+                })
+              : ""
+          }
+
+          ${
             this.showTermSearch
               ? `<div class="term-search-strip" id="term-search-strip">
                   ${svgIcon("search", 13)}
@@ -6337,6 +7047,10 @@ export class CodaTerminalWebApp {
             hasSpeechFallback,
             hasWhisperKey,
             useBracketedPaste: composerUseBracketedPaste,
+            snippets: this.promptSnippets,
+            savingSnippetOpen: this.savingSnippetOpen,
+            savingSnippetTitle: this.savingSnippetTitle,
+            savingSnippetBusy: this.savingSnippetBusy,
             tr: (en, zh) => this.tr(en, zh),
           })}
 
@@ -6714,6 +7428,16 @@ export class CodaTerminalWebApp {
             `
                 : this.settingsTab === "alerts"
                   ? `
+              ${renderWebPushSettingsCard({
+                vapid: this.vapidInfo,
+                vapidLoaded: this.vapidLoaded,
+                webPushCount: this.webPushCount,
+                thisDeviceSubscribed: this.webPushThisDeviceSubscribed,
+                busy: this.webPushBusy,
+                pushSupported: this.isWebPushApiSupported(),
+                iosNeedsHomeScreenTip: detectBrowserIosNonStandalone(),
+                tr: (en, zh) => this.tr(en, zh),
+              })}
               <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;padding-bottom:12px;margin-bottom:12px;border-bottom:1px solid var(--border-primary);">
                 <div style="min-width:0;">
                   <div style="font-size:12.5px;font-weight:500;display:inline-flex;align-items:center;gap:6px;">${svgIcon("bell", 13)} ${this.tr("Browser Alerts (OSC 7501)", "浏览器系统通知 (OSC 7501)")}</div>
@@ -6826,24 +7550,38 @@ export class CodaTerminalWebApp {
                   </div>
                   ${
                     this.latestInviteCode
-                      ? `<div class="coda-mono" style="background:var(--bg-elevated);border:1px dashed var(--signal-blue);padding:8px 10px;border-radius:8px;font-size:12px;margin-bottom:8px;">
-                          ${this.tr("New invite code:", "新签发邀请码：")} <b>${this.escapeHtml(this.latestInviteCode)}</b>
+                      ? `<div class="coda-mono" style="background:var(--bg-elevated);border:1px dashed var(--signal-blue);padding:8px 10px;border-radius:8px;font-size:12px;margin-bottom:8px;display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;">
+                          <span>${this.tr("New invite code:", "新签发邀请码：")} <b>${this.escapeHtml(this.latestInviteCode)}</b></span>
+                          <button type="button" class="pm-btn pm-btn-secondary pm-btn-sm" style="height:24px;padding:0 8px;font-size:11px;" data-copy-invite-link="${this.escapeHtml(this.latestInviteCode)}">
+                            ${svgIcon("copy", 12)} ${this.tr("Copy Invite Link", "复制邀请链接")}
+                          </button>
                         </div>`
                       : ""
                   }
-                  <div style="display:flex;flex-direction:column;gap:5px;max-height:120px;overflow-y:auto;">
+                  <div style="display:flex;flex-direction:column;gap:5px;max-height:135px;overflow-y:auto;">
                     ${this.invitesList
                       .map(
                         (inv) => `
                       <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:6px 10px;border-radius:6px;background:var(--bg-elevated);border:1px solid var(--border-primary);font-size:11.5px;">
                         <span class="coda-mono">${this.escapeHtml(inv.code)} <span style="color:var(--text-tertiary);">(${inv.used_count}/${inv.max_uses})</span></span>
-                        <button type="button" class="pm-btn pm-btn-ghost pm-btn-sm" style="color:var(--rose);" data-delete-invite="${this.escapeHtml(inv.code)}">${this.tr("Revoke", "撤销")}</button>
+                        <div style="display:flex;align-items:center;gap:6px;flex-shrink:0;">
+                          <button type="button" class="pm-btn pm-btn-secondary pm-btn-sm" style="height:25px;padding:0 8px;font-size:11px;" data-copy-invite-link="${this.escapeHtml(inv.code)}">
+                            ${svgIcon("copy", 12)} ${this.tr("Copy Invite Link", "复制邀请链接")}
+                          </button>
+                          <button type="button" class="pm-btn pm-btn-ghost pm-btn-sm" style="color:var(--rose);" data-delete-invite="${this.escapeHtml(inv.code)}">${this.tr("Revoke", "撤销")}</button>
+                        </div>
                       </div>
                     `
                       )
                       .join("")}
                   </div>
                 </div>
+                ${renderAdminFriendsDirectorySection({
+                  users: this.adminUsers,
+                  busyUserId: this.adminResetBusyUserId,
+                  latestResetLink: this.latestAdminResetLink,
+                  tr: (en, zh) => this.tr(en, zh),
+                })}
               `
                   : ""
               }
@@ -6998,6 +7736,13 @@ export class CodaTerminalWebApp {
       this.cmdPaletteSelectedIdx = 0;
       this.pairCommand = null;
       this.latestInviteCode = null;
+      this.adminUsers = [];
+      this.adminResetBusyUserId = null;
+      this.latestAdminResetLink = null;
+      this.webPushCount = 0;
+      this.savingSnippetOpen = false;
+      this.savingSnippetTitle = "";
+      this.savingSnippetBusy = false;
       this.rttMs = null;
       this.consoleNotice = null;
       this.settingsFeedback = null;
@@ -7286,8 +8031,8 @@ export class CodaTerminalWebApp {
           this.settingsFeedback = {
             kind: "err",
             text: this.tr(
-              "No webhook channels configured yet — enter at least one URL or Telegram bot.",
-              "尚未配置任何推送通道，请至少填写一个 Webhook URL 或 Telegram 配置。"
+              "No push channels configured yet — enable Lock-Screen Web Push above, or enter at least one Webhook URL / Telegram bot.",
+              "尚未配置任何推送通道，请点击上方开启锁屏推送，或至少填写一个 Webhook URL / Telegram 配置。"
             ),
           };
         }
@@ -7381,6 +8126,148 @@ export class CodaTerminalWebApp {
         // proceed to local teardown regardless
       }
       performLocalSignOut();
+    });
+
+    root.querySelectorAll<HTMLElement>("[data-enable-web-push]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        void this.enableLockScreenWebPush();
+      });
+    });
+    root.querySelectorAll<HTMLElement>("[data-disable-web-push]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        void this.disableLockScreenWebPush();
+      });
+    });
+
+    document.getElementById("btn-onboarding-dismiss")?.addEventListener("click", () => {
+      this.onboardingDismissed = true;
+      writeLocalPref("coda_onboarding_dismissed", "1");
+      this.render();
+    });
+    document.getElementById("btn-sidebar-show-onboarding")?.addEventListener("click", () => {
+      this.onboardingDismissed = false;
+      writeLocalPref("coda_onboarding_dismissed", "0");
+      this.render();
+    });
+    document.getElementById("btn-onboarding-copy-install")?.addEventListener("click", async () => {
+      const ok = await this.copyTextWithFallback(installCmd);
+      this.onboardingCopiedInstall = ok;
+      this.showToastNotice(
+        ok ? "ok" : "err",
+        ok
+          ? this.tr("Copied 1-line install command to clipboard.", "已复制一行主机安装绑定命令。")
+          : this.tr("Copy the install command manually from Step 1.", "请直接手动复制步骤 1 中的安装命令。")
+      );
+      this.render();
+      if (ok) {
+        setTimeout(() => {
+          this.onboardingCopiedInstall = false;
+          if (this.route === "console" && !this.isTypingIntoInput()) {
+            this.render();
+          }
+        }, 2000);
+      }
+    });
+    document.getElementById("btn-onboarding-open-devices")?.addEventListener("click", () => {
+      this.settingsTab = "devices";
+      openSettings();
+    });
+    document.getElementById("btn-onboarding-open-alerts")?.addEventListener("click", () => {
+      this.settingsTab = "alerts";
+      openSettings();
+    });
+    document.getElementById("btn-onboarding-launch-agent")?.addEventListener("click", () => {
+      if (this.selectedDaemon?.is_online) {
+        this.openNewAgentModal();
+      } else {
+        this.settingsTab = "devices";
+        openSettings();
+        this.settingsFeedback = {
+          kind: "ok",
+          text: this.tr(
+            "Run the Step 1 install command on your Mac/Linux host first, then approve its device code here.",
+            "请先在你的 Mac 或 Linux 主机终端执行一行安装命令，然后在此输入设备码完成绑定。"
+          ),
+        };
+        this.render();
+      }
+    });
+
+    root.querySelectorAll<HTMLElement>("[data-copy-invite-link]").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const code = (btn.dataset.copyInviteLink || "").trim();
+        if (!code) return;
+        const inviteBase = this.siteInfo?.public_base_url || window.location.origin;
+        const inviteUrl = buildInviteRegistrationUrl(inviteBase, code);
+        const ok = await this.copyTextWithFallback(inviteUrl);
+        const msg = ok
+          ? this.tr(`Copied invite link: ${inviteUrl}`, `已复制好友注册邀请链接：${inviteUrl}`)
+          : this.tr(`Invite link: ${inviteUrl}`, `好友注册邀请链接：${inviteUrl}`);
+        this.settingsFeedback = { kind: "ok", text: msg };
+        this.showToastNotice("ok", msg);
+        this.renderSettingsPreservingInputs();
+      });
+    });
+
+    document.getElementById("btn-copy-latest-reset-link")?.addEventListener("click", async () => {
+      if (!this.latestAdminResetLink) return;
+      const url = this.latestAdminResetLink.resetUrl;
+      const ok = await this.copyTextWithFallback(url);
+      const msg = ok
+        ? this.tr(
+            `Copied reset link for @${this.latestAdminResetLink.handle}.`,
+            `已复制 @${this.latestAdminResetLink.handle} 的密码重置链接。`
+          )
+        : url;
+      this.settingsFeedback = { kind: "ok", text: msg };
+      this.showToastNotice("ok", msg);
+      this.renderSettingsPreservingInputs();
+    });
+
+    root.querySelectorAll<HTMLElement>("[data-admin-reset-user]").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const userId = (btn.dataset.adminResetUser || "").trim();
+        const handleHint = (btn.dataset.adminResetHandle || "").trim();
+        if (!userId || this.adminResetBusyUserId) return;
+        this.adminResetBusyUserId = userId;
+        this.renderSettingsPreservingInputs();
+        try {
+          const res = await this.api(
+            `/api/v1/admin/users/${encodeURIComponent(userId)}/reset-link`,
+            "POST",
+            {}
+          );
+          const resetBase = this.siteInfo?.public_base_url || window.location.origin;
+          const resetUrl = String(
+            res?.reset_url ||
+              `${resetBase.replace(/\/+$/, "")}/reset-password?token=${encodeURIComponent(
+                String(res?.reset_token || "")
+              )}`
+          );
+          const handle = String(res?.handle || handleHint || "member");
+          this.latestAdminResetLink = { handle, resetUrl };
+          const copied = await this.copyTextWithFallback(resetUrl);
+          const msg = copied
+            ? this.tr(
+                `Copied one-time reset link for @${handle} (valid 24h). Send it directly to your friend!`,
+                `已生成并复制 @${handle} 的一次性密码重置链接（24 小时内有效），可直接发给好友！`
+              )
+            : this.tr(
+                `Generated reset link for @${handle}: ${resetUrl}`,
+                `已生成 @${handle} 的重置链接：${resetUrl}`
+              );
+          this.settingsFeedback = { kind: "ok", text: msg };
+          this.showToastNotice("ok", msg);
+        } catch (err: any) {
+          this.settingsFeedback = {
+            kind: "err",
+            text: String(err?.message || this.tr("Failed issuing reset link", "生成重置链接失败")),
+          };
+        } finally {
+          this.adminResetBusyUserId = null;
+          this.renderSettingsPreservingInputs();
+        }
+      });
     });
 
     root.querySelectorAll<HTMLElement>("[data-delete-invite]").forEach((btn) => {
@@ -7847,6 +8734,159 @@ export class CodaTerminalWebApp {
     });
     document.getElementById("btn-composer-send")?.addEventListener("click", () => {
       sendPromptComposerPayload();
+    });
+
+    root.querySelectorAll<HTMLButtonElement>("[data-snippet-insert]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const snipId = btn.dataset.snippetInsert || "";
+        const snip = this.promptSnippets.find((s) => s.id === snipId);
+        if (!snip) return;
+        const curDraft = composerTextarea ? composerTextarea.value : this.draftInput;
+        this.draftInput = insertSnippetIntoDraft(curDraft, snip.prompt);
+        this.updateDraftPreviewInPlace();
+        if (composerTextarea) {
+          composerTextarea.value = this.draftInput;
+          composerTextarea.focus();
+          composerTextarea.selectionStart = composerTextarea.value.length;
+          composerTextarea.selectionEnd = composerTextarea.value.length;
+        }
+      });
+    });
+
+    root.querySelectorAll<HTMLButtonElement>("[data-snippet-delete]").forEach((btn) => {
+      btn.addEventListener("click", async (e) => {
+        e.stopPropagation();
+        const snipId = btn.dataset.snippetDelete || "";
+        if (!snipId || this.savingSnippetBusy) return;
+        const target = this.promptSnippets.find((s) => s.id === snipId);
+        if (!target) return;
+        if (composerTextarea) {
+          this.draftInput = composerTextarea.value;
+        }
+        const nextList = this.promptSnippets.filter((s) => s.id !== snipId);
+        this.savingSnippetBusy = true;
+        try {
+          await this.savePromptSnippetsToServer(nextList);
+          this.showToastNotice(
+            "ok",
+            this.tr(`Removed snippet "${target.title}"`, `已删除常用片段「${target.title}」`)
+          );
+        } catch (err: any) {
+          this.showToastNotice(
+            "err",
+            String(err?.message || this.tr("Failed deleting snippet", "删除常用片段失败"))
+          );
+        } finally {
+          this.savingSnippetBusy = false;
+          this.render();
+        }
+      });
+    });
+
+    document.getElementById("btn-composer-save-snippet-toggle")?.addEventListener("click", () => {
+      const currentDraft = (composerTextarea ? composerTextarea.value : this.draftInput).trim();
+      if (!currentDraft) {
+        this.showToastNotice(
+          "err",
+          this.tr(
+            "Type a prompt in the composer first to save it as a snippet.",
+            "请先在编排器中输入 Prompt 内容再保存为常用片段。"
+          )
+        );
+        composerTextarea?.focus();
+        return;
+      }
+      this.draftInput = composerTextarea ? composerTextarea.value : this.draftInput;
+      this.savingSnippetOpen = !this.savingSnippetOpen;
+      if (this.savingSnippetOpen) {
+        this.savingSnippetTitle = deriveSnippetTitleFromPrompt(currentDraft);
+      }
+      this.render();
+      if (this.savingSnippetOpen) {
+        setTimeout(() => {
+          const titleInp = document.getElementById(
+            "composer-snippet-title-input"
+          ) as HTMLInputElement | null;
+          titleInp?.focus();
+          titleInp?.select();
+        }, 0);
+      }
+    });
+
+    const snippetTitleInp = document.getElementById(
+      "composer-snippet-title-input"
+    ) as HTMLInputElement | null;
+    snippetTitleInp?.addEventListener("input", () => {
+      this.savingSnippetTitle = snippetTitleInp.value;
+    });
+
+    const submitSaveSnippet = async () => {
+      if (this.savingSnippetBusy) return;
+      const promptText = (composerTextarea ? composerTextarea.value : this.draftInput).trim();
+      const rawTitle = (snippetTitleInp ? snippetTitleInp.value : this.savingSnippetTitle).trim();
+      if (this.promptSnippets.length >= MAX_PROMPT_SNIPPETS) {
+        this.showToastNotice(
+          "err",
+          this.tr(
+            `Maximum ${MAX_PROMPT_SNIPPETS} saved snippets reached — delete an unused snippet first.`,
+            `最多保存 ${MAX_PROMPT_SNIPPETS} 条常用片段，请先删除不常用的片段。`
+          )
+        );
+        return;
+      }
+      const validated = validatePromptSnippet({
+        title: rawTitle || deriveSnippetTitleFromPrompt(promptText),
+        prompt: promptText,
+      });
+      if (!validated.ok) {
+        this.showToastNotice("err", validated.error);
+        return;
+      }
+      this.draftInput = composerTextarea ? composerTextarea.value : this.draftInput;
+      this.savingSnippetBusy = true;
+      this.render();
+      try {
+        await this.savePromptSnippetsToServer([...this.promptSnippets, validated.snippet]);
+        this.savingSnippetOpen = false;
+        this.savingSnippetTitle = "";
+        this.showToastNotice(
+          "ok",
+          this.tr(
+            `Saved snippet "${validated.snippet.title}" across devices.`,
+            `已跨设备保存常用片段「${validated.snippet.title}」。`
+          )
+        );
+      } catch (err: any) {
+        this.showToastNotice(
+          "err",
+          String(err?.message || this.tr("Failed saving snippet", "保存常用片段失败"))
+        );
+      } finally {
+        this.savingSnippetBusy = false;
+        this.render();
+      }
+    };
+
+    document.getElementById("btn-composer-save-snippet-confirm")?.addEventListener("click", () => {
+      void submitSaveSnippet();
+    });
+    document.getElementById("btn-composer-save-snippet-cancel")?.addEventListener("click", () => {
+      if (composerTextarea) {
+        this.draftInput = composerTextarea.value;
+      }
+      this.savingSnippetOpen = false;
+      this.savingSnippetTitle = "";
+      this.render();
+    });
+    snippetTitleInp?.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && !e.isComposing && !this.imeComposing) {
+        e.preventDefault();
+        void submitSaveSnippet();
+      } else if (e.key === "Escape") {
+        e.preventDefault();
+        this.savingSnippetOpen = false;
+        this.render();
+      }
     });
 
     // Split View, Git Diff, ⌘F Search, Markdown Export, ⌘+Click URL, Remote File Browser & Port Preview

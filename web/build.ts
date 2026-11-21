@@ -23,6 +23,25 @@ const hashedBundleName = `app.${hash}.js`;
 writeFileSync(`./dist/${hashedBundleName}`, bundleBytes);
 rmSync("./dist/app.js", { force: true });
 
+const swRes = await Bun.build({
+  entrypoints: ["./src/sw.ts"],
+  outdir: "./dist",
+  minify: true,
+  target: "browser",
+  format: "iife",
+});
+
+if (!swRes.success) {
+  console.error("Service Worker build failed:", swRes.logs);
+  process.exit(1);
+}
+
+const swCode = readFileSync("./dist/sw.js", "utf8").replaceAll(
+  "__CODA_SW_CACHE_VERSION__",
+  hash
+);
+writeFileSync("./dist/sw.js", swCode, "utf8");
+
 if (existsSync("../assets/logo.svg")) {
   copyFileSync("../assets/logo.svg", "./dist/logo.svg");
 }
@@ -40,4 +59,4 @@ const html = readFileSync("./index.html", "utf8")
   .replace("/manifest.json", `/manifest.json?v=${hash}`);
 
 writeFileSync("./dist/index.html", html, "utf8");
-console.log(`Built Coda Web Console -> web/dist/ (${hashedBundleName})`);
+console.log(`Built Coda Web Console -> web/dist/ (${hashedBundleName}, sw.js)`);

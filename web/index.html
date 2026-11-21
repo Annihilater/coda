@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; img-src 'self' data: blob:; connect-src 'self' ws: wss: http: https:; frame-src 'self'; base-uri 'self'; form-action 'self'; object-src 'none'" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; worker-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; img-src 'self' data: blob:; connect-src 'self' ws: wss: http: https:; frame-src 'self'; base-uri 'self'; form-action 'self'; object-src 'none'" />
   <title>Coda — Zero-Knowledge Cross-Device AI Coding Workbench</title>
   <meta id="meta-desc" name="description" content="Connect your Linux servers, macOS workstation, and iPhone/Web into one zero-knowledge encrypted mesh. Persistent herdr-core PTYs, sub-millisecond LAN P2P, and zero exposed ports via Cloudflare Tunnel." />
   <link rel="icon" type="image/svg+xml" href="/logo.svg" />
@@ -1987,6 +1987,155 @@
       display: flex;
       flex-direction: column;
       gap: 8px;
+    }
+    /* v1.1.0 Web Push, Friend Onboarding, Saved Snippets & Admin Friends Directory */
+    .web-push-card {
+      border: 1px solid var(--signal-blue-bd);
+      background: var(--signal-blue-bg);
+      border-radius: 10px;
+      padding: 11px 12px;
+      margin-bottom: 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 9px;
+    }
+    .ios-pwa-tip {
+      font-size: 11.5px;
+      line-height: 1.5;
+      padding: 6px 9px;
+      border-radius: 7px;
+      border: 1px solid var(--amber-bd);
+      background: var(--amber-bg);
+      color: var(--amber);
+    }
+    .friend-onboarding-card {
+      border: 1px solid var(--border-strong);
+      border-radius: 11px;
+      background: var(--bg-surface);
+      padding: 12px 14px;
+      margin-bottom: 10px;
+      display: flex;
+      flex-direction: column;
+      gap: 11px;
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.22);
+    }
+    .onboarding-steps-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 10px;
+    }
+    @media (max-width: 980px) {
+      .onboarding-steps-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+    .onboarding-step-box {
+      border: 1px solid var(--border-primary);
+      border-radius: 9px;
+      background: var(--bg-card);
+      padding: 10px 11px;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      gap: 8px;
+      min-width: 0;
+    }
+    .composer-snippet-strip {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      overflow-x: auto;
+      padding: 1px 0 3px;
+      scrollbar-width: thin;
+    }
+    .snippet-pill-group {
+      display: inline-flex;
+      align-items: center;
+      flex-shrink: 0;
+      border-radius: 999px;
+      border: 1px solid var(--border-primary);
+      background: var(--bg-card);
+      transition: border-color 0.15s, background-color 0.15s;
+    }
+    .snippet-pill-group:hover {
+      border-color: var(--border-strong);
+      background: var(--bg-elevated);
+    }
+    .snippet-pill-btn {
+      border: none;
+      background: transparent;
+      color: var(--text-secondary);
+      font-size: 11.5px;
+      font-weight: 500;
+      padding: 3px 9px;
+      cursor: pointer;
+      white-space: nowrap;
+      max-width: 190px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .snippet-pill-btn:hover {
+      color: var(--text-primary);
+    }
+    .snippet-pill-del {
+      border: none;
+      border-left: 1px solid var(--border-primary);
+      background: transparent;
+      color: var(--text-tertiary);
+      font-size: 12px;
+      line-height: 1;
+      padding: 3px 7px 3px 6px;
+      cursor: pointer;
+      border-top-right-radius: 999px;
+      border-bottom-right-radius: 999px;
+    }
+    .snippet-pill-del:hover {
+      color: var(--rose);
+      background: var(--rose-bg);
+    }
+    .snippet-save-trigger {
+      flex-shrink: 0;
+      border-radius: 999px;
+      border: 1px dashed var(--border-strong);
+      background: transparent;
+      color: var(--signal-blue);
+      font-size: 11.5px;
+      font-weight: 500;
+      padding: 3px 10px;
+      cursor: pointer;
+      white-space: nowrap;
+      transition: background-color 0.15s, border-color 0.15s;
+    }
+    .snippet-save-trigger:hover {
+      background: var(--signal-blue-bg);
+      border-color: var(--signal-blue);
+    }
+    .composer-save-bar {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-wrap: wrap;
+      padding: 6px 8px;
+      border-radius: 8px;
+      border: 1px solid var(--signal-blue-bd);
+      background: var(--bg-elevated);
+    }
+    .admin-friends-list {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      max-height: 165px;
+      overflow-y: auto;
+    }
+    .admin-friend-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 7px 10px;
+      border-radius: 8px;
+      background: var(--bg-elevated);
+      border: 1px solid var(--border-primary);
     }
     @media (max-width: 768px) {
       input,
