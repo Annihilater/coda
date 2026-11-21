@@ -128,6 +128,46 @@ CREATE TABLE IF NOT EXISTS user_notification_settings (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- 9. Admin-Issued Passwordless One-Time Reset Links (SHA-256 hashed at rest, 24h TTL)
+CREATE TABLE IF NOT EXISTS password_reset_tokens (
+    token_sha256 TEXT PRIMARY KEY,
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_by UUID REFERENCES users(id) ON DELETE SET NULL,
+    expires_at TIMESTAMPTZ NOT NULL,
+    consumed_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_password_reset_tokens_user ON password_reset_tokens (user_id, expires_at);
+
+-- 10. Server-Level Persistent Key-Value Metadata (e.g. W3C VAPID ES256 keypair)
+CREATE TABLE IF NOT EXISTS server_kv (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- 11. Standard W3C Web Push Subscriptions (RFC 8292 VAPID + RFC 8291 aes128gcm)
+CREATE TABLE IF NOT EXISTS web_push_subscriptions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    endpoint TEXT NOT NULL,
+    p256dh_b64url TEXT NOT NULL,
+    auth_b64url TEXT NOT NULL,
+    user_agent TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_web_push_user_endpoint UNIQUE (user_id, endpoint)
+);
+
+CREATE INDEX IF NOT EXISTS idx_web_push_subscriptions_user ON web_push_subscriptions (user_id, created_at);
+
+-- 12. Cross-Device Saved Prompt Snippets
+CREATE TABLE IF NOT EXISTS user_prompt_snippets (
+    user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    snippets_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 -- Idempotent schema hardening for databases created before these constraints existed.
 DO $$
 BEGIN

@@ -25,6 +25,7 @@ futures-util.workspace = true
 hex.workspace = true
 rand.workspace = true
 reqwest.workspace = true
+ring.workspace = true
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pki-types = "1"
 serde.workspace = true

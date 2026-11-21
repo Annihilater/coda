@@ -139,6 +139,8 @@ pub struct NotificationSettingsRecord {
     pub generic_webhook_url: String,
     pub notify_on_needs_you: bool,
     pub notify_on_finished: bool,
+    #[serde(default)]
+    pub web_push_count: usize,
 }
 
 impl Default for NotificationSettingsRecord {
@@ -152,8 +154,40 @@ impl Default for NotificationSettingsRecord {
             generic_webhook_url: String::new(),
             notify_on_needs_you: true,
             notify_on_finished: true,
+            web_push_count: 0,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminUserSummaryRecord {
+    pub id: Uuid,
+    pub handle: String,
+    pub email: String,
+    pub display_name: String,
+    pub is_admin: bool,
+    pub online_devices: i64,
+    pub total_devices: i64,
+    pub last_login_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebPushSubscriptionRecord {
+    pub id: Uuid,
+    pub user_id: Uuid,
+    pub endpoint: String,
+    pub p256dh_b64url: String,
+    pub auth_b64url: String,
+    pub user_agent: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptSnippetRecord {
+    pub id: String,
+    pub title: String,
+    pub prompt: String,
 }
 
 struct DbInner {
@@ -1514,6 +1548,7 @@ impl Db {
                 &[&user_id],
             )
             .await?;
+        let web_push_count = self.count_web_push_subscriptions(user_id).await?;
         Ok(match row {
             Some(r) => NotificationSettingsRecord {
                 bark_url: r.get(0),
@@ -1524,8 +1559,12 @@ impl Db {
                 generic_webhook_url: r.get(5),
                 notify_on_needs_you: r.get(6),
                 notify_on_finished: r.get(7),
+                web_push_count,
             },
-            None => NotificationSettingsRecord::default(),
+            None => NotificationSettingsRecord {
+                web_push_count,
+                ..NotificationSettingsRecord::default()
+            },
         })
     }
 
@@ -1571,6 +1610,7 @@ impl Db {
                 ],
             )
             .await?;
+        let web_push_count = self.count_web_push_subscriptions(user_id).await?;
         Ok(NotificationSettingsRecord {
             bark_url: row.get(0),
             telegram_bot_token: row.get(1),
@@ -1580,6 +1620,7 @@ impl Db {
             generic_webhook_url: row.get(5),
             notify_on_needs_you: row.get(6),
             notify_on_finished: row.get(7),
+            web_push_count,
         })
     }
 
@@ -1975,6 +2016,519 @@ impl Db {
 
         Ok(DeviceAuthPollState::Expired)
     }
+
+    pub async fn get_server_kv(&self, key: &str) -> Result<Option<String>> {
+        let client = self.client().await?;
+        let row = client
+            .query_opt("SELECT value FROM server_kv WHERE key = $1", &[&key])
+            .await?;
+        Ok(row.map(|r| r.get(0)))
+    }
+
+    pub async fn set_server_kv(&self, key: &str, value: &str) -> Result<()> {
+        let client = self.client().await?;
+        client
+            .execute(
+                r#"
+                INSERT INTO server_kv (key, value, updated_at)
+                VALUES ($1, $2, NOW())
+                ON CONFLICT (key) DO UPDATE
+                SET value = EXCLUDED.value,
+                    updated_at = NOW()
+                "#,
+                &[&key, &value],
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn insert_or_get_server_kv(&self, key: &str, candidate_value: &str) -> Result<String> {
+        let client = self.client().await?;
+        let row = client
+            .query_one(
+                r#"
+                WITH ins AS (
+                    INSERT INTO server_kv (key, value, updated_at)
+                    VALUES ($1, $2, NOW())
+                    ON CONFLICT (key) DO NOTHING
+                    RETURNING value
+                )
+                SELECT value FROM ins
+                UNION ALL
+                SELECT value FROM server_kv WHERE key = $1
+                LIMIT 1
+                "#,
+                &[&key, &candidate_value],
+            )
+            .await?;
+        Ok(row.get(0))
+    }
+
+    pub async fn list_admin_users(&self, caller: &UserRecord) -> Result<Vec<AdminUserSummaryRecord>> {
+        if !caller.is_admin {
+            bail!("only admin accounts can list users");
+        }
+        let client = self.client().await?;
+        let rows = client
+            .query(
+                r#"
+                SELECT
+                    u.id,
+                    u.handle,
+                    u.email,
+                    u.display_name,
+                    u.is_admin,
+                    COUNT(d.id) FILTER (WHERE d.is_online)::BIGINT AS online_devices,
+                    COUNT(d.id)::BIGINT AS total_devices,
+                    u.last_login_at,
+                    u.created_at
+                FROM users u
+                LEFT JOIN devices d ON d.user_id = u.id
+                GROUP BY u.id
+                ORDER BY u.is_admin DESC, u.created_at ASC
+                "#,
+                &[],
+            )
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| AdminUserSummaryRecord {
+                id: r.get(0),
+                handle: r.get(1),
+                email: r.get(2),
+                display_name: r.get(3),
+                is_admin: r.get(4),
+                online_devices: r.get(5),
+                total_devices: r.get(6),
+                last_login_at: r.get(7),
+                created_at: r.get(8),
+            })
+            .collect())
+    }
+
+    pub async fn create_password_reset_token(
+        &self,
+        admin: &UserRecord,
+        target_user_id: Uuid,
+        ttl_secs: i64,
+    ) -> Result<Option<(String, String)>> {
+        if !admin.is_admin {
+            bail!("only admin accounts can generate password reset links");
+        }
+        let client = self.client().await?;
+        let Some(urow) = client
+            .query_opt("SELECT handle FROM users WHERE id = $1", &[&target_user_id])
+            .await?
+        else {
+            return Ok(None);
+        };
+        let handle: String = urow.get(0);
+
+        let mut raw_bytes = [0u8; 32];
+        OsRng.fill_bytes(&mut raw_bytes);
+        let raw_token = format!(
+            "rst_{}",
+            base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, raw_bytes)
+        );
+        let token_sha256 = sha256_hex(&raw_token);
+        let expires_at = Utc::now() + Duration::seconds(ttl_secs.clamp(60, 7 * 86_400));
+
+        client
+            .execute(
+                r#"
+                INSERT INTO password_reset_tokens (token_sha256, user_id, created_by, expires_at)
+                VALUES ($1, $2, $3, $4)
+                "#,
+                &[&token_sha256, &target_user_id, &admin.id, &expires_at],
+            )
+            .await?;
+        Ok(Some((handle, raw_token)))
+    }
+
+    /// Consumes a one-time `rst_...` password reset token, updates the Argon2 password hash,
+    /// and revokes `scope = 'full'` `auth_sessions` while preserving paired `daemon_host` sessions and relay tickets.
+    pub async fn consume_password_reset_token(
+        &self,
+        raw_token_or_url: &str,
+        new_password: &str,
+    ) -> Result<(Uuid, String, Vec<String>)> {
+        if new_password.len() < 8 || new_password.len() > 256 {
+            bail!("new_password must be 8..=256 bytes");
+        }
+        let raw_token = extract_reset_token_from_input(raw_token_or_url)?;
+        let token_sha256 = sha256_hex(&raw_token);
+
+        {
+            let pre_client = self.client().await?;
+            let valid: bool = pre_client
+                .query_one(
+                    r#"
+                    SELECT EXISTS(
+                        SELECT 1 FROM password_reset_tokens
+                        WHERE token_sha256 = $1
+                          AND consumed_at IS NULL
+                          AND expires_at > NOW()
+                    )
+                    "#,
+                    &[&token_sha256],
+                )
+                .await?
+                .get(0);
+            if !valid {
+                bail!("invalid, expired, or already-used password reset token");
+            }
+        }
+
+        let new_pw = new_password.to_string();
+        let new_hash = tokio::task::spawn_blocking(move || -> Result<String> {
+            let salt = SaltString::generate(&mut OsRng);
+            Argon2::default()
+                .hash_password(new_pw.as_bytes(), &salt)
+                .map(|h| h.to_string())
+                .map_err(|e| anyhow!("password hash error: {e}"))
+        })
+        .await??;
+
+        let mut tx_guard = self.acquire_tx_client().await?;
+        let tx = tx_guard.as_mut().transaction().await?;
+
+        let consumed = tx
+            .query_opt(
+                r#"
+                UPDATE password_reset_tokens
+                SET consumed_at = NOW()
+                WHERE token_sha256 = $1
+                  AND consumed_at IS NULL
+                  AND expires_at > NOW()
+                RETURNING user_id
+                "#,
+                &[&token_sha256],
+            )
+            .await?
+            .ok_or_else(|| anyhow!("invalid, expired, or already-used password reset token"))?;
+        let user_id: Uuid = consumed.get(0);
+
+        let user_row = tx
+            .query_opt(
+                "UPDATE users SET password_hash = $2 WHERE id = $1 RETURNING handle",
+                &[&user_id, &new_hash],
+            )
+            .await?
+            .ok_or_else(|| anyhow!("target user account not found"))?;
+        let handle: String = user_row.get(0);
+
+        let revoked_rows = tx
+            .query(
+                r#"
+                DELETE FROM auth_sessions
+                WHERE user_id = $1
+                  AND scope = 'full'
+                RETURNING token_sha256
+                "#,
+                &[&user_id],
+            )
+            .await?;
+        let revoked_hashes: Vec<String> = revoked_rows.into_iter().map(|r| r.get(0)).collect();
+
+        tx.commit().await?;
+        Ok((user_id, handle, revoked_hashes))
+    }
+
+    pub async fn count_web_push_subscriptions(&self, user_id: Uuid) -> Result<usize> {
+        let client = self.client().await?;
+        let row = client
+            .query_one(
+                "SELECT COUNT(*)::BIGINT FROM web_push_subscriptions WHERE user_id = $1",
+                &[&user_id],
+            )
+            .await?;
+        let n: i64 = row.get(0);
+        Ok(n.max(0) as usize)
+    }
+
+    pub async fn list_web_push_subscriptions(
+        &self,
+        user_id: Uuid,
+    ) -> Result<Vec<WebPushSubscriptionRecord>> {
+        let client = self.client().await?;
+        let rows = client
+            .query(
+                r#"
+                SELECT id, user_id, endpoint, p256dh_b64url, auth_b64url, user_agent, created_at
+                FROM web_push_subscriptions
+                WHERE user_id = $1
+                ORDER BY created_at DESC, id DESC
+                LIMIT 32
+                "#,
+                &[&user_id],
+            )
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| WebPushSubscriptionRecord {
+                id: r.get(0),
+                user_id: r.get(1),
+                endpoint: r.get(2),
+                p256dh_b64url: r.get(3),
+                auth_b64url: r.get(4),
+                user_agent: r.get(5),
+                created_at: r.get(6),
+            })
+            .collect())
+    }
+
+    pub async fn upsert_web_push_subscription(
+        &self,
+        user_id: Uuid,
+        endpoint: &str,
+        p256dh_b64url: &str,
+        auth_b64url: &str,
+        user_agent: &str,
+        max_per_user: usize,
+    ) -> Result<usize> {
+        let clean_ua: String = user_agent
+            .trim()
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(256)
+            .collect();
+        let cap = (max_per_user.clamp(1, 64)) as i64;
+
+        let mut tx_guard = self.acquire_tx_client().await?;
+        let tx = tx_guard.as_mut().transaction().await?;
+
+        tx.execute(
+            r#"
+            INSERT INTO web_push_subscriptions (
+                user_id, endpoint, p256dh_b64url, auth_b64url, user_agent, created_at
+            )
+            VALUES ($1, $2, $3, $4, $5, NOW())
+            ON CONFLICT (user_id, endpoint) DO UPDATE
+            SET p256dh_b64url = EXCLUDED.p256dh_b64url,
+                auth_b64url = EXCLUDED.auth_b64url,
+                user_agent = EXCLUDED.user_agent,
+                created_at = NOW()
+            "#,
+            &[&user_id, &endpoint, &p256dh_b64url, &auth_b64url, &clean_ua],
+        )
+        .await?;
+
+        tx.execute(
+            r#"
+            DELETE FROM web_push_subscriptions
+            WHERE user_id = $1
+              AND id NOT IN (
+                  SELECT id FROM web_push_subscriptions
+                  WHERE user_id = $1
+                  ORDER BY created_at DESC, id DESC
+                  LIMIT $2
+              )
+            "#,
+            &[&user_id, &cap],
+        )
+        .await?;
+
+        let count_row = tx
+            .query_one(
+                "SELECT COUNT(*)::BIGINT FROM web_push_subscriptions WHERE user_id = $1",
+                &[&user_id],
+            )
+            .await?;
+        let count: i64 = count_row.get(0);
+        tx.commit().await?;
+        Ok(count.max(0) as usize)
+    }
+
+    pub async fn delete_web_push_subscription(
+        &self,
+        user_id: Uuid,
+        endpoint_or_wildcard: &str,
+    ) -> Result<usize> {
+        let client = self.client().await?;
+        let trimmed = endpoint_or_wildcard.trim();
+        if trimmed.is_empty() || trimmed == "*" {
+            client
+                .execute(
+                    "DELETE FROM web_push_subscriptions WHERE user_id = $1",
+                    &[&user_id],
+                )
+                .await?;
+        } else {
+            client
+                .execute(
+                    "DELETE FROM web_push_subscriptions WHERE user_id = $1 AND endpoint = $2",
+                    &[&user_id, &trimmed],
+                )
+                .await?;
+        }
+        self.count_web_push_subscriptions(user_id).await
+    }
+
+    pub async fn delete_web_push_subscription_by_id(&self, sub_id: Uuid) -> Result<bool> {
+        let client = self.client().await?;
+        let deleted = client
+            .execute(
+                "DELETE FROM web_push_subscriptions WHERE id = $1",
+                &[&sub_id],
+            )
+            .await?;
+        Ok(deleted > 0)
+    }
+
+    pub async fn get_user_prompt_snippets(&self, user_id: Uuid) -> Result<Vec<PromptSnippetRecord>> {
+        let client = self.client().await?;
+        let row = client
+            .query_opt(
+                "SELECT snippets_json FROM user_prompt_snippets WHERE user_id = $1",
+                &[&user_id],
+            )
+            .await?;
+        match row {
+            None => Ok(default_prompt_snippets()),
+            Some(r) => {
+                let raw_json: Value = r.get(0);
+                let parsed: Vec<PromptSnippetRecord> = serde_json::from_value(raw_json)
+                    .unwrap_or_else(|_| default_prompt_snippets());
+                Ok(parsed)
+            }
+        }
+    }
+
+    pub async fn put_user_prompt_snippets(
+        &self,
+        user_id: Uuid,
+        snippets: &[PromptSnippetRecord],
+    ) -> Result<Vec<PromptSnippetRecord>> {
+        let validated = validate_prompt_snippets(snippets)?;
+        let json_val = serde_json::to_value(&validated)?;
+        let client = self.client().await?;
+        client
+            .execute(
+                r#"
+                INSERT INTO user_prompt_snippets (user_id, snippets_json, updated_at)
+                VALUES ($1, $2, NOW())
+                ON CONFLICT (user_id) DO UPDATE
+                SET snippets_json = EXCLUDED.snippets_json,
+                    updated_at = NOW()
+                "#,
+                &[&user_id, &json_val],
+            )
+            .await?;
+        Ok(validated)
+    }
+}
+
+pub fn default_prompt_snippets() -> Vec<PromptSnippetRecord> {
+    vec![
+        PromptSnippetRecord {
+            id: "s1".to_string(),
+            title: "Run Tests & Fix".to_string(),
+            prompt: "Run the full test suite, fix any failures or compiler warnings, and summarize what changed.".to_string(),
+        },
+        PromptSnippetRecord {
+            id: "s2".to_string(),
+            title: "Review Git Diff".to_string(),
+            prompt: "Review the current git diff carefully for bugs, edge cases, or regressions before committing.".to_string(),
+        },
+        PromptSnippetRecord {
+            id: "s3".to_string(),
+            title: "Continue".to_string(),
+            prompt: "Continue with the next steps until everything is complete and verified.".to_string(),
+        },
+        PromptSnippetRecord {
+            id: "s4".to_string(),
+            title: "Clean Commit".to_string(),
+            prompt: "Stage and commit the current changes with a concise conventional commit message.".to_string(),
+        },
+    ]
+}
+
+pub fn validate_prompt_snippets(raw: &[PromptSnippetRecord]) -> Result<Vec<PromptSnippetRecord>> {
+    if raw.len() > 24 {
+        bail!("at most 24 prompt snippets are allowed");
+    }
+    let mut seen_ids = std::collections::HashSet::with_capacity(raw.len());
+    let mut clean = Vec::with_capacity(raw.len());
+    for item in raw {
+        let id = item.id.trim().to_string();
+        let title = item.title.trim().to_string();
+        let prompt = item.prompt.trim().to_string();
+        if id.is_empty() || id.chars().count() > 128 || id.chars().any(|c| c.is_control()) {
+            bail!("snippet id must be 1..=128 non-control characters");
+        }
+        if title.is_empty() || title.chars().count() > 60 || title.chars().any(|c| c.is_control()) {
+            bail!("snippet title must be 1..=60 non-control characters");
+        }
+        if prompt.is_empty() || prompt.chars().count() > 4000 {
+            bail!("snippet prompt must be 1..=4000 characters");
+        }
+        if !seen_ids.insert(id.clone()) {
+            bail!("duplicate snippet id '{id}'");
+        }
+        clean.push(PromptSnippetRecord { id, title, prompt });
+    }
+    Ok(clean)
+}
+
+/// Extracts a clean `rst_...` password reset token from either a raw token or a full URL containing `token=rst_...`.
+pub fn extract_reset_token_from_input(raw: &str) -> Result<String> {
+    let trimmed = raw
+        .trim()
+        .trim_matches(|c: char| matches!(c, '"' | '\'' | '`' | '<' | '>'))
+        .trim();
+    if trimmed.is_empty() {
+        bail!("reset token is required");
+    }
+
+    let candidate = if let Some((_, after_eq)) = trimmed.split_once("token=") {
+        let stop_idx = after_eq
+            .find(|c: char| {
+                c.is_whitespace() || matches!(c, '&' | '#' | '?' | '"' | '\'' | '`' | '>')
+            })
+            .unwrap_or(after_eq.len());
+        percent_decode_ascii_simple(&after_eq[..stop_idx])
+    } else if let Some(idx) = trimmed.find("rst_") {
+        let rest = &trimmed[idx..];
+        let stop_idx = rest
+            .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-')))
+            .unwrap_or(rest.len());
+        rest[..stop_idx].to_string()
+    } else {
+        trimmed.to_string()
+    };
+
+    let clean = candidate.trim();
+    if !clean.starts_with("rst_")
+        || clean.len() < 16
+        || clean.len() > 256
+        || !clean[4..]
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
+    {
+        bail!("invalid password reset token format");
+    }
+    Ok(clean.to_string())
+}
+
+fn percent_decode_ascii_simple(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (
+                (bytes[i + 1] as char).to_digit(16),
+                (bytes[i + 2] as char).to_digit(16),
+            ) {
+                out.push(((hi << 4) | lo) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn validate_email(email: &str) -> Result<()> {
@@ -2049,6 +2603,12 @@ async fn purge_expired_with_client(client: &Client) -> Result<()> {
     let _ = client
         .execute(
             "DELETE FROM device_auth_requests WHERE expires_at < NOW() - INTERVAL '1 hour'",
+            &[],
+        )
+        .await?;
+    let _ = client
+        .execute(
+            "DELETE FROM password_reset_tokens WHERE expires_at < NOW() - INTERVAL '7 days'",
             &[],
         )
         .await?;

@@ -44,7 +44,7 @@ async fn acquire_clean_test_db(db_url: &str) -> tokio_postgres::Client {
         .await
         .expect("PostgreSQL coda_test should be reachable and migrate cleanly");
     pg.batch_execute(
-        "TRUNCATE device_auth_requests, pairing_tokens, devices, auth_sessions, invite_codes, users RESTART IDENTITY CASCADE;",
+        "TRUNCATE server_kv, password_reset_tokens, web_push_subscriptions, user_prompt_snippets, device_auth_requests, pairing_tokens, devices, auth_sessions, invite_codes, users RESTART IDENTITY CASCADE;",
     )
     .await
     .unwrap();
@@ -2719,4 +2719,755 @@ async fn test_v090_webhook_notifications_daemon_alerts_prune_stale_and_bootstrap
 
     daemon_task.abort();
     mock_server_task.abort();
+}
+
+#[tokio::test]
+async fn test_v110_admin_friend_reset_vapid_web_push_and_prompt_snippets() {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64_URL;
+    use ring::{
+        agreement::{EphemeralPrivateKey, ECDH_P256},
+        rand::{SecureRandom, SystemRandom},
+        signature::{UnparsedPublicKey as VerifyPublicKey, ECDSA_P256_SHA256_FIXED},
+    };
+
+    let _guard = DB_TEST_LOCK.get_or_init(|| Mutex::new(())).lock().await;
+    let db_url = std::env::var("TEST_DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://vampire@localhost:5432/coda_test".to_string());
+    let pg = acquire_clean_test_db(&db_url).await;
+
+    // Prepare a synthetic `web_dist` folder to verify `/sw.js` headers & `/reset-password` SPA route.
+    let tmp_web_dist = std::env::temp_dir().join(format!("coda-e2e-webdist-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&tmp_web_dist).unwrap();
+    std::fs::write(
+        tmp_web_dist.join("index.html"),
+        "<!doctype html><html><body>coda-spa</body></html>",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp_web_dist.join("sw.js"),
+        "self.addEventListener('push', () => {});",
+    )
+    .unwrap();
+
+    let server = start_full_server_with_options(
+        &db_url,
+        "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+        "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+        b"integration-test-hmac-secret-v110-2026".to_vec(),
+        None,
+        Some(tmp_web_dist.clone()),
+        ServerOptions::default(),
+    )
+    .await
+    .unwrap();
+
+    let base = format!("http://{}", server.http_addr);
+    let http = reqwest::Client::new();
+
+    // 1. Verify `/sw.js` headers (`Service-Worker-Allowed: /`, `Cache-Control: no-cache`),
+    //    `/reset-password` SPA serving, and `/api/v1/site-info` alias.
+    let sw_resp = http.get(format!("{base}/sw.js")).send().await.unwrap();
+    assert_eq!(sw_resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        sw_resp
+            .headers()
+            .get("service-worker-allowed")
+            .and_then(|v| v.to_str().ok()),
+        Some("/")
+    );
+    assert_eq!(
+        sw_resp
+            .headers()
+            .get("cache-control")
+            .and_then(|v| v.to_str().ok()),
+        Some("no-cache")
+    );
+
+    let reset_spa = http
+        .get(format!("{base}/reset-password?token=rst_example"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reset_spa.status(), reqwest::StatusCode::OK);
+    assert!(reset_spa.text().await.unwrap().contains("coda-spa"));
+
+    let site_info_alias: serde_json::Value = http
+        .get(format!("{base}/api/v1/site-info"))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(site_info_alias["service"], "coda-server");
+
+    // 2. Register Owner (Admin) + Invite Friend Leo + Pair Daemons
+    let owner: AuthResponse = http
+        .post(format!("{base}/api/v1/auth/register"))
+        .json(&json!({
+            "email": "admin110@coda.dev",
+            "handle": "admin110",
+            "display_name": "Admin 110",
+            "password": "owner-password-110",
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(owner.user.is_admin);
+
+    let invite: InviteCodeRecord = http
+        .post(format!("{base}/api/v1/invites"))
+        .bearer_auth(&owner.token)
+        .json(&json!({ "note": "Leo v1.1", "max_uses": 2, "valid_days": 7 }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let leo: AuthResponse = http
+        .post(format!("{base}/api/v1/auth/register"))
+        .json(&json!({
+            "email": "leo110@friends.dev",
+            "handle": "leo110",
+            "display_name": "Leo 110",
+            "password": "leo-old-password-110",
+            "invite_code": invite.code,
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(!leo.user.is_admin);
+
+    // Pair an admin daemon (to verify `scope == "full"` is strictly required even for an admin's daemon_host token!)
+    let owner_flow = start_device_login_flow(&base, "daemon", Some("Admin-Daemon".into()), None)
+        .await
+        .unwrap();
+    http.post(format!("{base}/api/v1/auth/device/approve"))
+        .bearer_auth(&owner.token)
+        .json(&json!({ "user_code": owner_flow.user_code }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let owner_daemon = poll_device_login_once(&owner_flow)
+        .await
+        .unwrap()
+        .expect("admin daemon approved");
+    let owner_daemon_tok = owner_daemon.session_token.clone().unwrap();
+
+    // Pair a daemon for Leo (to verify password reset preserves paired daemon_host session & relay ticket!)
+    let leo_flow = start_device_login_flow(&base, "daemon", Some("Leo-Linux-Box".into()), None)
+        .await
+        .unwrap();
+    http.post(format!("{base}/api/v1/auth/device/approve"))
+        .bearer_auth(&leo.token)
+        .json(&json!({ "user_code": leo_flow.user_code }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let leo_daemon = poll_device_login_once(&leo_flow)
+        .await
+        .unwrap()
+        .expect("leo daemon approved");
+    let leo_daemon_tok = leo_daemon.session_token.clone().unwrap();
+
+    // Non-admin Leo MUST receive 403 on admin endpoints
+    assert_eq!(
+        http.get(format!("{base}/api/v1/admin/users"))
+            .bearer_auth(&leo.token)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        http.post(format!("{base}/api/v1/admin/users/{}/reset-link", owner.user.id))
+            .bearer_auth(&leo.token)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::FORBIDDEN
+    );
+    // Admin's `daemon_host` scoped token MUST ALSO receive 403 (`auth.scope == "full"` required!)
+    assert_eq!(
+        http.get(format!("{base}/api/v1/admin/users"))
+            .bearer_auth(&owner_daemon_tok)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::FORBIDDEN
+    );
+
+    // Admin fetches Friends Directory
+    let admin_users_resp: serde_json::Value = http
+        .get(format!("{base}/api/v1/admin/users"))
+        .bearer_auth(&owner.token)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let users_arr = admin_users_resp["users"].as_array().unwrap();
+    assert_eq!(users_arr.len(), 2);
+    let leo_entry = users_arr
+        .iter()
+        .find(|u| u["handle"] == "leo110")
+        .expect("leo in admin users list");
+    assert_eq!(leo_entry["is_admin"], false);
+    assert_eq!(leo_entry["total_devices"], 1);
+    assert_eq!(leo_entry["online_devices"], 0);
+    assert!(leo_entry["last_login_at"].is_string());
+
+    // 3. Admin issues Passwordless Friend Reset Link -> SHA-256 at rest, full URL parsing,
+    //    replay rejection, `scope = 'full'` revocation, and daemon preservation!
+    let reset_resp: serde_json::Value = http
+        .post(format!("{base}/api/v1/admin/users/{}/reset-link", leo.user.id))
+        .bearer_auth(&owner.token)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(reset_resp["ok"], true);
+    assert_eq!(reset_resp["handle"], "leo110");
+    assert_eq!(reset_resp["expires_in_secs"], 86_400);
+    let reset_token = reset_resp["reset_token"].as_str().unwrap().to_string();
+    let reset_url = reset_resp["reset_url"].as_str().unwrap().to_string();
+    assert!(reset_token.starts_with("rst_") && reset_token.len() >= 36);
+    assert_eq!(reset_url, format!("{base}/reset-password?token={reset_token}"));
+
+    // Ensure raw token is NEVER stored in plaintext in PostgreSQL
+    let raw_in_db: i64 = pg
+        .query_one(
+            "SELECT COUNT(*)::BIGINT FROM password_reset_tokens WHERE token_sha256 = $1",
+            &[&reset_token],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(raw_in_db, 0);
+
+    // Too-short password (< 8 bytes) must return 400 WITHOUT burning the one-time reset token
+    let short_pw_resp = http
+        .post(format!("{base}/api/v1/auth/reset-password"))
+        .json(&json!({
+            "token": reset_url,
+            "new_password": "short",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(short_pw_resp.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    // Consume reset link by pasting the full URL (with surrounding whitespace)
+    let consumed_ok: serde_json::Value = http
+        .post(format!("{base}/api/v1/auth/reset-password"))
+        .json(&json!({
+            "token": format!("  {reset_url}  "),
+            "new_password": "leo-fresh-password-2026!",
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(consumed_ok["ok"], true);
+    assert_eq!(consumed_ok["handle"], "leo110");
+
+    // Replaying the same reset token MUST be rejected!
+    let replay_resp = http
+        .post(format!("{base}/api/v1/auth/reset-password"))
+        .json(&json!({
+            "token": reset_token,
+            "new_password": "another-password-9999",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(replay_resp.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    // Leo's old `scope = 'full'` session MUST be revoked (401), while Leo's paired daemon stays authenticated!
+    assert_eq!(
+        http.get(format!("{base}/api/v1/auth/me"))
+            .bearer_auth(&leo.token)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        http.get(format!("{base}/api/v1/relay/trusted-peers"))
+            .bearer_auth(&leo_daemon_tok)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::OK
+    );
+    assert_eq!(
+        http.get(format!("{base}/api/v1/relay/trusted-peers"))
+            .header("x-coda-relay-ticket", &leo_daemon.daemon_relay_ticket)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::OK
+    );
+
+    // Old password rejected, new password succeeds!
+    assert_eq!(
+        http.post(format!("{base}/api/v1/auth/login"))
+            .json(&json!({
+                "email_or_handle": "leo110",
+                "password": "leo-old-password-110",
+            }))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+    let leo_relogin: AuthResponse = http
+        .post(format!("{base}/api/v1/auth/login"))
+        .json(&json!({
+            "email_or_handle": "leo110",
+            "password": "leo-fresh-password-2026!",
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    // 4. Standard W3C VAPID Web Push (`RFC 8292 + RFC 8291 aes128gcm` + SSRF + 410 auto-prune)
+    let vapid_info: coda_server::VapidPublicKeyResponse = http
+        .get(format!("{base}/api/v1/push/vapid-public-key"))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(vapid_info.enabled);
+    let vapid_pub_bytes = coda_server::web_push::decode_flexible_b64(&vapid_info.public_key).unwrap();
+    assert_eq!(vapid_pub_bytes.len(), 65);
+    assert_eq!(vapid_pub_bytes[0], 0x04);
+
+    // Verify `server_kv` persistence across reload
+    let reloaded_wp = coda_server::WebPushService::load_or_init(&server.state.db)
+        .await
+        .unwrap();
+    assert_eq!(reloaded_wp.public_key_b64url(), vapid_info.public_key);
+
+    // Spin up mock W3C Web Push service capturing headers + encrypted body
+    #[derive(Debug)]
+    struct CapturedWebPush {
+        authorization: String,
+        content_encoding: String,
+        ttl: String,
+        urgency: String,
+        body: Vec<u8>,
+    }
+    let (wp_tx, mut wp_rx) = tokio::sync::mpsc::unbounded_channel::<CapturedWebPush>();
+    let wp_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let wp_addr = wp_listener.local_addr().unwrap();
+    let wp_router = axum::Router::new()
+        .route(
+            "/push/active",
+            axum::routing::post({
+                let tx = wp_tx.clone();
+                move |headers: axum::http::HeaderMap, body: axum::body::Bytes| {
+                    let tx = tx.clone();
+                    async move {
+                        let get_h = |k: &str| {
+                            headers
+                                .get(k)
+                                .and_then(|v| v.to_str().ok())
+                                .unwrap_or("")
+                                .to_string()
+                        };
+                        let _ = tx.send(CapturedWebPush {
+                            authorization: get_h("authorization"),
+                            content_encoding: get_h("content-encoding"),
+                            ttl: get_h("ttl"),
+                            urgency: get_h("urgency"),
+                            body: body.to_vec(),
+                        });
+                        axum::http::StatusCode::CREATED
+                    }
+                }
+            }),
+        )
+        .route(
+            "/push/stale",
+            axum::routing::post(|| async { axum::http::StatusCode::GONE }),
+        );
+    let wp_server_task = tokio::spawn(async move {
+        let _ = axum::serve(wp_listener, wp_router).await;
+    });
+
+    let rng = SystemRandom::new();
+    let ua_priv_1 = EphemeralPrivateKey::generate(&ECDH_P256, &rng).unwrap();
+    let ua_pub_1 = ua_priv_1.compute_public_key().unwrap();
+    let mut auth_sec_1 = [0u8; 16];
+    rng.fill(&mut auth_sec_1).unwrap();
+
+    // Without allow_local_webhook_test, http://127.0.0.1 MUST be blocked by SSRF policy
+    let blocked_sub = http
+        .post(format!("{base}/api/v1/me/web-push/subscribe"))
+        .bearer_auth(&leo_relogin.token)
+        .json(&json!({
+            "endpoint": format!("http://{wp_addr}/push/active"),
+            "keys": {
+                "p256dh": B64_URL.encode(ua_pub_1.as_ref()),
+                "auth": B64_URL.encode(auth_sec_1),
+            },
+            "user_agent": "Safari iOS PWA",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(blocked_sub.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    server
+        .state
+        .allow_local_webhook_test
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    // Metadata IP is STILL blocked even with allow_local_webhook_test=true
+    let blocked_meta = http
+        .post(format!("{base}/api/v1/me/web-push/subscribe"))
+        .bearer_auth(&leo_relogin.token)
+        .json(&json!({
+            "endpoint": "http://169.254.169.254/latest/meta-data",
+            "keys": {
+                "p256dh": B64_URL.encode(ua_pub_1.as_ref()),
+                "auth": B64_URL.encode(auth_sec_1),
+            },
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(blocked_meta.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    // Subscribe both active (201) and stale (410) push endpoints
+    let sub_active_res: serde_json::Value = http
+        .post(format!("{base}/api/v1/me/web-push/subscribe"))
+        .bearer_auth(&leo_relogin.token)
+        .json(&json!({
+            "endpoint": format!("http://{wp_addr}/push/active"),
+            "keys": {
+                "p256dh": B64_URL.encode(ua_pub_1.as_ref()),
+                "auth": B64_URL.encode(auth_sec_1),
+            },
+            "user_agent": "Safari iOS PWA 18.4",
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(sub_active_res["ok"], true);
+    assert_eq!(sub_active_res["web_push_count"], 1);
+
+    let sub_stale_res: serde_json::Value = http
+        .post(format!("{base}/api/v1/me/web-push/subscribe"))
+        .bearer_auth(&leo_relogin.token)
+        .json(&json!({
+            "endpoint": format!("http://{wp_addr}/push/stale"),
+            "keys": {
+                "p256dh": B64_URL.encode(ua_pub_1.as_ref()),
+                "auth": B64_URL.encode(auth_sec_1),
+            },
+            "user_agent": "Old Uninstalled Browser",
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(sub_stale_res["web_push_count"], 2);
+
+    let notif_with_wp: coda_server::NotificationSettingsRecord = http
+        .get(format!("{base}/api/v1/me/notifications"))
+        .bearer_auth(&leo_relogin.token)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(notif_with_wp.web_push_count, 2);
+
+    // Trigger `POST /api/v1/me/notifications/test` -> delivers encrypted `web_push` + auto-deletes `410 Gone`!
+    let test_wp_res: serde_json::Value = http
+        .post(format!("{base}/api/v1/me/notifications/test"))
+        .bearer_auth(&leo_relogin.token)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(test_wp_res["ok"], true);
+    assert_eq!(test_wp_res["delivered_channels"], json!(["web_push"]));
+
+    let captured_1 = tokio::time::timeout(std::time::Duration::from_secs(3), wp_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(captured_1.content_encoding, "aes128gcm");
+    assert_eq!(captured_1.ttl, "3600");
+    assert_eq!(captured_1.urgency, "high");
+
+    // Verify RFC 8292 VAPID ES256 JWT signature on the captured HTTP request
+    let vapid_rest = captured_1.authorization.strip_prefix("vapid t=").unwrap();
+    let (jwt_str, k_str) = vapid_rest.split_once(", k=").unwrap();
+    assert_eq!(k_str, vapid_info.public_key);
+    let jwt_parts: Vec<&str> = jwt_str.split('.').collect();
+    assert_eq!(jwt_parts.len(), 3);
+    let verifier = VerifyPublicKey::new(&ECDSA_P256_SHA256_FIXED, &vapid_pub_bytes);
+    verifier
+        .verify(
+            format!("{}.{}", jwt_parts[0], jwt_parts[1]).as_bytes(),
+            &coda_server::web_push::decode_flexible_b64(jwt_parts[2]).unwrap(),
+        )
+        .expect("live VAPID ES256 JWT must verify");
+
+    // Decrypt RFC 8291 `aes128gcm` HTTP body as the subscriber user-agent!
+    let plain_1 = coda_server::web_push::decrypt_web_push_aes128gcm(
+        ua_priv_1,
+        ua_pub_1.as_ref(),
+        &auth_sec_1,
+        &captured_1.body,
+    )
+    .unwrap();
+    let plain_1_json: serde_json::Value = serde_json::from_slice(&plain_1).unwrap();
+    assert_eq!(plain_1_json["url"], "/console");
+    assert_eq!(plain_1_json["tag"], "coda-test");
+    assert!(plain_1_json["title"].as_str().unwrap().contains("Alert Test"));
+
+    // Confirm `/push/stale` (HTTP 410) was auto-removed -> `web_push_count == 1`!
+    let notif_after_410: coda_server::NotificationSettingsRecord = http
+        .get(format!("{base}/api/v1/me/notifications"))
+        .bearer_auth(&leo_relogin.token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(notif_after_410.web_push_count, 1);
+
+    // Rotate subscriber keys on `/push/active` (idempotent upsert) and test `POST /api/v1/daemon/alert`!
+    let ua_priv_2 = EphemeralPrivateKey::generate(&ECDH_P256, &rng).unwrap();
+    let ua_pub_2 = ua_priv_2.compute_public_key().unwrap();
+    let mut auth_sec_2 = [0u8; 16];
+    rng.fill(&mut auth_sec_2).unwrap();
+    let sub_rot_res: serde_json::Value = http
+        .post(format!("{base}/api/v1/me/web-push/subscribe"))
+        .bearer_auth(&leo_relogin.token)
+        .json(&json!({
+            "endpoint": format!("http://{wp_addr}/push/active"),
+            "keys": {
+                "p256dh": B64_URL.encode(ua_pub_2.as_ref()),
+                "auth": B64_URL.encode(auth_sec_2),
+            },
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(sub_rot_res["web_push_count"], 1);
+
+    let daemon_wp_alert: serde_json::Value = http
+        .post(format!("{base}/api/v1/daemon/alert"))
+        .bearer_auth(&leo_daemon.daemon_relay_ticket)
+        .json(&json!({
+            "device_id": leo_daemon.device_id,
+            "device_name": "Leo-Linux-Box",
+            "session_name": "codex-fix",
+            "status": "needs_you",
+            "cwd_basename": "/home/leo_secret/my-repo",
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(daemon_wp_alert["ok"], true);
+    assert_eq!(daemon_wp_alert["dispatched"], 1);
+
+    let captured_2 = tokio::time::timeout(std::time::Duration::from_secs(3), wp_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let plain_2 = coda_server::web_push::decrypt_web_push_aes128gcm(
+        ua_priv_2,
+        ua_pub_2.as_ref(),
+        &auth_sec_2,
+        &captured_2.body,
+    )
+    .unwrap();
+    let plain_2_str = String::from_utf8(plain_2).unwrap();
+    assert!(!plain_2_str.contains("leo_secret"));
+    let plain_2_json: serde_json::Value = serde_json::from_str(&plain_2_str).unwrap();
+    assert_eq!(plain_2_json["url"], "/console");
+    assert!(plain_2_json["body"].as_str().unwrap().contains("my-repo"));
+
+    // Unsubscribe wildcard `*` removes all user subscriptions
+    let unsub_res: serde_json::Value = http
+        .post(format!("{base}/api/v1/me/web-push/unsubscribe"))
+        .bearer_auth(&leo_relogin.token)
+        .json(&json!({ "endpoint": "*" }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(unsub_res["ok"], true);
+    assert_eq!(unsub_res["web_push_count"], 0);
+
+    // 5. Cross-Device Saved Prompt Snippets (`GET / PUT /api/v1/me/snippets`)
+    let initial_snippets: serde_json::Value = http
+        .get(format!("{base}/api/v1/me/snippets"))
+        .bearer_auth(&leo_relogin.token)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(initial_snippets["snippets"].as_array().unwrap().len(), 4);
+    assert_eq!(initial_snippets["snippets"][0]["id"], "s1");
+
+    // Validation rejects over-length title (> 60 chars)
+    let bad_snippets = http
+        .put(format!("{base}/api/v1/me/snippets"))
+        .bearer_auth(&leo_relogin.token)
+        .json(&json!({
+            "snippets": [{
+                "id": "bad1",
+                "title": "x".repeat(65),
+                "prompt": "do work",
+            }]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad_snippets.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    // Save custom snippets for Leo and verify persistence + tenant isolation
+    let custom_payload = json!({
+        "snippets": [
+            {
+                "id": "custom-1",
+                "title": "Audit Security",
+                "prompt": "Audit all auth & SSRF boundaries and write tests.",
+            },
+            {
+                "id": "custom-2",
+                "title": "Ship Release",
+                "prompt": "Run full cargo & bun test suites and summarize.",
+            }
+        ]
+    });
+    let saved_snippets: serde_json::Value = http
+        .put(format!("{base}/api/v1/me/snippets"))
+        .bearer_auth(&leo_relogin.token)
+        .json(&custom_payload)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(saved_snippets["snippets"].as_array().unwrap().len(), 2);
+
+    let fetched_leo_snippets: serde_json::Value = http
+        .get(format!("{base}/api/v1/me/snippets"))
+        .bearer_auth(&leo_relogin.token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(fetched_leo_snippets["snippets"][0]["title"], "Audit Security");
+
+    // Owner still has the 4 untouched curated default snippets!
+    let owner_snippets: serde_json::Value = http
+        .get(format!("{base}/api/v1/me/snippets"))
+        .bearer_auth(&owner.token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(owner_snippets["snippets"].as_array().unwrap().len(), 4);
+
+    wp_server_task.abort();
+    let _ = std::fs::remove_dir_all(&tmp_web_dist);
 }

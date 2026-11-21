@@ -1,5 +1,6 @@
 pub mod db;
 pub mod relay;
+pub mod web_push;
 
 use std::{
     collections::HashMap,
@@ -89,7 +90,11 @@ impl RateLimiter {
     }
 }
 
-pub use crate::db::NotificationSettingsRecord;
+pub use crate::db::{
+    AdminUserSummaryRecord, NotificationSettingsRecord, PromptSnippetRecord,
+    WebPushSubscriptionRecord,
+};
+pub use crate::web_push::{VapidPublicKeyResponse, WebPushService};
 use crate::{
     db::{
         AuthSessionRecord, AuthenticatedSession, Db, DeviceAuthPollState, DeviceAuthPublicInfo,
@@ -157,6 +162,7 @@ pub struct AppState {
     pub allowed_origins: Vec<String>,
     pub http_no_redirect: reqwest::Client,
     pub webhook_http: reqwest::Client,
+    pub web_push: WebPushService,
     pub allow_local_webhook_test: Arc<std::sync::atomic::AtomicBool>,
     pub latest_release_cache: Arc<RwLock<Option<(Option<String>, Instant)>>>,
     pub rate_limiter: Arc<RateLimiter>,
@@ -384,7 +390,17 @@ async fn cache_control_middleware(req: Request, next: Next) -> Response {
     let is_ok_hashed = is_hashed_bundle && resp.status() == StatusCode::OK;
     let is_ok_asset = is_static_asset && resp.status() == StatusCode::OK;
     let headers = resp.headers_mut();
-    if is_ok_hashed {
+    if path == "/sw.js" {
+        headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+        headers.insert(
+            HeaderName::from_static("service-worker-allowed"),
+            HeaderValue::from_static("/"),
+        );
+        headers.insert(
+            HeaderName::from_static("cdn-cache-control"),
+            HeaderValue::from_static("no-store"),
+        );
+    } else if is_ok_hashed {
         headers.insert(
             header::CACHE_CONTROL,
             HeaderValue::from_static("public, max-age=31536000, immutable"),
@@ -461,12 +477,18 @@ pub fn build_router(state: AppState, web_dist_dir: Option<PathBuf>) -> Router {
 
     let api = Router::new()
         .route("/api/v1/health", get(health_handler))
+        .route("/api/v1/site-info", get(public_site_info_handler))
         .route("/api/v1/public/site-info", get(public_site_info_handler))
+        .route(
+            "/api/v1/push/vapid-public-key",
+            get(vapid_public_key_handler),
+        )
         .route("/api/v1/auth/register", post(register_handler))
         .route("/api/v1/auth/login", post(login_handler))
         .route("/api/v1/auth/logout", post(logout_handler))
         .route("/api/v1/auth/logout-all", post(logout_all_handler))
         .route("/api/v1/auth/password", post(change_password_handler))
+        .route("/api/v1/auth/reset-password", post(reset_password_handler))
         .route("/api/v1/auth/sessions", get(list_sessions_handler))
         .route(
             "/api/v1/auth/sessions/{id}",
@@ -476,6 +498,11 @@ pub fn build_router(state: AppState, web_dist_dir: Option<PathBuf>) -> Router {
             "/api/v1/auth/me",
             get(me_handler).delete(delete_account_handler),
         )
+        .route("/api/v1/admin/users", get(admin_list_users_handler))
+        .route(
+            "/api/v1/admin/users/{id}/reset-link",
+            post(admin_create_reset_link_handler),
+        )
         .route(
             "/api/v1/me/notifications",
             get(get_notifications_handler).put(put_notifications_handler),
@@ -483,6 +510,18 @@ pub fn build_router(state: AppState, web_dist_dir: Option<PathBuf>) -> Router {
         .route(
             "/api/v1/me/notifications/test",
             post(test_notifications_handler),
+        )
+        .route(
+            "/api/v1/me/web-push/subscribe",
+            post(web_push_subscribe_handler),
+        )
+        .route(
+            "/api/v1/me/web-push/unsubscribe",
+            post(web_push_unsubscribe_handler),
+        )
+        .route(
+            "/api/v1/me/snippets",
+            get(get_snippets_handler).put(put_snippets_handler),
         )
         .route("/api/v1/daemon/alert", post(daemon_alert_handler))
         .route("/api/v1/auth/device/start", post(start_device_auth_handler))
@@ -531,6 +570,7 @@ pub fn build_router(state: AppState, web_dist_dir: Option<PathBuf>) -> Router {
             .route_service("/register", ServeFile::new(&index))
             .route_service("/activate", ServeFile::new(&index))
             .route_service("/console", ServeFile::new(&index))
+            .route_service("/reset-password", ServeFile::new(&index))
             .fallback_service(ServeDir::new(dir).not_found_service(ServeFile::new(index)))
     } else {
         api
@@ -620,6 +660,7 @@ pub async fn start_full_server_with_options(
         &server_pubkey_b64,
     )
     .await?;
+    let web_push = WebPushService::load_or_init(&db).await?;
 
     let http_no_redirect = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -660,6 +701,7 @@ pub async fn start_full_server_with_options(
         allowed_origins: options.allowed_origins,
         http_no_redirect,
         webhook_http,
+        web_push,
         allow_local_webhook_test,
         latest_release_cache: Arc::new(RwLock::new(None)),
         rate_limiter: Arc::new(RateLimiter::default()),
@@ -2550,6 +2592,7 @@ async fn put_notifications_handler(
             .notify_on_needs_you
             .unwrap_or(current.notify_on_needs_you),
         notify_on_finished: req.notify_on_finished.unwrap_or(current.notify_on_finished),
+        web_push_count: current.web_push_count,
     };
 
     let saved = st
@@ -2558,6 +2601,68 @@ async fn put_notifications_handler(
         .await
         .map_err(ApiError::internal)?;
     Ok(Json(saved))
+}
+
+async fn dispatch_user_web_push(
+    st: &AppState,
+    user_id: Uuid,
+    title: &str,
+    body: &str,
+    tag: &str,
+    allow_local: bool,
+) -> Result<(usize, Vec<String>), ApiError> {
+    let subs = st
+        .db
+        .list_web_push_subscriptions(user_id)
+        .await
+        .map_err(ApiError::internal)?;
+    if subs.is_empty() {
+        return Ok((0, Vec::new()));
+    }
+    let payload = json!({
+        "title": title,
+        "body": body,
+        "url": "/console",
+        "tag": tag,
+    });
+    let outcomes = futures_util::future::join_all(subs.iter().map(|sub| {
+        crate::web_push::send_web_push_notification(
+            &st.web_push,
+            &st.webhook_http,
+            sub,
+            &payload,
+            allow_local,
+        )
+    }))
+    .await;
+
+    let mut delivered_count = 0usize;
+    let mut errors = Vec::new();
+    let mut gone_codes = Vec::new();
+
+    for (sub, outcome) in subs.iter().zip(outcomes.into_iter()) {
+        match outcome {
+            crate::web_push::WebPushDeliveryOutcome::Delivered(_) => {
+                delivered_count += 1;
+            }
+            crate::web_push::WebPushDeliveryOutcome::Gone(code) => {
+                let _ = st.db.delete_web_push_subscription_by_id(sub.id).await;
+                gone_codes.push(code);
+            }
+            crate::web_push::WebPushDeliveryOutcome::Failed(err) => {
+                errors.push(err);
+            }
+        }
+    }
+
+    if delivered_count == 0 && errors.is_empty() && !gone_codes.is_empty() {
+        errors.push(format!(
+            "web_push: subscription expired (HTTP {}) and was removed",
+            gone_codes[0]
+        ));
+    }
+
+    Ok((delivered_count, errors))
 }
 
 async fn test_notifications_handler(
@@ -2601,6 +2706,14 @@ async fn test_notifications_handler(
             Err(err_msg) => errors.push(err_msg),
         }
     }
+
+    let (wp_delivered, wp_errors) =
+        dispatch_user_web_push(&st, session.user.id, title, &message, "coda-test", allow_local)
+            .await?;
+    if wp_delivered > 0 {
+        delivered_channels.push("web_push".to_string());
+    }
+    errors.extend(wp_errors);
 
     Ok(Json(json!({
         "ok": true,
@@ -2779,11 +2892,260 @@ async fn daemon_alert_handler(
         }
     }
 
+    let push_tag = format!("coda-{}-{}-{}", req.device_id, clean_session_name, status_norm);
+    let (wp_delivered, wp_errors) =
+        dispatch_user_web_push(&st, user_id, &title, &body, &push_tag, allow_local).await?;
+    dispatched += wp_delivered;
+    for err_msg in wp_errors {
+        tracing::warn!("daemon alert web push delivery failed: {err_msg}");
+        errors.push(err_msg);
+    }
+
     Ok(Json(json!({
         "ok": true,
         "dispatched": dispatched,
         "errors": errors,
     })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ResetPasswordRequest {
+    pub token: String,
+    pub new_password: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WebPushKeysInput {
+    pub p256dh: String,
+    pub auth: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WebPushSubscribeRequest {
+    pub endpoint: String,
+    pub keys: WebPushKeysInput,
+    #[serde(default)]
+    pub user_agent: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct WebPushUnsubscribeRequest {
+    #[serde(default)]
+    pub endpoint: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PutSnippetsRequest {
+    pub snippets: Vec<PromptSnippetRecord>,
+}
+
+async fn admin_list_users_handler(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let session = require_auth_session(&st, &headers).await?;
+    if !session.user.is_admin {
+        return Err(ApiError::forbidden(anyhow::anyhow!(
+            "admin privileges required"
+        )));
+    }
+    let users = st
+        .db
+        .list_admin_users(&session.user)
+        .await
+        .map_err(ApiError::forbidden)?;
+    Ok(Json(json!({ "users": users })))
+}
+
+async fn admin_create_reset_link_handler(
+    State(st): State<AppState>,
+    conn: Option<Extension<ConnectInfo<SocketAddr>>>,
+    headers: HeaderMap,
+    Path(target_user_id): Path<Uuid>,
+) -> Result<Json<Value>, ApiError> {
+    let ip = client_rate_key(&st, conn.as_ref(), &headers);
+    st.rate_limiter
+        .check(&format!("admin_reset:{ip}"), 30, Duration::from_secs(60))
+        .await?;
+    let session = require_auth_session(&st, &headers).await?;
+    if !session.user.is_admin {
+        return Err(ApiError::forbidden(anyhow::anyhow!(
+            "admin privileges required"
+        )));
+    }
+    let expires_in_secs = 86_400i64;
+    let Some((handle, reset_token)) = st
+        .db
+        .create_password_reset_token(&session.user, target_user_id, expires_in_secs)
+        .await
+        .map_err(ApiError::internal)?
+    else {
+        return Err(ApiError {
+            status: StatusCode::NOT_FOUND,
+            message: "user not found".into(),
+        });
+    };
+    let public_base = effective_public_base_url(&st, conn.as_ref(), &headers);
+    let reset_url = format!("{public_base}/reset-password?token={reset_token}");
+    Ok(Json(json!({
+        "ok": true,
+        "user_id": target_user_id,
+        "handle": handle,
+        "reset_token": reset_token,
+        "reset_url": reset_url,
+        "expires_in_secs": expires_in_secs,
+    })))
+}
+
+async fn reset_password_handler(
+    State(st): State<AppState>,
+    conn: Option<Extension<ConnectInfo<SocketAddr>>>,
+    headers: HeaderMap,
+    Json(req): Json<ResetPasswordRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let ip = client_rate_key(&st, conn.as_ref(), &headers);
+    st.rate_limiter
+        .check(&format!("reset_password:{ip}"), 15, Duration::from_secs(60))
+        .await?;
+    let (user_id, handle, revoked_hashes) = st
+        .db
+        .consume_password_reset_token(&req.token, &req.new_password)
+        .await
+        .map_err(ApiError::bad_request)?;
+    for sha in revoked_hashes {
+        st.relay_hub.notify_session_revoked(user_id, Some(sha));
+    }
+    Ok(Json(json!({
+        "ok": true,
+        "handle": handle,
+    })))
+}
+
+async fn vapid_public_key_handler(
+    State(st): State<AppState>,
+    conn: Option<Extension<ConnectInfo<SocketAddr>>>,
+    headers: HeaderMap,
+) -> Result<Json<VapidPublicKeyResponse>, ApiError> {
+    let ip = client_rate_key(&st, conn.as_ref(), &headers);
+    st.rate_limiter
+        .check(&format!("vapid_pub:{ip}"), 120, Duration::from_secs(60))
+        .await?;
+    Ok(Json(st.web_push.public_key_response()))
+}
+
+async fn web_push_subscribe_handler(
+    State(st): State<AppState>,
+    conn: Option<Extension<ConnectInfo<SocketAddr>>>,
+    headers: HeaderMap,
+    Json(req): Json<WebPushSubscribeRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let ip = client_rate_key(&st, conn.as_ref(), &headers);
+    st.rate_limiter
+        .check(&format!("wp_sub:{ip}"), 30, Duration::from_secs(60))
+        .await?;
+    let session = require_auth_session(&st, &headers).await?;
+    if !st.web_push.is_enabled() {
+        return Err(ApiError::bad_request(anyhow::anyhow!(
+            "W3C Web Push is not enabled on this server"
+        )));
+    }
+    let allow_local = effective_allow_local_webhook(&st);
+    let clean_endpoint = crate::web_push::validate_web_push_endpoint(&req.endpoint, allow_local)
+        .map_err(ApiError::bad_request)?;
+    let (p256dh_b64url, auth_b64url) =
+        crate::web_push::validate_and_normalize_subscription_keys(&req.keys.p256dh, &req.keys.auth)
+            .map_err(ApiError::bad_request)?;
+
+    let ua = if !req.user_agent.trim().is_empty() {
+        req.user_agent
+    } else {
+        headers
+            .get(header::USER_AGENT)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string()
+    };
+
+    let count = st
+        .db
+        .upsert_web_push_subscription(
+            session.user.id,
+            &clean_endpoint,
+            &p256dh_b64url,
+            &auth_b64url,
+            &ua,
+            crate::web_push::MAX_WEB_PUSH_SUBSCRIPTIONS_PER_USER,
+        )
+        .await
+        .map_err(ApiError::internal)?;
+
+    Ok(Json(json!({
+        "ok": true,
+        "web_push_count": count,
+    })))
+}
+
+async fn web_push_unsubscribe_handler(
+    State(st): State<AppState>,
+    conn: Option<Extension<ConnectInfo<SocketAddr>>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<Value>, ApiError> {
+    let ip = client_rate_key(&st, conn.as_ref(), &headers);
+    st.rate_limiter
+        .check(&format!("wp_unsub:{ip}"), 30, Duration::from_secs(60))
+        .await?;
+    let session = require_auth_session(&st, &headers).await?;
+    let trimmed_body = std::str::from_utf8(&body).unwrap_or("").trim();
+    let req: WebPushUnsubscribeRequest = if trimmed_body.is_empty() {
+        WebPushUnsubscribeRequest::default()
+    } else {
+        serde_json::from_slice(&body)
+            .map_err(|e| ApiError::bad_request(anyhow::anyhow!("invalid JSON body: {e}")))?
+    };
+
+    let count = st
+        .db
+        .delete_web_push_subscription(session.user.id, &req.endpoint)
+        .await
+        .map_err(ApiError::internal)?;
+
+    Ok(Json(json!({
+        "ok": true,
+        "web_push_count": count,
+    })))
+}
+
+async fn get_snippets_handler(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let session = require_auth_session(&st, &headers).await?;
+    let snippets = st
+        .db
+        .get_user_prompt_snippets(session.user.id)
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(Json(json!({ "snippets": snippets })))
+}
+
+async fn put_snippets_handler(
+    State(st): State<AppState>,
+    conn: Option<Extension<ConnectInfo<SocketAddr>>>,
+    headers: HeaderMap,
+    Json(req): Json<PutSnippetsRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let ip = client_rate_key(&st, conn.as_ref(), &headers);
+    st.rate_limiter
+        .check(&format!("put_snippets:{ip}"), 30, Duration::from_secs(60))
+        .await?;
+    let session = require_auth_session(&st, &headers).await?;
+    let saved = st
+        .db
+        .put_user_prompt_snippets(session.user.id, &req.snippets)
+        .await
+        .map_err(ApiError::bad_request)?;
+    Ok(Json(json!({ "snippets": saved })))
 }
 
 async fn prune_stale_devices_handler(
@@ -3023,5 +3385,83 @@ mod tests {
             .check("daemon_alert:u1:d1:s1:needs_you", 1, Duration::from_secs(60))
             .await
             .is_err());
+    }
+
+    #[test]
+    fn extract_reset_token_accepts_raw_token_and_full_urls() {
+        let tok = "rst_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789_-";
+        assert_eq!(
+            crate::db::extract_reset_token_from_input(tok).unwrap(),
+            tok
+        );
+        assert_eq!(
+            crate::db::extract_reset_token_from_input(&format!(
+                "  https://codahub.dev/reset-password?token={tok}  "
+            ))
+            .unwrap(),
+            tok
+        );
+        assert_eq!(
+            crate::db::extract_reset_token_from_input(&format!(
+                "<https://codahub.dev/reset-password?foo=1&token={tok}&utm=wechat#top>"
+            ))
+            .unwrap(),
+            tok
+        );
+        assert_eq!(
+            crate::db::extract_reset_token_from_input(&format!("Reset link: {tok}")).unwrap(),
+            tok
+        );
+        assert!(crate::db::extract_reset_token_from_input("").is_err());
+        assert!(crate::db::extract_reset_token_from_input("rst_short").is_err());
+        assert!(
+            crate::db::extract_reset_token_from_input("https://codahub.dev/reset-password")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn prompt_snippets_defaults_and_validation_bounds() {
+        let defaults = crate::db::default_prompt_snippets();
+        assert_eq!(defaults.len(), 4);
+        assert_eq!(defaults[0].id, "s1");
+        assert!(crate::db::validate_prompt_snippets(&defaults).is_ok());
+
+        // Empty list is valid (user deleted all snippets)
+        assert!(crate::db::validate_prompt_snippets(&[]).unwrap().is_empty());
+
+        // Title > 60 chars rejected
+        let too_long_title = vec![PromptSnippetRecord {
+            id: "x1".into(),
+            title: "a".repeat(61),
+            prompt: "ok".into(),
+        }];
+        assert!(crate::db::validate_prompt_snippets(&too_long_title).is_err());
+
+        // Prompt > 4000 chars rejected
+        let too_long_prompt = vec![PromptSnippetRecord {
+            id: "x1".into(),
+            title: "Valid".into(),
+            prompt: "p".repeat(4001),
+        }];
+        assert!(crate::db::validate_prompt_snippets(&too_long_prompt).is_err());
+
+        // Empty fields rejected
+        let empty_prompt = vec![PromptSnippetRecord {
+            id: "x1".into(),
+            title: "Valid".into(),
+            prompt: "   ".into(),
+        }];
+        assert!(crate::db::validate_prompt_snippets(&empty_prompt).is_err());
+
+        // > 24 items rejected
+        let overflow: Vec<PromptSnippetRecord> = (0..25)
+            .map(|i| PromptSnippetRecord {
+                id: format!("id-{i}"),
+                title: format!("Title {i}"),
+                prompt: "Run checks".into(),
+            })
+            .collect();
+        assert!(crate::db::validate_prompt_snippets(&overflow).is_err());
     }
 }
