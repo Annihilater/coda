@@ -119,6 +119,7 @@ fn preview_http_client() -> &'static reqwest::Client {
         reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(std::time::Duration::from_secs(10))
+            .pool_max_idle_per_host(0)
             .no_proxy()
             .build()
             .unwrap_or_else(|_| reqwest::Client::new())
@@ -7705,20 +7706,23 @@ mod tests {
                         let body = req_txt.split("\r\n\r\n").nth(1).unwrap_or("");
                         let resp_body = format!("cookie={has_cookie};body={body}");
                         let resp = format!(
-                            "HTTP/1.1 201 Created\r\nContent-Type: text/plain\r\nSet-Cookie: sid=renewed; Path=/\r\nContent-Length: {}\r\n\r\n{}",
+                            "HTTP/1.1 201 Created\r\nContent-Type: text/plain\r\nSet-Cookie: sid=renewed; Path=/\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
                             resp_body.len(),
                             resp_body
                         );
                         let _ = sock.write_all(resp.as_bytes()).await;
+                        let _ = sock.shutdown().await;
                     } else if first_line.starts_with("GET /login") {
-                        let resp = "HTTP/1.1 302 Found\r\nLocation: /dashboard\r\nContent-Length: 0\r\n\r\n";
+                        let resp = "HTTP/1.1 302 Found\r\nLocation: /dashboard\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
                         let _ = sock.write_all(resp.as_bytes()).await;
+                        let _ = sock.shutdown().await;
                     } else if first_line.starts_with("HEAD /asset") {
-                        let resp = "HTTP/1.1 200 OK\r\nContent-Type: application/javascript\r\nETag: \"v1\"\r\nContent-Length: 999999\r\n\r\n";
+                        let resp = "HTTP/1.1 200 OK\r\nContent-Type: application/javascript\r\nETag: \"v1\"\r\nConnection: close\r\nContent-Length: 999999\r\n\r\n";
                         let _ = sock.write_all(resp.as_bytes()).await;
+                        let _ = sock.shutdown().await;
                     } else if first_line.starts_with("GET /events") {
                         let _ = sock
-                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\ndata: ping\n\n")
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: ping\n\n")
                             .await;
                         // Hold SSE connection open for 15s to verify daemon short-circuits cleanly
                         tokio::time::sleep(std::time::Duration::from_secs(15)).await;
