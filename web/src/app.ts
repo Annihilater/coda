@@ -50,6 +50,7 @@ import { BentoMotionController } from "./bento_motion";
 import {
   encodeTerminalKeyEvent,
   isJumpNeedsYouShortcut,
+  isToggleSplitViewShortcut,
   wrapBracketedPaste,
 } from "./terminal_keys";
 import {
@@ -120,16 +121,26 @@ import {
 import {
   DEFAULT_PROMPT_SNIPPETS,
   MAX_PROMPT_SNIPPETS,
+  SNIPPETS_CACHE_STORAGE_KEY,
   buildInviteRegistrationUrl,
+  clearAccountScopedSignOutState,
+  deriveConsoleConnectionVisualState,
   deriveSnippetTitleFromPrompt,
   detectBrowserIosNonStandalone,
+  extractImagesFromClipboardItems,
   extractPushSubscriptionKeys,
+  formatConsoleHeaderSubtitle,
   insertSnippetIntoDraft,
+  isPushSubscriptionVapidKeyMismatch,
   normalizePromptSnippetsList,
+  onboardingDismissedStorageKey,
   parseLocationRouteAndParams,
   renderAdminFriendsDirectorySection,
+  renderConsoleEmptyStateHtml,
   renderFriendOnboardingCard,
   renderWebPushSettingsCard,
+  teardownWebPushOnSignOut,
+  validateNewPasswordLength,
   validatePromptSnippet,
   validateResetPasswordInputs,
   vapidBase64UrlToUint8Array,
@@ -321,12 +332,12 @@ export class CodaTerminalWebApp {
   private vapidLoaded = false;
   private webPushCount = 0;
   private webPushThisDeviceSubscribed = false;
-  private webPushEndpoint: string | null = null;
+  private webPushEndpoint = "";
   private webPushBusy = false;
   private adminUsers: AdminUserSummary[] = [];
   private adminResetBusyUserId: string | null = null;
   private latestAdminResetLink: { handle: string; resetUrl: string } | null = null;
-  private onboardingDismissed: boolean = readLocalPref("coda_onboarding_dismissed", "0") === "1";
+  private onboardingDismissed = false;
   private onboardingCopiedInstall = false;
   private promptSnippets: PromptSnippet[] = this.loadInitialCachedSnippets();
   private savingSnippetOpen = false;
@@ -565,6 +576,14 @@ export class CodaTerminalWebApp {
         this.jumpToNextNeedsYouTerminal();
       } else if (
         !e.defaultPrevented &&
+        isToggleSplitViewShortcut(e) &&
+        this.route === "console" &&
+        !this.isAnyModalOpen()
+      ) {
+        e.preventDefault();
+        this.toggleSplitView();
+      } else if (
+        !e.defaultPrevented &&
         (e.metaKey || e.ctrlKey) &&
         !e.altKey &&
         !e.shiftKey &&
@@ -730,6 +749,7 @@ export class CodaTerminalWebApp {
     if (this.token) {
       try {
         this.user = await this.api("/api/v1/auth/me");
+        this.syncUserScopedPrefs();
         await this.bootstrapMesh();
         if (this.route === "login" || this.route === "register") {
           const target = this.pendingActivationCode
@@ -740,7 +760,13 @@ export class CodaTerminalWebApp {
         }
       } catch {
         this.token = null;
+        this.user = null;
         clearSessionToken();
+        const cleaned = clearAccountScopedSignOutState(
+          typeof localStorage !== "undefined" ? localStorage : null
+        );
+        this.promptSnippets = cleaned.promptSnippets;
+        this.onboardingDismissed = cleaned.onboardingDismissed;
       }
     }
     this.render();
@@ -1130,23 +1156,90 @@ export class CodaTerminalWebApp {
     this.syncNeedsYouBarInPlace(activeTerm);
   }
 
+  private isRelayWsConnected(): boolean {
+    return Boolean(this.ws && typeof WebSocket !== "undefined" && this.ws.readyState === WebSocket.OPEN);
+  }
+
+  private isDirectWsConnected(): boolean {
+    return Boolean(
+      this.activeTransportMode === "lan_ws" &&
+        this.directWs &&
+        typeof WebSocket !== "undefined" &&
+        this.directWs.readyState === WebSocket.OPEN
+    );
+  }
+
+  private computeConsoleConnectionVisual() {
+    return deriveConsoleConnectionVisualState({
+      devicesCount: this.devices.length,
+      selectedDaemon: this.selectedDaemon,
+      relayWsOpen: this.isRelayWsConnected(),
+      directWsOpen: this.isDirectWsConnected(),
+      transportMode: this.activeTransportMode,
+      rttMs: this.rttMs,
+      tr: (en, zh) => this.tr(en, zh),
+    });
+  }
+
+  private computeConsoleEmptyStateHtml(installCmd: string, activeTerm?: HerdrTerminal): string {
+    return renderConsoleEmptyStateHtml({
+      devicesCount: this.devices.length,
+      selectedDaemon: this.selectedDaemon,
+      activeTerminalName: activeTerm ? activeTerm.name || activeTerm.address : null,
+      relayWsOpen: this.isRelayWsConnected(),
+      directWsOpen: this.isDirectWsConnected(),
+      transportMode: this.activeTransportMode,
+      rttMs: this.rttMs,
+      installCmd,
+      tr: (en, zh) => this.tr(en, zh),
+    });
+  }
+
   private updateTransportFooterInPlace() {
+    if (typeof document === "undefined") return;
+    const connVisual = this.computeConsoleConnectionVisual();
+    const sidebarConn = document.getElementById("console-sidebar-conn");
+    if (sidebarConn) {
+      sidebarConn.style.color = connVisual.sidebarColorCss;
+    }
+    const sidebarIcon = document.getElementById("console-sidebar-conn-icon");
+    if (sidebarIcon) {
+      sidebarIcon.innerHTML = svgIcon(connVisual.icon, 11);
+    }
     const rttEl = document.getElementById("console-rtt-label");
     if (rttEl) {
-      const modeLabel =
-        this.activeTransportMode === "lan_ws"
-          ? this.tr("LAN Direct", "局域网直连")
-          : this.tr("Smart Relay", "智能中继");
-      rttEl.textContent = `${modeLabel}${this.rttMs !== null ? ` (${this.rttMs}ms)` : ""}`;
+      rttEl.textContent = connVisual.sidebarLabel;
+    }
+    const railPill = document.getElementById("rail-status-pill");
+    if (railPill) {
+      railPill.style.borderColor = connVisual.railBorderCss;
+      railPill.setAttribute("title", connVisual.railTitle);
+      railPill.setAttribute("aria-label", connVisual.railTitle);
+    }
+    const railDot = document.getElementById("rail-status-dot");
+    if (railDot) {
+      railDot.style.background = connVisual.railDotBgCss;
+      railDot.style.boxShadow = connVisual.railDotShadowCss;
+    }
+    const railMode = document.getElementById("rail-transport-mode");
+    if (railMode) {
+      railMode.innerHTML = connVisual.railTransportBadgeHtml;
     }
     const metaEl = document.getElementById("term-footer-meta");
     if (metaEl) {
-      const modeText =
-        this.activeTransportMode === "lan_ws"
-          ? `LAN Direct :24444`
-          : `Relay WSS :443`;
-      const rttText = this.rttMs !== null ? `${this.rttMs}ms RTT` : modeText;
-      metaEl.textContent = `${rttText} · E2EE X25519 + ChaCha20 · ${this.termCols}×${this.termRows} · ${this.terminals.length} PTY`;
+      const hint = this.tr(
+        "⌘+Click URL · Ctrl+V/⌘V screenshot to upload",
+        "⌘+点击打开链接 · Ctrl+V/⌘V 粘贴截图直传终端"
+      );
+      metaEl.textContent = `${connVisual.footerTransport} · E2EE X25519 + ChaCha20 · ${this.termCols}×${this.termRows} · ${this.terminals.length} PTY · ${hint}`;
+    }
+    const screenEl = document.getElementById("term-screen-output");
+    if (screenEl && screenEl.getAttribute("data-vt-mode") === "placeholder") {
+      const baseUrl = this.siteInfo?.public_base_url || window.location.origin;
+      const installCmd =
+        this.siteInfo?.install_command || `curl -fsSL ${baseUrl}/install.sh | sh`;
+      const activeTerm = this.terminals.find((t) => t.address === this.activeTerminalAddr);
+      screenEl.innerHTML = this.computeConsoleEmptyStateHtml(installCmd, activeTerm);
     }
   }
 
@@ -1406,9 +1499,18 @@ export class CodaTerminalWebApp {
     }
   }
 
+  private syncUserScopedPrefs() {
+    if (!this.user?.id) {
+      this.onboardingDismissed = false;
+      return;
+    }
+    this.onboardingDismissed =
+      readLocalPref(onboardingDismissedStorageKey(this.user.id), "0") === "1";
+  }
+
   private loadInitialCachedSnippets(): PromptSnippet[] {
     try {
-      const raw = readLocalPref("coda_snippets_cache", "");
+      const raw = readLocalPref(SNIPPETS_CACHE_STORAGE_KEY, "");
       if (raw) {
         const parsedJson = JSON.parse(raw);
         if (Array.isArray(parsedJson)) {
@@ -1423,10 +1525,50 @@ export class CodaTerminalWebApp {
 
   private cacheSnippetsLocally(snippets: readonly PromptSnippet[]) {
     try {
-      writeLocalPref("coda_snippets_cache", JSON.stringify(snippets));
+      writeLocalPref(SNIPPETS_CACHE_STORAGE_KEY, JSON.stringify(snippets));
     } catch {
       // ignore storage errors
     }
+  }
+
+  private async resolvePushRegistration(
+    regHint?: ServiceWorkerRegistration | null
+  ): Promise<ServiceWorkerRegistration | null> {
+    if (regHint) {
+      this.swRegistration = regHint;
+      return regHint;
+    }
+    if (this.swRegistration) return this.swRegistration;
+    if (typeof navigator === "undefined" || typeof navigator.serviceWorker?.getRegistration !== "function") {
+      return null;
+    }
+    try {
+      const reg =
+        (await navigator.serviceWorker.getRegistration("/sw.js")) ??
+        (await navigator.serviceWorker.getRegistration("/")) ??
+        (await navigator.serviceWorker.getRegistration()) ??
+        null;
+      if (reg) this.swRegistration = reg;
+      return reg;
+    } catch {
+      return null;
+    }
+  }
+
+  private async unsubscribeWebPushForSignOut(): Promise<void> {
+    const res = await teardownWebPushOnSignOut({
+      getSubscription: async () => {
+        const reg = await this.resolvePushRegistration();
+        return await reg?.pushManager?.getSubscription();
+      },
+      knownEndpoint: this.webPushEndpoint,
+      hasAuthToken: Boolean(this.token),
+      unsubscribeServer: (endpoint) =>
+        this.api("/api/v1/me/web-push/unsubscribe", "POST", { endpoint }),
+    });
+    this.webPushThisDeviceSubscribed = res.webPushThisDeviceSubscribed;
+    this.webPushEndpoint = res.webPushEndpoint;
+    this.webPushCount = res.webPushCount;
   }
 
   private isWebPushApiSupported(): boolean {
@@ -1460,28 +1602,23 @@ export class CodaTerminalWebApp {
   ): Promise<void> {
     if (!this.isWebPushApiSupported()) {
       this.webPushThisDeviceSubscribed = false;
-      this.webPushEndpoint = null;
+      this.webPushEndpoint = "";
       return;
     }
     try {
-      const reg =
-        regHint ??
-        this.swRegistration ??
-        (await navigator.serviceWorker.getRegistration("/sw.js")) ??
-        (await navigator.serviceWorker.getRegistration("/")) ??
-        null;
-      if (reg) this.swRegistration = reg;
+      const reg = await this.resolvePushRegistration(regHint);
       const sub = await reg?.pushManager?.getSubscription();
       this.webPushThisDeviceSubscribed = Boolean(sub);
-      this.webPushEndpoint = sub?.endpoint || null;
+      this.webPushEndpoint = sub?.endpoint || "";
     } catch {
       this.webPushThisDeviceSubscribed = false;
-      this.webPushEndpoint = null;
+      this.webPushEndpoint = "";
     }
   }
 
   private async refreshWebPushMetadata(): Promise<void> {
     const reqToken = this.token;
+    let serverCount: number | null = null;
     const tasks: Array<Promise<void>> = [
       this.syncLocalPushSubscriptionState(),
       this.api("/api/v1/push/vapid-public-key")
@@ -1504,6 +1641,7 @@ export class CodaTerminalWebApp {
           .then((notif) => {
             if (this.token === reqToken && notif && typeof notif === "object") {
               if (typeof notif.web_push_count === "number") {
+                serverCount = notif.web_push_count;
                 this.webPushCount = notif.web_push_count;
               }
             }
@@ -1514,6 +1652,9 @@ export class CodaTerminalWebApp {
       );
     }
     await Promise.allSettled(tasks);
+    if (this.token === reqToken && serverCount === 0 && !this.webPushBusy) {
+      this.webPushThisDeviceSubscribed = false;
+    }
   }
 
   private async enableLockScreenWebPush(): Promise<void> {
@@ -1578,6 +1719,16 @@ export class CodaTerminalWebApp {
       }
 
       let pushSub = await reg.pushManager.getSubscription();
+      if (
+        pushSub &&
+        isPushSubscriptionVapidKeyMismatch(
+          pushSub.options?.applicationServerKey,
+          applicationServerKey
+        )
+      ) {
+        await pushSub.unsubscribe().catch(() => false);
+        pushSub = null;
+      }
       if (!pushSub) {
         try {
           pushSub = await reg.pushManager.subscribe({
@@ -1636,12 +1787,7 @@ export class CodaTerminalWebApp {
     this.render();
 
     try {
-      const reg =
-        this.swRegistration ??
-        (typeof navigator !== "undefined"
-          ? await navigator.serviceWorker?.getRegistration("/sw.js")
-          : null) ??
-        null;
+      const reg = await this.resolvePushRegistration();
       const pushSub = await reg?.pushManager?.getSubscription();
       const endpoint = String(pushSub?.endpoint || this.webPushEndpoint || "");
       if (pushSub) {
@@ -1651,7 +1797,7 @@ export class CodaTerminalWebApp {
         endpoint,
       });
       this.webPushThisDeviceSubscribed = false;
-      this.webPushEndpoint = null;
+      this.webPushEndpoint = "";
       this.webPushCount = Number(res?.web_push_count ?? 0);
       const msg = this.tr(
         "Disabled lock-screen push on this device.",
@@ -1730,6 +1876,7 @@ export class CodaTerminalWebApp {
   }
 
   private async bootstrapMesh() {
+    this.syncUserScopedPrefs();
     this.myClientDevice = await this.api("/api/v1/devices/register-client", "POST", {
       name: this.webIdentity.name,
       platform: "web",
@@ -2154,6 +2301,7 @@ export class CodaTerminalWebApp {
               try { this.ws.close(); } catch {}
             }
             this.ws = sock;
+            this.updateTransportFooterInPlace();
             this.relayKeepAliveTimer = setInterval(() => {
               if (this.ws === sock && sock.readyState === WebSocket.OPEN) {
                 try {
@@ -2186,6 +2334,7 @@ export class CodaTerminalWebApp {
         }
         if (this.ws !== sock) return;
         this.ws = null;
+        this.updateTransportFooterInPlace();
         if (this.relayKeepAliveTimer) {
           clearInterval(this.relayKeepAliveTimer);
           this.relayKeepAliveTimer = null;
@@ -3508,6 +3657,22 @@ export class CodaTerminalWebApp {
     this.showToastNotice("ok", this.tr("Exported session transcript (.md)", "已导出当前终端会话日志 (.md)"));
   }
 
+  private toggleSplitView() {
+    if (typeof window !== "undefined" && window.innerWidth < 900) {
+      this.showToastNotice(
+        "err",
+        this.tr(
+          "Split view requires a desktop or tablet viewport (≥ 900px).",
+          "双栏分屏需要桌面或平板宽屏视口（宽度 ≥ 900px）。"
+        )
+      );
+      return;
+    }
+    this.toggleSplitTerminals();
+    this.render();
+    this.scheduleTerminalResizeSync();
+  }
+
   private toggleSplitTerminals() {
     this.splitMode = !this.splitMode;
     if (this.splitMode) {
@@ -3929,11 +4094,20 @@ export class CodaTerminalWebApp {
     targetMode: "pty" | "draft" = "pty"
   ) {
     const targetDaemon = pinnedDaemon ?? this.selectedDaemon;
-    const targetTerminal = pinnedTerminal ?? this.getFocusedTerminalAddr();
-    if (!targetDaemon || !targetTerminal) {
+    const targetTerminal =
+      pinnedTerminal !== undefined ? pinnedTerminal : this.getFocusedTerminalAddr();
+    if (!targetDaemon || !targetDaemon.is_online || !targetTerminal) {
       this.showToastNotice(
         "err",
-        this.tr("Select an online host and terminal before uploading.", "请先选择一个在线主机和终端再上传文件。")
+        targetDaemon && !targetDaemon.is_online
+          ? this.tr(
+              `Host ${targetDaemon.name} is currently offline — reconnect before uploading files.`,
+              `主机 ${targetDaemon.name} 当前离线，请待主机上线后再上传文件。`
+            )
+          : this.tr(
+              "Select an online host and open a terminal first.",
+              "请先选择一台在线主机并打开终端会话。"
+            )
       );
       return;
     }
@@ -3960,6 +4134,17 @@ export class CodaTerminalWebApp {
       if (!this.token || this.token !== reqToken || this.selectedDaemon?.id !== targetDaemon.id) {
         return;
       }
+      const liveDaemon = this.devices.find((d) => d.id === targetDaemon.id) ?? targetDaemon;
+      if (!liveDaemon.is_online) {
+        this.showToastNotice(
+          "err",
+          this.tr(
+            `Host ${liveDaemon.name} went offline before upload could start.`,
+            `主机 ${liveDaemon.name} 已离线，无法开始上传。`
+          )
+        );
+        return;
+      }
       const reqId = `up-${Date.now()}-${seq}`;
       if (this.pendingUploadTargets.size >= 64) {
         const oldest = this.pendingUploadTargets.keys().next().value;
@@ -3967,7 +4152,7 @@ export class CodaTerminalWebApp {
       }
       this.pendingUploadTargets.set(reqId, {
         target: targetMode,
-        daemonId: targetDaemon.id,
+        daemonId: liveDaemon.id,
         terminalAddr: targetTerminal,
       });
       const b64 = toB64(bytes);
@@ -3975,7 +4160,7 @@ export class CodaTerminalWebApp {
         "ok",
         this.tr(`Uploading ${safeName} over E2EE…`, `正在端到端加密上传 ${safeName}…`)
       );
-      this.sendEncrypted(targetDaemon, {
+      this.sendEncrypted(liveDaemon, {
         op: "upload_terminal_file",
         req_id: reqId,
         terminal: targetTerminal,
@@ -4130,8 +4315,8 @@ export class CodaTerminalWebApp {
           id: "action:split",
           group: this.tr("Actions", "快捷操作"),
           label: this.tr("Toggle Split Terminals", "切换双栏分屏终端"),
-          hint: this.splitMode ? "ON" : "OFF",
-          action: () => this.toggleSplitTerminals(),
+          hint: `${this.splitMode ? "ON · " : ""}⌘D / Ctrl+Shift+D`,
+          action: () => this.toggleSplitView(),
         },
         {
           id: "action:search",
@@ -5533,7 +5718,7 @@ export class CodaTerminalWebApp {
                   </div>
                   <div class="bento-faint coda-mono" style="font-size:11px;display:flex;justify-content:space-between;">
                     <span>coda-daemon login</span>
-                    <a href="/activate?code=CODA-7F29" data-nav="/activate?code=CODA-7F29" style="color:var(--signal-blue);">/activate &rarr;</a>
+                    <a href="/activate" data-nav="/activate" style="color:var(--signal-blue);">/activate &rarr;</a>
                   </div>
                 </article>
 
@@ -6174,10 +6359,10 @@ export class CodaTerminalWebApp {
                   </div>
                 </div>
                 <div class="pm-field">
-                  <label class="pm-field-label">${this.tr("Password", "登录密码")} <span>${this.tr("At least 6 characters", "至少 6 位")}</span></label>
+                  <label class="pm-field-label">${this.tr("Password", "登录密码")} <span>${this.tr("At least 8 characters", "至少 8 位")}</span></label>
                   <div class="pm-input-wrap has-right">
                     <span class="pm-input-icon">${svgIcon("lock", 14)}</span>
-                    <input id="auth-password-input" type="${this.showPassword ? "text" : "password"}" name="password" class="pm-input" required autocomplete="new-password" />
+                    <input id="auth-password-input" type="${this.showPassword ? "text" : "password"}" name="password" class="pm-input" minlength="8" maxlength="256" required autocomplete="new-password" />
                     <button id="btn-toggle-pw" type="button" class="pm-pw-toggle" title="${this.tr("Show or hide password", "显示或隐藏密码")}">${svgIcon(this.showPassword ? "eyeOff" : "eye", 14)}</button>
                   </div>
                 </div>
@@ -6278,12 +6463,24 @@ export class CodaTerminalWebApp {
     document.getElementById("auth-form")?.addEventListener("submit", async (e) => {
       e.preventDefault();
       const payload = Object.fromEntries(new FormData(e.target as HTMLFormElement).entries());
+      if (isReg) {
+        const pwCheck = validateNewPasswordLength(
+          String(payload.password || ""),
+          (en, zh) => this.tr(en, zh)
+        );
+        if (!pwCheck.ok) {
+          this.errorMsg = pwCheck.error;
+          this.render();
+          return;
+        }
+      }
       try {
         const res = isReg
           ? await this.api("/api/v1/auth/register", "POST", payload)
           : await this.api("/api/v1/auth/login", "POST", payload);
         this.token = res.token;
         this.user = res.user;
+        this.syncUserScopedPrefs();
         this.errorMsg = "";
         this.authSuccessMsg = "";
         this.authInviteCode = "";
@@ -6676,22 +6873,19 @@ export class CodaTerminalWebApp {
       this.selectedDaemon && focusedAddr
         ? this.vtTerminals.get(this.vtKey(this.selectedDaemon.id, focusedAddr))
         : activeVt;
-    const initialVtHtml = isVtStream && activeVt
-      ? activeVt.renderInitialRowsHtml(showPrimaryCursor)
-      : this.tr(
-          `  - Connected to PostgreSQL 18 multi-tenant control plane &amp; E2EE tunnel (X25519 + ChaCha20-Poly1305)\n  - Local Herdr Core online. Use '+' on the right rail to launch Shell / Claude Code / Codex / Grok / AGY / Gemini CLI.\n\n* Ready · ${this.rttMs !== null ? `RTT ${this.rttMs}ms` : "Relay WSS :443 Ready"}`,
-          `  - 已连接 PostgreSQL 18 多租户控制面与端到端加密隧道 (X25519 + ChaCha20-Poly1305)\n  - 本机 Herdr Core 在线，随时可通过右侧「+」拉起 Shell / Claude Code / Codex / Grok / AGY / Gemini CLI\n\n* Ready · ${this.rttMs !== null ? `RTT ${this.rttMs}ms` : "Relay WSS :443 Ready"}`
-        );
-    const modeLabel =
-      this.activeTransportMode === "lan_ws"
-        ? this.tr("LAN Direct", "局域网直连")
-        : this.tr("Smart Relay", "智能中继");
-    const footerTransport =
-      this.rttMs !== null
-        ? `${this.rttMs}ms RTT`
-        : this.activeTransportMode === "lan_ws"
-          ? "LAN Direct :24444"
-          : "Relay WSS :443";
+    const initialVtHtml =
+      isVtStream && activeVt
+        ? activeVt.renderInitialRowsHtml(showPrimaryCursor)
+        : this.computeConsoleEmptyStateHtml(installCmd, activeTerm);
+    const connVisual = this.computeConsoleConnectionVisual();
+    const footerTransport = connVisual.footerTransport;
+    const headerSubtitleHtml = formatConsoleHeaderSubtitle({
+      devicesCount: this.devices.length,
+      selectedDaemon: this.selectedDaemon,
+      activeCwd: activeTerm?.cwd,
+      activeBranch: activeBranch?.branch,
+      tr: (en, zh) => this.tr(en, zh),
+    });
 
     const feedbackBanner = this.settingsFeedback
       ? `<div style="padding:9px 11px;border-radius:8px;font-size:12px;margin-bottom:10px;border:1px solid ${
@@ -6762,9 +6956,9 @@ export class CodaTerminalWebApp {
                 ${codaLogoSVG(24)}
                 <div style="min-width:0;">
                   <div style="font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${this.escapeHtml(this.user.email)}</div>
-                  <div style="font-size:11px;color:var(--emerald);margin-top:2px;display:inline-flex;align-items:center;gap:4px;">
-                    ${this.activeTransportMode === "lan_ws" ? svgIcon("zap", 11) : svgIcon("cloud", 11)}
-                    <span id="console-rtt-label">${this.escapeHtml(`${modeLabel}${this.rttMs !== null ? ` (${this.rttMs}ms)` : ""}`)}</span>
+                  <div id="console-sidebar-conn" style="font-size:11px;color:${connVisual.sidebarColorCss};margin-top:2px;display:inline-flex;align-items:center;gap:4px;">
+                    <span id="console-sidebar-conn-icon" style="display:inline-flex;align-items:center;">${svgIcon(connVisual.icon, 11)}</span>
+                    <span id="console-rtt-label">${this.escapeHtml(connVisual.sidebarLabel)}</span>
                   </div>
                 </div>
               </div>
@@ -6890,8 +7084,8 @@ export class CodaTerminalWebApp {
               <div id="active-term-title" style="font-size:15px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
                 ${this.escapeHtml(activeTerm?.status?.title || activeTerm?.name || this.tr("Coda Interactive AI Terminal", "Coda 交互式 AI 终端会话"))}
               </div>
-              <div class="coda-mono" style="font-size:12px;color:var(--text-tertiary);margin-top:2px;">
-                ${this.escapeHtml(activeTerm?.cwd || "~")} &middot; ${this.escapeHtml(activeBranch?.branch || "main")} &middot; ${this.escapeHtml(this.selectedDaemon?.name || this.tr("Unselected", "未选择主机"))}
+              <div id="active-term-subtitle" class="coda-mono" style="font-size:12px;color:var(--text-tertiary);margin-top:2px;">
+                ${headerSubtitleHtml}
               </div>
             </div>
             <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
@@ -6906,9 +7100,10 @@ export class CodaTerminalWebApp {
               }
               ${
                 !isNarrowViewport
-                  ? `<button type="button" id="btn-console-split" class="pm-cmd-trigger" style="height:30px;padding:0 9px;${this.splitMode ? "border-color:var(--signal-blue);color:var(--text-primary);" : ""}" title="${this.tr("Toggle Dual-Pane Split Terminal", "切换双栏分屏终端")}">
+                  ? `<button type="button" id="btn-console-split" class="pm-cmd-trigger" style="height:30px;padding:0 9px;${this.splitMode ? "border-color:var(--signal-blue);color:var(--text-primary);" : ""}" title="${this.tr("Toggle Dual-Pane Split Terminal (⌘D / Ctrl+Shift+D)", "切换双栏分屏终端 (⌘D / Ctrl+Shift+D)")}">
                       <span>◫</span>
                       <span class="pm-cmd-label">${this.tr("Split", "分屏")}</span>
+                      <span class="pm-kbd">⌘D</span>
                     </button>`
                   : ""
               }
@@ -7131,19 +7326,15 @@ export class CodaTerminalWebApp {
 
         <!-- RIGHT VERTICAL THUMB RAIL -->
         <aside class="right-rail">
-          <div style="width:34px;height:58px;border-radius:999px;border:1px solid var(--rose-bd);background:var(--bg-card);display:flex;align-items:flex-end;justify-content:center;padding-bottom:8px;">
-            <span style="width:10px;height:10px;border-radius:99px;background:var(--emerald);box-shadow:0 0 8px var(--emerald);"></span>
+          <div id="rail-status-pill" role="status" title="${this.escapeHtml(connVisual.railTitle)}" aria-label="${this.escapeHtml(connVisual.railTitle)}" style="width:34px;height:58px;border-radius:999px;border:1px solid ${connVisual.railBorderCss};background:var(--bg-card);display:flex;align-items:flex-end;justify-content:center;padding-bottom:8px;">
+            <span id="rail-status-dot" style="width:10px;height:10px;border-radius:99px;background:${connVisual.railDotBgCss};box-shadow:${connVisual.railDotShadowCss};"></span>
           </div>
 
           <div style="text-align:center;" class="coda-mono">
             <div style="font-size:12px;font-weight:700;">${nowTime}</div>
             <div style="margin-top:6px;width:42px;height:42px;border-radius:999px;border:2px solid var(--border-strong);border-top-color:var(--text-primary);display:flex;flex-direction:column;align-items:center;justify-content:center;font-size:10.5px;">
               <strong>${this.terminals.length}</strong>
-              ${
-                this.activeTransportMode === "lan_ws"
-                  ? `<span style="color:var(--emerald);">LAN</span>`
-                  : `<span style="color:var(--text-tertiary);">WSS</span>`
-              }
+              <span id="rail-transport-mode">${connVisual.railTransportBadgeHtml}</span>
             </div>
           </div>
 
@@ -7589,7 +7780,7 @@ export class CodaTerminalWebApp {
               <form id="change-pw-form" style="border-top:1px solid var(--border-primary);padding-top:12px;margin-bottom:14px;display:flex;flex-direction:column;gap:6px;">
                 <strong style="font-size:12.5px;">${this.tr("Change Password", "修改登录密码")}</strong>
                 <input type="password" name="current_password" class="pm-input" style="margin:0;" required placeholder="${this.tr("Current password", "当前密码")}" autocomplete="current-password" />
-                <input type="password" name="new_password" class="pm-input" style="margin:0;" required minlength="6" placeholder="${this.tr("New password (at least 6 chars)", "新密码（至少 6 位）")}" autocomplete="new-password" />
+                <input type="password" name="new_password" class="pm-input" style="margin:0;" required minlength="8" maxlength="256" placeholder="${this.tr("New password (at least 8 chars)", "新密码（至少 8 位）")}" autocomplete="new-password" />
                 <button type="submit" class="pm-btn pm-btn-secondary pm-btn-sm">${this.tr("Update Password", "确认修改密码")}</button>
               </form>
 
@@ -7676,7 +7867,8 @@ export class CodaTerminalWebApp {
       });
     };
 
-    const performLocalSignOut = () => {
+    const performLocalSignOut = async () => {
+      await this.unsubscribeWebPushForSignOut();
       this.stopVoiceCaptureResources();
       this.isRecordingVoice = false;
       this.isTranscribingVoice = false;
@@ -7739,7 +7931,15 @@ export class CodaTerminalWebApp {
       this.adminUsers = [];
       this.adminResetBusyUserId = null;
       this.latestAdminResetLink = null;
-      this.webPushCount = 0;
+      const cleaned = clearAccountScopedSignOutState(
+        typeof localStorage !== "undefined" ? localStorage : null
+      );
+      this.webPushThisDeviceSubscribed = cleaned.webPushThisDeviceSubscribed;
+      this.webPushEndpoint = cleaned.webPushEndpoint;
+      this.webPushCount = cleaned.webPushCount;
+      this.promptSnippets = cleaned.promptSnippets;
+      this.onboardingDismissed = cleaned.onboardingDismissed;
+      this.onboardingCopiedInstall = cleaned.onboardingCopiedInstall;
       this.savingSnippetOpen = false;
       this.savingSnippetTitle = "";
       this.savingSnippetBusy = false;
@@ -8120,12 +8320,15 @@ export class CodaTerminalWebApp {
       if (!window.confirm(this.tr("Sign out all browser/mobile sessions?", "确认强制退出全部登录会话吗？"))) {
         return;
       }
+      await this.unsubscribeWebPushForSignOut();
       try {
-        await this.api("/api/v1/auth/logout-all", "POST", {});
+        if (this.token) {
+          await this.api("/api/v1/auth/logout-all", "POST", {});
+        }
       } catch {
         // proceed to local teardown regardless
       }
-      performLocalSignOut();
+      await performLocalSignOut();
     });
 
     root.querySelectorAll<HTMLElement>("[data-enable-web-push]").forEach((btn) => {
@@ -8141,12 +8344,12 @@ export class CodaTerminalWebApp {
 
     document.getElementById("btn-onboarding-dismiss")?.addEventListener("click", () => {
       this.onboardingDismissed = true;
-      writeLocalPref("coda_onboarding_dismissed", "1");
+      writeLocalPref(onboardingDismissedStorageKey(this.user?.id), "1");
       this.render();
     });
     document.getElementById("btn-sidebar-show-onboarding")?.addEventListener("click", () => {
       this.onboardingDismissed = false;
-      writeLocalPref("coda_onboarding_dismissed", "0");
+      writeLocalPref(onboardingDismissedStorageKey(this.user?.id), "0");
       this.render();
     });
     document.getElementById("btn-onboarding-copy-install")?.addEventListener("click", async () => {
@@ -8288,10 +8491,17 @@ export class CodaTerminalWebApp {
     document.getElementById("change-pw-form")?.addEventListener("submit", async (e) => {
       e.preventDefault();
       const fd = Object.fromEntries(new FormData(e.target as HTMLFormElement).entries()) as any;
+      const newPw = String(fd.new_password || "");
+      const pwCheck = validateNewPasswordLength(newPw, (en, zh) => this.tr(en, zh));
+      if (!pwCheck.ok) {
+        this.settingsFeedback = { kind: "err", text: pwCheck.error };
+        this.render();
+        return;
+      }
       try {
         const res = await this.api("/api/v1/auth/password", "POST", {
           current_password: String(fd.current_password || ""),
-          new_password: String(fd.new_password || ""),
+          new_password: newPw,
         });
         if (res?.token) {
           this.token = res.token;
@@ -8327,7 +8537,7 @@ export class CodaTerminalWebApp {
         await this.api("/api/v1/auth/me", "DELETE", {
           password: String(fd.current_password || ""),
         });
-        performLocalSignOut();
+        await performLocalSignOut();
       } catch (err: any) {
         this.settingsFeedback = { kind: "err", text: String(err?.message || "Delete account failed") };
         this.render();
@@ -8471,6 +8681,12 @@ export class CodaTerminalWebApp {
         this.jumpToNextNeedsYouTerminal();
         return;
       }
+      if (isToggleSplitViewShortcut(e)) {
+        e.preventDefault();
+        e.stopPropagation();
+        this.toggleSplitView();
+        return;
+      }
       if (!this.selectedDaemon || !this.activeTerminalAddr) return;
       setFocusedPane("primary");
       const keyVt = this.vtTerminals.get(this.vtKey(this.selectedDaemon.id, this.activeTerminalAddr));
@@ -8524,6 +8740,12 @@ export class CodaTerminalWebApp {
         this.jumpToNextNeedsYouTerminal();
         return;
       }
+      if (isToggleSplitViewShortcut(e)) {
+        e.preventDefault();
+        e.stopPropagation();
+        this.toggleSplitView();
+        return;
+      }
       if (!this.selectedDaemon || !this.secondaryTerminalAddr) return;
       setFocusedPane("secondary");
       const secVt = this.vtTerminals.get(this.vtKey(this.selectedDaemon.id, this.secondaryTerminalAddr));
@@ -8559,39 +8781,50 @@ export class CodaTerminalWebApp {
       const types = e.dataTransfer?.types;
       return Boolean(types && Array.from(types).includes("Files"));
     };
-    let dropDepth = 0;
-    termBox?.addEventListener("dragenter", (e) => {
-      if (!dragHasFiles(e)) return;
-      e.preventDefault();
-      dropDepth += 1;
-      termBox.classList.add("term-drop-active");
-    });
-    termBox?.addEventListener("dragover", (e) => {
-      if (!dragHasFiles(e)) return;
-      e.preventDefault();
-      if (e.dataTransfer) e.dataTransfer.dropEffect = "copy";
-    });
-    termBox?.addEventListener("dragleave", () => {
-      if (dropDepth <= 0) return;
-      dropDepth = Math.max(0, dropDepth - 1);
-      if (dropDepth === 0) termBox.classList.remove("term-drop-active");
-    });
-    termBox?.addEventListener("drop", (e) => {
-      if (!dragHasFiles(e)) return;
-      e.preventDefault();
-      dropDepth = 0;
-      termBox.classList.remove("term-drop-active");
-      const files = Array.from(e.dataTransfer?.files || []);
-      if (files.length > 0) {
-        const pinnedDaemon = this.selectedDaemon;
-        const pinnedTerminal = this.activeTerminalAddr;
-        void (async () => {
-          for (const f of files) {
-            await this.uploadSingleFileToHost(f, pinnedDaemon, pinnedTerminal, undefined, "pty");
+    const bindTerminalDropZone = (boxEl: HTMLElement | null, pane: "primary" | "secondary") => {
+      if (!boxEl) return;
+      let dropDepth = 0;
+      boxEl.addEventListener("dragenter", (e) => {
+        if (!dragHasFiles(e)) return;
+        e.preventDefault();
+        dropDepth += 1;
+        boxEl.classList.add("term-drop-active");
+      });
+      boxEl.addEventListener("dragover", (e) => {
+        if (!dragHasFiles(e)) return;
+        e.preventDefault();
+        if (e.dataTransfer) e.dataTransfer.dropEffect = "copy";
+      });
+      boxEl.addEventListener("dragleave", () => {
+        if (dropDepth <= 0) return;
+        dropDepth = Math.max(0, dropDepth - 1);
+        if (dropDepth === 0) boxEl.classList.remove("term-drop-active");
+      });
+      boxEl.addEventListener("drop", (e) => {
+        if (!dragHasFiles(e)) return;
+        e.preventDefault();
+        dropDepth = 0;
+        boxEl.classList.remove("term-drop-active");
+        const files = Array.from(e.dataTransfer?.files || []);
+        if (files.length > 0) {
+          if (pane === "secondary" && this.secondaryTerminalAddr) {
+            setFocusedPane("secondary");
+          } else if (pane === "primary") {
+            setFocusedPane("primary");
           }
-        })();
-      }
-    });
+          const pinnedDaemon = this.selectedDaemon;
+          const pinnedTerminal =
+            pane === "secondary" ? this.secondaryTerminalAddr ?? null : this.activeTerminalAddr ?? null;
+          void (async () => {
+            for (const f of files) {
+              await this.uploadSingleFileToHost(f, pinnedDaemon, pinnedTerminal, undefined, "pty");
+            }
+          })();
+        }
+      });
+    };
+    bindTerminalDropZone(termBox, "primary");
+    bindTerminalDropZone(secTermBox, "secondary");
 
     termBox?.addEventListener("scroll", () => {
       this.syncScrollBottomPill(termBox);
@@ -8724,10 +8957,19 @@ export class CodaTerminalWebApp {
     });
     document.getElementById("btn-composer-attach")?.addEventListener("click", () => {
       const fileInp = document.getElementById("rail-file-input") as HTMLInputElement | null;
-      if (fileInp && this.selectedDaemon && this.getFocusedTerminalAddr()) {
-        this.nextFileInputTarget = "draft";
-        fileInp.click();
+      const targetAddr = this.getFocusedTerminalAddr();
+      if (!this.selectedDaemon?.is_online || !targetAddr || !fileInp) {
+        this.showToastNotice(
+          "err",
+          this.tr(
+            "Select an online host and open a terminal first.",
+            "请先选择一台在线主机并打开终端会话。"
+          )
+        );
+        return;
       }
+      this.nextFileInputTarget = "draft";
+      fileInp.click();
     });
     document.getElementById("btn-composer-voice")?.addEventListener("click", () => {
       void this.toggleVoiceInput();
@@ -8891,9 +9133,7 @@ export class CodaTerminalWebApp {
 
     // Split View, Git Diff, ⌘F Search, Markdown Export, ⌘+Click URL, Remote File Browser & Port Preview
     document.getElementById("btn-console-split")?.addEventListener("click", () => {
-      this.toggleSplitTerminals();
-      this.render();
-      this.scheduleTerminalResizeSync();
+      this.toggleSplitView();
     });
     document.getElementById("btn-console-diff")?.addEventListener("click", () => {
       this.openRemoteGitDiff();
@@ -9230,6 +9470,7 @@ export class CodaTerminalWebApp {
     });
 
     document.getElementById("btn-logout")?.addEventListener("click", async () => {
+      await this.unsubscribeWebPushForSignOut();
       try {
         if (this.token) {
           await this.api("/api/v1/auth/logout", "POST", {});
@@ -9237,7 +9478,7 @@ export class CodaTerminalWebApp {
       } catch {
         // Ignore network/revoked errors during local teardown
       } finally {
-        performLocalSignOut();
+        await performLocalSignOut();
       }
     });
 
@@ -9470,12 +9711,18 @@ export class CodaTerminalWebApp {
     document.getElementById("rail-refresh-btn")?.addEventListener("click", () => {
       const fileInp = document.getElementById("rail-file-input") as HTMLInputElement | null;
       const targetAddr = this.getFocusedTerminalAddr();
-      if (fileInp && this.selectedDaemon && targetAddr) {
-        this.nextFileInputTarget = "pty";
-        fileInp.click();
-      } else if (targetAddr) {
-        this.requestScreen(targetAddr);
+      if (!this.selectedDaemon?.is_online || !targetAddr || !fileInp) {
+        this.showToastNotice(
+          "err",
+          this.tr(
+            "Select an online host and open a terminal first.",
+            "请先选择一台在线主机并打开终端会话。"
+          )
+        );
+        return;
       }
+      this.nextFileInputTarget = "pty";
+      fileInp.click();
     });
 
     document.getElementById("rail-file-input")?.addEventListener("change", async (ev) => {
@@ -9493,33 +9740,86 @@ export class CodaTerminalWebApp {
     });
 
     document.getElementById("rail-paste-btn")?.addEventListener("click", async () => {
+      const canReadText = typeof navigator.clipboard?.readText === "function";
+      const canReadItems = typeof navigator.clipboard?.read === "function";
+      if (!canReadText && !canReadItems) {
+        this.showToastNotice(
+          "err",
+          this.tr(
+            "Clipboard API unavailable in this browser context",
+            "当前浏览器上下文不支持剪贴板读取"
+          )
+        );
+        return;
+      }
       try {
-        if (!navigator.clipboard?.readText) {
-          this.showToastNotice(
-            "err",
-            this.tr("Clipboard API unavailable in this browser context", "当前浏览器上下文不支持剪贴板读取")
-          );
+        let clip = "";
+        let readTextError: unknown = null;
+        if (canReadText) {
+          try {
+            clip = await navigator.clipboard.readText();
+          } catch (err) {
+            readTextError = err;
+          }
+        }
+        if (clip) {
+          this.draftInput = this.draftInput ? `${this.draftInput}${clip}` : clip;
+          this.updateDraftPreviewInPlace();
+          const composerArea = document.getElementById(
+            "prompt-composer-textarea"
+          ) as HTMLTextAreaElement | null;
+          const desktopInp = document.getElementById(
+            "desktop-prompt-input"
+          ) as HTMLInputElement | null;
+          if (composerArea) {
+            composerArea.value = this.draftInput;
+            composerArea.focus();
+          } else if (desktopInp) {
+            desktopInp.value = this.draftInput;
+            desktopInp.focus();
+          } else {
+            this.render();
+          }
           return;
         }
-        const clip = await navigator.clipboard.readText();
-        if (!clip) return;
-        this.draftInput = this.draftInput ? `${this.draftInput}${clip}` : clip;
-        this.updateDraftPreviewInPlace();
-        const composerArea = document.getElementById("prompt-composer-textarea") as HTMLTextAreaElement | null;
-        const desktopInp = document.getElementById("desktop-prompt-input") as HTMLInputElement | null;
-        if (composerArea) {
-          composerArea.value = this.draftInput;
-          composerArea.focus();
-        } else if (desktopInp) {
-          desktopInp.value = this.draftInput;
-          desktopInp.focus();
-        } else {
-          this.render();
+
+        if (canReadItems) {
+          const items = await navigator.clipboard.read();
+          const imageBlobs = await extractImagesFromClipboardItems(items);
+          if (imageBlobs.length > 0) {
+            const pinnedDaemon = this.selectedDaemon;
+            const pinnedTerminal = this.getFocusedTerminalAddr();
+            const targetMode: "pty" | "draft" = this.showPromptComposer ? "draft" : "pty";
+            const baseTs = Date.now();
+            for (let idx = 0; idx < imageBlobs.length; idx += 1) {
+              const blob = imageBlobs[idx];
+              const fname = buildClipboardImageFilename(baseTs, idx, blob.type, "");
+              await this.uploadSingleFileToHost(
+                blob,
+                pinnedDaemon,
+                pinnedTerminal,
+                fname,
+                targetMode
+              );
+            }
+            return;
+          }
         }
+
+        if (readTextError) {
+          throw readTextError;
+        }
+        this.showToastNotice(
+          "err",
+          this.tr("Clipboard is empty.", "剪贴板当前为空。")
+        );
       } catch {
         this.showToastNotice(
           "err",
-          this.tr("Clipboard permission denied; paste directly with Ctrl+V / ⌘V", "剪贴板读取未授权，请直接使用 Ctrl+V / ⌘V 粘贴")
+          this.tr(
+            "Clipboard permission denied; paste directly with Ctrl+V / ⌘V",
+            "剪贴板读取未授权，请直接使用 Ctrl+V / ⌘V 粘贴"
+          )
         );
       }
     });

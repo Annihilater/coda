@@ -29,6 +29,7 @@ import {
 import {
   encodeTerminalKeyEvent,
   isJumpNeedsYouShortcut,
+  isToggleSplitViewShortcut,
   sanitizeBracketedPasteText,
   wrapBracketedPaste,
 } from "./terminal_keys";
@@ -97,22 +98,32 @@ import {
   DEFAULT_PROMPT_SNIPPETS,
   IOS_PWA_LOCK_SCREEN_PUSH_TIP_EN,
   MAX_PROMPT_SNIPPETS,
+  SNIPPETS_CACHE_STORAGE_KEY,
   arrayBufferToBase64Url,
   buildInviteRegistrationUrl,
+  clearAccountScopedSignOutState,
+  deriveConsoleConnectionVisualState,
   deriveSnippetTitleFromPrompt,
+  extractImagesFromClipboardItems,
   extractPushSubscriptionKeys,
   extractResetTokenFromInput,
+  formatConsoleHeaderSubtitle,
   insertSnippetIntoDraft,
   isCustomPromptSnippet,
   isIosNonStandaloneBrowser,
+  isPushSubscriptionVapidKeyMismatch,
   normalizePromptSnippetsList,
   normalizeSwNotificationTargetUrl,
+  onboardingDismissedStorageKey,
   parseLocationRouteAndParams,
   parseSwPushPayload,
   renderAdminFriendsDirectorySection,
+  renderConsoleEmptyStateHtml,
   renderFriendOnboardingCard,
   renderWebPushSettingsCard,
   shouldSwCacheStaticAsset,
+  teardownWebPushOnSignOut,
+  validateNewPasswordLength,
   validatePromptSnippet,
   validateResetPasswordInputs,
   vapidBase64UrlToUint8Array,
@@ -2006,5 +2017,261 @@ describe("v1.1.0 Service Worker Web Push, Invite/Reset Deep-Links, Snippets & On
     await pendingPromise;
     expect(closedNotif).toBe(true);
     expect(focusedConsoleClient).toBe(true);
+  });
+
+  test("VAPID key rotation mismatch detection, sign-out Web Push & local state cleanup helpers", async () => {
+    const serverKeyA = new Uint8Array(65).map((_, idx) => (idx === 0 ? 0x04 : (idx * 7 + 3) & 0xff));
+    const serverKeyB = new Uint8Array(serverKeyA);
+    serverKeyB[64] ^= 0xff;
+
+    // Exact match via ArrayBuffer and sliced Uint8Array view
+    expect(isPushSubscriptionVapidKeyMismatch(serverKeyA.buffer.slice(0), serverKeyA)).toBe(false);
+    const padded = new Uint8Array(80);
+    padded.set(serverKeyA, 8);
+    const subView = padded.subarray(8, 8 + 65);
+    expect(isPushSubscriptionVapidKeyMismatch(subView, serverKeyA)).toBe(false);
+
+    // Omitted options.applicationServerKey (undefined) does not force unsubscribe, while null or mismatched key does
+    expect(isPushSubscriptionVapidKeyMismatch(undefined, serverKeyA)).toBe(false);
+    expect(isPushSubscriptionVapidKeyMismatch(null, serverKeyA)).toBe(true);
+    expect(isPushSubscriptionVapidKeyMismatch(serverKeyB.buffer, serverKeyA)).toBe(true);
+    expect(isPushSubscriptionVapidKeyMismatch(new Uint8Array(32).buffer, serverKeyA)).toBe(true);
+
+    // Sign-out unsubscribes server FIRST (while bearer token is valid), then browser PushSubscription
+    const callOrder: string[] = [];
+    const signOutRes = await teardownWebPushOnSignOut({
+      getSubscription: async () => ({
+        endpoint: "https://fcm.googleapis.com/fcm/send/tenant-a-endpoint",
+        unsubscribe: async () => {
+          callOrder.push("browser:unsubscribe");
+          return true;
+        },
+      }),
+      knownEndpoint: "https://fallback.example/push",
+      hasAuthToken: true,
+      unsubscribeServer: async (ep) => {
+        callOrder.push(`server:unsubscribe:${ep}`);
+      },
+    });
+    expect(callOrder).toEqual([
+      "server:unsubscribe:https://fcm.googleapis.com/fcm/send/tenant-a-endpoint",
+      "browser:unsubscribe",
+    ]);
+    expect(signOutRes).toEqual({
+      endpoint: "https://fcm.googleapis.com/fcm/send/tenant-a-endpoint",
+      unsubscribedServer: true,
+      unsubscribedBrowser: true,
+      webPushThisDeviceSubscribed: false,
+      webPushEndpoint: "",
+      webPushCount: 0,
+    });
+
+    // Even if server unsubscribe rejects (network offline / revoked session), browser subscription still unsubscribes cleanly
+    let browserUnsubAfterServerErr = false;
+    const offlineRes = await teardownWebPushOnSignOut({
+      getSubscription: async () => ({
+        endpoint: "https://web.push.apple.com/tenant-a",
+        unsubscribe: async () => {
+          browserUnsubAfterServerErr = true;
+          return true;
+        },
+      }),
+      hasAuthToken: true,
+      unsubscribeServer: async () => {
+        throw new Error("Network unreachable");
+      },
+    });
+    expect(browserUnsubAfterServerErr).toBe(true);
+    expect(offlineRes.unsubscribedServer).toBe(false);
+    expect(offlineRes.unsubscribedBrowser).toBe(true);
+    expect(offlineRes.webPushThisDeviceSubscribed).toBe(false);
+    expect(offlineRes.webPushEndpoint).toBe("");
+    expect(offlineRes.webPushCount).toBe(0);
+
+    // Account-scoped storage cleanup clears coda_snippets_cache, resets snippets & namespaces onboarding per user.id
+    const removedKeys: string[] = [];
+    const cleaned = clearAccountScopedSignOutState({
+      removeItem: (k) => removedKeys.push(k),
+    });
+    expect(removedKeys).toEqual([SNIPPETS_CACHE_STORAGE_KEY]);
+    expect(cleaned.promptSnippets).toEqual([...DEFAULT_PROMPT_SNIPPETS]);
+    expect(cleaned.webPushThisDeviceSubscribed).toBe(false);
+    expect(cleaned.webPushEndpoint).toBe("");
+    expect(cleaned.webPushCount).toBe(0);
+    expect(cleaned.onboardingDismissed).toBe(false);
+
+    expect(onboardingDismissedStorageKey("user-uuid-1")).toBe(
+      "coda_onboarding_dismissed:user-uuid-1"
+    );
+    expect(onboardingDismissedStorageKey("user-uuid-2")).toBe(
+      "coda_onboarding_dismissed:user-uuid-2"
+    );
+    expect(onboardingDismissedStorageKey("")).toBe("coda_onboarding_dismissed");
+  });
+
+  test("truthful /console empty-state rendering, connection indicators, ⌘D shortcut & clipboard image extraction", async () => {
+    const trEn = (en: string) => en;
+
+    // 1. 0 paired hosts: prompts to bind first host, zero misleading PostgreSQL/Local Herdr Core/Relay Ready text
+    const zeroHostsHtml = renderConsoleEmptyStateHtml({
+      devicesCount: 0,
+      selectedDaemon: null,
+      activeTerminalName: null,
+      relayWsOpen: false,
+      directWsOpen: false,
+      transportMode: "relay_ws",
+      rttMs: null,
+      installCmd: 'curl -fsSL "https://codahub.dev/install.sh" | sh',
+      tr: trEn,
+    });
+    expect(zeroHostsHtml).toContain("No remote hosts paired to this account yet.");
+    expect(zeroHostsHtml).toContain("bind your first host");
+    expect(zeroHostsHtml).toContain("&quot;https://codahub.dev/install.sh&quot;");
+    expect(zeroHostsHtml).not.toContain("PostgreSQL 18");
+    expect(zeroHostsHtml).not.toContain("Local Herdr Core online");
+    expect(zeroHostsHtml).not.toContain("Relay WSS :443 Ready");
+
+    const zeroVis = deriveConsoleConnectionVisualState({
+      devicesCount: 0,
+      selectedDaemon: null,
+      relayWsOpen: true,
+      directWsOpen: false,
+      transportMode: "relay_ws",
+      rttMs: null,
+      tr: trEn,
+    });
+    expect(zeroVis.tone).toBe("idle");
+    expect(zeroVis.sidebarColorCss).not.toBe("var(--emerald)");
+    expect(zeroVis.railDotBgCss).not.toBe("var(--emerald)");
+    expect(
+      formatConsoleHeaderSubtitle({
+        devicesCount: 0,
+        selectedDaemon: null,
+        activeCwd: null,
+        activeBranch: null,
+        tr: trEn,
+      })
+    ).toBe("No hosts paired");
+
+    // 2. Offline host: shows "Host <name> is currently offline" (HTML-escaped), non-green status dot, no fake "main" branch
+    const offlineHtml = renderConsoleEmptyStateHtml({
+      devicesCount: 1,
+      selectedDaemon: { name: "prod-box<1>", is_online: false },
+      activeTerminalName: null,
+      relayWsOpen: true,
+      directWsOpen: false,
+      transportMode: "relay_ws",
+      rttMs: null,
+      installCmd: "curl -fsSL https://codahub.dev/install.sh | sh",
+      tr: trEn,
+    });
+    expect(offlineHtml).toContain("Host prod-box&lt;1&gt; is currently offline.");
+    expect(offlineHtml).not.toContain("Local Herdr Core online");
+
+    const offlineVis = deriveConsoleConnectionVisualState({
+      devicesCount: 1,
+      selectedDaemon: { name: "prod-box", is_online: false },
+      relayWsOpen: true,
+      directWsOpen: false,
+      transportMode: "relay_ws",
+      rttMs: null,
+      tr: trEn,
+    });
+    expect(offlineVis.tone).toBe("offline");
+    expect(offlineVis.railDotBgCss).toBe("var(--text-quaternary)");
+    expect(offlineVis.railTitle).toContain("Host prod-box is currently offline");
+    expect(
+      formatConsoleHeaderSubtitle({
+        devicesCount: 1,
+        selectedDaemon: { name: "prod-box", is_online: false },
+        activeCwd: undefined,
+        activeBranch: undefined,
+        tr: trEn,
+      })
+    ).toBe("prod-box (offline)");
+
+    // 3. Online host with 0 terminals: prompts "Press + to launch Claude Code, Codex, Grok, AGY, or Shell"
+    const onlineEmptyHtml = renderConsoleEmptyStateHtml({
+      devicesCount: 1,
+      selectedDaemon: { name: "Mac-Studio", is_online: true },
+      activeTerminalName: null,
+      relayWsOpen: true,
+      directWsOpen: false,
+      transportMode: "relay_ws",
+      rttMs: 18,
+      installCmd: "curl -fsSL https://codahub.dev/install.sh | sh",
+      tr: trEn,
+    });
+    expect(onlineEmptyHtml).toContain(
+      "Press + to launch Claude Code, Codex, Grok, AGY, or Shell."
+    );
+    expect(onlineEmptyHtml).toContain("RTT 18ms");
+
+    const connectingVis = deriveConsoleConnectionVisualState({
+      devicesCount: 1,
+      selectedDaemon: { name: "Mac-Studio", is_online: true },
+      relayWsOpen: false,
+      directWsOpen: false,
+      transportMode: "relay_ws",
+      rttMs: null,
+      tr: trEn,
+    });
+    expect(connectingVis.tone).toBe("connecting");
+    expect(connectingVis.railDotBgCss).toBe("var(--amber)");
+
+    const onlineVis = deriveConsoleConnectionVisualState({
+      devicesCount: 1,
+      selectedDaemon: { name: "Mac-Studio", is_online: true },
+      relayWsOpen: true,
+      directWsOpen: false,
+      transportMode: "relay_ws",
+      rttMs: 14,
+      tr: trEn,
+    });
+    expect(onlineVis.tone).toBe("online");
+    expect(onlineVis.railDotBgCss).toBe("var(--emerald)");
+
+    // Header subtitle includes git branch ONLY when present, never defaulting to "main"
+    expect(
+      formatConsoleHeaderSubtitle({
+        devicesCount: 1,
+        selectedDaemon: { name: "Mac-Studio", is_online: true },
+        activeCwd: "/tmp/scratch",
+        activeBranch: null,
+        tr: trEn,
+      })
+    ).toBe("/tmp/scratch &middot; Mac-Studio");
+    expect(
+      formatConsoleHeaderSubtitle({
+        devicesCount: 1,
+        selectedDaemon: { name: "Mac-Studio", is_online: true },
+        activeCwd: "/opt/coda",
+        activeBranch: "feat/web-polish",
+        tr: trEn,
+      })
+    ).toBe("/opt/coda &middot; feat/web-polish &middot; Mac-Studio");
+
+    // 4. ⌘D / Ctrl+Shift+D Split View shortcut preserves bare Ctrl+D (\x04 EOF) and Alt+D (\x1bd)
+    expect(isToggleSplitViewShortcut({ key: "d", metaKey: true })).toBe(true);
+    expect(isToggleSplitViewShortcut({ key: "D", ctrlKey: true, shiftKey: true })).toBe(true);
+    expect(isToggleSplitViewShortcut({ key: "d", ctrlKey: true })).toBe(false);
+    expect(isToggleSplitViewShortcut({ key: "d", altKey: true })).toBe(false);
+    expect(encodeTerminalKeyEvent({ key: "d", ctrlKey: true })).toBe("\x04");
+
+    // 5. Password min-length helper & clipboard image item extraction & landing /activate link check
+    expect(validateNewPasswordLength("1234567", trEn).ok).toBe(false);
+    expect(validateNewPasswordLength("12345678", trEn).ok).toBe(true);
+
+    const pngBlob = new Blob([new Uint8Array([0x89, 0x50, 0x4e, 0x47])], { type: "image/png" });
+    const extractedImages = await extractImagesFromClipboardItems([
+      { types: ["text/plain"], getType: async () => new Blob(["hi"], { type: "text/plain" }) },
+      { types: ["image/png"], getType: async () => pngBlob },
+    ]);
+    expect(extractedImages.length).toBe(1);
+    expect(extractedImages[0].type).toBe("image/png");
+
+    const appTsSrc = readFileSync(new URL("./app.ts", import.meta.url), "utf8");
+    expect(appTsSrc).not.toContain("/activate?code=CODA-7F29");
+    expect(appTsSrc).not.toContain("Local Herdr Core online");
   });
 });

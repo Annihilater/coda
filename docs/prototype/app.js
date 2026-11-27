@@ -2721,12 +2721,26 @@
 
   document.addEventListener("keydown", (ev) => {
     const mod = ev.metaKey || ev.ctrlKey;
+    const isSplitShortcut =
+      (ev.metaKey && !ev.ctrlKey && !ev.altKey && !ev.shiftKey && ev.key.toLowerCase() === "d") ||
+      (ev.ctrlKey && ev.shiftKey && !ev.metaKey && !ev.altKey && ev.key.toLowerCase() === "d");
+    const modalOpen = !document.getElementById("proto-modal-backdrop").classList.contains("hidden");
     if (mod && ev.key.toLowerCase() === "k") {
       ev.preventDefault();
       openModal("palette");
     } else if (mod && ev.key.toLowerCase() === "j") {
       ev.preventDefault();
       jumpNextNeedsYou();
+    } else if (isSplitShortcut && !modalOpen) {
+      if (state.platform === "web_desktop" && state.webSubView === "workbench") {
+        ev.preventDefault();
+        state.webSplit = !state.webSplit;
+        render();
+      } else if (state.platform === "mac_gpui") {
+        ev.preventDefault();
+        state.macSplit = !state.macSplit;
+        render();
+      }
     } else if (mod && ev.key.toLowerCase() === "f") {
       ev.preventDefault();
       state.termSearchOpen = !state.termSearchOpen;

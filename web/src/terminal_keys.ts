@@ -131,3 +131,14 @@ export function isJumpNeedsYouShortcut(e: TerminalKeyEventLike): boolean {
   if (e.ctrlKey && e.shiftKey && !e.altKey && !e.metaKey) return true;
   return false;
 }
+
+/**
+ * Matches `⌘D` (macOS) or `Ctrl+Shift+D` (Linux/Windows) for toggling Dual-Pane Split View,
+ * intentionally preserving bare `Ctrl+D` (`\x04` EOF) and `Alt+D` (`\x1bd` kill-word) inside PTYs.
+ */
+export function isToggleSplitViewShortcut(e: TerminalKeyEventLike): boolean {
+  if (String(e.key || "").toLowerCase() !== "d") return false;
+  if (e.metaKey && !e.altKey && !e.ctrlKey && !e.shiftKey) return true;
+  if (e.ctrlKey && e.shiftKey && !e.altKey && !e.metaKey) return true;
+  return false;
+}

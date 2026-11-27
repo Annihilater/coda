@@ -4,6 +4,7 @@ import type {
   AdminUserSummary,
   AppRoute,
   PromptSnippet,
+  TransportMode,
   VapidPublicKeyInfo,
 } from "./types";
 
@@ -66,10 +67,143 @@ export function arrayBufferToBase64Url(
 
 export interface PushSubscriptionLike {
   endpoint?: string;
+  options?: {
+    applicationServerKey?: ArrayBuffer | ArrayBufferView | null;
+  };
+  unsubscribe?: () => Promise<boolean>;
   getKey?: (name: "p256dh" | "auth") => ArrayBuffer | null;
   toJSON?: () => {
     endpoint?: string;
     keys?: Record<string, string | undefined>;
+  };
+}
+
+/**
+ * Returns `true` when an existing browser `PushSubscription` has an `applicationServerKey`
+ * that differs from the current coordinator VAPID public key (e.g. after server key rotation),
+ * requiring `pushSub.unsubscribe()` before re-subscribing.
+ */
+export function isPushSubscriptionVapidKeyMismatch(
+  existingKey: ArrayBuffer | ArrayBufferView | null | undefined,
+  expectedServerKey: Uint8Array
+): boolean {
+  if (existingKey === undefined) {
+    return false;
+  }
+  if (existingKey === null) {
+    return expectedServerKey.byteLength > 0;
+  }
+  const existingBytes = ArrayBuffer.isView(existingKey)
+    ? new Uint8Array(existingKey.buffer, existingKey.byteOffset, existingKey.byteLength)
+    : new Uint8Array(existingKey);
+  if (existingBytes.byteLength !== expectedServerKey.byteLength) {
+    return true;
+  }
+  for (let i = 0; i < existingBytes.byteLength; i += 1) {
+    if (existingBytes[i] !== expectedServerKey[i]) {
+      return true;
+    }
+  }
+  return false;
+}
+
+export const SNIPPETS_CACHE_STORAGE_KEY = "coda_snippets_cache";
+export const ONBOARDING_DISMISSED_STORAGE_PREFIX = "coda_onboarding_dismissed";
+
+export function onboardingDismissedStorageKey(userId: string | null | undefined): string {
+  const cleanId = String(userId || "").trim();
+  return cleanId
+    ? `${ONBOARDING_DISMISSED_STORAGE_PREFIX}:${cleanId}`
+    : ONBOARDING_DISMISSED_STORAGE_PREFIX;
+}
+
+export interface StorageRemoveLike {
+  removeItem(key: string): void;
+}
+
+export interface SignedOutAccountLocalState {
+  webPushThisDeviceSubscribed: false;
+  webPushEndpoint: "";
+  webPushCount: 0;
+  promptSnippets: PromptSnippet[];
+  onboardingDismissed: false;
+  onboardingCopiedInstall: false;
+}
+
+/**
+ * Clears account-scoped local cache entries (`coda_snippets_cache`) and returns clean reset values
+ * for Web Push, Saved Snippets, and Onboarding state on sign-out.
+ */
+export function clearAccountScopedSignOutState(
+  storage?: StorageRemoveLike | null
+): SignedOutAccountLocalState {
+  try {
+    storage?.removeItem(SNIPPETS_CACHE_STORAGE_KEY);
+  } catch {
+    // ignore storage errors
+  }
+  return {
+    webPushThisDeviceSubscribed: false,
+    webPushEndpoint: "",
+    webPushCount: 0,
+    promptSnippets: [...DEFAULT_PROMPT_SNIPPETS],
+    onboardingDismissed: false,
+    onboardingCopiedInstall: false,
+  };
+}
+
+/**
+ * Best-effort W3C Web Push teardown executed BEFORE clearing/revoking the bearer auth token
+ * on Sign Out / Sign Out All: unsubscribes on the server first (while bearer token is valid)
+ * AND unsubscribes the browser `PushSubscription` so neither tenant alerts nor UI state leak.
+ */
+export async function teardownWebPushOnSignOut(opts: {
+  getSubscription: () => Promise<PushSubscriptionLike | null | undefined>;
+  knownEndpoint?: string | null;
+  hasAuthToken: boolean;
+  unsubscribeServer: (endpoint: string) => Promise<unknown>;
+}): Promise<{
+  endpoint: string;
+  unsubscribedServer: boolean;
+  unsubscribedBrowser: boolean;
+  webPushThisDeviceSubscribed: false;
+  webPushEndpoint: "";
+  webPushCount: 0;
+}> {
+  let pushSub: PushSubscriptionLike | null | undefined = null;
+  try {
+    pushSub = await opts.getSubscription();
+  } catch {
+    pushSub = null;
+  }
+  const endpoint = String(pushSub?.endpoint || opts.knownEndpoint || "").trim();
+  let unsubscribedServer = false;
+  let unsubscribedBrowser = false;
+
+  if (opts.hasAuthToken && endpoint) {
+    try {
+      await opts.unsubscribeServer(endpoint);
+      unsubscribedServer = true;
+    } catch {
+      // best-effort while bearer token is still valid
+    }
+  }
+
+  if (pushSub && typeof pushSub.unsubscribe === "function") {
+    try {
+      unsubscribedBrowser = Boolean(await pushSub.unsubscribe());
+    } catch {
+      unsubscribedBrowser = false;
+    }
+  }
+
+  return {
+    endpoint,
+    unsubscribedServer,
+    unsubscribedBrowser,
+    webPushThisDeviceSubscribed: false,
+    webPushEndpoint: "",
+    webPushCount: 0,
   };
 }
 
@@ -379,6 +513,32 @@ export function validateResetPasswordInputs(
   return { ok: true, token, newPassword: pw };
 }
 
+export function validateNewPasswordLength(
+  password: string,
+  tr: (en: string, zh: string) => string
+): { ok: true } | { ok: false; error: string } {
+  const pwBytes = new TextEncoder().encode(String(password || "")).length;
+  if (pwBytes < 8) {
+    return {
+      ok: false,
+      error: tr(
+        "Password must be at least 8 characters.",
+        "密码长度至少需要 8 位字符。"
+      ),
+    };
+  }
+  if (pwBytes > 256) {
+    return {
+      ok: false,
+      error: tr(
+        "Password must not exceed 256 bytes.",
+        "密码长度不能超过 256 字节。"
+      ),
+    };
+  }
+  return { ok: true };
+}
+
 export function formatAdminLastLogin(
   lastLoginAt: string | null | undefined,
   tr: (en: string, zh: string) => string
@@ -683,4 +843,264 @@ export function renderFriendOnboardingCard(opts: {
       </div>
     </section>
   `;
+}
+
+// ============================================================================
+// 4. Console Truthful Empty State, Connection Indicators & Clipboard Images
+// ============================================================================
+
+export interface ClipboardItemLike {
+  readonly types: readonly string[];
+  getType(type: string): Promise<Blob>;
+}
+
+/**
+ * Extracts image blobs (`image/*`) from `navigator.clipboard.read()` items when `readText()` is empty.
+ */
+export async function extractImagesFromClipboardItems(
+  items: readonly ClipboardItemLike[] | null | undefined
+): Promise<Blob[]> {
+  if (!items || items.length === 0) return [];
+  const out: Blob[] = [];
+  for (const item of items) {
+    if (!item || !Array.isArray(item.types)) continue;
+    const imgType = item.types.find((t) =>
+      String(t || "")
+        .trim()
+        .toLowerCase()
+        .startsWith("image/")
+    );
+    if (!imgType || typeof item.getType !== "function") continue;
+    try {
+      const blob = await item.getType(imgType);
+      if (blob && blob.size > 0) {
+        out.push(blob);
+      }
+    } catch {
+      // ignore unreadable representation
+    }
+  }
+  return out;
+}
+
+export interface ConsoleConnectionVisualState {
+  tone: "online" | "connecting" | "offline" | "idle";
+  icon: "zap" | "cloud";
+  sidebarColorCss: string;
+  sidebarLabel: string;
+  railBorderCss: string;
+  railDotBgCss: string;
+  railDotShadowCss: string;
+  railTitle: string;
+  railTransportBadgeHtml: string;
+  footerTransport: string;
+}
+
+export function deriveConsoleConnectionVisualState(opts: {
+  devicesCount: number;
+  selectedDaemon: { name: string; is_online: boolean } | null;
+  relayWsOpen: boolean;
+  directWsOpen: boolean;
+  transportMode: TransportMode;
+  rttMs: number | null;
+  tr: (en: string, zh: string) => string;
+}): ConsoleConnectionVisualState {
+  const { tr } = opts;
+  if (opts.devicesCount === 0) {
+    return {
+      tone: "idle",
+      icon: "cloud",
+      sidebarColorCss: "var(--text-tertiary)",
+      sidebarLabel: tr("No hosts paired", "暂未绑定主机"),
+      railBorderCss: "var(--border-primary)",
+      railDotBgCss: "var(--text-quaternary)",
+      railDotShadowCss: "none",
+      railTitle: tr(
+        "No hosts paired yet — bind a Mac or Linux host to start",
+        "尚未绑定主机 — 绑定 Mac 或 Linux 主机后即可开始"
+      ),
+      railTransportBadgeHtml: '<span style="color:var(--text-quaternary);">IDLE</span>',
+      footerTransport: tr("No host paired", "暂未绑定主机"),
+    };
+  }
+
+  if (!opts.selectedDaemon) {
+    return {
+      tone: "idle",
+      icon: "cloud",
+      sidebarColorCss: "var(--text-tertiary)",
+      sidebarLabel: tr("No host selected", "未选择主机"),
+      railBorderCss: "var(--border-primary)",
+      railDotBgCss: "var(--text-quaternary)",
+      railDotShadowCss: "none",
+      railTitle: tr("No host selected", "未选择主机"),
+      railTransportBadgeHtml: '<span style="color:var(--text-quaternary);">—</span>',
+      footerTransport: tr("No host selected", "未选择主机"),
+    };
+  }
+
+  if (!opts.selectedDaemon.is_online) {
+    return {
+      tone: "offline",
+      icon: "cloud",
+      sidebarColorCss: "var(--text-tertiary)",
+      sidebarLabel: tr("Host offline", "主机离线"),
+      railBorderCss: "var(--border-primary)",
+      railDotBgCss: "var(--text-quaternary)",
+      railDotShadowCss: "none",
+      railTitle: tr(
+        `Host ${opts.selectedDaemon.name} is currently offline`,
+        `主机 ${opts.selectedDaemon.name} 当前处于离线状态`
+      ),
+      railTransportBadgeHtml: '<span style="color:var(--text-quaternary);">OFF</span>',
+      footerTransport: tr(
+        `Host ${opts.selectedDaemon.name} offline`,
+        `主机 ${opts.selectedDaemon.name} 离线`
+      ),
+    };
+  }
+
+  if (opts.transportMode === "lan_ws" && opts.directWsOpen) {
+    const rttSuffix = opts.rttMs !== null ? ` (${opts.rttMs}ms)` : "";
+    return {
+      tone: "online",
+      icon: "zap",
+      sidebarColorCss: "var(--emerald)",
+      sidebarLabel: `${tr("LAN Direct", "局域网直连")}${rttSuffix}`,
+      railBorderCss: "var(--emerald-bd)",
+      railDotBgCss: "var(--emerald)",
+      railDotShadowCss: "0 0 8px var(--emerald)",
+      railTitle: tr(
+        `Connected to ${opts.selectedDaemon.name} via LAN Direct${rttSuffix}`,
+        `已通过局域网直连主机 ${opts.selectedDaemon.name}${rttSuffix}`
+      ),
+      railTransportBadgeHtml: '<span style="color:var(--emerald);">LAN</span>',
+      footerTransport: opts.rttMs !== null ? `${opts.rttMs}ms RTT · LAN Direct` : "LAN Direct :24444",
+    };
+  }
+
+  if (opts.relayWsOpen) {
+    const rttSuffix = opts.rttMs !== null ? ` (${opts.rttMs}ms)` : "";
+    return {
+      tone: "online",
+      icon: "cloud",
+      sidebarColorCss: "var(--emerald)",
+      sidebarLabel: `${tr("Smart Relay", "智能中继")}${rttSuffix}`,
+      railBorderCss: "var(--emerald-bd)",
+      railDotBgCss: "var(--emerald)",
+      railDotShadowCss: "0 0 8px var(--emerald)",
+      railTitle: tr(
+        `Connected to ${opts.selectedDaemon.name} via E2EE Smart Relay${rttSuffix}`,
+        `已通过端到端加密智能中继连接 ${opts.selectedDaemon.name}${rttSuffix}`
+      ),
+      railTransportBadgeHtml: '<span style="color:var(--emerald);">WSS</span>',
+      footerTransport: opts.rttMs !== null ? `${opts.rttMs}ms RTT` : "Relay WSS :443",
+    };
+  }
+
+  return {
+    tone: "connecting",
+    icon: "cloud",
+    sidebarColorCss: "var(--amber)",
+    sidebarLabel: tr("Connecting relay…", "正在连接中继…"),
+    railBorderCss: "var(--amber-bd)",
+    railDotBgCss: "var(--amber)",
+    railDotShadowCss: "none",
+    railTitle: tr(
+      `Connecting E2EE relay to ${opts.selectedDaemon.name}…`,
+      `正在连接至 ${opts.selectedDaemon.name} 的加密中继…`
+    ),
+    railTransportBadgeHtml: '<span style="color:var(--amber);">WSS</span>',
+    footerTransport: tr("Connecting relay…", "正在连接中继…"),
+  };
+}
+
+export function formatConsoleHeaderSubtitle(opts: {
+  devicesCount: number;
+  selectedDaemon: { name: string; is_online: boolean } | null;
+  activeCwd?: string | null;
+  activeBranch?: string | null;
+  tr: (en: string, zh: string) => string;
+}): string {
+  const { tr } = opts;
+  const parts: string[] = [];
+  const cwd = String(opts.activeCwd || "").trim();
+  const branch = String(opts.activeBranch || "").trim();
+  if (cwd) {
+    parts.push(escapeHtml(cwd));
+  }
+  if (branch) {
+    parts.push(escapeHtml(branch));
+  }
+  if (opts.devicesCount === 0) {
+    parts.push(escapeHtml(tr("No hosts paired", "暂未绑定主机")));
+  } else if (opts.selectedDaemon) {
+    const statusSuffix = opts.selectedDaemon.is_online ? "" : ` (${tr("offline", "离线")})`;
+    parts.push(escapeHtml(`${opts.selectedDaemon.name}${statusSuffix}`));
+  } else {
+    parts.push(escapeHtml(tr("Unselected", "未选择主机")));
+  }
+  return parts.join(" &middot; ");
+}
+
+export function renderConsoleEmptyStateHtml(opts: {
+  devicesCount: number;
+  selectedDaemon: { name: string; is_online: boolean } | null;
+  activeTerminalName?: string | null;
+  relayWsOpen: boolean;
+  directWsOpen: boolean;
+  transportMode: TransportMode;
+  rttMs: number | null;
+  installCmd: string;
+  tr: (en: string, zh: string) => string;
+}): string {
+  const { tr } = opts;
+  if (opts.devicesCount === 0) {
+    const safeCmd = escapeHtml(opts.installCmd);
+    return tr(
+      `  No remote hosts paired to this account yet.\n  Run the 1-line install command on your Mac or Linux host to bind your first host:\n    $ ${safeCmd}\n  Then approve its device code in Settings or /activate.`,
+      `  当前账号尚未绑定任何远端主机。\n  请在你的 Mac 或 Linux 主机运行以下一行安装命令绑定首台主机：\n    $ ${safeCmd}\n  随后在「设置」或 /activate 页面批准设备码即可接入。`
+    );
+  }
+
+  if (!opts.selectedDaemon) {
+    return escapeHtml(
+      tr(
+        "  Select a paired host from the left sidebar to view or launch terminals.",
+        "  请从左侧边栏选择一台已绑定主机以查看或启动终端。"
+      )
+    );
+  }
+
+  const safeHost = escapeHtml(opts.selectedDaemon.name);
+  if (!opts.selectedDaemon.is_online) {
+    return tr(
+      `  Host ${safeHost} is currently offline.\n  Start coda-daemon (or open Coda.app in Host mode) on that machine to reconnect over E2EE.`,
+      `  主机 ${safeHost} 当前处于离线状态。\n  请在该机器上启动 coda-daemon（或打开 Coda.app 开启主机模式）以恢复端到端加密连接。`
+    );
+  }
+
+  const activeTerm = String(opts.activeTerminalName || "").trim();
+  if (activeTerm) {
+    const safeTerm = escapeHtml(activeTerm);
+    return tr(
+      `  Attaching to ${safeTerm} on ${safeHost} over E2EE…`,
+      `  正在通过端到端加密连接 ${safeHost} 上的终端会话 ${safeTerm}…`
+    );
+  }
+
+  const isConnected =
+    (opts.transportMode === "lan_ws" && opts.directWsOpen) || opts.relayWsOpen;
+  const transportLine = isConnected
+    ? `● ${safeHost} · ${
+        opts.transportMode === "lan_ws" && opts.directWsOpen
+          ? tr("LAN Direct", "局域网直连")
+          : tr("E2EE Smart Relay", "端到端加密中继")
+      }${opts.rttMs !== null ? ` · RTT ${opts.rttMs}ms` : ""}`
+    : tr("○ Connecting E2EE relay…", "○ 正在建立端到端加密中继连接…");
+
+  return tr(
+    `  Host ${safeHost} is online (0 active terminals).\n  Press + to launch Claude Code, Codex, Grok, AGY, or Shell.\n\n  ${transportLine}`,
+    `  主机 ${safeHost} 在线（当前暂无活跃终端）。\n  请按右侧「+」启动 Claude Code、Codex、Grok、AGY 或 Shell。\n\n  ${transportLine}`
+  );
 }
