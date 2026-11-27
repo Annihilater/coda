@@ -5080,7 +5080,7 @@ export class CodaTerminalWebApp {
               <div class="pm-wb-kicker" style="margin-top:12px;">SERVICES</div>
               <div class="pm-wb-tree-row">
                 <span>coda-daemon</span>
-                <span style="color:var(--emerald);">v1.1.0</span>
+                <span style="color:var(--emerald);">v1.1.1</span>
               </div>
               <div class="pm-wb-tree-row">
                 <span>herdr-core</span>
@@ -5368,7 +5368,7 @@ export class CodaTerminalWebApp {
     const root = document.getElementById("app")!;
     const baseUrl = this.siteInfo?.public_base_url || window.location.origin;
     const installCmd = this.siteInfo?.install_command || `curl -fsSL ${baseUrl}/install.sh | sh`;
-    const ver = this.siteInfo?.version || "v1.1.0";
+    const ver = this.siteInfo?.version || "v1.1.1";
     const dl: SiteInfo["downloads"] = this.siteInfo?.downloads || {
       daemon_linux_x64: `${baseUrl}/download/daemon-linux-x86_64.tar.gz`,
       daemon_linux_arm64: `${baseUrl}/download/daemon-linux-aarch64.tar.gz`,
