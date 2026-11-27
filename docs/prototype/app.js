@@ -1,7 +1,7 @@
 (() => {
   "use strict";
 
-  // ===================== Shared Live State (v1.1.0) =====================
+  // ===================== Shared Live State (v1.1.1) =====================
   const ROUTES = [
     { id: "lan", labelZh: "⚡ 局域网直连 · 1.4ms", labelEn: "⚡ LAN Direct · 1.4ms", short: "LAN P2P", isRelay: false },
     { id: "ipv6", labelZh: "🚀 公网 IPv6 直连 · 9.2ms", labelEn: "🚀 CN IPv6 P2P · 9.2ms", short: "IPv6 P2P", isRelay: false },
@@ -87,7 +87,7 @@
         online: true,
         cpu: "18%",
         ram: "11.4/32G",
-        daemonVer: "v1.1.0",
+        daemonVer: "v1.1.1",
         needsOta: false,
         branches: ["main", "feat/vapid-push", "feat/sw-push"],
       },
@@ -111,7 +111,7 @@
         online: false,
         cpu: "—",
         ram: "—",
-        daemonVer: "v1.1.0",
+        daemonVer: "v1.1.1",
         needsOta: false,
         branches: ["main"],
       },
@@ -236,7 +236,7 @@
         added: 78,
         del: 0,
         snippet: [
-          "// Coda v1.1.0 Zero-Config W3C Web Push Service Worker",
+          "// Coda v1.1.1 Zero-Config W3C Web Push Service Worker",
           "self.addEventListener('push', (event) => {",
           "  const data = event.data ? event.data.json() : { title: 'Coda Alert' };",
           "  event.waitUntil(self.registration.showNotification(data.title, {",
@@ -486,12 +486,12 @@
   function upgradeHostOta(hostId) {
     const h = state.hosts.find((x) => x.id === hostId);
     if (!h) return;
-    h.daemonVer = "v1.1.0";
+    h.daemonVer = "v1.1.1";
     h.needsOta = false;
     showToast(
       t(
-        `🚀 ${h.name} 已完成 SHA256SUMS 校验 + SIGUSR1 零中断热升级至 v1.1.0（活跃 PTY 零断连）`,
-        `🚀 ${h.name} upgraded to v1.1.0 via SHA256SUMS + SIGUSR1 zero-downtime OTA`
+        `🚀 ${h.name} 已完成 SHA256SUMS 校验 + SIGUSR1 零中断热升级至 v1.1.1（活跃 PTY 零断连）`,
+        `🚀 ${h.name} upgraded to v1.1.1 via SHA256SUMS + SIGUSR1 zero-downtime OTA`
       )
     );
     render();
@@ -499,14 +499,14 @@
 
   function triggerMacSelfUpdate() {
     if (state.macAppUpdated) {
-      showToast(t("✓ Coda.app 当前已是最新 v1.1.0 版本", "✓ Coda.app is already up-to-date on v1.1.0"));
+      showToast(t("✓ Coda.app 当前已是最新 v1.1.1 版本", "✓ Coda.app is already up-to-date on v1.1.1"));
       return;
     }
     state.macAppUpdated = true;
     showToast(
       t(
-        "✨ Coda.app 已校验 SHA256SUMS、清理 quarantine 属性并完成 v1.1.0 原子热更新！",
-        "✨ Coda.app verified SHA256SUMS, stripped quarantine & self-updated to v1.1.0!"
+        "✨ Coda.app 已校验 SHA256SUMS、清理 quarantine 属性并完成 v1.1.1 原子热更新！",
+        "✨ Coda.app verified SHA256SUMS, stripped quarantine & self-updated to v1.1.1!"
       )
     );
     render();
@@ -656,7 +656,7 @@
           <span class="health-pill">RAM ${esc(h.ram)}</span>
           ${
             h.needsOta
-              ? `<button type="button" class="ota-pill" data-upgrade-host="${esc(h.id)}">⚡ OTA v1.1.0</button>`
+              ? `<button type="button" class="ota-pill" data-upgrade-host="${esc(h.id)}">⚡ OTA v1.1.1</button>`
               : `<span class="health-pill" style="color:var(--green);border-color:rgba(34,197,94,0.3);">${esc(h.daemonVer)}</span>`
           }
         </div>
@@ -669,7 +669,7 @@
     return `
       <div class="onboard-card">
         <div style="display:flex;align-items:center;justify-content:space-between;">
-          <strong style="font-size:12px;color:var(--sky);">👋 ${esc(t("Coda v1.1.0 好友三步极速上手卡片（空状态引导预览）", "Coda v1.1.0 3-Step Friend Quickstart Card"))}</strong>
+          <strong style="font-size:12px;color:var(--sky);">👋 ${esc(t("Coda v1.1.1 好友三步极速上手卡片（空状态引导预览）", "Coda v1.1.1 3-Step Friend Quickstart Card"))}</strong>
           <button type="button" class="icon-btn" style="width:22px;height:22px;" data-toggle-onboarding>✕</button>
         </div>
         <div class="onboard-steps">
@@ -933,7 +933,7 @@
         <div class="landing-wrap">
           <div style="display:flex;align-items:center;justify-content:space-between;">
             <div style="display:flex;align-items:center;gap:8px;font-weight:700;font-size:15px;">
-              <span class="dot online"></span> Coda <span class="mono" style="font-size:11px;color:var(--green);">v1.1.0</span>
+              <span class="dot online"></span> Coda <span class="mono" style="font-size:11px;color:var(--green);">v1.1.1</span>
               <span class="badge working">5 AI Agents · W3C VAPID Push · Zero-Downtime OTA</span>
             </div>
             <div style="display:flex;gap:8px;">
@@ -952,7 +952,7 @@
                 )
               )}</p>
               <div style="display:flex;gap:8px;flex-wrap:wrap;">
-                <button type="button" class="pill-btn primary" data-web-sub="workbench">${esc(t("立即体验 v1.1.0 工作台", "Launch v1.1.0 Console"))}</button>
+                <button type="button" class="pill-btn primary" data-web-sub="workbench">${esc(t("立即体验 v1.1.1 工作台", "Launch v1.1.1 Console"))}</button>
                 <button type="button" class="pill-btn" data-open-settings-tab="alerts">🔔 ${esc(t("锁屏推送与告警", "Lock-Screen Push"))}</button>
                 <button type="button" class="pill-btn" data-open-settings-tab="friends">🤝 ${esc(t("好友邀请与重置链接", "Invite & Reset Links"))}</button>
               </div>
@@ -961,7 +961,7 @@
               <div class="mono" style="font-size:11px;color:var(--green);">$ curl -fsSL https://codahub.dev/install.sh | sh</div>
               <div class="mono" style="font-size:11px;color:var(--muted);margin-top:6px;">
                 ==&gt; [1/4] herdr-core verified (Claude / Codex / Grok / AGY / Gemini)<br/>
-                ==&gt; [2/4] coda-daemon v1.1.0 SHA256SUMS OK (SIGUSR1 OTA ready)<br/>
+                ==&gt; [2/4] coda-daemon v1.1.1 SHA256SUMS OK (SIGUSR1 OTA ready)<br/>
                 ==&gt; [3/4] Browser approval: K7M9-4X2Q<br/>
                 ==&gt; [4/4] LAN IPv6 P2P + CN Raw TCP :24443 + CDN WSS active
               </div>
@@ -969,7 +969,7 @@
           </div>
           <div class="dl-grid">
             <div class="dl-card">
-              <h4>macOS Desktop (Coda.app v1.1.0)</h4>
+              <h4>macOS Desktop (Coda.app v1.1.1)</h4>
               <p>Rust GPUI Metal 120Hz · 应用内一键自更新 (SHA256SUMS) · 127.0.0.1 全方法端口隧道 + ⌘V 截图粘贴</p>
             </div>
             <div class="dl-card">
@@ -991,7 +991,7 @@
             <p>${esc(t("正在将新设备绑定到当前账号 @vampire（Ed25519/X25519 公钥指纹已校验）", "Bind this device to @vampire with verified Ed25519/X25519 keys"))}</p>
             <div class="mono" style="font-size:26px;font-weight:700;color:var(--amber);text-align:center;padding:12px;background:#08090c;border-radius:10px;border:1px solid var(--border);">K7M9-4X2Q</div>
             <div style="font-size:12px;color:var(--muted);">
-              ${esc(t("主机名称", "Host"))}: <strong style="color:var(--text);">Mac mini · 家里主力</strong> · <span class="mono">macos-aarch64 / v1.1.0</span>
+              ${esc(t("主机名称", "Host"))}: <strong style="color:var(--text);">Mac mini · 家里主力</strong> · <span class="mono">macos-aarch64 / v1.1.1</span>
             </div>
             <div style="display:flex;gap:8px;margin-top:4px;">
               <button type="button" class="pill-btn primary" style="flex:1;justify-content:center;padding:8px;" data-web-sub="workbench" data-toast="${esc(t("已批准主机 K7M9-4X2Q 入网", "Approved K7M9-4X2Q"))}">${esc(t("确认批准入网", "Approve Device"))}</button>
@@ -1050,7 +1050,7 @@
           <aside class="wb-sidebar">
             <div style="padding:10px 10px 6px;display:flex;align-items:center;justify-content:space-between;">
               <div style="display:flex;align-items:center;gap:6px;font-weight:700;font-size:13px;">
-                <span class="dot online"></span> Coda Web <span class="mono" style="font-size:10px;color:var(--green);">v1.1.0</span>
+                <span class="dot online"></span> Coda Web <span class="mono" style="font-size:10px;color:var(--green);">v1.1.1</span>
               </div>
               <div style="display:flex;gap:4px;">
                 <button type="button" class="icon-btn" title="⌘K" data-open-modal="palette">⌘K</button>
@@ -1149,7 +1149,7 @@
           <button type="button" class="icon-btn" data-toggle-web-drawer>☰</button>
           <div style="min-width:0;flex:1;text-align:center;">
             <div style="font-size:12px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${esc(s.workspace)} · ${esc(s.agent)}</div>
-            <div class="mono" style="font-size:9.5px;color:var(--muted);">v1.1.0 PWA · ${esc(s.branch)}</div>
+            <div class="mono" style="font-size:9.5px;color:var(--muted);">v1.1.1 PWA · ${esc(s.branch)}</div>
           </div>
           <div style="display:flex;gap:4px;">
             ${needsCount > 0 ? `<button type="button" class="icon-btn" style="border-color:rgba(245,158,11,0.5);color:var(--amber);" data-jump-needs title="⌘J">▲${needsCount}</button>` : ""}
@@ -1169,7 +1169,7 @@
           <div class="mobile-drawer-backdrop" data-close-web-drawer>
             <div class="mobile-drawer-panel" data-stop-prop>
               <div style="padding:12px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;">
-                <strong>Coda PWA <span class="mono" style="font-size:10.5px;color:var(--green);">v1.1.0</span></strong>
+                <strong>Coda PWA <span class="mono" style="font-size:10.5px;color:var(--green);">v1.1.1</span></strong>
                 <button type="button" class="icon-btn" data-close-web-drawer>✕</button>
               </div>
               <div class="wb-sidebar-scroll">
@@ -1243,7 +1243,7 @@
                     <span class="health-pill">RAM ${esc(h.ram)}</span>
                     ${
                       h.needsOta
-                        ? `<button type="button" class="ota-pill" data-upgrade-host="${esc(h.id)}">⚡ OTA v1.1.0</button>`
+                        ? `<button type="button" class="ota-pill" data-upgrade-host="${esc(h.id)}">⚡ OTA v1.1.1</button>`
                         : `<span class="health-pill" style="color:var(--green);">${esc(h.daemonVer)}</span>`
                     }
                   </div>
@@ -1268,7 +1268,7 @@
             <span style="font-size:12px;font-weight:700;">Coda.app</span>
             <span class="mono" style="font-size:10px;color:var(--muted);">Metal 120Hz · ${esc(state.allowRemoteControl ? "hybrid" : "client")}</span>
             <button type="button" class="update-pill ${state.macAppUpdated ? "done" : ""}" data-self-update>
-              ${esc(state.macAppUpdated ? t("✓ v1.1.0 最新", "✓ v1.1.0 Latest") : t("✨ 升级 v1.1.0", "✨ Update v1.1.0"))}
+              ${esc(state.macAppUpdated ? t("✓ v1.1.1 最新", "✓ v1.1.1 Latest") : t("✨ 升级 v1.1.1", "✨ Update v1.1.1"))}
             </button>
           </div>
           <div style="display:flex;align-items:center;gap:5px;">
@@ -1361,7 +1361,7 @@
     return `
       <div class="frame-ipad">
         <div class="ios-status" style="background:#101217;border-bottom:1px solid #1e222b;">
-          <span>9:41 · Coda v1.1.0</span>
+          <span>9:41 · Coda v1.1.1</span>
           <span class="mono" style="font-size:11px;color:var(--muted);">iPadOS Split View · GhosttyReflow</span>
           <span>Wi-Fi · 96%</span>
         </div>
@@ -1371,7 +1371,7 @@
               ? `
             <aside class="wb-sidebar" style="width:276px;background:#13151a;">
               <div style="padding:10px 12px;display:flex;align-items:center;justify-content:space-between;">
-                <span style="font-weight:700;font-size:15px;"><span class="dot online" style="margin-right:6px;"></span>Coda <span class="mono" style="font-size:10.5px;color:var(--green);">v1.1.0</span></span>
+                <span style="font-weight:700;font-size:15px;"><span class="dot online" style="margin-right:6px;"></span>Coda <span class="mono" style="font-size:10.5px;color:var(--green);">v1.1.1</span></span>
                 <div style="display:flex;gap:5px;align-items:center;">
                   ${attentionCount() > 0 ? `<button type="button" class="red-badge" style="border:none;background:var(--amber);color:#000;" data-jump-needs>▲ ${attentionCount()}</button>` : ""}
                   <button type="button" class="icon-btn" data-open-modal="launcher">+</button>
@@ -1526,7 +1526,7 @@
                 <span style="font-size:13px;font-weight:600;"><span class="dot ${h.online ? "online" : "offline"}" style="margin-right:6px;"></span>${esc(h.name)}</span>
                 ${
                   h.needsOta
-                    ? `<button type="button" class="ota-pill" data-upgrade-host="${esc(h.id)}">⚡ OTA v1.1.0</button>`
+                    ? `<button type="button" class="ota-pill" data-upgrade-host="${esc(h.id)}">⚡ OTA v1.1.1</button>`
                     : `<span class="mono" style="font-size:10px;color:var(--green);">${esc(h.daemonVer)}</span>`
                 }
               </div>
@@ -1603,7 +1603,7 @@
             </div>
             <div class="duo-rail">
               <div style="font-size:11.5px;font-weight:700;"><span class="dot online" style="margin-right:4px;"></span>Duo</div>
-              <span class="mono" style="font-size:9px;color:var(--green);">v1.1.0</span>
+              <span class="mono" style="font-size:9px;color:var(--green);">v1.1.1</span>
               <button type="button" class="duo-rail-btn active" data-duo-posture="cover">${esc(t("外屏", "Cover"))}</button>
               <button type="button" class="duo-rail-btn" data-duo-posture="inner_landscape">${esc(t("展开", "Unfold"))}</button>
               <button type="button" class="duo-rail-btn" data-duo-posture="tabletop">${esc(t("笔电", "Laptop"))}</button>
@@ -1739,7 +1739,7 @@
             <div class="term-head" style="height:36px;">
               <div style="display:flex;align-items:center;gap:8px;">
                 <span class="dot online"></span>
-                <strong style="font-size:12.5px;">Coda Duo 7.6" <span class="mono" style="font-size:10px;color:var(--green);">v1.1.0</span></strong>
+                <strong style="font-size:12.5px;">Coda Duo 7.6" <span class="mono" style="font-size:10px;color:var(--green);">v1.1.1</span></strong>
                 <span class="mono" style="font-size:10px;color:var(--muted);">433 + 24 Crease + 349 + 84 Rail</span>
               </div>
               <div style="display:flex;gap:4px;">
@@ -1794,7 +1794,7 @@
     if (resolvedKind === "launcher") {
       modal.innerHTML = `
         <div class="proto-modal-head">
-          <span>🚀 ${esc(t("启动远端 AI Agent / 工作区引导 (v1.1.0)", "Launch Remote AI Agent & Workspace Bootstrapper"))}</span>
+          <span>🚀 ${esc(t("启动远端 AI Agent / 工作区引导 (v1.1.1)", "Launch Remote AI Agent & Workspace Bootstrapper"))}</span>
           <button type="button" class="icon-btn" data-close-modal>✕</button>
         </div>
         <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;">
@@ -2015,12 +2015,12 @@
               <div class="host-card-title">✨ ${esc(t("Coda.app 应用内一键自更新 (SHA256SUMS 强校验)", "Coda.app In-App Self-Updater (SHA256SUMS Verified)"))}</div>
               <div class="host-card-sub">${esc(
                 state.macAppUpdated
-                  ? t("当前已运行最新 v1.1.0 原生二进制（已剥离 quarantine）", "Running latest v1.1.0 binary (quarantine stripped)")
-                  : t("检测到新版本 v1.1.0 · 自动下载校验 SHA256SUMS 并原子热替换重启", "New version v1.1.0 ready · Verifies SHA256SUMS & relaunches")
+                  ? t("当前已运行最新 v1.1.1 原生二进制（已剥离 quarantine）", "Running latest v1.1.1 binary (quarantine stripped)")
+                  : t("检测到新版本 v1.1.1 · 自动下载校验 SHA256SUMS 并原子热替换重启", "New version v1.1.1 ready · Verifies SHA256SUMS & relaunches")
               )}</div>
             </div>
             <button type="button" class="pill-btn ${state.macAppUpdated ? "green" : "amber"}" data-self-update>
-              ${esc(state.macAppUpdated ? "✓ v1.1.0" : t("立即自更新", "Update & Restart"))}
+              ${esc(state.macAppUpdated ? "✓ v1.1.1" : t("立即自更新", "Update & Restart"))}
             </button>
           </div>
           <div class="host-card">
@@ -2039,7 +2039,7 @@
                 <div class="host-card-sub mono">${esc(h.platform)} · CPU ${esc(h.cpu)} · RAM ${esc(h.ram)} · ${esc(h.daemonVer)}</div>
               </div>
               <div style="display:flex;gap:5px;">
-                ${h.needsOta ? `<button type="button" class="pill-btn sky" data-upgrade-host="${esc(h.id)}">⚡ OTA v1.1.0</button>` : ""}
+                ${h.needsOta ? `<button type="button" class="pill-btn sky" data-upgrade-host="${esc(h.id)}">⚡ OTA v1.1.1</button>` : ""}
                 <button type="button" class="pill-btn" data-toast="${esc(t(`已重命名主机 ${h.name}`, `Renamed ${h.name}`))}">${esc(t("改名", "Rename"))}</button>
               </div>
             </div>`
@@ -2090,7 +2090,7 @@
 
       modal.innerHTML = `
         <div class="proto-modal-head">
-          <span>⚙ ${esc(t("Coda v1.1.0 全端设置、推送与好友中心", "Coda v1.1.0 Settings, Push & Friends Center"))}</span>
+          <span>⚙ ${esc(t("Coda v1.1.1 全端设置、推送与好友中心", "Coda v1.1.1 Settings, Push & Friends Center"))}</span>
           <button type="button" class="icon-btn" data-close-modal>✕</button>
         </div>
         <div style="display:flex;gap:5px;flex-wrap:wrap;">
@@ -2119,11 +2119,11 @@
     document.getElementById("proto-modal-backdrop").classList.add("hidden");
   }
 
-  // ===================== Spec Annotations (v1.1.0) =====================
+  // ===================== Spec Annotations (v1.1.1) =====================
   const PLATFORM_SPECS = {
     web_desktop: {
-      titleZh: "Web 桌面端控制台 (v1.1.0)",
-      titleEn: "Web Desktop Console (v1.1.0)",
+      titleZh: "Web 桌面端控制台 (v1.1.1)",
+      titleEn: "Web Desktop Console (v1.1.1)",
       res: "≥ 900px · OLED #000000 · sw.js VAPID",
       pointsZh: [
         "<strong>好友深链与重置路由</strong>：支持 `/register?invite=CODA-XXXXXX` 自动填码注册、`/reset-password?token=rst_...` 免邮件单次改密与三步新手引导卡片。",
@@ -2139,8 +2139,8 @@
       ],
     },
     web_mobile: {
-      titleZh: "Web 手机端 / Safari PWA (v1.1.0)",
-      titleEn: "Web Mobile / Safari PWA (v1.1.0)",
+      titleZh: "Web 手机端 / Safari PWA (v1.1.1)",
+      titleEn: "Web Mobile / Safari PWA (v1.1.1)",
       res: "< 900px · 100dvh + iOS Lock-Screen Push",
       pointsZh: [
         "<strong>iOS 主屏幕锁屏推送</strong>：添加到主屏幕后一键订阅 W3C VAPID Web Push，Agent 待审批时直接点亮 iPhone 锁屏。",
@@ -2154,40 +2154,40 @@
       ],
     },
     mac_gpui: {
-      titleZh: "macOS GPUI 桌面端 (Coda.app v1.1.0)",
-      titleEn: "macOS GPUI Desktop (Coda.app v1.1.0)",
+      titleZh: "macOS GPUI 桌面端 (Coda.app v1.1.1)",
+      titleEn: "macOS GPUI Desktop (Coda.app v1.1.1)",
       res: "Metal 120Hz · Self-Updater · 127.0.0.1 Proxy",
       pointsZh: [
-        "<strong>应用内一键自更新</strong>：顶栏 `✨ 升级 v1.1.0` 自动下载并严格校验 `SHA256SUMS`、清理 `quarantine`、原子替换重启。",
+        "<strong>应用内一键自更新</strong>：顶栏 `✨ 升级 v1.1.1` 自动下载并严格校验 `SHA256SUMS`、清理 `quarantine`、原子替换重启。",
         "<strong>127.0.0.1 全方法回环隧道</strong>：自动映射远端端口至本地 `127.0.0.1`，完整透传 `GET/POST/PUT/PATCH/DELETE` 与 `Set-Cookie`。",
         "<strong>置顶待确认收件箱 (`⌘J`)</strong>：侧栏置顶阻塞会话 + Dock 角标提醒，配合 `⌘D` 分屏、`⌘F` 搜索与 `.md` 导出。",
         "<strong>工作区 `git clone` 引导与截图直传</strong>：支持远端目录浏览 / `git clone` 启动 5 大 Agent，以及 `⌘V` 截图加密上传。",
       ],
       pointsEn: [
-        "<strong>In-App Self-Updater</strong>: Header `✨ Update v1.1.0` verifies `SHA256SUMS`, strips `quarantine`, swaps atomically & restarts.",
+        "<strong>In-App Self-Updater</strong>: Header `✨ Update v1.1.1` verifies `SHA256SUMS`, strips `quarantine`, swaps atomically & restarts.",
         "<strong>127.0.0.1 Full-Method Tunnel</strong>: Proxies `GET/POST/PUT/PATCH/DELETE` + `Location`/`Set-Cookie` over E2EE.",
         "<strong>Pinned Attention Inbox (`⌘J`)</strong>: Cyclic jump to blocked agents + `⌘D` split + `⌘F` search + `.md` export.",
         "<strong>Git Clone Bootstrapper & `⌘V` Image</strong>: Clone remote repos on launch + paste screenshots directly into PTY.",
       ],
     },
     ipad: {
-      titleZh: "iPadOS 分栏工作台 (v1.1.0)",
-      titleEn: "iPadOS Split Workbench (v1.1.0)",
+      titleZh: "iPadOS 分栏工作台 (v1.1.1)",
+      titleEn: "iPadOS Split Workbench (v1.1.1)",
       res: "Regular Split · 288pt Sidebar · Swift 6",
       pointsZh: [
-        "<strong>Swift 6 多主机并发路由</strong>：多台主机独立维护中继票据，侧栏实时展示主机 CPU/RAM 与一键 `OTA v1.1.0`。",
+        "<strong>Swift 6 多主机并发路由</strong>：多台主机独立维护中继票据，侧栏实时展示主机 CPU/RAM 与一键 `OTA v1.1.1`。",
         "<strong>相册 `PhotosPicker` 与剪贴板图直传</strong>：一键将 iPad 截图或设计稿经 E2EE 传至远端工作区供 Agent 视觉分析。",
         "<strong>免配置 `SFSpeechRecognizer` + 云端 Snippets</strong>：无需填写 API Key 即可原生语音转写，亦可切换 E2EE 守护进程 Whisper。",
       ],
       pointsEn: [
-        "<strong>Multi-Host Relay & Health</strong>: Live CPU/RAM badges and 1-tap zero-downtime `OTA v1.1.0` per host.",
+        "<strong>Multi-Host Relay & Health</strong>: Live CPU/RAM badges and 1-tap zero-downtime `OTA v1.1.1` per host.",
         "<strong>PhotosPicker & Clipboard Paste</strong>: Upload screenshots/mockups over E2EE directly into the prompt.",
         "<strong>Zero-Config Speech & Snippets</strong>: Native `SFSpeechRecognizer` + E2EE daemon Whisper + synced Snippets.",
       ],
     },
     iphone: {
-      titleZh: "iPhone 原生客户端 (v1.1.0)",
-      titleEn: "iPhone Native SwiftUI (v1.1.0)",
+      titleZh: "iPhone 原生客户端 (v1.1.1)",
+      titleEn: "iPhone Native SwiftUI (v1.1.1)",
       res: "390×844 · Dynamic Island · Swift 6",
       pointsZh: [
         "<strong>随身审批与快速恢复</strong>：配合 Bark / Telegram / PWA 锁屏推送，掏出手机 1 秒点击 `1 · Yes` 放行阻塞任务。",
@@ -2201,8 +2201,8 @@
       ],
     },
     iphone_duo: {
-      titleZh: "iPhone Duo 折叠屏三态工作台 (v1.1.0)",
-      titleEn: "iPhone Duo Foldable (3 Postures · v1.1.0)",
+      titleZh: "iPhone Duo 折叠屏三态工作台 (v1.1.1)",
+      titleEn: "iPhone Duo Foldable (3 Postures · v1.1.1)",
       res: "466×678 ↔ 890×626 ↔ 626×890",
       pointsZh: [
         "<strong>7.6\" 展开双栏 + 内联三合一检视屏</strong>：左叶运行终端，跨过 24pt 折痕在右叶直接切换 `Changes(??) | Files | Port Preview`。",
@@ -2220,7 +2220,7 @@
   function renderSpecDrawer() {
     const spec = PLATFORM_SPECS[state.platform];
     const pts = state.lang === "zh" ? spec.pointsZh : spec.pointsEn;
-    document.getElementById("spec-drawer-title").textContent = t("v1.1.0 交互说明与设计标注", "v1.1.0 UX Notes & Tokens");
+    document.getElementById("spec-drawer-title").textContent = t("v1.1.1 交互说明与设计标注", "v1.1.1 UX Notes & Tokens");
     document.getElementById("spec-drawer-content").innerHTML = `
       <div class="spec-block">
         <h4>${esc(state.lang === "zh" ? spec.titleZh : spec.titleEn)}</h4>
@@ -2228,7 +2228,7 @@
         <ul>${pts.map((p) => `<li>${p}</li>`).join("")}</ul>
       </div>
       <div class="spec-block">
-        <h4>${esc(t("v1.1.0 必测交互清单", "v1.1.0 Interactive Try-Out"))}</h4>
+        <h4>${esc(t("v1.1.1 必测交互清单", "v1.1.1 Interactive Try-Out"))}</h4>
         <ul>
           <li>${t("点击 <strong>+ 启动器</strong> 体验 5 大 AI Agent 与 <strong>Git Clone 引导</strong>。", "Click <strong>+</strong> to launch all 5 AI Agents or toggle <strong>Git Clone</strong>.")}</li>
           <li>${t("切换检视器 <strong>Changes (??) / Files / Port Preview</strong> 查看新建文件绿色补丁与 `127.0.0.1` 隧道。", "Switch <strong>Changes (??) / Files / Port Preview</strong> for untracked diffs & live tunnels.")}</li>
@@ -2323,8 +2323,8 @@
 
   function render() {
     document.getElementById("studio-sub").textContent = t(
-      "v1.1.0 · 全端可交互高保真原型台",
-      "v1.1.0 · 6-Platform Interactive Prototype Studio"
+      "v1.1.1 · 全端可交互高保真原型台",
+      "v1.1.1 · 6-Platform Interactive Prototype Studio"
     );
     document.getElementById("device-tabs").innerHTML = DEVICE_LIST.map(
       ([id, icon, zh, en]) =>

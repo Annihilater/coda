@@ -1,6 +1,6 @@
 # Coda 全端产品原型与设计规范书（Product Prototype & Design Spec）
 
-> **对齐版本**：`v1.1.0`（全端能力对齐与好友圈零门槛交付基线）  
+> **对齐版本**：`v1.1.1`（全端能力对齐与好友圈零门槛交付基线）  
 > **可交互高保真原型台**：直接在浏览器打开 [docs/prototype/index.html](prototype/index.html)（零外部构建依赖，支持 6 端切换、全局状态联动、中英双语、智能链路模拟、`Needs-You` 事件模拟与交互设计标注抽屉）  
 > **支持智能体矩阵**：`Claude Code`、`Codex`、`Grok CLI`、`Antigravity (AGY)`、`Gemini CLI`（及 `herdr-core` / 原生 Unix PTY Shell）  
 > **覆盖形态**：Web 桌面端、Web 手机端 / Safari PWA、macOS GPUI 桌面端（`Coda.app`）、iPadOS 分栏工作台、iPhone 原生 SwiftUI、iPhone Duo 折叠屏（5.4" 外屏 / 7.6" 展开双栏 / 笔电半折三态）
@@ -15,7 +15,7 @@ Coda 是一款**支持好友圈多租户隔离、零知识端到端加密（Zero
 2. **Attention-First（注意力优先与锁屏闭环）**：侧边栏置顶 `NEEDS ATTENTION` 收件箱并支持 `⌘J`（`Ctrl+Shift+J`）一键环形速跳；离线时由守护进程零明文触发 **W3C VAPID 原生锁屏 Web Push（`sw.js`）** 与 **Bark / Telegram / 飞书 / Discord Webhook**。
 3. **统一 E2EE 工作区检视器（Inspector）**：全端对齐 **`Files（文件树与代码预览） | Changes（含 ?? 未跟踪新建文件绿色 + 补丁的 Git Diff） | Port Preview（沙箱预览与 GPUI 127.0.0.1 全方法本地回环隧道）`**。
 4. **多模态输入与跨端快捷指令（Prompt Composer）**：自适应 `?2004h` 多行指令编辑器内置**跨设备云同步快捷指令胶囊（Saved Snippets）**、**`⌘V` 剪贴板截图 / iOS `PhotosPicker` 相册一键加密直传**，以及**免配置系统原生语音听写 + E2EE 守护进程代理 Whisper（`TranscribeAudio`）**。
-5. **好友圈零门槛交付与零中断自更新**：支持一键复制**好友邀请注册深链（`/register?invite=CODA-XXXXXX`）**、**管理员免邮件一键重置好友密码链接（`/reset-password?token=rst_...`）**、三步空状态新手引导卡片、`coda-daemon` `SIGUSR1` 零中断热升级与 `Coda.app` 顶栏一键应用内自更新（`✨ Update v1.1.0`）。
+5. **好友圈零门槛交付与零中断自更新**：支持一键复制**好友邀请注册深链（`/register?invite=CODA-XXXXXX`）**、**管理员免邮件一键重置好友密码链接（`/reset-password?token=rst_...`）**、三步空状态新手引导卡片、`coda-daemon` `SIGUSR1` 零中断热升级与 `Coda.app` 顶栏一键应用内自更新（`✨ Update v1.1.1`）。
 
 ---
 
@@ -43,11 +43,11 @@ Coda 是一款**支持好友圈多租户隔离、零知识端到端加密（Zero
 
 ---
 
-## 三、全端信息架构（Information Architecture · v1.1.0）
+## 三、全端信息架构（Information Architecture · v1.1.1）
 
 ```mermaid
 flowchart TD
-    Root["Coda v1.1.0 零知识跨设备 AI 开发网"] --> Web["Web 控制台 (Desktop & Safari PWA)"]
+    Root["Coda v1.1.1 零知识跨设备 AI 开发网"] --> Web["Web 控制台 (Desktop & Safari PWA)"]
     Root --> Mac["macOS GPUI 桌面端 (Coda.app)"]
     Root --> Apple["Apple Swift 6 (iPadOS / iPhone / iPhone Duo)"]
 
@@ -59,7 +59,7 @@ flowchart TD
     Web --> W6["sw.js W3C VAPID 锁屏推送 + 五类 Webhook + 好友管理/重置链接"]
 
     Mac --> M1["左侧栏 (NEEDS ATTENTION ⌘J + 主机 CPU/RAM/OTA + 5 大 Agent 启动器)"]
-    Mac --> M2["中央 Metal 120Hz 画布 (⌘D 分屏 + ⌘F 搜索 + ✨ Update v1.1.0 自更新)"]
+    Mac --> M2["中央 Metal 120Hz 画布 (⌘D 分屏 + ⌘F 搜索 + ✨ Update v1.1.1 自更新)"]
     Mac --> M3["右侧检视器 (Changes | Files | 127.0.0.1 全方法代理隧道 | Mesh 被控开关)"]
     Mac --> M4["⌘K 命令面板 (含 Snippets 速发) + 截图粘贴 + 好友重置管理"]
 
@@ -71,7 +71,7 @@ flowchart TD
 
 ---
 
-## 四、核心用户旅程流程（Key User Journeys · v1.1.0）
+## 四、核心用户旅程流程（Key User Journeys · v1.1.1）
 
 ### 1. 好友邀请深链、管理员一键重置密码与受控机入网
 
@@ -128,11 +128,11 @@ sequenceDiagram
 
 ### 5. 守护进程零中断 OTA 与 `Coda.app` 应用内一键自更新
 - **远端 `coda-daemon` 零中断热升级**：支持本地 `coda-daemon upgrade` 或在任意客户端主机卡片一键触发 E2EE `UpgradeDaemon` —— 自动下载对应架构产物、严格校验 `SHA256SUMS`、原子替换二进制并通过 `SIGUSR1` 热重执，全程不断开正在运行的 `herdr-core` Agent 会话。
-- **`Coda.app` 应用内自更新（Self-Updater）**：自动比对 `/api/v1/site-info` 与 GitHub Releases 最新语义化版本；发现新版时顶栏浮现 **`✨ Update v1.1.0`** 胶囊，点击后后台下载并校验 `SHA256SUMS`、清理 `com.apple.quarantine` 隔离属性、冒烟验证 `--version` 后原子替换并自动重启应用。
+- **`Coda.app` 应用内自更新（Self-Updater）**：自动比对 `/api/v1/site-info` 与 GitHub Releases 最新语义化版本；发现新版时顶栏浮现 **`✨ Update v1.1.1`** 胶囊，点击后后台下载并校验 `SHA256SUMS`、清理 `com.apple.quarantine` 隔离属性、冒烟验证 `--version` 后原子替换并自动重启应用。
 
 ---
 
-## 五、六端功能与交互形态对照矩阵（`v1.1.0`）
+## 五、六端功能与交互形态对照矩阵（`v1.1.1`）
 
 | 能力维度 | Web 桌面端 | Web 手机 PWA | macOS GPUI (`Coda.app`) | iPadOS | iPhone | iPhone Duo 折叠屏 |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
