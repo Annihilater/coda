@@ -78,67 +78,92 @@ public func formatRelativeAge(since date: Date, now: Date = Date()) -> String {
 
 // MARK: - Platform Utilities (Copy to Clipboard, Adaptive Modifiers)
 
+public enum CodaClipboardBridge {
+    public static func copyTextToClipboard(_ text: String) {
+        #if os(iOS)
+        UIPasteboard.general.string = text
+        #elseif os(macOS)
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+        #endif
+    }
+
+    public static func readTextFromClipboard() -> String? {
+        #if os(iOS)
+        return UIPasteboard.general.string
+        #elseif os(macOS)
+        return NSPasteboard.general.string(forType: .string)
+        #else
+        return nil
+        #endif
+    }
+
+    public static func clipboardHasImage() -> Bool {
+        #if os(iOS)
+        return UIPasteboard.general.hasImages
+            || UIPasteboard.general.contains(pasteboardTypes: ["public.png", "public.jpeg", "public.tiff"])
+        #elseif os(macOS)
+        let pb = NSPasteboard.general
+        return pb.canReadItem(withDataConformingToTypes: [
+            NSPasteboard.PasteboardType.png.rawValue,
+            NSPasteboard.PasteboardType.tiff.rawValue,
+        ])
+        #else
+        return false
+        #endif
+    }
+
+    public static func readImagePNGFromClipboard() -> Data? {
+        #if os(iOS)
+        if let img = UIPasteboard.general.image, let png = img.pngData() {
+            return png
+        }
+        if let raw = UIPasteboard.general.data(forPasteboardType: "public.png") {
+            return raw
+        }
+        if let jpeg = UIPasteboard.general.data(forPasteboardType: "public.jpeg"),
+           let img = UIImage(data: jpeg) {
+            return img.pngData()
+        }
+        return nil
+        #elseif os(macOS)
+        let pb = NSPasteboard.general
+        if let pngData = pb.data(forType: .png) {
+            return pngData
+        }
+        if let tiffData = pb.data(forType: .tiff),
+           let bitmap = NSBitmapImageRep(data: tiffData),
+           let pngData = bitmap.representation(using: .png, properties: [:]) {
+            return pngData
+        }
+        return nil
+        #else
+        return nil
+        #endif
+    }
+
+    public static func readPreferredPasteContent() -> CodaClipboardPasteContent {
+        CodaClipboardPasteResolver.resolve(
+            text: readTextFromClipboard(),
+            readImagePNG: { readImagePNGFromClipboard() }
+        )
+    }
+}
+
 public func copyTextToClipboard(_ text: String) {
-    #if os(iOS)
-    UIPasteboard.general.string = text
-    #elseif os(macOS)
-    NSPasteboard.general.clearContents()
-    NSPasteboard.general.setString(text, forType: .string)
-    #endif
+    CodaClipboardBridge.copyTextToClipboard(text)
 }
 
 public func readTextFromClipboard() -> String? {
-    #if os(iOS)
-    return UIPasteboard.general.string
-    #elseif os(macOS)
-    return NSPasteboard.general.string(forType: .string)
-    #else
-    return nil
-    #endif
+    CodaClipboardBridge.readTextFromClipboard()
 }
 
 public func clipboardHasImage() -> Bool {
-    #if os(iOS)
-    return UIPasteboard.general.hasImages
-        || UIPasteboard.general.contains(pasteboardTypes: ["public.png", "public.jpeg", "public.tiff"])
-    #elseif os(macOS)
-    let pb = NSPasteboard.general
-    return pb.canReadItem(withDataConformingToTypes: [
-        NSPasteboard.PasteboardType.png.rawValue,
-        NSPasteboard.PasteboardType.tiff.rawValue,
-    ])
-    #else
-    return false
-    #endif
+    CodaClipboardBridge.clipboardHasImage()
 }
 
 public func readImagePNGFromClipboard() -> Data? {
-    #if os(iOS)
-    if let img = UIPasteboard.general.image, let png = img.pngData() {
-        return png
-    }
-    if let raw = UIPasteboard.general.data(forPasteboardType: "public.png") {
-        return raw
-    }
-    if let jpeg = UIPasteboard.general.data(forPasteboardType: "public.jpeg"),
-       let img = UIImage(data: jpeg) {
-        return img.pngData()
-    }
-    return nil
-    #elseif os(macOS)
-    let pb = NSPasteboard.general
-    if let pngData = pb.data(forType: .png) {
-        return pngData
-    }
-    if let tiffData = pb.data(forType: .tiff),
-       let bitmap = NSBitmapImageRep(data: tiffData),
-       let pngData = bitmap.representation(using: .png, properties: [:]) {
-        return pngData
-    }
-    return nil
-    #else
-    return nil
-    #endif
+    CodaClipboardBridge.readImagePNGFromClipboard()
 }
 
 public extension View {

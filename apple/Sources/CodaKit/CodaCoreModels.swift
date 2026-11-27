@@ -280,6 +280,64 @@ public enum CodaAPIError: Error, LocalizedError, Sendable {
     }
 }
 
+public enum CodaNetworkError: Error, LocalizedError, Sendable, Equatable {
+    case remoteOperationFailed(String)
+    case invalidPayload(String)
+
+    public var errorDescription: String? {
+        switch self {
+        case .remoteOperationFailed(let message),
+             .invalidPayload(let message):
+            return message
+        }
+    }
+}
+
+public enum CodaClipboardPasteContent: Sendable, Equatable {
+    case text(String)
+    case imagePNG(Data)
+    case empty
+}
+
+public enum CodaClipboardPasteResolver {
+    /// Prioritizes non-empty plain text over rasterized clipboard images so copying cells or styled text
+    /// from Numbers, Excel, Word, Keynote, Pages, or Notes pastes text instead of uploading a PNG snapshot.
+    public static func resolve(
+        text: String?,
+        readImagePNG: () -> Data?
+    ) -> CodaClipboardPasteContent {
+        if let text, !text.isEmpty {
+            return .text(text)
+        }
+        if let img = readImagePNG(), !img.isEmpty {
+            return .imagePNG(img)
+        }
+        return .empty
+    }
+}
+
+public enum CodaSheetSessionStateHelper {
+    public static func reconciledActiveSheetSessionID(
+        current: String?,
+        selectedSessionID: String?,
+        showComposeSheet: Bool,
+        showPaneMinimapSheet: Bool,
+        showGitDiffSheet: Bool,
+        showRemoteFilesSheet: Bool,
+        didSwitchSelectedSession: Bool = false,
+        activeSheetIsSecondary: Bool = false
+    ) -> String? {
+        let anySheetOpen = showComposeSheet || showPaneMinimapSheet || showGitDiffSheet || showRemoteFilesSheet
+        guard anySheetOpen else {
+            return nil
+        }
+        if didSwitchSelectedSession && !activeSheetIsSecondary {
+            return selectedSessionID
+        }
+        return current ?? selectedSessionID
+    }
+}
+
 public enum CodaCryptoError: Error, LocalizedError {
     case invalidKeyEncoding
     case nonContributoryKey

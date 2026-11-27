@@ -203,6 +203,7 @@ public struct CodaTerminalSessionView: View {
                 set: { if !isSecondaryLeaf { store.showComposeSheet = $0 } }
             ),
             onDismiss: {
+                store.reconcileActiveSheetSessionOnDismissIfNeeded()
                 if store.pendingOpenSettingsAfterCompose {
                     store.pendingOpenSettingsAfterCompose = false
                     store.settingsInitialFocusPairing = false
@@ -212,22 +213,37 @@ public struct CodaTerminalSessionView: View {
         ) {
             CodaComposePromptSheet(store: store, session: store.activeSheetSession ?? session)
         }
-        .sheet(isPresented: Binding(
-            get: { !isSecondaryLeaf && store.showPaneMinimapSheet },
-            set: { if !isSecondaryLeaf { store.showPaneMinimapSheet = $0 } }
-        )) {
+        .sheet(
+            isPresented: Binding(
+                get: { !isSecondaryLeaf && store.showPaneMinimapSheet },
+                set: { if !isSecondaryLeaf { store.showPaneMinimapSheet = $0 } }
+            ),
+            onDismiss: {
+                store.reconcileActiveSheetSessionOnDismissIfNeeded()
+            }
+        ) {
             CodaPaneMinimapSheet(store: store, session: store.activeSheetSession ?? session)
         }
-        .sheet(isPresented: Binding(
-            get: { !isSecondaryLeaf && store.showGitDiffSheet },
-            set: { if !isSecondaryLeaf { store.showGitDiffSheet = $0 } }
-        )) {
+        .sheet(
+            isPresented: Binding(
+                get: { !isSecondaryLeaf && store.showGitDiffSheet },
+                set: { if !isSecondaryLeaf { store.showGitDiffSheet = $0 } }
+            ),
+            onDismiss: {
+                store.reconcileActiveSheetSessionOnDismissIfNeeded()
+            }
+        ) {
             CodaGitDiffSheet(store: store, session: store.activeSheetSession ?? session)
         }
-        .sheet(isPresented: Binding(
-            get: { !isSecondaryLeaf && store.showRemoteFilesSheet },
-            set: { if !isSecondaryLeaf { store.showRemoteFilesSheet = $0 } }
-        )) {
+        .sheet(
+            isPresented: Binding(
+                get: { !isSecondaryLeaf && store.showRemoteFilesSheet },
+                set: { if !isSecondaryLeaf { store.showRemoteFilesSheet = $0 } }
+            ),
+            onDismiss: {
+                store.reconcileActiveSheetSessionOnDismissIfNeeded()
+            }
+        ) {
             CodaRemoteFilesSheet(store: store, session: store.activeSheetSession ?? session)
         }
     }
@@ -1061,8 +1077,8 @@ public struct CodaTerminalSessionView: View {
             if let uploadMsg = store.uploadStatusBanner {
                 Text(uploadMsg)
                     .font(.system(size: 10.5, design: .monospaced))
-                    .foregroundStyle(CodaHerdrTheme.cyanWorking)
-                    .lineLimit(1)
+                    .foregroundStyle(store.uploadBannerIsError ? CodaHerdrTheme.redDiff : CodaHerdrTheme.cyanWorking)
+                    .lineLimit(2)
             }
 
             if let voiceErr = store.voiceError {
@@ -1186,17 +1202,19 @@ public struct CodaTerminalSessionView: View {
     }
 
     private func pasteClipboardIntoDirectBar() {
-        if let imgData = readImagePNGFromClipboard() {
-            let filename = "clipboard-\(Int(Date().timeIntervalSince1970)).png"
-            store.uploadAttachmentData(data: imgData, filename: filename, for: session) { inserted in
-                appendTokenToDirectInput(inserted, trailingSpace: true)
-            }
-        } else if let text = readTextFromClipboard(), !text.isEmpty {
+        switch CodaClipboardBridge.readPreferredPasteContent() {
+        case .text(let text):
             if text.contains("\n") {
                 local.useMultiLineComposer = true
             }
             appendTokenToDirectInput(text, trailingSpace: false)
-        } else {
+        case .imagePNG(let imgData):
+            let filename = "clipboard-\(Int(Date().timeIntervalSince1970)).png"
+            store.uploadAttachmentData(data: imgData, filename: filename, for: session) { inserted in
+                appendTokenToDirectInput(inserted, trailingSpace: true)
+            }
+        case .empty:
+            store.uploadBannerIsError = false
             store.uploadStatusBanner = tr("Clipboard is empty.", "剪贴板为空。", locale: store.locale)
         }
     }
@@ -1205,6 +1223,7 @@ public struct CodaTerminalSessionView: View {
     private func uploadPickedPhotoItem(_ item: PhotosPickerItem, intoDirectInput: Bool) async {
         let ext = item.supportedContentTypes.first?.preferredFilenameExtension ?? "png"
         guard let data = try? await item.loadTransferable(type: Data.self), !data.isEmpty else {
+            store.uploadBannerIsError = true
             store.uploadStatusBanner = tr("Could not load selected photo.", "无法读取所选照片。", locale: store.locale)
             return
         }
@@ -1770,11 +1789,15 @@ public struct CodaComposePromptSheet: View {
                 HStack(spacing: 6) {
                     if store.isUploadingAttachment {
                         ProgressView().controlSize(.mini).tint(CodaHerdrTheme.cyanWorking)
+                    } else if store.uploadBannerIsError {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.system(size: 11))
+                            .foregroundStyle(CodaHerdrTheme.redDiff)
                     }
                     Text(uploadBanner)
                         .font(.system(size: 11, design: .monospaced))
-                        .foregroundStyle(CodaHerdrTheme.cyanWorking)
-                        .lineLimit(1)
+                        .foregroundStyle(store.uploadBannerIsError ? CodaHerdrTheme.redDiff : CodaHerdrTheme.cyanWorking)
+                        .lineLimit(2)
                 }
             }
 
@@ -1822,7 +1845,7 @@ public struct CodaComposePromptSheet: View {
                     Button {
                         pasteClipboardIntoCompose()
                     } label: {
-                        Label(tr("Paste", "粘贴截图", locale: store.locale), systemImage: "doc.on.clipboard")
+                        Label(tr("Paste", "粘贴", locale: store.locale), systemImage: "doc.on.clipboard")
                             .font(.system(size: 12, weight: .medium))
                             .foregroundStyle(CodaHerdrTheme.textPrimary)
                             .padding(.horizontal, 11)
@@ -1951,6 +1974,7 @@ public struct CodaComposePromptSheet: View {
             Task { @MainActor in
                 let ext = item.supportedContentTypes.first?.preferredFilenameExtension ?? "png"
                 guard let data = try? await item.loadTransferable(type: Data.self), !data.isEmpty else {
+                    store.uploadBannerIsError = true
                     store.uploadStatusBanner = tr("Could not load selected photo.", "无法读取所选照片。", locale: store.locale)
                     return
                 }
@@ -1962,12 +1986,14 @@ public struct CodaComposePromptSheet: View {
     }
 
     private func pasteClipboardIntoCompose() {
-        if let imgData = readImagePNGFromClipboard() {
+        switch CodaClipboardBridge.readPreferredPasteContent() {
+        case .text(let text):
+            store.appendComposeDraft(text, for: session.id)
+        case .imagePNG(let imgData):
             let filename = "clipboard-\(Int(Date().timeIntervalSince1970)).png"
             store.uploadAttachmentData(data: imgData, filename: filename, for: session)
-        } else if let text = readTextFromClipboard(), !text.isEmpty {
-            store.appendComposeDraft(text, for: session.id)
-        } else {
+        case .empty:
+            store.uploadBannerIsError = false
             store.uploadStatusBanner = tr("Clipboard has no image or text.", "剪贴板中没有图片或文本。", locale: store.locale)
         }
     }

@@ -357,7 +357,8 @@ struct CodaSelfTest {
                 cols: 100,
                 rows: 30
             )
-            guard let termAddr = launched?.address else {
+            let termAddr = launched.address
+            guard !termAddr.isEmpty else {
                 preconditionFailure("launchAgent failed to return terminal address for host \(host.name)")
             }
 
@@ -598,6 +599,74 @@ struct CodaSelfTest {
         )
         precondition(loopbackBoot.ok && loopbackBoot.workspacePath == "/Users/dev/workspace/demo-repo")
 
+        // Verify uploadTerminalFile success and error surfacing (never returning fake filename on ok:false)
+        let uploadedRemotePath = try await net.uploadTerminalFile(
+            on: targetDevice,
+            clientIdentity: clientIdentity,
+            clientDeviceId: clientId,
+            terminal: "t1",
+            filename: "screenshot.png",
+            data: Data([0x89, 0x50, 0x4E, 0x47])
+        )
+        precondition(uploadedRemotePath == "/tmp/coda-uploads/screenshot.png")
+
+        var uploadErrorCaught: String?
+        do {
+            _ = try await net.uploadTerminalFile(
+                on: targetDevice,
+                clientIdentity: clientIdentity,
+                clientDeviceId: clientId,
+                terminal: "t-dead",
+                filename: "fail-local.png",
+                data: Data([0x89, 0x50, 0x4E, 0x47])
+            )
+        } catch {
+            uploadErrorCaught = error.localizedDescription
+        }
+        precondition(
+            uploadErrorCaught == "terminal exited: permission denied",
+            "Expected uploadTerminalFile failure error, got: \(String(describing: uploadErrorCaught))"
+        )
+
+        // Verify launchAgent success and error surfacing when ok:false
+        let launchedLoopback = try await net.launchAgent(
+            on: targetDevice,
+            clientIdentity: clientIdentity,
+            clientDeviceId: clientId,
+            agent: "claude",
+            cwd: "/Users/dev/coda",
+            cols: 96,
+            rows: 30
+        )
+        precondition(launchedLoopback.address == "t2" && launchedLoopback.alive)
+
+        var launchErrorCaught: String?
+        do {
+            _ = try await net.launchAgent(
+                on: targetDevice,
+                clientIdentity: clientIdentity,
+                clientDeviceId: clientId,
+                agent: "missing-cli",
+                cwd: "/Users/dev/coda"
+            )
+        } catch {
+            launchErrorCaught = error.localizedDescription
+        }
+        precondition(
+            launchErrorCaught == "missing-cli: command not found",
+            "Expected launchAgent failure error, got: \(String(describing: launchErrorCaught))"
+        )
+
+        // Verify upgradeRemoteDaemon loopback RPC & 65s OTA timeout constant
+        precondition(CodaNetworkClient.daemonOTATimeoutSeconds == 65)
+        let otaRes = try await net.upgradeRemoteDaemon(
+            on: targetDevice,
+            clientIdentity: clientIdentity,
+            clientDeviceId: clientId,
+            targetVersion: "1.1.1"
+        )
+        precondition(otaRes.ok && otaRes.previousVersion == "1.1.0" && otaRes.targetVersion == "1.1.1")
+
         tcpListener.cancel()
     }
 
@@ -765,6 +834,62 @@ struct CodaSelfTest {
                     "ok": true,
                     "workspace_path": "/Users/dev/workspace/demo-repo",
                     "detail": "cloned",
+                ]
+            case "upload_terminal_file":
+                let term = (req["terminal"] as? String) ?? ""
+                let fname = (req["filename"] as? String) ?? ""
+                if term == "t-dead" {
+                    replyObj = [
+                        "op": "upload_terminal_file_result",
+                        "req_id": reqId,
+                        "terminal": term,
+                        "ok": false,
+                        "bytes": 0,
+                        "error": "terminal exited: permission denied",
+                    ]
+                } else {
+                    replyObj = [
+                        "op": "upload_terminal_file_result",
+                        "req_id": reqId,
+                        "terminal": term,
+                        "ok": true,
+                        "remote_path": "/tmp/coda-uploads/\(fname)",
+                        "bytes": 4,
+                    ]
+                }
+            case "launch_agent":
+                let agentName = (req["agent"] as? String) ?? ""
+                if agentName == "missing-cli" {
+                    replyObj = [
+                        "op": "launch_agent_result",
+                        "req_id": reqId,
+                        "ok": false,
+                        "error": "missing-cli: command not found",
+                    ]
+                } else {
+                    replyObj = [
+                        "op": "launch_agent_result",
+                        "req_id": reqId,
+                        "ok": true,
+                        "terminal": [
+                            "address": "t2",
+                            "name": "Launched \(agentName)",
+                            "argv": [agentName],
+                            "cwd": (req["cwd"] as? String) ?? "/Users/dev/coda",
+                            "cols": (req["cols"] as? Int) ?? 96,
+                            "rows": (req["rows"] as? Int) ?? 30,
+                            "alive": true,
+                        ],
+                    ]
+                }
+            case "upgrade_daemon":
+                replyObj = [
+                    "op": "upgrade_daemon_result",
+                    "req_id": reqId,
+                    "ok": true,
+                    "previous_version": "1.1.0",
+                    "target_version": (req["target_version"] as? String) ?? "1.1.1",
+                    "message": "staged hot restart",
                 ]
             default:
                 replyObj = [
@@ -1575,6 +1700,117 @@ struct CodaSelfTest {
         let resetConfirmJSON = Data(#"{"ok":true,"handle":"alice"}"#.utf8)
         let decodedResetConfirm = try JSONDecoder().decode(CodaPasswordResetConfirmResult.self, from: resetConfirmJSON)
         precondition(decodedResetConfirm.ok && decodedResetConfirm.handle == "alice")
+
+        // 8o. v1.1.1 Upload/Launch Error Surfacing, Clipboard Text-First Priority, 65s OTA Timeout & Sheet Session Lifecycle
+        let validUploadPath = try CodaNetworkClient.decodeUploadTerminalFileResult(
+            Data(#"{"ok":true,"remote_path":"/tmp/coda-uploads/diagram.png","bytes":2048}"#.utf8)
+        )
+        precondition(validUploadPath == "/tmp/coda-uploads/diagram.png")
+
+        var uploadFalseRejected = false
+        do {
+            _ = try CodaNetworkClient.decodeUploadTerminalFileResult(
+                Data(#"{"ok":false,"remote_path":null,"error":"disk full on remote host"}"#.utf8)
+            )
+        } catch let err as CodaNetworkError {
+            uploadFalseRejected = (err == .remoteOperationFailed("disk full on remote host"))
+        }
+        precondition(uploadFalseRejected, "Expected ok:false upload_terminal_file_result to throw CodaNetworkError")
+
+        var uploadNilPathRejected = false
+        do {
+            _ = try CodaNetworkClient.decodeUploadTerminalFileResult(
+                Data(#"{"ok":true,"remote_path":"   "}"#.utf8)
+            )
+        } catch let err as CodaNetworkError {
+            uploadNilPathRejected = (err == .remoteOperationFailed("Remote file upload failed"))
+        }
+        precondition(uploadNilPathRejected, "Expected whitespace/nil remote_path to throw fallback CodaNetworkError")
+
+        var launchFalseRejected = false
+        do {
+            _ = try CodaNetworkClient.decodeLaunchAgentResult(
+                Data(#"{"ok":false,"terminal":null,"error":"grok: executable not found in PATH"}"#.utf8)
+            )
+        } catch let err as CodaNetworkError {
+            launchFalseRejected = (err == .remoteOperationFailed("grok: executable not found in PATH"))
+        }
+        precondition(launchFalseRejected, "Expected ok:false launch_agent_result to throw CodaNetworkError")
+
+        var launchMissingTermRejected = false
+        do {
+            _ = try CodaNetworkClient.decodeLaunchAgentResult(
+                Data(#"{"ok":true,"terminal":null}"#.utf8)
+            )
+        } catch let err as CodaNetworkError {
+            launchMissingTermRejected = (err == .remoteOperationFailed("Remote host did not return launched terminal details"))
+        }
+        precondition(launchMissingTermRejected, "Expected ok:true with nil terminal to throw CodaNetworkError")
+
+        // Clipboard rich-text priority: Numbers/Excel/Word/Notes cells must paste text without invoking PNG rasterization
+        var rasterizedPNGCalled = false
+        let richTextPaste = CodaClipboardPasteResolver.resolve(
+            text: "metric\tvalue\nlatency_ms\t4.2",
+            readImagePNG: {
+                rasterizedPNGCalled = true
+                return Data([0x89, 0x50, 0x4E, 0x47])
+            }
+        )
+        precondition(
+            richTextPaste == .text("metric\tvalue\nlatency_ms\t4.2") && !rasterizedPNGCalled,
+            "Non-empty clipboard text must win over PNG and skip image rasterization"
+        )
+        let pureImagePaste = CodaClipboardPasteResolver.resolve(
+            text: nil,
+            readImagePNG: { Data([0x89, 0x50, 0x4E, 0x47]) }
+        )
+        precondition(pureImagePaste == .imagePNG(Data([0x89, 0x50, 0x4E, 0x47])))
+        let emptyTextFallbackImagePaste = CodaClipboardPasteResolver.resolve(
+            text: "",
+            readImagePNG: { Data([0x89, 0x50, 0x4E, 0x47]) }
+        )
+        precondition(emptyTextFallbackImagePaste == .imagePNG(Data([0x89, 0x50, 0x4E, 0x47])))
+        let emptyPaste = CodaClipboardPasteResolver.resolve(text: nil, readImagePNG: { nil })
+        precondition(emptyPaste == .empty)
+
+        // Sheet session lifecycle reconciliation on dismiss and session switch
+        precondition(
+            CodaSheetSessionStateHelper.reconciledActiveSheetSessionID(
+                current: "host-a/t1",
+                selectedSessionID: "host-a/t1",
+                showComposeSheet: false,
+                showPaneMinimapSheet: false,
+                showGitDiffSheet: false,
+                showRemoteFilesSheet: false
+            ) == nil,
+            "activeSheetSessionID must clear when all session sheets dismiss"
+        )
+        precondition(
+            CodaSheetSessionStateHelper.reconciledActiveSheetSessionID(
+                current: "host-a/t1",
+                selectedSessionID: "host-a/t2",
+                showComposeSheet: false,
+                showPaneMinimapSheet: false,
+                showGitDiffSheet: false,
+                showRemoteFilesSheet: true,
+                didSwitchSelectedSession: true,
+                activeSheetIsSecondary: false
+            ) == "host-a/t2",
+            "activeSheetSessionID must follow newly selected primary session while inspector sheet stays open"
+        )
+        precondition(
+            CodaSheetSessionStateHelper.reconciledActiveSheetSessionID(
+                current: "host-a/t2",
+                selectedSessionID: "host-a/t1",
+                showComposeSheet: true,
+                showPaneMinimapSheet: false,
+                showGitDiffSheet: false,
+                showRemoteFilesSheet: false,
+                didSwitchSelectedSession: true,
+                activeSheetIsSecondary: true
+            ) == "host-a/t2",
+            "Secondary-leaf sheet session must remain pinned to secondary leaf when primary selection changes"
+        )
     }
 
     private static func readFramed(conn: NWConnection, completion: @escaping @Sendable ([String: Any]?) -> Void) {

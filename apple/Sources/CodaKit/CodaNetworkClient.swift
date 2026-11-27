@@ -2585,6 +2585,8 @@ public actor CodaNetworkClient {
         )
     }
 
+    public static let daemonOTATimeoutSeconds: UInt64 = 65
+
     public func upgradeRemoteDaemon(
         on device: CodaRemoteDevice,
         clientIdentity: CodaDeviceIdentity,
@@ -2604,7 +2606,8 @@ public actor CodaNetworkClient {
             to: device,
             clientIdentity: clientIdentity,
             clientDeviceId: clientDeviceId,
-            lane: "control_p0"
+            lane: "control_p0",
+            timeoutSeconds: Self.daemonOTATimeoutSeconds
         )
         struct Resp: Decodable {
             let ok: Bool
@@ -2844,6 +2847,32 @@ public actor CodaNetworkClient {
         )
     }
 
+    public static func decodeLaunchAgentResult(_ respData: Data) throws -> CodaHerdrTerminalSummary {
+        struct Resp: Decodable {
+            let ok: Bool
+            let terminal: CodaHerdrTerminalSummary?
+            let error: String?
+        }
+        let decoded: Resp
+        do {
+            decoded = try JSONDecoder().decode(Resp.self, from: respData)
+        } catch {
+            throw CodaNetworkError.invalidPayload("Invalid launch_agent_result payload")
+        }
+        let cleanError = decoded.error?.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard decoded.ok else {
+            let message = (cleanError?.isEmpty == false) ? cleanError! : "Remote agent launch failed"
+            throw CodaNetworkError.remoteOperationFailed(message)
+        }
+        guard let terminal = decoded.terminal else {
+            let message = (cleanError?.isEmpty == false)
+                ? cleanError!
+                : "Remote host did not return launched terminal details"
+            throw CodaNetworkError.remoteOperationFailed(message)
+        }
+        return terminal
+    }
+
     public func launchAgent(
         on device: CodaRemoteDevice,
         clientIdentity: CodaDeviceIdentity,
@@ -2854,7 +2883,7 @@ public actor CodaNetworkClient {
         initialPrompt: String? = nil,
         cols: Int = 100,
         rows: Int = 32
-    ) async throws -> CodaHerdrTerminalSummary? {
+    ) async throws -> CodaHerdrTerminalSummary {
         var obj: [String: Any] = [
             "op": "launch_agent",
             "req_id": nextRequestID(),
@@ -2874,11 +2903,34 @@ public actor CodaNetworkClient {
             clientDeviceId: clientDeviceId,
             lane: "control_p0"
         )
+        return try Self.decodeLaunchAgentResult(respData)
+    }
+
+    public static func decodeUploadTerminalFileResult(_ respData: Data) throws -> String {
         struct Resp: Decodable {
             let ok: Bool
-            let terminal: CodaHerdrTerminalSummary?
+            let remotePath: String?
+            let error: String?
+            enum CodingKeys: String, CodingKey {
+                case ok
+                case remotePath = "remote_path"
+                case error
+            }
         }
-        return (try? JSONDecoder().decode(Resp.self, from: respData))?.terminal
+        let decoded: Resp
+        do {
+            decoded = try JSONDecoder().decode(Resp.self, from: respData)
+        } catch {
+            throw CodaNetworkError.invalidPayload("Invalid upload_terminal_file_result payload")
+        }
+        let cleanError = decoded.error?.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard decoded.ok,
+              let remotePath = decoded.remotePath,
+              !remotePath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            let message = (cleanError?.isEmpty == false) ? cleanError! : "Remote file upload failed"
+            throw CodaNetworkError.remoteOperationFailed(message)
+        }
+        return remotePath
     }
 
     public func uploadTerminalFile(
@@ -2888,7 +2940,7 @@ public actor CodaNetworkClient {
         terminal: String,
         filename: String,
         data: Data
-    ) async throws -> String? {
+    ) async throws -> String {
         let reqData = try JSONSerialization.data(withJSONObject: [
             "op": "upload_terminal_file",
             "req_id": nextRequestID(),
@@ -2901,17 +2953,10 @@ public actor CodaNetworkClient {
             to: device,
             clientIdentity: clientIdentity,
             clientDeviceId: clientDeviceId,
-            lane: "bulk_p1"
+            lane: "bulk_p1",
+            timeoutSeconds: 30
         )
-        struct Resp: Decodable {
-            let ok: Bool
-            let remotePath: String?
-            enum CodingKeys: String, CodingKey {
-                case ok
-                case remotePath = "remote_path"
-            }
-        }
-        return (try? JSONDecoder().decode(Resp.self, from: respData))?.remotePath
+        return try Self.decodeUploadTerminalFileResult(respData)
     }
 
     public func fetchRemoteGitDiff(

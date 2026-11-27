@@ -128,7 +128,8 @@ public struct CodaAdaptiveRootView: View {
                     toast: toast,
                     locale: store.locale,
                     onTap: {
-                        if let match = store.sessions.first(where: { $0.id == toast.sessionId }) {
+                        if !toast.sessionId.isEmpty,
+                           let match = store.sessions.first(where: { $0.id == toast.sessionId }) {
                             store.selectSession(match)
                         }
                         store.activeToast = nil
@@ -693,20 +694,36 @@ public struct CodaToastBannerView: View {
     public let onTap: () -> Void
     public let onDismiss: () -> Void
 
+    private var accentColor: Color {
+        switch toast.state {
+        case .needsYou: return CodaHerdrTheme.amberNeedsYou
+        case .error: return CodaHerdrTheme.redDiff
+        default: return CodaHerdrTheme.blueUnread
+        }
+    }
+
+    private var stateLabel: String {
+        switch toast.state {
+        case .needsYou: return tr("Needs you", "待确认", locale: locale)
+        case .error: return tr("Error", "失败", locale: locale)
+        default: return tr("Done", "已完成", locale: locale)
+        }
+    }
+
     public var body: some View {
         HStack(spacing: 10) {
             Circle()
-                .fill(toast.state == .needsYou ? CodaHerdrTheme.amberNeedsYou : CodaHerdrTheme.blueUnread)
+                .fill(accentColor)
                 .frame(width: 8, height: 8)
 
             VStack(alignment: .leading, spacing: 1) {
-                Text("\(toast.workspaceName) · \(toast.state == .needsYou ? tr("Needs you", "待确认", locale: locale) : tr("Done", "已完成", locale: locale))")
+                Text("\(toast.workspaceName) · \(stateLabel)")
                     .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(CodaHerdrTheme.textPrimary)
+                    .foregroundStyle(toast.state == .error ? CodaHerdrTheme.redDiff : CodaHerdrTheme.textPrimary)
                 Text(toast.title)
                     .font(.system(size: 11))
                     .foregroundStyle(CodaHerdrTheme.textSecondary)
-                    .lineLimit(1)
+                    .lineLimit(2)
             }
 
             Spacer(minLength: 8)
@@ -721,9 +738,15 @@ public struct CodaToastBannerView: View {
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
         .background(
-            Capsule()
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
                 .fill(CodaHerdrTheme.elevatedBG.opacity(0.97))
-                .overlay(Capsule().strokeBorder(CodaHerdrTheme.borderHairline, lineWidth: 1))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                        .strokeBorder(
+                            toast.state == .error ? CodaHerdrTheme.redDiff.opacity(0.45) : CodaHerdrTheme.borderHairline,
+                            lineWidth: 1
+                        )
+                )
                 .shadow(color: .black.opacity(0.45), radius: 14, x: 0, y: 6)
         )
         .onTapGesture(perform: onTap)

@@ -1428,20 +1428,21 @@ public struct CodaDuoTabletopControlDeck: View {
                     }
                     .buttonStyle(.plain)
 
+                    let canOpenCompose = (store.selectedSession != nil && session != nil)
                     Button {
-                        if let active = session {
+                        if let active = session ?? store.selectedSession {
                             store.openComposeSheet(for: active)
-                        } else {
-                            store.showComposeSheet = true
                         }
                     } label: {
                         Image(systemName: "square.and.pencil")
                             .font(.system(size: 14, weight: .semibold))
-                            .foregroundStyle(CodaHerdrTheme.textPrimary)
+                            .foregroundStyle(canOpenCompose ? CodaHerdrTheme.textPrimary : CodaHerdrTheme.textDim)
                             .frame(width: 32, height: 32)
                             .background(Circle().fill(CodaHerdrTheme.elevatedBG))
+                            .opacity(canOpenCompose ? 1.0 : 0.42)
                     }
                     .buttonStyle(.plain)
+                    .disabled(!canOpenCompose)
                 }
                 .padding(.horizontal, 12)
                 .padding(.vertical, 9)

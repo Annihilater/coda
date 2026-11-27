@@ -65,10 +65,18 @@ public final class CodaWorkspaceStore: ObservableObject {
     @Published public var showSettingsSheet: Bool = false
     @Published public var settingsInitialFocusPairing: Bool = false
     @Published public var settingsInitialAuthMode: Int? = nil
-    @Published public var showComposeSheet: Bool = false
-    @Published public var showPaneMinimapSheet: Bool = false
-    @Published public var showGitDiffSheet: Bool = false
-    @Published public var showRemoteFilesSheet: Bool = false
+    @Published public var showComposeSheet: Bool = false {
+        didSet { if !showComposeSheet { reconcileActiveSheetSessionOnDismissIfNeeded() } }
+    }
+    @Published public var showPaneMinimapSheet: Bool = false {
+        didSet { if !showPaneMinimapSheet { reconcileActiveSheetSessionOnDismissIfNeeded() } }
+    }
+    @Published public var showGitDiffSheet: Bool = false {
+        didSet { if !showGitDiffSheet { reconcileActiveSheetSessionOnDismissIfNeeded() } }
+    }
+    @Published public var showRemoteFilesSheet: Bool = false {
+        didSet { if !showRemoteFilesSheet { reconcileActiveSheetSessionOnDismissIfNeeded() } }
+    }
     @Published public var inspectorSheetMode: CodaInspectorSheetMode = .files
     @Published public private(set) var inspectorSessionId: String? = nil
     @Published public var remoteFileRootPath: String = ""
@@ -107,6 +115,7 @@ public final class CodaWorkspaceStore: ObservableObject {
     @Published public var notificationStatusMessage: String? = nil
     @Published public var notificationErrorMessage: String? = nil
     @Published public var isPruningStaleDevices: Bool = false
+    @Published public var otaUpgradingDeviceIDs: Set<UUID> = []
     @Published public var showBootstrapWorkspaceSheet: Bool = false
     @Published public var bootstrapTargetDeviceID: UUID? = nil
     @Published public var bootstrapDefaultParentDir: String = "~/workspace"
@@ -121,6 +130,7 @@ public final class CodaWorkspaceStore: ObservableObject {
     @Published public var composeTextBySession: [String: String] = [:]
     @Published public private(set) var uploadingAttachmentCount: Int = 0
     @Published public var uploadStatusBanner: String? = nil
+    @Published public var uploadBannerIsError: Bool = false
     @Published public var isSendingAction: Bool = false
 
     @Published public var pendingDeviceAuth: CodaDeviceAuthStart? = nil
@@ -408,11 +418,17 @@ public final class CodaWorkspaceStore: ObservableObject {
         self.bootstrapErrorMessage = nil
         self.bootstrapStatusMessage = nil
         self.showBootstrapWorkspaceSheet = false
+        self.otaUpgradingDeviceIDs.removeAll()
+        self.showComposeSheet = false
+        self.showPaneMinimapSheet = false
+        self.showGitDiffSheet = false
+        self.showRemoteFilesSheet = false
         self.composeText = ""
         self.composeTextBySession.removeAll()
         self.uploadingAttachmentCount = 0
         self.activeToast = nil
         self.uploadStatusBanner = nil
+        self.uploadBannerIsError = false
         self.voiceConfigSyncMessage = nil
         self.lastAccountMetaSyncAt = nil
         self.snippetsMutationGeneration &+= 1
@@ -561,6 +577,61 @@ public final class CodaWorkspaceStore: ObservableObject {
             ))
         }
         return sections
+    }
+
+    public var hasActiveSessionSheet: Bool {
+        showComposeSheet || showPaneMinimapSheet || showGitDiffSheet || showRemoteFilesSheet
+    }
+
+    public func reconcileActiveSheetSessionOnDismissIfNeeded() {
+        let reconciled = CodaSheetSessionStateHelper.reconciledActiveSheetSessionID(
+            current: activeSheetSessionID,
+            selectedSessionID: selectedSessionID,
+            showComposeSheet: showComposeSheet,
+            showPaneMinimapSheet: showPaneMinimapSheet,
+            showGitDiffSheet: showGitDiffSheet,
+            showRemoteFilesSheet: showRemoteFilesSheet
+        )
+        guard reconciled == nil else { return }
+        if activeSheetSessionID != nil {
+            activeSheetSessionID = nil
+        }
+        if activeSheetIsSecondary {
+            activeSheetIsSecondary = false
+        }
+        let targetDraft = selectedSessionID.flatMap { composeTextBySession[$0] } ?? ""
+        if composeText != targetDraft {
+            composeText = targetDraft
+        }
+    }
+
+    private func preparedClientOrThrow() async throws -> CodaNetworkClient {
+        if let client = await preparedClient() {
+            return client
+        }
+        throw CodaNetworkError.remoteOperationFailed(
+            authError ?? tr(
+                "Control plane client is not ready.",
+                "控制面网络客户端尚未就绪。",
+                locale: locale
+            )
+        )
+    }
+
+    private func presentActionErrorToast(workspaceName: String, sessionId: String = "", message: String) {
+        let banner = CodaToastBanner(
+            sessionId: sessionId,
+            workspaceName: workspaceName,
+            title: message,
+            state: .error
+        )
+        activeToast = banner
+        Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 5_000_000_000)
+            if self?.activeToast?.id == banner.id {
+                self?.activeToast = nil
+            }
+        }
     }
 
     public var activeSheetSession: CodaAgentSession? {
@@ -757,6 +828,7 @@ public final class CodaWorkspaceStore: ObservableObject {
                 if isDirect {
                     CodaHaptics.success()
                 }
+                uploadBannerIsError = false
                 uploadStatusBanner = bannerMsg
                 Task { [weak self] in
                     try? await Task.sleep(nanoseconds: 4_000_000_000)
@@ -857,6 +929,7 @@ public final class CodaWorkspaceStore: ObservableObject {
                             "已无缝切回智能中继 · \(dev.name)",
                             locale: self.locale
                         )
+                        self.uploadBannerIsError = false
                         self.uploadStatusBanner = bannerMsg
                         try? await Task.sleep(nanoseconds: 4_000_000_000)
                         if self.uploadStatusBanner == bannerMsg {
@@ -869,6 +942,7 @@ public final class CodaWorkspaceStore: ObservableObject {
                             "直连已断开 · 正在重连 \(dev.name)...",
                             locale: self.locale
                         )
+                        self.uploadBannerIsError = true
                         self.uploadStatusBanner = errMsg
                         try? await Task.sleep(nanoseconds: 4_000_000_000)
                         if self.uploadStatusBanner == errMsg {
@@ -1267,6 +1341,7 @@ public final class CodaWorkspaceStore: ObservableObject {
             if let sel = selectedSession, sel.deviceId == device.id {
                 selectedSessionID = nil
             }
+            otaUpgradingDeviceIDs.remove(device.id)
             remoteMachines.removeAll { $0.id == device.id }
             sessions.removeAll { $0.deviceId == device.id }
             accountStatusMessage = tr("Removed host \(device.name).", "已移除主机 \(device.name)。", locale: locale)
@@ -1339,8 +1414,19 @@ public final class CodaWorkspaceStore: ObservableObject {
     }
 
     public func upgradeRemoteMachine(_ device: CodaRemoteDevice) async {
-        guard isSignedIn, device.isOnline, let client = await preparedClient() else { return }
+        guard isSignedIn,
+              device.isOnline,
+              !otaUpgradingDeviceIDs.contains(device.id),
+              let client = await preparedClient() else { return }
         let epoch = self.workspaceEpoch
+        otaUpgradingDeviceIDs.insert(device.id)
+        defer {
+            self.otaUpgradingDeviceIDs.remove(device.id)
+        }
+        if localIdentity.deviceId == nil {
+            await ensureClientDeviceRegistered(using: client)
+            guard self.workspaceEpoch == epoch else { return }
+        }
         accountStatusMessage = tr(
             "Upgrading coda-daemon on \(device.name) (zero-downtime OTA)…",
             "正在为 \(device.name) 无感升级 coda-daemon…",
@@ -1348,6 +1434,11 @@ public final class CodaWorkspaceStore: ObservableObject {
         )
         authError = nil
         do {
+            _ = try? await client.connectBestAvailable(
+                sessionToken: settings.sessionToken,
+                targetDevice: device,
+                clientIdentity: localIdentity
+            )
             let res = try await client.upgradeRemoteDaemon(
                 on: device,
                 clientIdentity: localIdentity,
@@ -1423,6 +1514,10 @@ public final class CodaWorkspaceStore: ObservableObject {
         bootstrapErrorMessage = nil
         bootstrapStatusMessage = nil
         showBootstrapWorkspaceSheet = false
+        otaUpgradingDeviceIDs.removeAll()
+        showComposeSheet = false
+        showPaneMinimapSheet = false
+        showGitDiffSheet = false
         showRemoteFilesSheet = false
         remoteFileEntries = []
         remoteFileSubPath = ""
@@ -1440,6 +1535,7 @@ public final class CodaWorkspaceStore: ObservableObject {
         activeToast = nil
         voiceConfigSyncMessage = nil
         uploadStatusBanner = nil
+        uploadBannerIsError = false
         currentUser = nil
         adminInvites = []
         adminUsers = []
@@ -1644,6 +1740,17 @@ public final class CodaWorkspaceStore: ObservableObject {
             }
             if let secId = self.secondarySessionID, !self.sessions.contains(where: { $0.id == secId }) {
                 self.secondarySessionID = nil
+            }
+            if let sheetSid = self.activeSheetSessionID, !self.sessions.contains(where: { $0.id == sheetSid }) {
+                self.activeSheetSessionID = nil
+                self.activeSheetIsSecondary = false
+                self.showComposeSheet = false
+                self.showPaneMinimapSheet = false
+                self.showGitDiffSheet = false
+                self.showRemoteFilesSheet = false
+            } else if !self.hasActiveSessionSheet && self.activeSheetSessionID != nil {
+                self.activeSheetSessionID = nil
+                self.activeSheetIsSecondary = false
             }
 
             if let pendingSid = pendingSelectSessionID,
@@ -1941,7 +2048,30 @@ public final class CodaWorkspaceStore: ObservableObject {
         }
         pendingSelectSessionID = nil
         selectedSessionID = session.id
-        if !showComposeSheet {
+        let keepSecondarySheet = activeSheetIsSecondary && duoSplitMode == .dualTerminalSplit
+        let nextSheetSid = CodaSheetSessionStateHelper.reconciledActiveSheetSessionID(
+            current: activeSheetSessionID,
+            selectedSessionID: session.id,
+            showComposeSheet: showComposeSheet,
+            showPaneMinimapSheet: showPaneMinimapSheet,
+            showGitDiffSheet: showGitDiffSheet,
+            showRemoteFilesSheet: showRemoteFilesSheet,
+            didSwitchSelectedSession: changedSession,
+            activeSheetIsSecondary: keepSecondarySheet
+        )
+        if nextSheetSid == nil {
+            activeSheetSessionID = nil
+            activeSheetIsSecondary = false
+        } else if nextSheetSid != activeSheetSessionID {
+            if showComposeSheet, let prevSheetSid = activeSheetSessionID {
+                composeTextBySession[prevSheetSid] = composeText
+            }
+            activeSheetSessionID = nextSheetSid
+            if !keepSecondarySheet {
+                activeSheetIsSecondary = false
+            }
+        }
+        if !showComposeSheet || activeSheetSessionID == session.id {
             composeText = composeTextBySession[session.id] ?? ""
         }
         if changedSession {
@@ -1992,6 +2122,16 @@ public final class CodaWorkspaceStore: ObservableObject {
             cancelVoiceDictation()
         }
         secondarySessionID = session.id
+        if !hasActiveSessionSheet {
+            activeSheetSessionID = nil
+            activeSheetIsSecondary = false
+        } else if activeSheetIsSecondary && changedSecondary {
+            if showComposeSheet, let prevSheetSid = activeSheetSessionID, prevSheetSid != session.id {
+                composeTextBySession[prevSheetSid] = composeText
+                composeText = composeTextBySession[session.id] ?? ""
+            }
+            activeSheetSessionID = session.id
+        }
         if changedSecondary {
             detachIfNoLongerDisplayed(previousSecondary)
         }
@@ -2206,11 +2346,17 @@ public final class CodaWorkspaceStore: ObservableObject {
     public func closeTerminalToInbox() {
         cancelVoiceDictation()
         let closing = selectedSession
-        if let prevId = closing?.id, !showComposeSheet {
+        if let prevId = (activeSheetSessionID ?? closing?.id) {
             composeTextBySession[prevId] = composeText
         }
         screenRefreshTask?.cancel()
         screenRefreshTask = nil
+        showComposeSheet = false
+        showPaneMinimapSheet = false
+        showGitDiffSheet = false
+        showRemoteFilesSheet = false
+        activeSheetSessionID = nil
+        activeSheetIsSecondary = false
         selectedSessionID = nil
         dpadVisible = false
         ctrlActive = false
@@ -2309,7 +2455,9 @@ public final class CodaWorkspaceStore: ObservableObject {
         }
         if activeSheetSessionID == sid {
             activeSheetSessionID = nil
+            activeSheetIsSecondary = false
             showComposeSheet = false
+            showPaneMinimapSheet = false
             showRemoteFilesSheet = false
             showGitDiffSheet = false
         }
@@ -2557,6 +2705,7 @@ public final class CodaWorkspaceStore: ObservableObject {
             }
             if let fileSize = (try? fileURL.resourceValues(forKeys: [.fileSizeKey]).fileSize),
                fileSize > maxUploadBytes {
+                uploadBannerIsError = true
                 uploadStatusBanner = tr(
                     "File exceeds 4 MiB upload limit.",
                     "文件超过 4 MiB 上传限制。",
@@ -2565,6 +2714,7 @@ public final class CodaWorkspaceStore: ObservableObject {
                 return
             }
             guard let data = try? Data(contentsOf: fileURL) else {
+                uploadBannerIsError = true
                 uploadStatusBanner = tr("Could not read selected file.", "读取文件失败。", locale: locale)
                 return
             }
@@ -2583,15 +2733,24 @@ public final class CodaWorkspaceStore: ObservableObject {
         for targetSession: CodaAgentSession? = nil,
         onUploadedToken: ((String) -> Void)? = nil
     ) {
-        guard let session = targetSession ?? activeSheetSession ?? selectedSession,
-              let client = networkClient,
-              let devId = session.deviceId,
-              let dev = remoteMachines.first(where: { $0.id == devId }),
-              let clientDevId = localIdentity.deviceId else { return }
+        guard let session = targetSession ?? activeSheetSession ?? selectedSession else { return }
+        guard let devId = session.deviceId,
+              let dev = remoteMachines.first(where: { $0.id == devId }) else {
+            let msg = tr(
+                "Upload failed: target host is offline or unavailable.",
+                "上传失败：目标主机离线或不可用。",
+                locale: locale
+            )
+            uploadBannerIsError = true
+            uploadStatusBanner = msg
+            presentActionErrorToast(workspaceName: session.workspaceName, sessionId: session.id, message: msg)
+            return
+        }
 
         // Keep raw upload under 4 MiB so double-Base64 inside encrypted RelayWireFrame stays below 8 MiB.
         let maxUploadBytes = 4 * 1024 * 1024
         guard data.count <= maxUploadBytes else {
+            uploadBannerIsError = true
             uploadStatusBanner = tr(
                 "File exceeds 4 MiB upload limit.",
                 "文件超过 4 MiB 上传限制。",
@@ -2603,6 +2762,7 @@ public final class CodaWorkspaceStore: ObservableObject {
         let targetSid = session.id
         let epoch = workspaceEpoch
         uploadingAttachmentCount += 1
+        uploadBannerIsError = false
         uploadStatusBanner = tr("Uploading \(filename)...", "正在上传 \(filename)...", locale: locale)
         Task { [weak self] in
             guard let self else { return }
@@ -2612,6 +2772,12 @@ public final class CodaWorkspaceStore: ObservableObject {
                 }
             }
             do {
+                let client = try await self.preparedClientOrThrow()
+                if self.localIdentity.deviceId == nil {
+                    await self.ensureClientDeviceRegistered(using: client)
+                }
+                guard self.workspaceEpoch == epoch else { return }
+                let clientDevId = self.localIdentity.deviceId ?? devId
                 let remotePath = try await client.uploadTerminalFile(
                     on: dev,
                     clientIdentity: self.localIdentity,
@@ -2621,19 +2787,28 @@ public final class CodaWorkspaceStore: ObservableObject {
                     data: data
                 )
                 guard self.workspaceEpoch == epoch else { return }
-                let inserted = codaShellQuotePath(remotePath ?? filename)
+                let inserted = codaShellQuotePath(remotePath)
                 if let onUploadedToken {
                     onUploadedToken(inserted)
                 } else {
                     self.appendComposeDraft(inserted, for: targetSid, padTrailingSpace: true)
                 }
+                self.uploadBannerIsError = false
                 self.uploadStatusBanner = tr("Attached \(inserted)", "已附加 \(inserted)", locale: self.locale)
             } catch {
                 guard self.workspaceEpoch == epoch else { return }
-                self.uploadStatusBanner = tr(
+                let errMsg = tr(
                     "Upload failed: \(error.localizedDescription)",
                     "上传失败：\(error.localizedDescription)",
                     locale: self.locale
+                )
+                self.uploadBannerIsError = true
+                self.uploadStatusBanner = errMsg
+                self.authError = errMsg
+                self.presentActionErrorToast(
+                    workspaceName: session.workspaceName,
+                    sessionId: session.id,
+                    message: errMsg
                 )
             }
         }
@@ -3022,11 +3197,16 @@ public final class CodaWorkspaceStore: ObservableObject {
         agent: String?,
         initialPrompt: String? = nil
     ) async -> Bool {
-        guard isSignedIn, let client = await preparedClient() else { return false }
+        guard isSignedIn else {
+            let msg = tr("Please sign in before launching a workspace.", "请先登录后再创建或启动工作区。", locale: locale)
+            bootstrapErrorMessage = msg
+            authError = msg
+            return false
+        }
         let epoch = workspaceEpoch
-        let clientDevId = localIdentity.deviceId ?? device.id
         bootstrapErrorMessage = nil
         bootstrapStatusMessage = nil
+        authError = nil
         isBootstrappingWorkspace = true
         defer {
             if self.workspaceEpoch == epoch {
@@ -3035,6 +3215,12 @@ public final class CodaWorkspaceStore: ObservableObject {
         }
 
         do {
+            let client = try await preparedClientOrThrow()
+            if localIdentity.deviceId == nil {
+                await ensureClientDeviceRegistered(using: client)
+                guard self.workspaceEpoch == epoch else { return false }
+            }
+            let clientDevId = localIdentity.deviceId ?? device.id
             _ = try? await client.connectBestAvailable(
                 sessionToken: settings.sessionToken,
                 targetDevice: device,
@@ -3050,9 +3236,11 @@ public final class CodaWorkspaceStore: ObservableObject {
             )
             guard self.workspaceEpoch == epoch else { return false }
             guard res.ok else {
-                bootstrapErrorMessage = res.detail.isEmpty
+                let msg = res.detail.isEmpty
                     ? tr("Workspace bootstrap failed.", "创建或克隆工作区失败。", locale: locale)
                     : res.detail
+                bootstrapErrorMessage = msg
+                authError = msg
                 return false
             }
 
@@ -3060,18 +3248,32 @@ public final class CodaWorkspaceStore: ObservableObject {
             let cleanAgent = (agent ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
             if !cleanAgent.isEmpty && cleanAgent != "none" {
                 let cleanPrompt = initialPrompt?.trimmingCharacters(in: .whitespacesAndNewlines)
-                if let launched = try? await client.launchAgent(
-                    on: device,
-                    clientIdentity: localIdentity,
-                    clientDeviceId: clientDevId,
-                    agent: cleanAgent,
-                    name: nil,
-                    cwd: res.workspacePath,
-                    initialPrompt: (cleanPrompt?.isEmpty == false) ? cleanPrompt : nil,
-                    cols: max(48, terminalColumns),
-                    rows: 32
-                ) {
+                do {
+                    let launched = try await client.launchAgent(
+                        on: device,
+                        clientIdentity: localIdentity,
+                        clientDeviceId: clientDevId,
+                        agent: cleanAgent,
+                        name: nil,
+                        cwd: res.workspacePath,
+                        initialPrompt: (cleanPrompt?.isEmpty == false) ? cleanPrompt : nil,
+                        cols: max(48, terminalColumns),
+                        rows: 32
+                    )
                     pendingSelectSessionID = "\(device.id.uuidString.lowercased())/\(launched.address)"
+                } catch {
+                    if self.workspaceEpoch == epoch {
+                        let msg = tr(
+                            "Workspace created at \(res.workspacePath), but launching \(cleanAgent) failed: \(error.localizedDescription)",
+                            "已在 \(res.workspacePath) 创建工作区，但启动 \(cleanAgent) 失败：\(error.localizedDescription)",
+                            locale: locale
+                        )
+                        bootstrapErrorMessage = msg
+                        authError = msg
+                        presentActionErrorToast(workspaceName: device.name, message: msg)
+                        await refreshMachinesAndSessions(forceWorkspaces: true)
+                    }
+                    return false
                 }
             }
             await refreshMachinesAndSessions(forceWorkspaces: true)
@@ -3079,28 +3281,64 @@ public final class CodaWorkspaceStore: ObservableObject {
         } catch {
             if self.workspaceEpoch == epoch {
                 bootstrapErrorMessage = error.localizedDescription
+                authError = error.localizedDescription
             }
             return false
         }
     }
 
     public func launchAgent(agent: String, on device: CodaRemoteDevice, cwd: String?, prompt: String? = nil) {
-        guard let client = networkClient,
-              let clientDevId = localIdentity.deviceId else { return }
-        Task {
-            _ = try? await client.launchAgent(
-                on: device,
-                clientIdentity: localIdentity,
-                clientDeviceId: clientDevId,
-                agent: agent,
-                name: nil,
-                cwd: cwd,
-                initialPrompt: prompt,
-                cols: max(48, terminalColumns),
-                rows: 32
-            )
-            try? await Task.sleep(nanoseconds: 350_000_000)
-            await refreshMachinesAndSessions()
+        let epoch = self.workspaceEpoch
+        authError = nil
+        Task { [weak self] in
+            guard let self else { return }
+            guard self.isSignedIn else {
+                let msg = tr("Please sign in before launching an agent.", "请先登录后再启动 Agent。", locale: self.locale)
+                self.authError = msg
+                self.presentActionErrorToast(workspaceName: device.name, message: msg)
+                return
+            }
+            do {
+                let client = try await self.preparedClientOrThrow()
+                if self.localIdentity.deviceId == nil {
+                    await self.ensureClientDeviceRegistered(using: client)
+                }
+                guard self.workspaceEpoch == epoch else { return }
+                let clientDevId = self.localIdentity.deviceId ?? device.id
+                _ = try? await client.connectBestAvailable(
+                    sessionToken: self.settings.sessionToken,
+                    targetDevice: device,
+                    clientIdentity: self.localIdentity
+                )
+                let launched = try await client.launchAgent(
+                    on: device,
+                    clientIdentity: self.localIdentity,
+                    clientDeviceId: clientDevId,
+                    agent: agent,
+                    name: nil,
+                    cwd: cwd,
+                    initialPrompt: prompt,
+                    cols: max(48, self.terminalColumns),
+                    rows: 32
+                )
+                guard self.workspaceEpoch == epoch else { return }
+                self.pendingSelectSessionID = "\(device.id.uuidString.lowercased())/\(launched.address)"
+                try? await Task.sleep(nanoseconds: 350_000_000)
+                if self.workspaceEpoch == epoch {
+                    await self.refreshMachinesAndSessions()
+                }
+            } catch {
+                guard self.workspaceEpoch == epoch else { return }
+                let msg = tr(
+                    "Failed to launch \(agent) on \(device.name): \(error.localizedDescription)",
+                    "在 \(device.name) 上启动 \(agent) 失败：\(error.localizedDescription)",
+                    locale: self.locale
+                )
+                self.authError = msg
+                self.uploadBannerIsError = true
+                self.uploadStatusBanner = msg
+                self.presentActionErrorToast(workspaceName: device.name, message: msg)
+            }
         }
     }
 
@@ -3489,6 +3727,7 @@ public final class CodaWorkspaceStore: ObservableObject {
             )
         }
         CodaHaptics.success()
+        uploadBannerIsError = false
         uploadStatusBanner = tr(
             "Saved snippet “\(candidate.title)”.",
             "已保存快捷片段「\(candidate.title)」。",

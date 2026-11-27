@@ -568,7 +568,12 @@ public struct CodaSettingsAndPairingSheet: View {
                         }
                     } else {
                         VStack(spacing: 10) {
-                            TextField(tr("Email or Handle", "邮箱或用户名", locale: store.locale), text: $form.emailInput)
+                            TextField(
+                                form.authMode == 2
+                                    ? tr("Email", "邮箱", locale: store.locale)
+                                    : tr("Email or Handle", "邮箱或用户名", locale: store.locale),
+                                text: $form.emailInput
+                            )
                                 .font(.system(size: 13))
                                 .padding(.horizontal, 10)
                                 .padding(.vertical, 8)
@@ -808,18 +813,35 @@ public struct CodaSettingsAndPairingSheet: View {
                                         .foregroundStyle(dev.isOnline ? CodaHerdrTheme.greenDiff : CodaHerdrTheme.textDim)
                                 }
 
-                                if canOTA {
+                                let isUpgradingOTA = store.otaUpgradingDeviceIDs.contains(dev.id)
+                                if canOTA || isUpgradingOTA {
                                     Button {
                                         Task { await store.upgradeRemoteMachine(dev) }
                                     } label: {
-                                        Text(tr("Upgrade", "升级", locale: store.locale))
+                                        HStack(spacing: 4) {
+                                            if isUpgradingOTA {
+                                                ProgressView()
+                                                    .controlSize(.mini)
+                                                    .tint(CodaHerdrTheme.cyanWorking)
+                                            }
+                                            Text(
+                                                isUpgradingOTA
+                                                    ? tr("Upgrading…", "升级中…", locale: store.locale)
+                                                    : tr("Upgrade", "升级", locale: store.locale)
+                                            )
                                             .font(.system(size: 10.5, weight: .semibold))
-                                            .foregroundStyle(CodaHerdrTheme.cyanWorking)
-                                            .padding(.horizontal, 7)
-                                            .padding(.vertical, 4)
-                                            .background(RoundedRectangle(cornerRadius: 6).fill(CodaHerdrTheme.cyanWorking.opacity(0.14)))
+                                        }
+                                        .foregroundStyle(CodaHerdrTheme.cyanWorking)
+                                        .padding(.horizontal, 7)
+                                        .padding(.vertical, 4)
+                                        .background(
+                                            RoundedRectangle(cornerRadius: 6)
+                                                .fill(CodaHerdrTheme.cyanWorking.opacity(isUpgradingOTA ? 0.08 : 0.14))
+                                        )
+                                        .opacity(isUpgradingOTA ? 0.72 : 1.0)
                                     }
                                     .buttonStyle(.plain)
+                                    .disabled(isUpgradingOTA)
                                 }
 
                                 Button {
