@@ -31,23 +31,7 @@ CREATE TABLE IF NOT EXISTS invite_codes (
     CONSTRAINT chk_invite_uses CHECK (used_count <= max_uses)
 );
 
--- 3. Auth Sessions (Bearer tokens hashed with SHA-256 at rest)
-CREATE TABLE IF NOT EXISTS auth_sessions (
-    token_sha256 TEXT PRIMARY KEY,
-    id UUID NOT NULL DEFAULT gen_random_uuid(),
-    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    device_id UUID REFERENCES devices(id) ON DELETE CASCADE,
-    scope TEXT NOT NULL DEFAULT 'full' CHECK (scope IN ('full', 'daemon_host')),
-    client_label TEXT NOT NULL DEFAULT 'web',
-    last_used_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    expires_at TIMESTAMPTZ NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-CREATE INDEX IF NOT EXISTS idx_auth_sessions_user ON auth_sessions (user_id);
-CREATE INDEX IF NOT EXISTS idx_auth_sessions_expires ON auth_sessions (expires_at);
-
--- 4. Devices (Isolated per user_id; stores Ed25519 identity & X25519 E2EE public keys)
+-- 3. Devices (Isolated per user_id; stores Ed25519 identity & X25519 E2EE public keys)
 CREATE TABLE IF NOT EXISTS devices (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -66,6 +50,22 @@ CREATE TABLE IF NOT EXISTS devices (
 );
 
 CREATE INDEX IF NOT EXISTS idx_devices_user_online ON devices (user_id, is_online);
+
+-- 4. Auth Sessions (Bearer tokens hashed with SHA-256 at rest)
+CREATE TABLE IF NOT EXISTS auth_sessions (
+    token_sha256 TEXT PRIMARY KEY,
+    id UUID NOT NULL DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    device_id UUID REFERENCES devices(id) ON DELETE CASCADE,
+    scope TEXT NOT NULL DEFAULT 'full' CHECK (scope IN ('full', 'daemon_host')),
+    client_label TEXT NOT NULL DEFAULT 'web',
+    last_used_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at TIMESTAMPTZ NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_auth_sessions_user ON auth_sessions (user_id);
+CREATE INDEX IF NOT EXISTS idx_auth_sessions_expires ON auth_sessions (expires_at);
 
 -- 5. Short-lived 6-digit Pairing Codes (e.g. `839-204` for 30-second Linux/Mac onboarding)
 CREATE TABLE IF NOT EXISTS pairing_tokens (
@@ -171,20 +171,36 @@ CREATE TABLE IF NOT EXISTS user_prompt_snippets (
 -- Idempotent schema hardening for databases created before these constraints existed.
 DO $$
 BEGIN
-    IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'devices_ed25519_pubkey_key') THEN
+    IF EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE connamespace = current_schema()::regnamespace
+          AND conname = 'devices_ed25519_pubkey_key'
+    ) THEN
         ALTER TABLE devices DROP CONSTRAINT devices_ed25519_pubkey_key;
     END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'uq_devices_user_ed25519') THEN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE connamespace = current_schema()::regnamespace
+          AND conname = 'uq_devices_user_ed25519'
+    ) THEN
         ALTER TABLE devices ADD CONSTRAINT uq_devices_user_ed25519 UNIQUE (user_id, ed25519_pubkey);
     END IF;
-    IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'devices_platform_check') THEN
+    IF EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE connamespace = current_schema()::regnamespace
+          AND conname = 'devices_platform_check'
+    ) THEN
         ALTER TABLE devices DROP CONSTRAINT devices_platform_check;
     END IF;
     ALTER TABLE devices
         ADD CONSTRAINT devices_platform_check
         CHECK (platform IN ('macos', 'ios', 'ipados', 'iphone_duo', 'linux', 'windows', 'web'));
 
-    IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'device_auth_requests_platform_check') THEN
+    IF EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE connamespace = current_schema()::regnamespace
+          AND conname = 'device_auth_requests_platform_check'
+    ) THEN
         ALTER TABLE device_auth_requests DROP CONSTRAINT device_auth_requests_platform_check;
     END IF;
     ALTER TABLE device_auth_requests
@@ -193,25 +209,33 @@ BEGIN
 
     IF NOT EXISTS (
         SELECT 1 FROM information_schema.columns
-        WHERE table_name = 'auth_sessions' AND column_name = 'id'
+        WHERE table_schema = current_schema()
+          AND table_name = 'auth_sessions'
+          AND column_name = 'id'
     ) THEN
         ALTER TABLE auth_sessions ADD COLUMN id UUID NOT NULL DEFAULT gen_random_uuid();
     END IF;
     IF NOT EXISTS (
         SELECT 1 FROM information_schema.columns
-        WHERE table_name = 'auth_sessions' AND column_name = 'device_id'
+        WHERE table_schema = current_schema()
+          AND table_name = 'auth_sessions'
+          AND column_name = 'device_id'
     ) THEN
         ALTER TABLE auth_sessions ADD COLUMN device_id UUID REFERENCES devices(id) ON DELETE CASCADE;
     END IF;
     IF NOT EXISTS (
         SELECT 1 FROM information_schema.columns
-        WHERE table_name = 'auth_sessions' AND column_name = 'scope'
+        WHERE table_schema = current_schema()
+          AND table_name = 'auth_sessions'
+          AND column_name = 'scope'
     ) THEN
         ALTER TABLE auth_sessions ADD COLUMN scope TEXT NOT NULL DEFAULT 'full';
     END IF;
     IF NOT EXISTS (
         SELECT 1 FROM information_schema.columns
-        WHERE table_name = 'auth_sessions' AND column_name = 'last_used_at'
+        WHERE table_schema = current_schema()
+          AND table_name = 'auth_sessions'
+          AND column_name = 'last_used_at'
     ) THEN
         ALTER TABLE auth_sessions ADD COLUMN last_used_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
     END IF;

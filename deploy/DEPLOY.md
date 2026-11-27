@@ -54,11 +54,11 @@ VER="$(curl -fsSLI -o /dev/null -w '%{url_effective}' https://github.com/Annihil
 curl -fsSL "https://github.com/Annihilater/coda/releases/download/${VER}/coda-deploy-bundle-${VER}.tar.gz" | tar -xz
 cd coda-deploy-bundle
 
-# 2. 预拉取镜像并一键启动（若无 .env，脚本会自动根据 env.example 生成随机密钥的 .env，并预设 https://codahub.dev）
+# 2. 预拉取镜像并一键启动（若无 .env，脚本会自动根据 env.example 生成随机密钥的 .env；默认留空 CODA_PUBLIC_URL= 按每次请求自动推导，生产环境建议显式设置 CODA_PUBLIC_URL=https://codahub.dev）
 ./pull.sh
 ./start.sh
 
-# （可选）如需自定义端口、中继密钥或关闭开放注册，查看 env.example 并编辑 .env 后执行 ./restart.sh
+# （推荐）生产环境显式设置 CODA_PUBLIC_URL=https://codahub.dev（或自定义端口、中继密钥与开放注册策略），编辑 .env 后执行 ./restart.sh
 vim .env
 ./restart.sh
 ```

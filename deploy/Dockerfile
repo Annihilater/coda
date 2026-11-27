@@ -5,9 +5,9 @@ COPY assets ./assets
 COPY web/package.json web/bun.lock ./web/
 WORKDIR /app/web
 RUN bun install --frozen-lockfile
-COPY web/build.ts web/index.html ./
+COPY web/build.ts web/index.html web/manifest.json ./
 COPY web/src ./src
-RUN bun run build
+RUN bun run build && test -f dist/manifest.json && test -f dist/sw.js
 
 FROM rust:bookworm AS rust-builder
 RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libzstd-dev && rm -rf /var/lib/apt/lists/*

@@ -3471,3 +3471,131 @@ async fn test_v110_admin_friend_reset_vapid_web_push_and_prompt_snippets() {
     wp_server_task.abort();
     let _ = std::fs::remove_dir_all(&tmp_web_dist);
 }
+
+#[tokio::test]
+async fn test_fresh_empty_schema_init_and_idempotent_remigration() {
+    const INIT_SQL: &str = include_str!("../../../migrations/001_init.sql");
+
+    let db_url = std::env::var("TEST_DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://vampire@localhost:5432/coda_test".to_string());
+    let (pg, conn) = tokio_postgres::connect(&db_url, tokio_postgres::NoTls)
+        .await
+        .expect("PostgreSQL coda_test should be reachable");
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let schema_name = format!("fresh_init_{}", uuid::Uuid::new_v4().simple());
+    let pure_schema = format!("fresh_pure_{}", uuid::Uuid::new_v4().simple());
+
+    pg.batch_execute(&format!(
+        "CREATE SCHEMA {schema_name}; CREATE SCHEMA {pure_schema};"
+    ))
+    .await
+    .expect("create isolated temporary PostgreSQL schemas");
+
+    let verification: Result<(), String> = async {
+        // 1. Set search_path to ONLY `fresh_init_<uuid>, public` with zero pre-existing tables in `fresh_init_<uuid>`.
+        pg.batch_execute(&format!("SET search_path TO {schema_name}, public;"))
+            .await
+            .map_err(|e| format!("failed setting search_path: {e}"))?;
+
+        let active_schema: String = pg
+            .query_one("SELECT current_schema()", &[])
+            .await
+            .map_err(|e| format!("failed querying current_schema: {e}"))?
+            .get(0);
+        if active_schema != schema_name {
+            return Err(format!(
+                "expected current_schema() == {schema_name}, got {active_schema}"
+            ));
+        }
+
+        let initial_tables: i64 = pg
+            .query_one(
+                "SELECT COUNT(*)::BIGINT FROM information_schema.tables WHERE table_schema = $1",
+                &[&schema_name],
+            )
+            .await
+            .map_err(|e| format!("failed counting initial tables: {e}"))?
+            .get(0);
+        if initial_tables != 0 {
+            return Err(format!(
+                "expected 0 pre-existing tables in {schema_name}, found {initial_tables}"
+            ));
+        }
+
+        // Execute `migrations/001_init.sql` TWICE in a row (fresh bootstrap + idempotent re-run).
+        pg.batch_execute(INIT_SQL)
+            .await
+            .map_err(|e| format!("first fresh 001_init.sql execution failed in {schema_name}: {e}"))?;
+        pg.batch_execute(INIT_SQL).await.map_err(|e| {
+            format!("second idempotent 001_init.sql execution failed in {schema_name}: {e}")
+        })?;
+
+        let created_tables: i64 = pg
+            .query_one(
+                "SELECT COUNT(*)::BIGINT FROM information_schema.tables WHERE table_schema = $1",
+                &[&schema_name],
+            )
+            .await
+            .map_err(|e| format!("failed counting created tables: {e}"))?
+            .get(0);
+        if created_tables != 12 {
+            return Err(format!(
+                "expected 12 tables in {schema_name}, found {created_tables}"
+            ));
+        }
+
+        // Verify every FK in `fresh_init_<uuid>` points strictly inside `fresh_init_<uuid>` (never leaking to `public`).
+        let cross_schema_fks: i64 = pg
+            .query_one(
+                r#"
+                SELECT COUNT(*)::BIGINT
+                FROM pg_constraint c
+                JOIN pg_namespace n_src ON n_src.oid = c.connamespace
+                JOIN pg_class rel_dst ON rel_dst.oid = c.confrelid
+                JOIN pg_namespace n_dst ON n_dst.oid = rel_dst.relnamespace
+                WHERE c.contype = 'f'
+                  AND n_src.nspname = $1
+                  AND n_dst.nspname <> $1
+                "#,
+                &[&schema_name],
+            )
+            .await
+            .map_err(|e| format!("failed checking FK target schemas: {e}"))?
+            .get(0);
+        if cross_schema_fks != 0 {
+            return Err(format!(
+                "expected 0 cross-schema foreign keys in {schema_name}, found {cross_schema_fks}"
+            ));
+        }
+
+        // 2. Also prove bootstrap + re-migration with `public` completely absent from `search_path`
+        //    (simulating a brand-new empty PostgreSQL 18 database with zero tables anywhere on `search_path`).
+        pg.batch_execute(&format!("SET search_path TO {pure_schema}, pg_catalog;"))
+            .await
+            .map_err(|e| format!("failed setting pure search_path: {e}"))?;
+        pg.batch_execute(INIT_SQL)
+            .await
+            .map_err(|e| format!("first pure-empty 001_init.sql execution failed: {e}"))?;
+        pg.batch_execute(INIT_SQL)
+            .await
+            .map_err(|e| format!("second pure-empty 001_init.sql execution failed: {e}"))?;
+
+        Ok(())
+    }
+    .await;
+
+    // Always clean up temporary schemas before panicking on any failure.
+    let cleanup_res = pg
+        .batch_execute(&format!(
+            "SET search_path TO public; DROP SCHEMA IF EXISTS {schema_name} CASCADE; DROP SCHEMA IF EXISTS {pure_schema} CASCADE;"
+        ))
+        .await;
+
+    if let Err(err) = verification {
+        panic!("fresh schema init / idempotent remigration test failed: {err}");
+    }
+    cleanup_res.expect("drop temporary fresh_init schemas cleanly");
+}
