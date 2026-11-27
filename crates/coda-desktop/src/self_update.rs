@@ -1,10 +1,11 @@
 //! In-app one-click self-updater for `Coda.app` (`coda-desktop`).
 //!
-//! Checks `/api/v1/site-info` (and `/api/v1/public/site-info`) with fallback to GitHub Releases
+//! Checks `/api/v1/public/site-info` (and `/api/v1/site-info`) with fallback to GitHub Releases
 //! `/releases/latest` redirect tag against `env!("CARGO_PKG_VERSION")`, strictly verifies the
 //! downloaded `coda-macos-aarch64-vX.Y.Z.tar.gz` SHA-256 hex digest against `SHA256SUMS`, stages
 //! the extracted binary next to `resolve_clean_exe_path()` (`Contents/MacOS/.coda-desktop.new-<pid>`),
 //! strips `com.apple.quarantine`, runs `<staged_bin> --version`, atomically `rename()`s in place,
+//! updates `Contents/Info.plist`, re-signs `<AppRoot>.app` ad-hoc (`codesign --force --deep --sign -`),
 //! and relaunches `Coda.app` cleanly.
 
 use std::cmp::Ordering;
@@ -336,13 +337,21 @@ pub fn verify_sha256_sums_strict(
     ))
 }
 
-async fn fetch_site_info_version(http: &reqwest::Client, server_url: &str) -> Option<String> {
+/// Returns ordered `site-info` probe URLs, querying `/api/v1/public/site-info` BEFORE
+/// `/api/v1/site-info` so `coda-server` responds 200 on the first request without a 404 probe.
+pub fn build_site_info_probe_urls(server_url: &str) -> Vec<String> {
     let base = server_url.trim().trim_end_matches('/');
     if !is_safe_http_url(base) {
-        return None;
+        return Vec::new();
     }
-    for route in ["/api/v1/site-info", "/api/v1/public/site-info"] {
-        let url = format!("{base}{route}");
+    ["/api/v1/public/site-info", "/api/v1/site-info"]
+        .into_iter()
+        .map(|route| format!("{base}{route}"))
+        .collect()
+}
+
+async fn fetch_site_info_version(http: &reqwest::Client, server_url: &str) -> Option<String> {
+    for url in build_site_info_probe_urls(server_url) {
         let Ok(resp) = http.get(&url).send().await else {
             continue;
         };
@@ -578,6 +587,162 @@ fn strip_macos_quarantine_best_effort(target: &Path) {
     }
 }
 
+fn replace_plist_key_string_value(xml: &str, key_name: &str, new_val: &str) -> Option<String> {
+    let key_tag = format!("<key>{key_name}</key>");
+    let key_pos = xml.find(&key_tag)?;
+    let after_key = key_pos + key_tag.len();
+    let rest = &xml[after_key..];
+    let trimmed_ws_len = rest.len() - rest.trim_start().len();
+    let after_ws = &rest[trimmed_ws_len..];
+    let inner = after_ws.strip_prefix("<string>")?;
+    let close_offset = inner.find("</string>")?;
+    let replace_start = after_key + trimmed_ws_len + "<string>".len();
+    let replace_end = replace_start + close_offset;
+    let mut out = String::with_capacity(xml.len() + new_val.len());
+    out.push_str(&xml[..replace_start]);
+    out.push_str(new_val);
+    out.push_str(&xml[replace_end..]);
+    Some(out)
+}
+
+/// Pure XML transformer that updates `CFBundleShortVersionString` and `CFBundleVersion` in a
+/// macOS `Info.plist` document to `target_tag.trim_start_matches('v')`.
+pub fn patch_plist_xml_bundle_versions(
+    plist_xml: &str,
+    target_tag_or_version: &str,
+) -> Result<String, String> {
+    let normalized = normalize_version_tag(target_tag_or_version).ok_or_else(|| {
+        format!("Invalid target version `{target_tag_or_version}` for Info.plist update")
+    })?;
+    let short_ver = normalized.trim_start_matches('v');
+    let mut updated = plist_xml.to_string();
+    let mut patched_any = false;
+    for key in ["CFBundleShortVersionString", "CFBundleVersion"] {
+        if let Some(next) = replace_plist_key_string_value(&updated, key, short_ver) {
+            updated = next;
+            patched_any = true;
+        }
+    }
+    if !patched_any {
+        return Err(
+            "Info.plist is missing CFBundleShortVersionString / CFBundleVersion keys".to_string(),
+        );
+    }
+    Ok(updated)
+}
+
+/// Atomically updates `CFBundleShortVersionString` and `CFBundleVersion` inside `<App>.app/Contents/Info.plist`.
+/// Returns `Ok(false)` when `plist_path` does not exist.
+pub fn patch_macos_info_plist_version(
+    plist_path: &Path,
+    target_tag_or_version: &str,
+) -> Result<bool, String> {
+    let normalized = normalize_version_tag(target_tag_or_version).ok_or_else(|| {
+        format!("Invalid target version `{target_tag_or_version}` for Info.plist update")
+    })?;
+    if !plist_path.is_file() {
+        return Ok(false);
+    }
+    let existing = std::fs::read_to_string(plist_path).map_err(|e| {
+        format!(
+            "Failed reading `{}` for version update: {e}",
+            plist_path.display()
+        )
+    })?;
+    let updated = patch_plist_xml_bundle_versions(&existing, &normalized)?;
+    let parent = plist_path
+        .parent()
+        .ok_or_else(|| format!("Info.plist `{}` has no parent directory", plist_path.display()))?;
+    let tmp_plist = parent.join(format!(
+        ".Info.plist.new-{}-{}",
+        std::process::id(),
+        &Uuid::new_v4().simple().to_string()[..8]
+    ));
+    let _ = std::fs::remove_file(&tmp_plist);
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_plist)
+            .map_err(|e| format!("Failed staging `{}`: {e}", tmp_plist.display()))?;
+        f.write_all(updated.as_bytes())
+            .and_then(|_| f.sync_all())
+            .map_err(|e| {
+                let _ = std::fs::remove_file(&tmp_plist);
+                format!("Failed writing staged Info.plist: {e}")
+            })?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&tmp_plist, std::fs::Permissions::from_mode(0o644));
+    }
+    if let Err(e) = std::fs::rename(&tmp_plist, plist_path) {
+        let _ = std::fs::remove_file(&tmp_plist);
+        return Err(format!(
+            "Failed atomically replacing `{}`: {e}",
+            plist_path.display()
+        ));
+    }
+    tracing::info!(
+        "Updated `{}` bundle version to `{}`",
+        plist_path.display(),
+        normalized.trim_start_matches('v')
+    );
+    Ok(true)
+}
+
+/// Re-signs `<AppRoot>.app` ad-hoc via `/usr/bin/codesign --force --deep --sign - <AppRoot>.app`
+/// so `Contents/_CodeSignature/CodeResources`, `Info.plist` (`dev.codahub.desktop`), and
+/// `Contents/MacOS/coda-desktop` remain sealed and pass `codesign --verify --deep --strict`.
+pub fn resign_macos_app_bundle_adhoc(app_root: &Path) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut cmd = std::process::Command::new("/usr/bin/codesign");
+        cmd.args(["--force", "--deep", "--sign", "-"]).arg(app_root);
+        let out = run_process_bounded(cmd, Duration::from_secs(20)).map_err(|e| {
+            tracing::error!(
+                "Failed invoking `/usr/bin/codesign` on `{}`: {e}",
+                app_root.display()
+            );
+            format!(
+                "Failed invoking `/usr/bin/codesign` on `{}`: {e}",
+                app_root.display()
+            )
+        })?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            tracing::error!(
+                "Ad-hoc bundle codesign failed for `{}` ({}): {stderr}",
+                app_root.display(),
+                out.status
+            );
+            return Err(format!(
+                "Ad-hoc bundle codesign failed for `{}` ({}): {stderr}",
+                app_root.display(),
+                out.status
+            ));
+        }
+        tracing::info!(
+            "Re-signed macOS app bundle `{}` ad-hoc after self-update",
+            app_root.display()
+        );
+        Ok(())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = app_root;
+        Ok(())
+    }
+}
+
+fn extract_version_tag_from_smoke_stdout(version_stdout: &str) -> Option<String> {
+    version_stdout
+        .split_whitespace()
+        .rev()
+        .find_map(normalize_version_tag)
+}
+
 fn locate_extracted_desktop_binary(unpack_dir: &Path) -> Result<PathBuf, String> {
     let preferred = unpack_dir.join("coda-macos-aarch64").join("coda-desktop");
     if let Ok(meta) = std::fs::symlink_metadata(&preferred) {
@@ -620,11 +785,21 @@ fn locate_extracted_desktop_binary(unpack_dir: &Path) -> Result<PathBuf, String>
 
 /// Extracts `coda-macos-aarch64/coda-desktop` from `archive_bytes`, stages it at
 /// `<exe_dir>/.coda-desktop.new-<pid>` (`0o755`), strips `com.apple.quarantine`, runs
-/// `<staged_bin> --version` smoke check, and atomically `rename()`s over `target_exe`.
+/// `<staged_bin> --version` smoke check, atomically `rename()`s over `target_exe`, and when inside
+/// `<AppRoot>.app`, patches `Contents/Info.plist` and re-signs `<AppRoot>.app` ad-hoc.
 pub fn stage_and_swap_extracted_desktop_binary(
     archive_bytes: &[u8],
     target_exe: &Path,
     pid: u32,
+) -> Result<String, String> {
+    stage_and_swap_extracted_desktop_binary_with_tag(archive_bytes, target_exe, pid, None)
+}
+
+pub fn stage_and_swap_extracted_desktop_binary_with_tag(
+    archive_bytes: &[u8],
+    target_exe: &Path,
+    pid: u32,
+    target_tag: Option<&str>,
 ) -> Result<String, String> {
     let staged_path = staged_executable_path_for(target_exe, pid)?;
     let work_dir = std::env::temp_dir().join(format!(
@@ -720,7 +895,22 @@ pub fn stage_and_swap_extracted_desktop_binary(
         }
 
         if let Some(app_root) = detect_macos_app_bundle_root(target_exe) {
+            let resolved_tag = target_tag
+                .and_then(normalize_version_tag)
+                .or_else(|| extract_version_tag_from_smoke_stdout(&version_stdout));
+            let plist_path = app_root.join("Contents").join("Info.plist");
+            if let Some(ref tag_for_plist) = resolved_tag {
+                patch_macos_info_plist_version(&plist_path, tag_for_plist)?;
+            }
             strip_macos_quarantine_best_effort(&app_root);
+            if plist_path.is_file() {
+                resign_macos_app_bundle_adhoc(&app_root)?;
+            } else {
+                tracing::warn!(
+                    "Bundle `{}` has no Contents/Info.plist; skipping deep bundle codesign",
+                    app_root.display()
+                );
+            }
         } else {
             strip_macos_quarantine_best_effort(target_exe);
         }
@@ -759,6 +949,40 @@ where
     .await
 }
 
+/// Builds ordered `(archive_urls, checksum_urls)` candidates for `target_tag`, querying
+/// `/download/checksums.txt` and `SHA256SUMS-{tag}.txt` / `SHA256SUMS.txt` BEFORE bare `SHA256SUMS`
+/// so real releases succeed without 404 probes.
+pub fn build_update_download_candidates(
+    server_url: &str,
+    github_download_base: &str,
+    target_tag: &str,
+    server_matches_tag: bool,
+) -> Result<(Vec<String>, Vec<String>), String> {
+    let tag = normalize_version_tag(target_tag)
+        .ok_or_else(|| format!("Invalid target release version `{target_tag}`"))?;
+    let versioned_asset = format!("coda-macos-aarch64-{tag}.tar.gz");
+    let clean_srv = server_url.trim().trim_end_matches('/');
+    let clean_gh = github_download_base.trim().trim_end_matches('/');
+
+    let mut archive_urls = Vec::new();
+    let mut checksum_urls = Vec::new();
+    if server_matches_tag && is_allowed_download_origin(clean_srv) {
+        archive_urls.push(format!("{clean_srv}/download/desktop-macos.tar.gz"));
+        checksum_urls.push(format!("{clean_srv}/download/checksums.txt"));
+        checksum_urls.push(format!("{clean_srv}/download/SHA256SUMS"));
+    }
+    if is_allowed_download_origin(clean_gh) {
+        archive_urls.push(format!("{clean_gh}/{tag}/{versioned_asset}"));
+        checksum_urls.push(format!("{clean_gh}/{tag}/SHA256SUMS-{tag}.txt"));
+        checksum_urls.push(format!("{clean_gh}/{tag}/SHA256SUMS.txt"));
+        checksum_urls.push(format!("{clean_gh}/{tag}/SHA256SUMS"));
+    }
+    if archive_urls.is_empty() {
+        return Err("No valid HTTPS download endpoint configured".to_string());
+    }
+    Ok((archive_urls, checksum_urls))
+}
+
 pub async fn download_verify_and_stage_update_with_bases<F>(
     server_url: &str,
     github_download_base: &str,
@@ -775,26 +999,12 @@ where
         .ok_or_else(|| format!("Invalid target release version `{target_tag}`"))?;
     let versioned_asset = format!("coda-macos-aarch64-{tag}.tar.gz");
     let unversioned_asset = "coda-macos-aarch64.tar.gz";
-
-    let clean_srv = server_url.trim().trim_end_matches('/');
-    let clean_gh = github_download_base.trim().trim_end_matches('/');
-
-    let mut archive_urls = Vec::new();
-    let mut checksum_urls = Vec::new();
-    if server_matches_tag && is_allowed_download_origin(clean_srv) {
-        archive_urls.push(format!("{clean_srv}/download/desktop-macos.tar.gz"));
-        checksum_urls.push(format!("{clean_srv}/download/SHA256SUMS"));
-        checksum_urls.push(format!("{clean_srv}/download/checksums.txt"));
-    }
-    if is_allowed_download_origin(clean_gh) {
-        archive_urls.push(format!("{clean_gh}/{tag}/{versioned_asset}"));
-        checksum_urls.push(format!("{clean_gh}/{tag}/SHA256SUMS"));
-        checksum_urls.push(format!("{clean_gh}/{tag}/SHA256SUMS-{tag}.txt"));
-        checksum_urls.push(format!("{clean_gh}/{tag}/SHA256SUMS.txt"));
-    }
-    if archive_urls.is_empty() {
-        return Err("No valid HTTPS download endpoint configured".to_string());
-    }
+    let (archive_urls, checksum_urls) = build_update_download_candidates(
+        server_url,
+        github_download_base,
+        &tag,
+        server_matches_tag,
+    )?;
 
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(60))
@@ -861,11 +1071,17 @@ where
         &archive_bytes,
     )?;
 
-    on_progress("Staging, stripping quarantine & verifying new binary…");
+    on_progress("Staging binary, updating Info.plist & re-signing Coda.app…");
     let target_owned = target_exe.to_path_buf();
+    let tag_owned = tag.clone();
     let pid = std::process::id();
     let reported = tokio::task::spawn_blocking(move || {
-        stage_and_swap_extracted_desktop_binary(&archive_bytes, &target_owned, pid)
+        stage_and_swap_extracted_desktop_binary_with_tag(
+            &archive_bytes,
+            &target_owned,
+            pid,
+            Some(&tag_owned),
+        )
     })
     .await
     .map_err(|e| format!("Update staging task panicked: {e}"))??;
@@ -1059,8 +1275,88 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_url_probe_candidate_order_avoids_guaranteed_404s() {
+        let site_urls = build_site_info_probe_urls("https://codahub.dev/");
+        assert_eq!(
+            site_urls,
+            vec![
+                "https://codahub.dev/api/v1/public/site-info".to_string(),
+                "https://codahub.dev/api/v1/site-info".to_string(),
+            ],
+            "must probe /api/v1/public/site-info BEFORE /api/v1/site-info"
+        );
+
+        let (archives, checksums) = build_update_download_candidates(
+            "https://codahub.dev/",
+            "https://github.com/Annihilater/coda/releases/download/",
+            "v1.1.1",
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            archives,
+            vec![
+                "https://codahub.dev/download/desktop-macos.tar.gz".to_string(),
+                "https://github.com/Annihilater/coda/releases/download/v1.1.1/coda-macos-aarch64-v1.1.1.tar.gz".to_string(),
+            ]
+        );
+        assert_eq!(
+            checksums,
+            vec![
+                "https://codahub.dev/download/checksums.txt".to_string(),
+                "https://codahub.dev/download/SHA256SUMS".to_string(),
+                "https://github.com/Annihilater/coda/releases/download/v1.1.1/SHA256SUMS-v1.1.1.txt".to_string(),
+                "https://github.com/Annihilater/coda/releases/download/v1.1.1/SHA256SUMS.txt".to_string(),
+                "https://github.com/Annihilater/coda/releases/download/v1.1.1/SHA256SUMS".to_string(),
+            ],
+            "checksums.txt and SHA256SUMS-vX.Y.Z.txt / SHA256SUMS.txt must precede bare SHA256SUMS"
+        );
+    }
+
+    #[test]
+    fn test_patch_macos_info_plist_version_inline_and_multiline() {
+        let release_plist = r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleIdentifier</key><string>dev.codahub.desktop</string>
+  <key>CFBundleShortVersionString</key><string>1.0.0</string>
+  <key>CFBundleVersion</key><string>1.0.0</string>
+</dict>
+</plist>
+"#;
+        let patched_inline =
+            patch_plist_xml_bundle_versions(release_plist, "v1.1.1").expect("patch inline plist");
+        assert!(patched_inline.contains("<key>CFBundleShortVersionString</key><string>1.1.1</string>"));
+        assert!(patched_inline.contains("<key>CFBundleVersion</key><string>1.1.1</string>"));
+        assert!(patched_inline.contains("<key>CFBundleIdentifier</key><string>dev.codahub.desktop</string>"));
+
+        let multiline_plist = "<plist><dict>\n  <key>CFBundleShortVersionString</key>\n  <string>0.9.0</string>\n  <key>CFBundleVersion</key>\n  <string>0.9.0</string>\n</dict></plist>\n";
+        let patched_multi =
+            patch_plist_xml_bundle_versions(multiline_plist, "1.2.0-rc.1").expect("patch multiline");
+        assert!(patched_multi.contains("<key>CFBundleShortVersionString</key>\n  <string>1.2.0-rc.1</string>"));
+        assert!(patched_multi.contains("<key>CFBundleVersion</key>\n  <string>1.2.0-rc.1</string>"));
+
+        // Reject hostile / non-SemVer inputs
+        assert!(patch_plist_xml_bundle_versions(release_plist, "1.1.1</string><evil/>").is_err());
+
+        // Atomic file update on disk
+        let tmp_dir = std::env::temp_dir().join(format!("coda-plist-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let plist_file = tmp_dir.join("Info.plist");
+        assert!(!patch_macos_info_plist_version(&plist_file, "v1.1.1").unwrap());
+        std::fs::write(&plist_file, release_plist).unwrap();
+        assert!(patch_macos_info_plist_version(&plist_file, "v1.1.1").unwrap());
+        let on_disk = std::fs::read_to_string(&plist_file).unwrap();
+        assert!(on_disk.contains("<string>1.1.1</string>"));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
     #[tokio::test]
     async fn test_end_to_end_self_update_check_download_verify_stage_and_atomic_swap() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        use std::sync::Arc;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         // Build a real `.tar.gz` containing `coda-macos-aarch64/coda-desktop` shell script that passes `--version`
@@ -1094,17 +1390,53 @@ mod tests {
         let tar_sha256 = hex::encode(Sha256::digest(&tar_bytes));
         let sums_body = format!("{tar_sha256}  coda-macos-aarch64-v1.1.0.tar.gz\n");
 
-        // Create a mock installed `Coda.app/Contents/MacOS/coda-desktop` (v1.0.0)
-        let app_macos_dir = tmp.join("Coda.app").join("Contents").join("MacOS");
+        // Create a realistic installed `Coda.app` bundle (v1.0.0) with Info.plist & Resources/AppIcon.icns
+        let app_root = tmp.join("Coda.app");
+        let app_contents = app_root.join("Contents");
+        let app_macos_dir = app_contents.join("MacOS");
+        let app_res_dir = app_contents.join("Resources");
         std::fs::create_dir_all(&app_macos_dir).unwrap();
+        std::fs::create_dir_all(&app_res_dir).unwrap();
         let installed_exe = app_macos_dir.join("coda-desktop");
         std::fs::write(&installed_exe, b"#!/bin/sh\necho \"coda-desktop 1.0.0\"\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&installed_exe, std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
+        std::fs::write(app_res_dir.join("AppIcon.icns"), b"mock-icns-payload").unwrap();
+        let plist_path = app_contents.join("Info.plist");
+        std::fs::write(
+            &plist_path,
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleExecutable</key><string>coda-desktop</string>
+  <key>CFBundleIconFile</key><string>AppIcon</string>
+  <key>CFBundleIdentifier</key><string>dev.codahub.desktop</string>
+  <key>CFBundleName</key><string>Coda</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleShortVersionString</key><string>1.0.0</string>
+  <key>CFBundleVersion</key><string>1.0.0</string>
+</dict>
+</plist>
+"#,
+        )
+        .unwrap();
+        #[cfg(target_os = "macos")]
+        {
+            resign_macos_app_bundle_adhoc(&app_root).expect("initial bundle sign must pass");
+        }
 
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let base_url = format!("http://127.0.0.1:{port}");
         let tar_for_srv = tar_bytes.clone();
         let sums_for_srv = sums_body.clone();
+        let not_found_hits = Arc::new(AtomicUsize::new(0));
+        let not_found_bg = Arc::clone(&not_found_hits);
 
         tokio::spawn(async move {
             for _ in 0..8 {
@@ -1114,7 +1446,7 @@ mod tests {
                 let mut buf = vec![0u8; 4096];
                 let n = stream.read(&mut buf).await.unwrap_or(0);
                 let req = String::from_utf8_lossy(&buf[..n]);
-                if req.starts_with("GET /api/v1/site-info ") {
+                if req.starts_with("GET /api/v1/public/site-info ") {
                     let body = br#"{"service":"coda-server","version":"v1.1.0"}"#;
                     let hdr = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -1132,7 +1464,7 @@ mod tests {
                     );
                     let _ = stream.write_all(hdr.as_bytes()).await;
                     let _ = stream.write_all(&tar_for_srv).await;
-                } else if req.starts_with("GET /download/SHA256SUMS ") {
+                } else if req.starts_with("GET /download/checksums.txt ") {
                     let hdr = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                         sums_for_srv.len()
@@ -1140,6 +1472,7 @@ mod tests {
                     let _ = stream.write_all(hdr.as_bytes()).await;
                     let _ = stream.write_all(sums_for_srv.as_bytes()).await;
                 } else {
+                    not_found_bg.fetch_add(1, AtomicOrdering::Relaxed);
                     let _ = stream
                         .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
                         .await;
@@ -1147,7 +1480,7 @@ mod tests {
             }
         });
 
-        // 1. Check via `/api/v1/site-info`
+        // 1. Check via `/api/v1/public/site-info` (zero 404 probes!)
         let chk = check_for_desktop_update_with_endpoints(&base_url, None, "1.0.0")
             .await
             .unwrap();
@@ -1168,7 +1501,7 @@ mod tests {
         assert_eq!(gh_fb.latest_version, "v1.2.0");
         assert_eq!(gh_fb.source, "github-releases");
 
-        // 3. Full download -> SHA256SUMS verification -> staging -> `--version` smoke check -> atomic rename
+        // 3. Full download -> checksums.txt verification -> staging -> `--version` smoke check -> atomic rename -> Info.plist patch -> bundle codesign
         let mut steps = Vec::new();
         let ver_out = download_verify_and_stage_update_with_bases(
             &base_url,
@@ -1183,10 +1516,36 @@ mod tests {
         .expect("end-to-end self-update staging must succeed");
         assert_eq!(ver_out, "coda-desktop 1.1.0");
         assert!(steps.len() >= 3);
+        assert_eq!(
+            not_found_hits.load(AtomicOrdering::Relaxed),
+            0,
+            "reordered site-info and checksums.txt URLs must produce zero 404 probes"
+        );
 
-        // Verify target binary was atomically replaced and no `.coda-desktop.new-*` temp file remains!
+        // Verify target binary was atomically replaced, Info.plist updated to 1.1.0, and codesign --verify --deep --strict passes!
         let swapped_content = std::fs::read_to_string(&installed_exe).unwrap();
         assert!(swapped_content.contains("coda-desktop 1.1.0"));
+        let updated_plist = std::fs::read_to_string(&plist_path).unwrap();
+        assert!(
+            updated_plist.contains("<key>CFBundleShortVersionString</key><string>1.1.0</string>"),
+            "plist={updated_plist}"
+        );
+        assert!(
+            updated_plist.contains("<key>CFBundleVersion</key><string>1.1.0</string>"),
+            "plist={updated_plist}"
+        );
+        #[cfg(target_os = "macos")]
+        {
+            let verify_status = std::process::Command::new("/usr/bin/codesign")
+                .args(["--verify", "--deep", "--strict"])
+                .arg(&app_root)
+                .status()
+                .expect("invoke codesign --verify");
+            assert!(
+                verify_status.success(),
+                "`codesign --verify --deep --strict` must pass on updated Coda.app"
+            );
+        }
         assert!(
             !staged_executable_path_for(&installed_exe, std::process::id())
                 .unwrap()

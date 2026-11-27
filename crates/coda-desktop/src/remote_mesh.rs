@@ -26,6 +26,7 @@ use crate::config::{
 };
 use crate::git_inspector::{RepoInspectorSnapshot, WorkspaceFileEntry};
 use crate::helpers::{
+    derive_default_handle_from_email, extract_invite_code_and_origin,
     extract_reset_token_and_origin, format_pasted_terminal_path, herdr_status_to_osc,
     load_desktop_daemon_config, normalize_newlines_for_vt, parse_git_status_short,
     path_within_root, save_desktop_daemon_config,
@@ -611,6 +612,103 @@ pub async fn api_reset_password_with_token(
     Ok(handle)
 }
 
+/// Saves updated webhook settings via `PUT /api/v1/me/notifications` and immediately triggers
+/// `POST /api/v1/me/notifications/test` so newly edited URLs are tested without stale DB state.
+pub async fn api_save_and_test_notification_webhooks(
+    server_url: &str,
+    token: &str,
+    settings: &NotificationWebhookSettings,
+) -> Result<(NotificationWebhookSettings, usize, Vec<String>), String> {
+    let updated = api_put_notification_webhooks(server_url, token, settings).await?;
+    let (delivered, errors) = api_test_notification_webhooks(server_url, token).await?;
+    Ok((updated, delivered, errors))
+}
+
+/// Registers a new Coda account via `POST /api/v1/auth/register`, accepting either a raw invite
+/// code (`CODA-XXXXXX`), an empty invite code (for bootstrap admin / open-registration servers),
+/// or a full `https://.../register?invite=CODA-XXXXXX` link.
+/// Returns `(effective_server_url, registered_email, registered_handle)`.
+pub async fn api_register_account(
+    server_url: &str,
+    email: &str,
+    handle: &str,
+    display_name: &str,
+    password: &str,
+    raw_invite_or_url: &str,
+) -> Result<(String, String, String), String> {
+    let (clean_invite, extracted_origin) = extract_invite_code_and_origin(raw_invite_or_url);
+    let eff_srv = extracted_origin
+        .as_deref()
+        .unwrap_or(server_url)
+        .trim()
+        .trim_end_matches('/')
+        .to_string();
+    if !is_safe_http_url(&eff_srv) {
+        return Err("Invalid server URL (must start with http:// or https://)".into());
+    }
+    let clean_email = email.trim().to_lowercase();
+    if clean_email.is_empty() || !clean_email.contains('@') {
+        return Err("Enter a valid email address".into());
+    }
+    let raw_handle = handle.trim().trim_start_matches('@').to_lowercase();
+    let clean_handle = if raw_handle.is_empty() {
+        derive_default_handle_from_email(&clean_email)
+    } else {
+        raw_handle
+    };
+    if clean_handle.len() < 2 || clean_handle.len() > 32 {
+        return Err("Handle must be between 2 and 32 characters (letters, digits, _ or -)".into());
+    }
+    let clean_display = if display_name.trim().is_empty() {
+        clean_handle.clone()
+    } else {
+        display_name.trim().to_string()
+    };
+    if password.len() < 6 || password.len() > 256 {
+        return Err("Password must be between 6 and 256 characters".into());
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(12))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let invite_opt = (!clean_invite.is_empty()).then_some(clean_invite);
+    let resp = client
+        .post(format!("{eff_srv}/api/v1/auth/register"))
+        .json(&serde_json::json!({
+            "email": clean_email,
+            "handle": clean_handle,
+            "display_name": clean_display,
+            "password": password,
+            "invite_code": invite_opt,
+        }))
+        .send()
+        .await
+        .map_err(|e| format!("POST /api/v1/auth/register failed: {e}"))?;
+    let status = resp.status();
+    let txt = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(extract_api_error_message(&txt, status, "Registration failed"));
+    }
+    let val: serde_json::Value = serde_json::from_str(&txt)
+        .map_err(|e| format!("Invalid /api/v1/auth/register JSON: {e}"))?;
+    let reg_email = val
+        .get("user")
+        .and_then(|u| u.get("email"))
+        .and_then(|v| v.as_str())
+        .unwrap_or(&clean_email)
+        .trim()
+        .to_string();
+    let reg_handle = val
+        .get("user")
+        .and_then(|u| u.get("handle"))
+        .and_then(|v| v.as_str())
+        .unwrap_or(&clean_handle)
+        .trim()
+        .to_string();
+    Ok((eff_srv, reg_email, reg_handle))
+}
+
 pub(crate) static EMBEDDED_HOST_STARTED: AtomicBool = AtomicBool::new(false);
 static PRIMARY_CLIENT_IDENTITY_CLAIMED: AtomicBool = AtomicBool::new(false);
 
@@ -768,6 +866,16 @@ impl RemoteMeshHub {
         self.tunnel_mgr.stop_all();
         if let Ok(mut g) = self.state.lock() {
             g.port_preview.clear_tunnels();
+        }
+        self.ui_dirty.store(true, Ordering::Release);
+    }
+
+    pub fn stop_tunnels_for_host(&self, device_id: Uuid) {
+        self.tunnel_mgr.stop_all_for_device(device_id);
+        if let Ok(mut g) = self.state.lock() {
+            let hosts_snap = g.remote_hosts.clone();
+            g.port_preview
+                .sync_from_manager(&self.tunnel_mgr, &hosts_snap, None);
         }
         self.ui_dirty.store(true, Ordering::Release);
     }
@@ -1276,6 +1384,12 @@ impl RemoteMeshHub {
             g.admin_loading = false;
             g.auth_account_input.clear();
             g.auth_password_input.clear();
+            g.auth_register_mode = false;
+            g.auth_register_email_input.clear();
+            g.auth_register_handle_input.clear();
+            g.auth_register_display_name_input.clear();
+            g.auth_register_password_input.clear();
+            g.auth_register_invite_input.clear();
             g.webhook_settings = NotificationWebhookSettings::default();
             g.webhook_loading = false;
             g.webhook_loaded_ok = false;
@@ -1571,6 +1685,7 @@ impl RemoteMeshHub {
             }
         }
         for stale_id in stale_host_ids {
+            hub_arc.stop_tunnels_for_host(stale_id);
             hub_arc.drop_peer(stale_id).await;
         }
         hub_arc.ui_dirty.store(true, Ordering::Release);
@@ -3762,6 +3877,84 @@ impl RemoteMeshHub {
         });
     }
 
+    pub fn save_and_test_notification_webhooks(
+        self: &Arc<Self>,
+        settings: NotificationWebhookSettings,
+    ) {
+        let hub = Arc::clone(self);
+        self.spawn_bg(async move {
+            let Ok(cfg) = load_desktop_daemon_config(&DaemonConfig::default_path()) else {
+                if let Ok(mut g) = hub.state.lock() {
+                    g.status_notice = Some(
+                        tr(
+                            g.locale,
+                            "Sign in required to test notification webhooks",
+                            "请先登录账号再发送测试推送",
+                        )
+                        .to_string(),
+                    );
+                }
+                hub.ui_dirty.store(true, Ordering::Release);
+                return;
+            };
+            let Some(ref tok) = cfg.session_token else {
+                return;
+            };
+            if let Ok(mut g) = hub.state.lock() {
+                g.webhook_loading = true;
+            }
+            hub.ui_dirty.store(true, Ordering::Release);
+
+            match api_put_notification_webhooks(&cfg.server_url, tok, &settings).await {
+                Ok(updated) => {
+                    if let Ok(mut g) = hub.state.lock() {
+                        g.webhook_loaded_ok = true;
+                        g.webhook_dirty = false;
+                        g.webhook_settings = updated;
+                    }
+                }
+                Err(err) => {
+                    if let Ok(mut g) = hub.state.lock() {
+                        g.webhook_loading = false;
+                        g.status_notice = Some(err);
+                    }
+                    hub.ui_dirty.store(true, Ordering::Release);
+                    return;
+                }
+            }
+
+            match api_test_notification_webhooks(&cfg.server_url, tok).await {
+                Ok((delivered, errors)) => {
+                    if let Ok(mut g) = hub.state.lock() {
+                        g.webhook_loading = false;
+                        g.status_notice = Some(if errors.is_empty() {
+                            format!(
+                                "{}: {delivered}",
+                                tr(
+                                    g.locale,
+                                    "Saved webhooks & delivered test alert to channels",
+                                    "已自动保存配置并送达测试推送渠道数",
+                                )
+                            )
+                        } else {
+                            format!(
+                                "Saved webhooks; delivered {delivered}, errors: {}",
+                                errors.join("; ")
+                            )
+                        });
+                    }
+                }
+                Err(err) => {
+                    if let Ok(mut g) = hub.state.lock() {
+                        g.webhook_loading = false;
+                        g.status_notice = Some(err);
+                    }
+                }
+            }
+            hub.ui_dirty.store(true, Ordering::Release);
+        });
+    }
+
     pub fn test_notification_webhooks(self: &Arc<Self>) {
         let hub = Arc::clone(self);
         self.spawn_bg(async move {
@@ -4767,12 +4960,15 @@ pub(crate) fn spawn_password_login(
                     if let Ok(mut g) = state_bg.lock() {
                         g.is_logged_in = true;
                         g.auth_form_expanded = false;
+                        g.auth_register_mode = false;
+                        g.auth_reset_mode = false;
                         g.auth_loading = false;
                         g.auth_error = None;
                         g.local_host_device_id = Some(cfg.device_id);
                         g.input_target = ActiveInputTarget::TerminalDirect;
                         g.account_email = cfg.owner_email.clone().unwrap_or(email);
                         g.auth_password_input.clear();
+                        g.auth_register_password_input.clear();
                         g.status_notice = Some("Signed in".to_string());
                     }
                     ui_dirty.store(true, Ordering::Release);
@@ -4861,6 +5057,128 @@ pub(crate) fn spawn_password_reset_with_token(
                         g.auth_loading = false;
                         g.auth_error = Some(err.clone());
                         g.status_notice = Some(err);
+                    }
+                    ui_dirty.store(true, Ordering::Release);
+                }
+            }
+        });
+    });
+}
+
+pub(crate) fn spawn_invite_registration(
+    state_bg: Arc<Mutex<CodaDesktopState>>,
+    ui_dirty: Arc<AtomicBool>,
+    mesh_hub: Arc<RemoteMeshHub>,
+    server_url: String,
+    email: String,
+    handle: String,
+    display_name: String,
+    password: String,
+    raw_invite_or_url: String,
+) {
+    std::thread::spawn(move || {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
+            return;
+        };
+        rt.block_on(async move {
+            let (eff_srv, reg_email, reg_handle) = match api_register_account(
+                &server_url,
+                &email,
+                &handle,
+                &display_name,
+                &password,
+                &raw_invite_or_url,
+            )
+            .await
+            {
+                Ok(res) => res,
+                Err(err) => {
+                    if let Ok(mut g) = state_bg.lock() {
+                        g.auth_loading = false;
+                        g.auth_error = Some(err.clone());
+                        g.status_notice = Some(err);
+                    }
+                    ui_dirty.store(true, Ordering::Release);
+                    return;
+                }
+            };
+
+            if eff_srv != server_url.trim().trim_end_matches('/') {
+                let saved_srv = eff_srv.clone();
+                CodaGpuWorkspaceView::update_prefs_async(move |p| {
+                    p.server_url = saved_srv;
+                });
+            }
+
+            let cfg_path = DaemonConfig::default_path();
+            let existing_identity = load_desktop_daemon_config(&cfg_path)
+                .ok()
+                .map(|c| c.identity);
+            match login_with_password_and_enroll_with_identity(
+                &eff_srv,
+                &reg_email,
+                &password,
+                "hybrid",
+                None,
+                existing_identity,
+            )
+            .await
+            {
+                Ok(cfg) => {
+                    mesh_hub.reset_for_account_switch().await;
+                    let _ = save_desktop_daemon_config(&cfg, &cfg_path);
+                    if let Ok(mut g) = state_bg.lock() {
+                        g.server_url = eff_srv;
+                        g.is_logged_in = true;
+                        g.auth_form_expanded = false;
+                        g.auth_register_mode = false;
+                        g.auth_reset_mode = false;
+                        g.auth_loading = false;
+                        g.auth_error = None;
+                        g.local_host_device_id = Some(cfg.device_id);
+                        g.input_target = ActiveInputTarget::TerminalDirect;
+                        g.account_email = cfg.owner_email.clone().unwrap_or(reg_email);
+                        g.account_handle = reg_handle.clone();
+                        g.auth_password_input.clear();
+                        g.auth_register_email_input.clear();
+                        g.auth_register_handle_input.clear();
+                        g.auth_register_display_name_input.clear();
+                        g.auth_register_password_input.clear();
+                        g.auth_register_invite_input.clear();
+                        g.status_notice = Some(format!(
+                            "{} @{reg_handle}",
+                            tr(
+                                g.locale,
+                                "Registered & signed in as",
+                                "账号注册并登录成功",
+                            )
+                        ));
+                    }
+                    ui_dirty.store(true, Ordering::Release);
+                    mesh_hub.ensure_embedded_host();
+                    mesh_hub.start_account_sync();
+                    mesh_hub.fetch_notification_webhooks();
+                    mesh_hub.fetch_prompt_snippets();
+                    mesh_hub.refresh_account_profile_and_admin_data();
+                    mesh_hub.check_desktop_self_update(false);
+                }
+                Err(enroll_err) => {
+                    if let Ok(mut g) = state_bg.lock() {
+                        g.server_url = eff_srv;
+                        g.auth_loading = false;
+                        g.auth_register_mode = false;
+                        g.auth_reset_mode = false;
+                        g.auth_register_password_input.clear();
+                        g.auth_account_input = reg_email;
+                        g.input_target = ActiveInputTarget::AuthPassword;
+                        let msg = format!(
+                            "Account @{reg_handle} created, please sign in ({enroll_err})"
+                        );
+                        g.auth_error = Some(msg.clone());
+                        g.status_notice = Some(msg);
                     }
                     ui_dirty.store(true, Ordering::Release);
                 }

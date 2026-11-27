@@ -1364,14 +1364,28 @@ impl CodaGpuWorkspaceView {
                     })
                     .when(show_auth_form, |el| {
                         let reset_mode = st.auth_reset_mode;
+                        let register_mode = st.auth_register_mode && !reset_mode;
+                        let signin_mode = !reset_mode && !register_mode;
                         let tok_focused = st.input_target == ActiveInputTarget::AuthResetToken;
                         let rpw_focused =
                             st.input_target == ActiveInputTarget::AuthResetNewPassword;
+                        let reg_inv_focused =
+                            st.input_target == ActiveInputTarget::AuthRegisterInviteCode;
+                        let reg_email_focused =
+                            st.input_target == ActiveInputTarget::AuthRegisterEmail;
+                        let reg_handle_focused =
+                            st.input_target == ActiveInputTarget::AuthRegisterHandle;
+                        let reg_disp_focused =
+                            st.input_target == ActiveInputTarget::AuthRegisterDisplayName;
+                        let reg_pw_focused =
+                            st.input_target == ActiveInputTarget::AuthRegisterPassword;
                         el.child(
                             div()
                                 .flex()
+                                .flex_wrap()
                                 .items_center()
                                 .justify_between()
+                                .gap(px(6.0))
                                 .child(
                                     div()
                                         .text_size(px(11.5))
@@ -1383,6 +1397,12 @@ impl CodaGpuWorkspaceView {
                                                 "Reset Password with Token",
                                                 "使用一次性口令重置密码",
                                             )
+                                        } else if register_mode {
+                                            tr(
+                                                loc,
+                                                "Register with Invite Code",
+                                                "使用邀请码注册账号",
+                                            )
                                         } else {
                                             tr(loc, "Coda Account Sign In", "Coda 账号登录")
                                         }),
@@ -1390,24 +1410,62 @@ impl CodaGpuWorkspaceView {
                                 .child(
                                     div()
                                         .flex()
+                                        .flex_wrap()
                                         .items_center()
-                                        .gap(px(6.0))
+                                        .gap(px(5.0))
+                                        .child(self.render_setting_pill(
+                                            "settings-btn-tab-signin",
+                                            tr(loc, "Sign In", "账号登录"),
+                                            signin_mode,
+                                            accent,
+                                            cx.listener(|this, _: &ClickEvent, _, cx| {
+                                                if let Ok(mut g) = this.state.lock() {
+                                                    g.auth_reset_mode = false;
+                                                    g.auth_register_mode = false;
+                                                    g.auth_error = None;
+                                                    g.input_selected_all = false;
+                                                    g.input_target = ActiveInputTarget::AuthAccount;
+                                                }
+                                                cx.notify();
+                                            }),
+                                        ))
+                                        .child(self.render_setting_pill(
+                                            "settings-btn-toggle-register-invite",
+                                            tr(
+                                                loc,
+                                                "Register (with Invite Code)",
+                                                "邀请码注册",
+                                            ),
+                                            register_mode,
+                                            accent,
+                                            cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                                if let Ok(mut g) = this.state.lock() {
+                                                    g.auth_register_mode = !register_mode;
+                                                    g.auth_reset_mode = false;
+                                                    g.auth_error = None;
+                                                    g.input_selected_all = false;
+                                                    g.input_target = if g.auth_register_mode {
+                                                        ActiveInputTarget::AuthRegisterInviteCode
+                                                    } else {
+                                                        ActiveInputTarget::AuthAccount
+                                                    };
+                                                }
+                                                cx.notify();
+                                            }),
+                                        ))
                                         .child(self.render_setting_pill(
                                             "settings-btn-toggle-reset-token",
-                                            if reset_mode {
-                                                tr(loc, "Back to Sign In", "返回账号登录")
-                                            } else {
-                                                tr(
-                                                    loc,
-                                                    "Reset Password with Token",
-                                                    "使用重置口令改密",
-                                                )
-                                            },
+                                            tr(
+                                                loc,
+                                                "Reset Password",
+                                                "口令改密",
+                                            ),
                                             reset_mode,
                                             accent,
                                             cx.listener(move |this, _: &ClickEvent, _, cx| {
                                                 if let Ok(mut g) = this.state.lock() {
                                                     g.auth_reset_mode = !reset_mode;
+                                                    g.auth_register_mode = false;
                                                     g.auth_error = None;
                                                     g.input_selected_all = false;
                                                     if g.auth_reset_mode {
@@ -1423,7 +1481,7 @@ impl CodaGpuWorkspaceView {
                                                 cx.notify();
                                             }),
                                         ))
-                                        .when(!reset_mode, |c| {
+                                        .when(signin_mode, |c| {
                                             c.child(self.render_setting_pill(
                                                 "settings-btn-browser-signin",
                                                 tr(
@@ -1463,8 +1521,10 @@ impl CodaGpuWorkspaceView {
                                                     if let Ok(mut g) = this.state.lock() {
                                                         g.auth_form_expanded = false;
                                                         g.auth_reset_mode = false;
+                                                        g.auth_register_mode = false;
                                                         g.auth_reset_token_input.clear();
                                                         g.auth_reset_new_pw_input.clear();
+                                                        g.auth_register_password_input.clear();
                                                         g.input_target =
                                                             ActiveInputTarget::TerminalDirect;
                                                     }
@@ -1474,7 +1534,7 @@ impl CodaGpuWorkspaceView {
                                         }),
                                 ),
                         )
-                        .when(!reset_mode, |el2| {
+                        .when(signin_mode, |el2| {
                             el2.child(
                                 div()
                                     .flex()
@@ -1599,6 +1659,348 @@ impl CodaGpuWorkspaceView {
                                                 this.submit_password_login();
                                                 cx.notify();
                                             })),
+                                    ),
+                            )
+                        })
+                        .when(register_mode, |el2| {
+                            let reg_pw_dots = "•"
+                                .repeat(st.auth_register_password_input.chars().count().min(32));
+                            el2.child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(6.0))
+                                    .child(
+                                        div()
+                                            .id("settings-input-register-invite")
+                                            .occlude()
+                                            .w_full()
+                                            .px(px(8.0))
+                                            .py(px(5.0))
+                                            .rounded(px(4.0))
+                                            .bg(rgb(palette::CANVAS_BG))
+                                            .border_1()
+                                            .border_color(rgb(if reg_inv_focused {
+                                                accent
+                                            } else {
+                                                palette::BORDER
+                                            }))
+                                            .cursor_pointer()
+                                            .font_family("Menlo")
+                                            .text_size(px(10.5))
+                                            .text_color(rgb(
+                                                if st.auth_register_invite_input.is_empty()
+                                                    && !reg_inv_focused
+                                                {
+                                                    palette::TEXT_DIM
+                                                } else {
+                                                    palette::TEXT_PRIMARY
+                                                },
+                                            ))
+                                            .truncate()
+                                            .child(if st.auth_register_invite_input.is_empty() {
+                                                if reg_inv_focused {
+                                                    "▏".to_string()
+                                                } else {
+                                                    tr(
+                                                        loc,
+                                                        "Invite code (CODA-XXXXXX) or paste full https://.../register?invite=... link",
+                                                        "输入邀请码 (CODA-XXXXXX) 或直接粘贴完整邀请链接",
+                                                    )
+                                                    .to_string()
+                                                }
+                                            } else if reg_inv_focused {
+                                                format!("{}▏", st.auth_register_invite_input)
+                                            } else {
+                                                st.auth_register_invite_input.clone()
+                                            })
+                                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                                if let Ok(mut g) = this.state.lock() {
+                                                    g.input_target =
+                                                        ActiveInputTarget::AuthRegisterInviteCode;
+                                                    g.input_selected_all = false;
+                                                }
+                                                cx.notify();
+                                            })),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(6.0))
+                                            .child(
+                                                div()
+                                                    .id("settings-input-register-email")
+                                                    .occlude()
+                                                    .flex_1()
+                                                    .min_w_0()
+                                                    .px(px(8.0))
+                                                    .py(px(5.0))
+                                                    .rounded(px(4.0))
+                                                    .bg(rgb(palette::CANVAS_BG))
+                                                    .border_1()
+                                                    .border_color(rgb(if reg_email_focused {
+                                                        accent
+                                                    } else {
+                                                        palette::BORDER
+                                                    }))
+                                                    .cursor_pointer()
+                                                    .text_size(px(11.0))
+                                                    .text_color(rgb(
+                                                        if st.auth_register_email_input.is_empty()
+                                                            && !reg_email_focused
+                                                        {
+                                                            palette::TEXT_DIM
+                                                        } else {
+                                                            palette::TEXT_PRIMARY
+                                                        },
+                                                    ))
+                                                    .truncate()
+                                                    .child(
+                                                        if st.auth_register_email_input.is_empty() {
+                                                            if reg_email_focused {
+                                                                "▏".to_string()
+                                                            } else {
+                                                                tr(
+                                                                    loc,
+                                                                    "Email (you@example.com)",
+                                                                    "邮箱 (you@example.com)",
+                                                                )
+                                                                .to_string()
+                                                            }
+                                                        } else if reg_email_focused {
+                                                            format!(
+                                                                "{}▏",
+                                                                st.auth_register_email_input
+                                                            )
+                                                        } else {
+                                                            st.auth_register_email_input.clone()
+                                                        },
+                                                    )
+                                                    .on_click(cx.listener(
+                                                        |this, _: &ClickEvent, _, cx| {
+                                                            if let Ok(mut g) = this.state.lock() {
+                                                                g.input_target = ActiveInputTarget::AuthRegisterEmail;
+                                                                g.input_selected_all = false;
+                                                            }
+                                                            cx.notify();
+                                                        },
+                                                    )),
+                                            )
+                                            .child(
+                                                div()
+                                                    .id("settings-input-register-handle")
+                                                    .occlude()
+                                                    .w(px(150.0))
+                                                    .px(px(8.0))
+                                                    .py(px(5.0))
+                                                    .rounded(px(4.0))
+                                                    .bg(rgb(palette::CANVAS_BG))
+                                                    .border_1()
+                                                    .border_color(rgb(if reg_handle_focused {
+                                                        accent
+                                                    } else {
+                                                        palette::BORDER
+                                                    }))
+                                                    .cursor_pointer()
+                                                    .text_size(px(11.0))
+                                                    .text_color(rgb(
+                                                        if st.auth_register_handle_input.is_empty()
+                                                            && !reg_handle_focused
+                                                        {
+                                                            palette::TEXT_DIM
+                                                        } else {
+                                                            palette::TEXT_PRIMARY
+                                                        },
+                                                    ))
+                                                    .truncate()
+                                                    .child(
+                                                        if st.auth_register_handle_input.is_empty()
+                                                        {
+                                                            if reg_handle_focused {
+                                                                "▏".to_string()
+                                                            } else {
+                                                                tr(
+                                                                    loc,
+                                                                    "Handle (e.g. alice)",
+                                                                    "用户名 handle",
+                                                                )
+                                                                .to_string()
+                                                            }
+                                                        } else if reg_handle_focused {
+                                                            format!(
+                                                                "{}▏",
+                                                                st.auth_register_handle_input
+                                                            )
+                                                        } else {
+                                                            st.auth_register_handle_input.clone()
+                                                        },
+                                                    )
+                                                    .on_click(cx.listener(
+                                                        |this, _: &ClickEvent, _, cx| {
+                                                            if let Ok(mut g) = this.state.lock() {
+                                                                g.input_target = ActiveInputTarget::AuthRegisterHandle;
+                                                                g.input_selected_all = false;
+                                                            }
+                                                            cx.notify();
+                                                        },
+                                                    )),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(6.0))
+                                            .child(
+                                                div()
+                                                    .id("settings-input-register-display")
+                                                    .occlude()
+                                                    .flex_1()
+                                                    .min_w_0()
+                                                    .px(px(8.0))
+                                                    .py(px(5.0))
+                                                    .rounded(px(4.0))
+                                                    .bg(rgb(palette::CANVAS_BG))
+                                                    .border_1()
+                                                    .border_color(rgb(if reg_disp_focused {
+                                                        accent
+                                                    } else {
+                                                        palette::BORDER
+                                                    }))
+                                                    .cursor_pointer()
+                                                    .text_size(px(11.0))
+                                                    .text_color(rgb(
+                                                        if st
+                                                            .auth_register_display_name_input
+                                                            .is_empty()
+                                                            && !reg_disp_focused
+                                                        {
+                                                            palette::TEXT_DIM
+                                                        } else {
+                                                            palette::TEXT_PRIMARY
+                                                        },
+                                                    ))
+                                                    .truncate()
+                                                    .child(
+                                                        if st
+                                                            .auth_register_display_name_input
+                                                            .is_empty()
+                                                        {
+                                                            if reg_disp_focused {
+                                                                "▏".to_string()
+                                                            } else {
+                                                                tr(
+                                                                    loc,
+                                                                    "Display name (optional)",
+                                                                    "显示昵称（可选）",
+                                                                )
+                                                                .to_string()
+                                                            }
+                                                        } else if reg_disp_focused {
+                                                            format!(
+                                                                "{}▏",
+                                                                st.auth_register_display_name_input
+                                                            )
+                                                        } else {
+                                                            st.auth_register_display_name_input
+                                                                .clone()
+                                                        },
+                                                    )
+                                                    .on_click(cx.listener(
+                                                        |this, _: &ClickEvent, _, cx| {
+                                                            if let Ok(mut g) = this.state.lock() {
+                                                                g.input_target = ActiveInputTarget::AuthRegisterDisplayName;
+                                                                g.input_selected_all = false;
+                                                            }
+                                                            cx.notify();
+                                                        },
+                                                    )),
+                                            )
+                                            .child(
+                                                div()
+                                                    .id("settings-input-register-pw")
+                                                    .occlude()
+                                                    .w(px(176.0))
+                                                    .px(px(8.0))
+                                                    .py(px(5.0))
+                                                    .rounded(px(4.0))
+                                                    .bg(rgb(palette::CANVAS_BG))
+                                                    .border_1()
+                                                    .border_color(rgb(if reg_pw_focused {
+                                                        accent
+                                                    } else {
+                                                        palette::BORDER
+                                                    }))
+                                                    .cursor_pointer()
+                                                    .text_size(px(11.0))
+                                                    .text_color(rgb(
+                                                        if st.auth_register_password_input.is_empty()
+                                                            && !reg_pw_focused
+                                                        {
+                                                            palette::TEXT_DIM
+                                                        } else {
+                                                            palette::TEXT_PRIMARY
+                                                        },
+                                                    ))
+                                                    .truncate()
+                                                    .child(
+                                                        if st
+                                                            .auth_register_password_input
+                                                            .is_empty()
+                                                        {
+                                                            if reg_pw_focused {
+                                                                "▏".to_string()
+                                                            } else {
+                                                                tr(
+                                                                    loc,
+                                                                    "Password (6+ chars)",
+                                                                    "密码（至少 6 位）",
+                                                                )
+                                                                .to_string()
+                                                            }
+                                                        } else if reg_pw_focused {
+                                                            format!("{reg_pw_dots}▏")
+                                                        } else {
+                                                            reg_pw_dots
+                                                        },
+                                                    )
+                                                    .on_click(cx.listener(
+                                                        |this, _: &ClickEvent, _, cx| {
+                                                            if let Ok(mut g) = this.state.lock() {
+                                                                g.input_target = ActiveInputTarget::AuthRegisterPassword;
+                                                                g.input_selected_all = false;
+                                                            }
+                                                            cx.notify();
+                                                        },
+                                                    )),
+                                            )
+                                            .child(
+                                                div()
+                                                    .id("settings-btn-submit-register")
+                                                    .occlude()
+                                                    .flex_shrink_0()
+                                                    .px(px(11.0))
+                                                    .py(px(5.0))
+                                                    .rounded(px(4.0))
+                                                    .bg(rgb(accent))
+                                                    .hover(|h| h.opacity(0.9))
+                                                    .cursor_pointer()
+                                                    .text_size(px(11.0))
+                                                    .font_weight(FontWeight::SEMIBOLD)
+                                                    .text_color(rgb(palette::CANVAS_BG))
+                                                    .child(if st.auth_loading {
+                                                        tr(loc, "Registering…", "注册中…")
+                                                    } else {
+                                                        tr(loc, "Create Account", "注册并登录")
+                                                    })
+                                                    .on_click(cx.listener(
+                                                        |this, _: &ClickEvent, _, cx| {
+                                                            this.submit_invite_registration();
+                                                            cx.notify();
+                                                        },
+                                                    )),
+                                            ),
                                     ),
                             )
                         })
@@ -1881,7 +2283,11 @@ impl CodaGpuWorkspaceView {
                                     ))
                                     .child(self.render_setting_pill(
                                         "settings-webhook-test",
-                                        tr(loc, "Test Push", "测试推送"),
+                                        if st.webhook_dirty {
+                                            tr(loc, "Save & Test Push", "保存并测试")
+                                        } else {
+                                            tr(loc, "Test Push", "测试推送")
+                                        },
                                         false,
                                         accent,
                                         cx.listener(|this, _: &ClickEvent, _, cx| {
@@ -3734,6 +4140,80 @@ impl CodaGpuWorkspaceView {
                                             .flex()
                                             .flex_wrap()
                                             .gap(px(6.0))
+                                            .when(st.remote_hosts.is_empty(), |empty_el| {
+                                                empty_el.child(
+                                                    div()
+                                                        .id("bootstrap-empty-hosts-hint")
+                                                        .w_full()
+                                                        .p(px(9.0))
+                                                        .rounded(px(6.0))
+                                                        .bg(rgb(palette::SURFACE_BG))
+                                                        .border_1()
+                                                        .border_color(rgb(palette::BORDER))
+                                                        .flex()
+                                                        .items_center()
+                                                        .justify_between()
+                                                        .gap(px(8.0))
+                                                        .child(
+                                                            div()
+                                                                .flex_1()
+                                                                .min_w_0()
+                                                                .text_size(px(11.0))
+                                                                .text_color(rgb(palette::TEXT_MUTED))
+                                                                .child(tr(
+                                                                    loc,
+                                                                    "No remote hosts paired yet. Sign in and run the 1-line daemon install on your Linux/Mac server first.",
+                                                                    "当前暂无已绑定的远端主机。请先登录账号并在目标服务器上执行一行装机命令。",
+                                                                )),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .id("bootstrap-open-account-nodes")
+                                                                .occlude()
+                                                                .flex_shrink_0()
+                                                                .px(px(8.0))
+                                                                .py(px(4.0))
+                                                                .rounded(px(4.0))
+                                                                .bg(rgb(palette::CHROME_BG))
+                                                                .border_1()
+                                                                .border_color(rgb(accent))
+                                                                .hover(|h| h.bg(rgb(palette::HOVER_BG)))
+                                                                .cursor_pointer()
+                                                                .text_size(px(10.5))
+                                                                .text_color(rgb(accent))
+                                                                .child(tr(
+                                                                    loc,
+                                                                    "Account & Nodes",
+                                                                    "账号与节点",
+                                                                ))
+                                                                .on_click(cx.listener(
+                                                                    |this, _: &ClickEvent, _, cx| {
+                                                                        let is_logged = if let Ok(mut g) =
+                                                                            this.state.lock()
+                                                                        {
+                                                                            g.bootstrap_modal.reset();
+                                                                            g.settings_open = true;
+                                                                            g.settings_section =
+                                                                                SettingsSection::Machines;
+                                                                            if !g.is_logged_in {
+                                                                                g.auth_form_expanded =
+                                                                                    true;
+                                                                                g.input_target =
+                                                                                    ActiveInputTarget::AuthAccount;
+                                                                            }
+                                                                            g.is_logged_in
+                                                                        } else {
+                                                                            false
+                                                                        };
+                                                                        if is_logged {
+                                                                            this.reload_account_settings_data();
+                                                                        }
+                                                                        cx.notify();
+                                                                    },
+                                                                )),
+                                                        ),
+                                                )
+                                            })
                                             .children(st.remote_hosts.iter().map(|host| {
                                                 let hid = host.id;
                                                 let is_sel = bm.host_id == Some(hid);

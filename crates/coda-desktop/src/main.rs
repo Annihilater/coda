@@ -105,6 +105,20 @@ fn main() -> Result<()> {
             "password reset token extraction self-test failed"
         );
         anyhow::ensure!(
+            coda_desktop::helpers::extract_invite_code_and_origin(
+                "https://codahub.dev/register?invite=CODA-SELFTEST"
+            ) == (
+                "CODA-SELFTEST".to_string(),
+                Some("https://codahub.dev".to_string())
+            ),
+            "invite link extraction self-test failed"
+        );
+        anyhow::ensure!(
+            coda_desktop::self_update::build_site_info_probe_urls("https://codahub.dev").first()
+                == Some(&"https://codahub.dev/api/v1/public/site-info".to_string()),
+            "site-info URL probe order self-test failed"
+        );
+        anyhow::ensure!(
             coda_desktop::helpers::format_pasted_terminal_path("/tmp/coda-paste-demo.png")
                 == "/tmp/coda-paste-demo.png ",
             "clipboard path helper self-test failed"

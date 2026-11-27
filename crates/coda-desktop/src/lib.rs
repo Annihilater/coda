@@ -4,7 +4,7 @@
 //! - Frameless transparent macOS titlebar merged with unified workspace chrome.
 //! - Real local Unix `openpty` shells & decoupled `herdr-core` (`hc`) persistent sessions.
 //! - TrueColor 24-bit ANSI VT100 rendering in `Menlo` with side-by-side split terminals.
-//! - Live `OSC 7501` agent inbox & 4-mode workbench (`Workbench`, `Terminals`, `Code`, `Board`).
+//! - Live `OSC 7501` agent attention inbox & 2-mode workbench (`Workbench`, `Terminals`).
 //! - Hot-reloadable `~/.config/coda/layout.json` & `~/.config/coda/AGENTS.md`.
 //! - Real Git working-tree diff/commits, workspace file browser, and E2EE Cloud Mesh (`coda-daemon`).
 
@@ -62,8 +62,8 @@ use crate::helpers::path_within_root;
 use crate::notify::{dispatch_native_notification, DesktopNotificationTracker};
 use crate::pty::{AgentLifecycleState, LocalPtyManager, Osc7501Status, StyledTerminalLine};
 use crate::remote_mesh::{
-    spawn_device_login, spawn_password_login, spawn_password_reset_with_token,
-    AdminFriendUserItem, AdminInviteCodeItem,
+    spawn_device_login, spawn_invite_registration, spawn_password_login,
+    spawn_password_reset_with_token, AdminFriendUserItem, AdminInviteCodeItem,
 };
 
 actions!(
@@ -143,6 +143,11 @@ pub enum ActiveInputTarget {
     SnippetPromptInput,
     AuthResetToken,
     AuthResetNewPassword,
+    AuthRegisterInviteCode,
+    AuthRegisterEmail,
+    AuthRegisterHandle,
+    AuthRegisterDisplayName,
+    AuthRegisterPassword,
     AdminInviteNote,
 }
 
@@ -189,7 +194,7 @@ pub struct SpaceEntry {
     pub avatar_color: u32,
 }
 
-/// Live terminal or agent session shown in tabs, the `Agents` inbox, and the Kanban board.
+/// Live terminal or agent session shown in workspace tabs, the `Agents` inbox, and the Terminals grid.
 #[derive(Debug, Clone)]
 pub struct TerminalSessionEntry {
     pub id: String,
@@ -420,9 +425,16 @@ pub struct CodaDesktopState {
     pub snippet_prompt_input: String,
     pub composer_draft_input: String,
     pub quickstart_dismissed: bool,
+    pub has_user_launched_agent: bool,
     pub auth_reset_mode: bool,
     pub auth_reset_token_input: String,
     pub auth_reset_new_pw_input: String,
+    pub auth_register_mode: bool,
+    pub auth_register_email_input: String,
+    pub auth_register_handle_input: String,
+    pub auth_register_display_name_input: String,
+    pub auth_register_password_input: String,
+    pub auth_register_invite_input: String,
     pub account_handle: String,
     pub account_is_admin: bool,
     pub admin_loading: bool,
@@ -514,9 +526,16 @@ impl Default for CodaDesktopState {
             snippet_prompt_input: String::new(),
             composer_draft_input: String::new(),
             quickstart_dismissed: false,
+            has_user_launched_agent: false,
             auth_reset_mode: false,
             auth_reset_token_input: String::new(),
             auth_reset_new_pw_input: String::new(),
+            auth_register_mode: false,
+            auth_register_email_input: String::new(),
+            auth_register_handle_input: String::new(),
+            auth_register_display_name_input: String::new(),
+            auth_register_password_input: String::new(),
+            auth_register_invite_input: String::new(),
             account_handle: String::new(),
             account_is_admin: false,
             admin_loading: false,
@@ -547,6 +566,15 @@ impl CodaDesktopState {
 
     pub fn session_by_id(&self, id: &str) -> Option<&TerminalSessionEntry> {
         self.sessions.iter().find(|s| s.id == id)
+    }
+
+    /// Returns `true` when the 3-Step Quickstart Onboarding Card should remain visible for
+    /// first-time users — even after auto-seeding a default local shell — until they dismiss it,
+    /// pair a remote host, or launch a coding agent.
+    pub fn should_show_quickstart_onboarding(&self) -> bool {
+        !self.quickstart_dismissed
+            && self.remote_hosts.is_empty()
+            && !self.has_user_launched_agent
     }
 
     /// Resolves `(device_id, cwd)` ONLY when the currently focused terminal session (or active
@@ -687,6 +715,8 @@ impl CodaDesktopState {
         self.auth_reset_mode = false;
         self.auth_reset_token_input.clear();
         self.auth_reset_new_pw_input.clear();
+        self.auth_register_mode = false;
+        self.auth_register_password_input.clear();
         self.admin_invite_note_input.clear();
         self.input_selected_all = false;
         if matches!(
@@ -699,6 +729,11 @@ impl CodaDesktopState {
                 | ActiveInputTarget::AuthPassword
                 | ActiveInputTarget::AuthResetToken
                 | ActiveInputTarget::AuthResetNewPassword
+                | ActiveInputTarget::AuthRegisterInviteCode
+                | ActiveInputTarget::AuthRegisterEmail
+                | ActiveInputTarget::AuthRegisterHandle
+                | ActiveInputTarget::AuthRegisterDisplayName
+                | ActiveInputTarget::AuthRegisterPassword
                 | ActiveInputTarget::AdminInviteNote
                 | ActiveInputTarget::SnippetTitleInput
                 | ActiveInputTarget::SnippetPromptInput
@@ -1595,95 +1630,26 @@ impl CodaGpuWorkspaceView {
 
     fn perform_copy_action(&self, force_all_screen: bool, cx: &mut Context<Self>) {
         let copy_res = self.state.lock().ok().and_then(|g| {
-            if g.palette_open {
-                return (!g.palette_query.is_empty()).then(|| (g.palette_query.clone(), false));
+            if let Some(input_txt) = copyable_input_text_for_state(&g) {
+                return Some((input_txt, false));
             }
-            match g.input_target {
-                ActiveInputTarget::AuthServerUrl => {
-                    (!g.server_url.is_empty()).then(|| (g.server_url.clone(), false))
+            if g.input_target == ActiveInputTarget::TerminalDirect
+                && !g.settings_open
+                && !g.bootstrap_modal.open
+            {
+                let id = g.focused_session_id()?.to_string();
+                drop(g);
+                if let Some(selected) = self.extract_selected_terminal_text(&id) {
+                    return Some((selected, false));
                 }
-                ActiveInputTarget::AuthAccount => {
-                    (!g.auth_account_input.is_empty()).then(|| (g.auth_account_input.clone(), false))
+                if force_all_screen {
+                    let g2 = self.state.lock().ok()?;
+                    let sess = g2.session_by_id(&id)?;
+                    let joined = sess.lines.join("\n").trim_end().to_string();
+                    return (!joined.is_empty()).then_some((joined, true));
                 }
-                ActiveInputTarget::RenameDeviceInput => {
-                    (!g.rename_host_input.is_empty()).then(|| (g.rename_host_input.clone(), false))
-                }
-                ActiveInputTarget::TerminalSearch => {
-                    (!g.terminal_search_query.is_empty())
-                        .then(|| (g.terminal_search_query.clone(), false))
-                }
-                ActiveInputTarget::VoiceBaseUrl => {
-                    (!g.voice_base_url.is_empty()).then(|| (g.voice_base_url.clone(), false))
-                }
-                ActiveInputTarget::VoiceModel => {
-                    (!g.voice_model.is_empty()).then(|| (g.voice_model.clone(), false))
-                }
-                ActiveInputTarget::PreviewPort => {
-                    (!g.port_preview.port_input.is_empty())
-                        .then(|| (g.port_preview.port_input.clone(), false))
-                }
-                ActiveInputTarget::PreviewPath => {
-                    (!g.port_preview.path_input.is_empty())
-                        .then(|| (g.port_preview.path_input.clone(), false))
-                }
-                ActiveInputTarget::WebhookBarkUrl => {
-                    (!g.webhook_settings.bark_url.is_empty())
-                        .then(|| (g.webhook_settings.bark_url.clone(), false))
-                }
-                ActiveInputTarget::WebhookTelegramChatId => {
-                    (!g.webhook_settings.telegram_chat_id.is_empty())
-                        .then(|| (g.webhook_settings.telegram_chat_id.clone(), false))
-                }
-                ActiveInputTarget::WebhookFeishuUrl => {
-                    (!g.webhook_settings.feishu_webhook_url.is_empty())
-                        .then(|| (g.webhook_settings.feishu_webhook_url.clone(), false))
-                }
-                ActiveInputTarget::WebhookDiscordUrl => {
-                    (!g.webhook_settings.discord_webhook_url.is_empty())
-                        .then(|| (g.webhook_settings.discord_webhook_url.clone(), false))
-                }
-                ActiveInputTarget::TerminalComposerInput => {
-                    (!g.composer_draft_input.is_empty())
-                        .then(|| (g.composer_draft_input.clone(), false))
-                }
-                ActiveInputTarget::SnippetTitleInput => {
-                    (!g.snippet_title_input.is_empty())
-                        .then(|| (g.snippet_title_input.clone(), false))
-                }
-                ActiveInputTarget::SnippetPromptInput => {
-                    (!g.snippet_prompt_input.is_empty())
-                        .then(|| (g.snippet_prompt_input.clone(), false))
-                }
-                ActiveInputTarget::AuthResetToken => {
-                    (!g.auth_reset_token_input.is_empty())
-                        .then(|| (g.auth_reset_token_input.clone(), false))
-                }
-                ActiveInputTarget::AdminInviteNote => {
-                    (!g.admin_invite_note_input.is_empty())
-                        .then(|| (g.admin_invite_note_input.clone(), false))
-                }
-                ActiveInputTarget::AuthPassword
-                | ActiveInputTarget::AuthResetNewPassword
-                | ActiveInputTarget::ChangePwCurrent
-                | ActiveInputTarget::ChangePwNew
-                | ActiveInputTarget::VoiceApiKey
-                | ActiveInputTarget::WebhookTelegramToken => None,
-                ActiveInputTarget::TerminalDirect if !g.settings_open => {
-                    let id = g.focused_session_id()?.to_string();
-                    drop(g);
-                    if let Some(selected) = self.extract_selected_terminal_text(&id) {
-                        return Some((selected, false));
-                    }
-                    if force_all_screen {
-                        let g2 = self.state.lock().ok()?;
-                        let sess = g2.session_by_id(&id)?;
-                        let joined = sess.lines.join("\n").trim_end().to_string();
-                        return (!joined.is_empty()).then_some((joined, true));
-                    }
-                    None
-                }
-                _ => None,
             }
+            None
         });
         if let Some((text, copied_all)) = copy_res {
             cx.write_to_clipboard(ClipboardItem::new_string(text));
@@ -1803,6 +1769,10 @@ impl CodaGpuWorkspaceView {
                         | ActiveInputTarget::BootstrapGitCloneUrl
                         | ActiveInputTarget::SnippetTitleInput
                         | ActiveInputTarget::AuthResetToken
+                        | ActiveInputTarget::AuthRegisterInviteCode
+                        | ActiveInputTarget::AuthRegisterEmail
+                        | ActiveInputTarget::AuthRegisterHandle
+                        | ActiveInputTarget::AuthRegisterDisplayName
                         | ActiveInputTarget::AdminInviteNote
                 ) {
                 txt.trim().to_string()
@@ -1810,6 +1780,7 @@ impl CodaGpuWorkspaceView {
                 target,
                 ActiveInputTarget::AuthPassword
                     | ActiveInputTarget::AuthResetNewPassword
+                    | ActiveInputTarget::AuthRegisterPassword
                     | ActiveInputTarget::ChangePwCurrent
                     | ActiveInputTarget::ChangePwNew
                     | ActiveInputTarget::VoiceApiKey
@@ -2282,6 +2253,77 @@ impl CodaGpuWorkspaceView {
                     g.auth_error = None;
                 }
             }
+            ActiveInputTarget::AuthRegisterInviteCode => {
+                let mut save_srv_pref: Option<String> = None;
+                if let Ok(mut g) = self.state.lock() {
+                    if g.input_selected_all {
+                        g.auth_register_invite_input.clear();
+                        g.input_selected_all = false;
+                    }
+                    let combined = format!("{}{text}", g.auth_register_invite_input);
+                    let (clean_code, maybe_orig) =
+                        crate::helpers::extract_invite_code_and_origin(&combined);
+                    if let Some(orig) = maybe_orig {
+                        if !g.is_logged_in && g.server_url != orig {
+                            g.server_url = orig.clone();
+                            save_srv_pref = Some(orig);
+                        }
+                        if !clean_code.is_empty() {
+                            g.auth_register_invite_input = clean_code;
+                        } else {
+                            g.auth_register_invite_input = combined;
+                        }
+                    } else {
+                        g.auth_register_invite_input = combined;
+                    }
+                    g.auth_error = None;
+                }
+                if let Some(orig) = save_srv_pref {
+                    Self::update_prefs_async(move |p| {
+                        p.server_url = orig;
+                    });
+                }
+            }
+            ActiveInputTarget::AuthRegisterEmail => {
+                if let Ok(mut g) = self.state.lock() {
+                    if g.input_selected_all {
+                        g.auth_register_email_input.clear();
+                        g.input_selected_all = false;
+                    }
+                    g.auth_register_email_input.push_str(text);
+                    g.auth_error = None;
+                }
+            }
+            ActiveInputTarget::AuthRegisterHandle => {
+                if let Ok(mut g) = self.state.lock() {
+                    if g.input_selected_all {
+                        g.auth_register_handle_input.clear();
+                        g.input_selected_all = false;
+                    }
+                    g.auth_register_handle_input.push_str(text);
+                    g.auth_error = None;
+                }
+            }
+            ActiveInputTarget::AuthRegisterDisplayName => {
+                if let Ok(mut g) = self.state.lock() {
+                    if g.input_selected_all {
+                        g.auth_register_display_name_input.clear();
+                        g.input_selected_all = false;
+                    }
+                    g.auth_register_display_name_input.push_str(text);
+                    g.auth_error = None;
+                }
+            }
+            ActiveInputTarget::AuthRegisterPassword => {
+                if let Ok(mut g) = self.state.lock() {
+                    if g.input_selected_all {
+                        g.auth_register_password_input.clear();
+                        g.input_selected_all = false;
+                    }
+                    g.auth_register_password_input.push_str(text);
+                    g.auth_error = None;
+                }
+            }
             ActiveInputTarget::AdminInviteNote => {
                 if let Ok(mut g) = self.state.lock() {
                     if g.input_selected_all {
@@ -2292,6 +2334,31 @@ impl CodaGpuWorkspaceView {
                 }
             }
             ActiveInputTarget::CommandPalette => {}
+        }
+    }
+
+    pub(crate) fn select_all_active_target(&self) {
+        if let Ok(mut g) = self.state.lock() {
+            if g.palette_open || g.input_target != ActiveInputTarget::TerminalDirect {
+                g.input_selected_all = true;
+            } else if !g.settings_open && !g.bootstrap_modal.open {
+                if let Some(sid) = g.focused_session_id().map(str::to_string) {
+                    if let Some(sess) = g.session_by_id(&sid) {
+                        if let Some((anchor, focus)) =
+                            select_all_terminal_range_for_session(sess)
+                        {
+                            if let Ok(mut sel) = self.terminal_selection.lock() {
+                                *sel = Some(TerminalSelection {
+                                    session_id: sid,
+                                    anchor,
+                                    focus,
+                                    dragging: false,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -2310,11 +2377,7 @@ impl CodaGpuWorkspaceView {
                     cx.stop_propagation();
                 }
                 "a" => {
-                    if let Ok(mut g) = self.state.lock() {
-                        if g.palette_open || g.input_target != ActiveInputTarget::TerminalDirect {
-                            g.input_selected_all = true;
-                        }
-                    }
+                    self.select_all_active_target();
                     cx.notify();
                     cx.stop_propagation();
                 }
@@ -2392,6 +2455,26 @@ impl CodaGpuWorkspaceView {
                                 }
                                 ActiveInputTarget::AuthResetNewPassword => {
                                     g.auth_reset_new_pw_input.clear();
+                                    g.auth_error = None;
+                                }
+                                ActiveInputTarget::AuthRegisterInviteCode => {
+                                    g.auth_register_invite_input.clear();
+                                    g.auth_error = None;
+                                }
+                                ActiveInputTarget::AuthRegisterEmail => {
+                                    g.auth_register_email_input.clear();
+                                    g.auth_error = None;
+                                }
+                                ActiveInputTarget::AuthRegisterHandle => {
+                                    g.auth_register_handle_input.clear();
+                                    g.auth_error = None;
+                                }
+                                ActiveInputTarget::AuthRegisterDisplayName => {
+                                    g.auth_register_display_name_input.clear();
+                                    g.auth_error = None;
+                                }
+                                ActiveInputTarget::AuthRegisterPassword => {
+                                    g.auth_register_password_input.clear();
                                     g.auth_error = None;
                                 }
                                 ActiveInputTarget::AdminInviteNote => {
@@ -3270,11 +3353,100 @@ impl CodaGpuWorkspaceView {
                     cx.notify();
                     cx.stop_propagation();
                 }
+                    "escape" => {
+                        if let Ok(mut g) = self.state.lock() {
+                            g.auth_reset_mode = false;
+                            g.auth_reset_token_input.clear();
+                            g.auth_reset_new_pw_input.clear();
+                            g.input_selected_all = false;
+                            g.input_target = ActiveInputTarget::TerminalDirect;
+                        }
+                        cx.notify();
+                        cx.stop_propagation();
+                    }
+                    _ => {}
+                },
+            ActiveInputTarget::AuthRegisterInviteCode
+            | ActiveInputTarget::AuthRegisterEmail
+            | ActiveInputTarget::AuthRegisterHandle
+            | ActiveInputTarget::AuthRegisterDisplayName
+            | ActiveInputTarget::AuthRegisterPassword => match key {
+                "backspace" => {
+                    if let Ok(mut g) = self.state.lock() {
+                        let sel_all = g.input_selected_all;
+                        g.input_selected_all = false;
+                        g.auth_error = None;
+                        let field = match target {
+                            ActiveInputTarget::AuthRegisterInviteCode => {
+                                &mut g.auth_register_invite_input
+                            }
+                            ActiveInputTarget::AuthRegisterEmail => {
+                                &mut g.auth_register_email_input
+                            }
+                            ActiveInputTarget::AuthRegisterHandle => {
+                                &mut g.auth_register_handle_input
+                            }
+                            ActiveInputTarget::AuthRegisterDisplayName => {
+                                &mut g.auth_register_display_name_input
+                            }
+                            _ => &mut g.auth_register_password_input,
+                        };
+                        if sel_all {
+                            field.clear();
+                        } else {
+                            field.pop();
+                        }
+                    }
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                "tab" => {
+                    if let Ok(mut g) = self.state.lock() {
+                        g.input_selected_all = false;
+                        g.input_target = match target {
+                            ActiveInputTarget::AuthRegisterInviteCode => {
+                                ActiveInputTarget::AuthRegisterEmail
+                            }
+                            ActiveInputTarget::AuthRegisterEmail => {
+                                ActiveInputTarget::AuthRegisterHandle
+                            }
+                            ActiveInputTarget::AuthRegisterHandle => {
+                                ActiveInputTarget::AuthRegisterDisplayName
+                            }
+                            ActiveInputTarget::AuthRegisterDisplayName => {
+                                ActiveInputTarget::AuthRegisterPassword
+                            }
+                            _ => ActiveInputTarget::AuthRegisterInviteCode,
+                        };
+                    }
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                "enter" | "return" => {
+                    if target == ActiveInputTarget::AuthRegisterPassword {
+                        self.submit_invite_registration();
+                    } else if let Ok(mut g) = self.state.lock() {
+                        g.input_selected_all = false;
+                        g.input_target = match target {
+                            ActiveInputTarget::AuthRegisterInviteCode => {
+                                ActiveInputTarget::AuthRegisterEmail
+                            }
+                            ActiveInputTarget::AuthRegisterEmail => {
+                                ActiveInputTarget::AuthRegisterHandle
+                            }
+                            ActiveInputTarget::AuthRegisterHandle => {
+                                ActiveInputTarget::AuthRegisterDisplayName
+                            }
+                            _ => ActiveInputTarget::AuthRegisterPassword,
+                        };
+                    }
+                    cx.notify();
+                    cx.stop_propagation();
+                }
                 "escape" => {
                     if let Ok(mut g) = self.state.lock() {
-                        g.auth_reset_mode = false;
-                        g.auth_reset_token_input.clear();
-                        g.auth_reset_new_pw_input.clear();
+                        g.auth_register_mode = false;
+                        g.auth_register_password_input.clear();
                         g.input_selected_all = false;
                         g.input_target = ActiveInputTarget::TerminalDirect;
                     }
@@ -3556,6 +3728,95 @@ impl CodaGpuWorkspaceView {
             srv,
             raw_tok,
             new_pw,
+        );
+    }
+
+    pub(crate) fn submit_invite_registration(&self) {
+        let (srv, email, handle, display_name, password, raw_invite) = {
+            let Ok(mut g) = self.state.lock() else {
+                return;
+            };
+            if g.auth_loading {
+                return;
+            }
+            let loc = g.locale;
+            let s = g.server_url.trim().to_string();
+            let raw_inv = g.auth_register_invite_input.trim().to_string();
+            let (_clean_inv, extracted_origin) =
+                crate::helpers::extract_invite_code_and_origin(&raw_inv);
+            let eff_srv = extracted_origin.as_deref().unwrap_or(&s);
+            if !is_safe_http_url(eff_srv) {
+                g.auth_error = Some(
+                    tr(
+                        loc,
+                        "Invalid server URL (must start with http:// or https://)",
+                        "无效的服务端地址（必须以 http:// 或 https:// 开头）",
+                    )
+                    .to_string(),
+                );
+                return;
+            }
+            let email = g.auth_register_email_input.trim().to_string();
+            if email.is_empty() || !email.contains('@') {
+                g.auth_error = Some(
+                    tr(
+                        loc,
+                        "Enter a valid email address",
+                        "请输入有效的注册邮箱地址",
+                    )
+                    .to_string(),
+                );
+                return;
+            }
+            let raw_handle = g
+                .auth_register_handle_input
+                .trim()
+                .trim_start_matches('@')
+                .to_string();
+            let eff_handle = if raw_handle.is_empty() {
+                crate::helpers::derive_default_handle_from_email(&email)
+            } else {
+                raw_handle
+            };
+            if eff_handle.len() < 2 {
+                g.auth_error = Some(
+                    tr(
+                        loc,
+                        "Enter a handle (2–32 letters, digits, _ or -)",
+                        "请输入 2–32 位的用户名 handle（字母、数字、_ 或 -）",
+                    )
+                    .to_string(),
+                );
+                return;
+            }
+            let pw = g.auth_register_password_input.clone();
+            if pw.len() < 6 {
+                g.auth_error = Some(
+                    tr(
+                        loc,
+                        "Password must be at least 6 characters",
+                        "注册密码至少需要 6 位字符",
+                    )
+                    .to_string(),
+                );
+                return;
+            }
+            let disp = g.auth_register_display_name_input.trim().to_string();
+            g.auth_loading = true;
+            g.auth_error = None;
+            g.input_selected_all = false;
+            (s, email, eff_handle, disp, pw, raw_inv)
+        };
+        spawn_invite_registration(
+            Arc::clone(&self.state),
+            Arc::clone(&self.ui_dirty),
+            Arc::clone(&self.mesh_hub),
+            srv,
+            email,
+            handle,
+            display_name,
+            password,
+            raw_invite,
         );
     }
 
@@ -4291,9 +4552,12 @@ impl CodaGpuWorkspaceView {
     fn launch_agent_session(&self, agent_cmd: &str) {
         self.ensure_active_space();
         let (space_id, space_name, cwd_str, is_remote, machine_id, hc_path, loc) = {
-            let Ok(g) = self.state.lock() else {
+            let Ok(mut g) = self.state.lock() else {
                 return;
             };
+            if agent_cmd != "shell" {
+                g.has_user_launched_agent = true;
+            }
             let Some(sp) = g.active_space() else {
                 return;
             };
@@ -4642,7 +4906,7 @@ impl CodaGpuWorkspaceView {
         if let Ok(mut mgr) = self.pty_mgr.lock() {
             mgr.kill_session(session_id);
         }
-        self.mesh_hub.stop_all_tunnels_quiet();
+        // Loopback port tunnels are scoped per-host/port, NOT per terminal tab — keep active tunnels alive!
         if let Ok(mut g) = self.state.lock() {
             g.sessions.retain(|s| s.id != session_id);
             g.notify_tracker.prune_session(session_id);
@@ -4683,14 +4947,24 @@ impl CodaGpuWorkspaceView {
         for sid in session_ids {
             self.close_session(&sid);
         }
-        self.mesh_hub.stop_all_tunnels_quiet();
 
+        let mut orphaned_remote_host_id: Option<Uuid> = None;
         if let Ok(mut g) = self.state.lock() {
-            let removed_path = g
+            let removed_meta = g
                 .spaces
                 .iter()
                 .find(|s| s.id == space_id)
-                .map(|s| s.path.clone());
+                .map(|s| (s.path.clone(), s.is_remote, s.machine_id.clone()));
+            let removed_path = removed_meta.as_ref().map(|(p, _, _)| p.clone());
+            if let Some((_, true, ref mid)) = removed_meta {
+                let other_spaces_on_host = g
+                    .spaces
+                    .iter()
+                    .any(|s| s.id != space_id && s.is_remote && s.machine_id == *mid);
+                if !other_spaces_on_host {
+                    orphaned_remote_host_id = Uuid::parse_str(mid).ok();
+                }
+            }
             g.dismissed_spaces.insert(space_id.to_string());
             let sp_owned = space_id.to_string();
             let rp_owned = removed_path.clone();
@@ -4730,6 +5004,9 @@ impl CodaGpuWorkspaceView {
                     });
                 }
             }
+        }
+        if let Some(host_id) = orphaned_remote_host_id {
+            self.mesh_hub.stop_tunnels_for_host(host_id);
         }
         self.refresh_active_space_inspector();
         self.ui_dirty.store(true, Ordering::Release);
@@ -5199,7 +5476,51 @@ impl CodaGpuWorkspaceView {
     }
 
     pub(crate) fn test_notification_webhooks(&self) {
-        self.mesh_hub.test_notification_webhooks();
+        enum TestAction {
+            SaveThenTest(NotificationWebhookSettings),
+            TestOnly,
+            ReloadFirst,
+            Blocked,
+        }
+        let action = match self.state.lock() {
+            Ok(mut g) => {
+                if !g.is_logged_in {
+                    g.status_notice = Some(
+                        tr(
+                            g.locale,
+                            "Sign in required to test notification webhooks",
+                            "请先登录账号再发送测试推送",
+                        )
+                        .to_string(),
+                    );
+                    TestAction::Blocked
+                } else if g.webhook_dirty {
+                    match prepare_webhook_save(&mut g) {
+                        Ok(settings) => TestAction::SaveThenTest(settings),
+                        Err(true) => TestAction::ReloadFirst,
+                        Err(false) => TestAction::Blocked,
+                    }
+                } else {
+                    TestAction::TestOnly
+                }
+            }
+            Err(_) => return,
+        };
+        match action {
+            TestAction::SaveThenTest(settings) => {
+                self.mesh_hub.save_and_test_notification_webhooks(settings);
+            }
+            TestAction::TestOnly => {
+                self.mesh_hub.test_notification_webhooks();
+            }
+            TestAction::ReloadFirst => {
+                self.reload_notification_webhooks();
+                self.ui_dirty.store(true, Ordering::Release);
+            }
+            TestAction::Blocked => {
+                self.ui_dirty.store(true, Ordering::Release);
+            }
+        }
     }
 
     pub(crate) fn prune_offline_web_devices(&self) {
@@ -5903,33 +6224,7 @@ impl Render for CodaGpuWorkspaceView {
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &SelectAllAction, _, cx| {
-                if let Ok(mut g) = this.state.lock() {
-                    if g.input_target != ActiveInputTarget::TerminalDirect {
-                        g.input_selected_all = true;
-                    } else if let Some(sid) = g.focused_session_id().map(str::to_string) {
-                        if let Some(sess) = g.session_by_id(&sid) {
-                            let last_line = sess.styled_lines.len().saturating_sub(1);
-                            let last_col: usize = sess
-                                .styled_lines
-                                .get(last_line)
-                                .map(|l| {
-                                    l.text
-                                        .chars()
-                                        .map(|ch| crate::pty::char_display_width(ch).max(1))
-                                        .sum()
-                                })
-                                .unwrap_or(0);
-                            if let Ok(mut sel) = this.terminal_selection.lock() {
-                                *sel = Some(TerminalSelection {
-                                    session_id: sid,
-                                    anchor: (0, 0),
-                                    focus: (last_line, last_col),
-                                    dragging: false,
-                                });
-                            }
-                        }
-                    }
-                }
+                this.select_all_active_target();
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &ZoomInTerminal, _, cx| {
@@ -7421,16 +7716,13 @@ impl CodaGpuWorkspaceView {
         let line_h = (font_size_px * 1.32).round();
 
         let Some(sess) = sess else {
-            let show_quickstart = pane_slot == SplitPane::Primary
-                && st.remote_hosts.is_empty()
-                && st.sessions.is_empty()
-                && !st.quickstart_dismissed;
+            let show_quickstart =
+                pane_slot == SplitPane::Primary && st.should_show_quickstart_onboarding();
             if show_quickstart {
                 return self.render_quickstart_onboarding_card(st, cx).into_any_element();
             }
             let can_reopen_quickstart = pane_slot == SplitPane::Primary
                 && st.remote_hosts.is_empty()
-                && st.sessions.is_empty()
                 && st.quickstart_dismissed;
             return div()
                 .size_full()
@@ -7780,6 +8072,10 @@ impl CodaGpuWorkspaceView {
                     }
                     cx.notify();
                 }),
+            )
+            .when(
+                pane_slot == SplitPane::Primary && st.should_show_quickstart_onboarding(),
+                |el| el.child(self.render_quickstart_onboarding_banner(st, cx)),
             )
             .when(show_search_bar, |el| {
                 let q_display = if st.terminal_search_query.is_empty() {
@@ -9732,35 +10028,71 @@ impl CodaGpuWorkspaceView {
                     )
                     .child(
                         div()
-                            .id("btn-drawer-open-reset-token")
-                            .occlude()
-                            .px(px(8.0))
-                            .py(px(4.0))
-                            .rounded(px(4.0))
-                            .hover(|h| h.bg(rgb(palette::HOVER_BG)))
-                            .cursor_pointer()
                             .flex()
                             .items_center()
-                            .justify_center()
-                            .text_size(px(10.5))
-                            .text_color(rgb(accent))
-                            .child(tr(
-                                loc,
-                                "Reset Password with Token…",
-                                "使用重置口令重置密码…",
-                            ))
-                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                if let Ok(mut g) = this.state.lock() {
-                                    g.settings_open = true;
-                                    g.settings_section = SettingsSection::Machines;
-                                    g.auth_form_expanded = true;
-                                    g.auth_reset_mode = true;
-                                    g.auth_error = None;
-                                    g.input_selected_all = false;
-                                    g.input_target = ActiveInputTarget::AuthResetToken;
-                                }
-                                cx.notify();
-                            })),
+                            .justify_between()
+                            .gap(px(4.0))
+                            .child(
+                                div()
+                                    .id("btn-drawer-open-register-invite")
+                                    .occlude()
+                                    .px(px(6.0))
+                                    .py(px(4.0))
+                                    .rounded(px(4.0))
+                                    .hover(|h| h.bg(rgb(palette::HOVER_BG)))
+                                    .cursor_pointer()
+                                    .text_size(px(10.5))
+                                    .text_color(rgb(accent))
+                                    .child(tr(
+                                        loc,
+                                        "Register with Invite…",
+                                        "邀请码注册…",
+                                    ))
+                                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                        if let Ok(mut g) = this.state.lock() {
+                                            g.settings_open = true;
+                                            g.settings_section = SettingsSection::Machines;
+                                            g.auth_form_expanded = true;
+                                            g.auth_register_mode = true;
+                                            g.auth_reset_mode = false;
+                                            g.auth_error = None;
+                                            g.input_selected_all = false;
+                                            g.input_target =
+                                                ActiveInputTarget::AuthRegisterInviteCode;
+                                        }
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .id("btn-drawer-open-reset-token")
+                                    .occlude()
+                                    .px(px(6.0))
+                                    .py(px(4.0))
+                                    .rounded(px(4.0))
+                                    .hover(|h| h.bg(rgb(palette::HOVER_BG)))
+                                    .cursor_pointer()
+                                    .text_size(px(10.5))
+                                    .text_color(rgb(accent))
+                                    .child(tr(
+                                        loc,
+                                        "Reset Password…",
+                                        "口令重置密码…",
+                                    ))
+                                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                        if let Ok(mut g) = this.state.lock() {
+                                            g.settings_open = true;
+                                            g.settings_section = SettingsSection::Machines;
+                                            g.auth_form_expanded = true;
+                                            g.auth_reset_mode = true;
+                                            g.auth_register_mode = false;
+                                            g.auth_error = None;
+                                            g.input_selected_all = false;
+                                            g.input_target = ActiveInputTarget::AuthResetToken;
+                                        }
+                                        cx.notify();
+                                    })),
+                            ),
                     )
                     .when_some(st.auth_error.clone(), |el, err| {
                         el.child(
@@ -9917,6 +10249,284 @@ impl CodaGpuWorkspaceView {
                     cx.notify();
                 }))
         }))
+    }
+
+    fn render_quickstart_onboarding_banner(
+        &self,
+        st: &CodaDesktopState,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let loc = st.locale;
+        let accent = st.layout.accent_color_u32();
+        let install_cmd = build_daemon_install_command(&st.server_url);
+
+        let agent_buttons: &[(&str, &str)] = &[
+            ("Claude Code", "claude"),
+            ("Codex", "codex"),
+            ("Grok", "grok"),
+            ("AGY", "agy"),
+            ("Gemini", "gemini"),
+        ];
+
+        div()
+            .id("quickstart-onboarding-banner")
+            .occlude()
+            .flex_shrink_0()
+            .mx(px(12.0))
+            .mt(px(10.0))
+            .mb(px(4.0))
+            .p(px(11.0))
+            .rounded(px(8.0))
+            .bg(rgb(palette::CHROME_BG))
+            .border_1()
+            .border_color(rgb(palette::BORDER_STRONG))
+            .flex()
+            .flex_col()
+            .gap(px(8.0))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                cx.stop_propagation();
+            })
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.0))
+                            .child(
+                                div()
+                                    .text_size(px(12.0))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(palette::TEXT_PRIMARY))
+                                    .child(tr(
+                                        loc,
+                                        "3-Step Quickstart · Coda Agent Mesh",
+                                        "三步快速上手 · Coda 多端智能体工作台",
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(10.5))
+                                    .text_color(rgb(palette::TEXT_DIM))
+                                    .truncate()
+                                    .child(tr(
+                                        loc,
+                                        "1. Pair host · 2. Launch Agent · 3. Lock-Screen Alerts",
+                                        "1. 绑定主机 · 2. 启动智能体 · 3. 配置锁屏推送",
+                                    )),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("btn-dismiss-quickstart-banner")
+                            .occlude()
+                            .flex_shrink_0()
+                            .px(px(7.0))
+                            .py(px(2.5))
+                            .rounded(px(4.0))
+                            .hover(|h| h.bg(rgb(palette::HOVER_BG)))
+                            .cursor_pointer()
+                            .text_size(px(10.5))
+                            .text_color(rgb(palette::TEXT_MUTED))
+                            .child(tr(loc, "Dismiss ×", "关闭 ×"))
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                if let Ok(mut g) = this.state.lock() {
+                                    g.quickstart_dismissed = true;
+                                }
+                                Self::update_prefs_async(|p| {
+                                    p.quickstart_dismissed = true;
+                                });
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(6.0))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .items_center()
+                            .gap(px(5.0))
+                            .child(
+                                div()
+                                    .id("btn-banner-copy-install")
+                                    .occlude()
+                                    .px(px(8.0))
+                                    .py(px(3.5))
+                                    .rounded(px(5.0))
+                                    .bg(rgb(accent))
+                                    .hover(|h| h.opacity(0.92))
+                                    .cursor_pointer()
+                                    .text_size(px(10.5))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(0x09090b))
+                                    .child(tr(
+                                        loc,
+                                        "1. Copy 1-Line Install",
+                                        "1. 复制装机命令",
+                                    ))
+                                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                        cx.write_to_clipboard(ClipboardItem::new_string(
+                                            install_cmd.clone(),
+                                        ));
+                                        if let Ok(mut g) = this.state.lock() {
+                                            g.status_notice = Some(
+                                                tr(
+                                                    g.locale,
+                                                    "Copied 1-line daemon install command",
+                                                    "已复制守护进程一行安装命令",
+                                                )
+                                                .to_string(),
+                                            );
+                                        }
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .id("btn-banner-account")
+                                    .occlude()
+                                    .px(px(8.0))
+                                    .py(px(3.5))
+                                    .rounded(px(5.0))
+                                    .bg(rgb(palette::SURFACE_BG))
+                                    .border_1()
+                                    .border_color(rgb(palette::BORDER))
+                                    .hover(|h| h.bg(rgb(palette::HOVER_BG)))
+                                    .cursor_pointer()
+                                    .text_size(px(10.5))
+                                    .text_color(rgb(palette::TEXT_PRIMARY))
+                                    .child(if st.is_logged_in {
+                                        tr(loc, "Nodes & Account", "账号与节点")
+                                    } else {
+                                        tr(loc, "Sign In", "登录账号")
+                                    })
+                                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                        let is_logged = if let Ok(mut g) = this.state.lock() {
+                                            g.settings_open = true;
+                                            g.settings_section = SettingsSection::Machines;
+                                            if !g.is_logged_in {
+                                                g.auth_form_expanded = true;
+                                                g.auth_register_mode = false;
+                                                g.auth_reset_mode = false;
+                                                g.input_target = ActiveInputTarget::AuthAccount;
+                                            }
+                                            g.is_logged_in
+                                        } else {
+                                            false
+                                        };
+                                        if is_logged {
+                                            this.reload_account_settings_data();
+                                        }
+                                        cx.notify();
+                                    })),
+                            )
+                            .when(!st.is_logged_in, |c| {
+                                c.child(
+                                    div()
+                                        .id("btn-banner-invite-register")
+                                        .occlude()
+                                        .px(px(8.0))
+                                        .py(px(3.5))
+                                        .rounded(px(5.0))
+                                        .bg(rgb(palette::SURFACE_BG))
+                                        .border_1()
+                                        .border_color(rgb(accent))
+                                        .hover(|h| h.bg(rgb(palette::HOVER_BG)))
+                                        .cursor_pointer()
+                                        .text_size(px(10.5))
+                                        .text_color(rgb(accent))
+                                        .child(tr(loc, "Invite Register", "邀请码注册"))
+                                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                            if let Ok(mut g) = this.state.lock() {
+                                                g.settings_open = true;
+                                                g.settings_section = SettingsSection::Machines;
+                                                g.auth_form_expanded = true;
+                                                g.auth_register_mode = true;
+                                                g.auth_reset_mode = false;
+                                                g.auth_error = None;
+                                                g.input_selected_all = false;
+                                                g.input_target =
+                                                    ActiveInputTarget::AuthRegisterInviteCode;
+                                            }
+                                            cx.notify();
+                                        })),
+                                )
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .items_center()
+                            .gap(px(5.0))
+                            .children(agent_buttons.iter().map(|&(label, cmd)| {
+                                div()
+                                    .id(SharedString::from(format!("btn-banner-agent-{cmd}")))
+                                    .occlude()
+                                    .px(px(7.5))
+                                    .py(px(3.5))
+                                    .rounded(px(5.0))
+                                    .bg(rgb(palette::SURFACE_BG))
+                                    .border_1()
+                                    .border_color(rgb(palette::BORDER_STRONG))
+                                    .hover(|h| {
+                                        h.bg(rgb(palette::HOVER_BG)).border_color(rgb(accent))
+                                    })
+                                    .cursor_pointer()
+                                    .text_size(px(10.5))
+                                    .text_color(rgb(palette::TEXT_PRIMARY))
+                                    .child(format!("▶ {label}"))
+                                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                        this.launch_agent_session(cmd);
+                                        cx.notify();
+                                    }))
+                            }))
+                            .child(
+                                div()
+                                    .id("btn-banner-configure-alerts")
+                                    .occlude()
+                                    .px(px(8.0))
+                                    .py(px(3.5))
+                                    .rounded(px(5.0))
+                                    .bg(rgb(palette::SURFACE_BG))
+                                    .border_1()
+                                    .border_color(rgb(accent))
+                                    .hover(|h| h.bg(rgb(palette::HOVER_BG)))
+                                    .cursor_pointer()
+                                    .text_size(px(10.5))
+                                    .text_color(rgb(accent))
+                                    .child(tr(loc, "3. Push Alerts", "3. 推送告警"))
+                                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                        let is_logged = if let Ok(mut g) = this.state.lock() {
+                                            g.settings_open = true;
+                                            g.settings_section = SettingsSection::Machines;
+                                            g.input_selected_all = false;
+                                            g.input_target = ActiveInputTarget::WebhookBarkUrl;
+                                            g.is_logged_in
+                                        } else {
+                                            false
+                                        };
+                                        if is_logged {
+                                            this.reload_account_settings_data();
+                                        }
+                                        cx.notify();
+                                    })),
+                            ),
+                    ),
+            )
     }
 
     fn render_quickstart_onboarding_card(
@@ -10902,6 +11512,82 @@ async fn reconcile_local_herdr_sessions(
         }
     }
     ui_dirty.store(true, Ordering::Release);
+}
+
+/// Extracts non-secret text from the currently focused custom text input for `⌘C` (`Copy`),
+/// exhaustively matching every `ActiveInputTarget` variant so no field can be omitted.
+pub(crate) fn copyable_input_text_for_state(g: &CodaDesktopState) -> Option<String> {
+    if g.palette_open {
+        return (!g.palette_query.is_empty()).then(|| g.palette_query.clone());
+    }
+    let raw: &str = match g.input_target {
+        ActiveInputTarget::CommandPalette => &g.palette_query,
+        ActiveInputTarget::TerminalSearch => &g.terminal_search_query,
+        ActiveInputTarget::AuthServerUrl => &g.server_url,
+        ActiveInputTarget::AuthAccount => &g.auth_account_input,
+        ActiveInputTarget::RenameDeviceInput => &g.rename_host_input,
+        ActiveInputTarget::VoiceBaseUrl => &g.voice_base_url,
+        ActiveInputTarget::VoiceModel => &g.voice_model,
+        ActiveInputTarget::PreviewPort => &g.port_preview.port_input,
+        ActiveInputTarget::PreviewPath => &g.port_preview.path_input,
+        ActiveInputTarget::WebhookBarkUrl => &g.webhook_settings.bark_url,
+        ActiveInputTarget::WebhookTelegramChatId => &g.webhook_settings.telegram_chat_id,
+        ActiveInputTarget::WebhookFeishuUrl => &g.webhook_settings.feishu_webhook_url,
+        ActiveInputTarget::WebhookDiscordUrl => &g.webhook_settings.discord_webhook_url,
+        ActiveInputTarget::WebhookGenericUrl => &g.webhook_settings.generic_webhook_url,
+        ActiveInputTarget::BootstrapParentDir => &g.bootstrap_modal.parent_dir,
+        ActiveInputTarget::BootstrapFolderName => &g.bootstrap_modal.folder_name,
+        ActiveInputTarget::BootstrapGitCloneUrl => &g.bootstrap_modal.git_clone_url,
+        ActiveInputTarget::TerminalComposerInput => &g.composer_draft_input,
+        ActiveInputTarget::SnippetTitleInput => &g.snippet_title_input,
+        ActiveInputTarget::SnippetPromptInput => &g.snippet_prompt_input,
+        ActiveInputTarget::AuthResetToken => &g.auth_reset_token_input,
+        ActiveInputTarget::AuthRegisterInviteCode => &g.auth_register_invite_input,
+        ActiveInputTarget::AuthRegisterEmail => &g.auth_register_email_input,
+        ActiveInputTarget::AuthRegisterHandle => &g.auth_register_handle_input,
+        ActiveInputTarget::AuthRegisterDisplayName => &g.auth_register_display_name_input,
+        ActiveInputTarget::AdminInviteNote => &g.admin_invite_note_input,
+        // Secret / masked fields and direct terminal canvas return None here.
+        ActiveInputTarget::TerminalDirect
+        | ActiveInputTarget::AuthPassword
+        | ActiveInputTarget::AuthResetNewPassword
+        | ActiveInputTarget::AuthRegisterPassword
+        | ActiveInputTarget::ChangePwCurrent
+        | ActiveInputTarget::ChangePwNew
+        | ActiveInputTarget::VoiceApiKey
+        | ActiveInputTarget::WebhookTelegramToken => return None,
+    };
+    (!raw.is_empty()).then(|| raw.to_string())
+}
+
+/// Computes the full-buffer `(anchor, focus)` selection coordinates for `⌘A` on a terminal session.
+pub(crate) fn select_all_terminal_range_for_session(
+    sess: &TerminalSessionEntry,
+) -> Option<((usize, usize), (usize, usize))> {
+    if sess.styled_lines.is_empty() && sess.lines.is_empty() {
+        return None;
+    }
+    let last_line = if !sess.styled_lines.is_empty() {
+        sess.styled_lines.len().saturating_sub(1)
+    } else {
+        sess.lines.len().saturating_sub(1)
+    };
+    let last_col: usize = sess
+        .styled_lines
+        .get(last_line)
+        .map(|l| l.text.as_str())
+        .or_else(|| sess.lines.get(last_line).map(String::as_str))
+        .map(|s| {
+            s.chars()
+                .map(|ch| crate::pty::char_display_width(ch).max(1))
+                .sum()
+        })
+        .unwrap_or(0);
+    if last_line == 0 && last_col == 0 {
+        None
+    } else {
+        Some(((0, 0), (last_line, last_col)))
+    }
 }
 
 pub(crate) fn prepare_webhook_save(
@@ -12115,5 +12801,180 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(reset_handle, "alice");
+    }
+
+    #[test]
+    fn test_quickstart_persists_after_auto_seed_shell_and_shortcuts_cover_all_inputs() {
+        let mut st = CodaDesktopState::default();
+        assert!(st.should_show_quickstart_onboarding());
+
+        // Simulating spawn_herdr_discovery / spawn_local_fallback_shell auto-seeding a local shell
+        // MUST NOT hide the 3-Step Quickstart Onboarding Card!
+        let now = Instant::now();
+        st.sessions.push(TerminalSessionEntry {
+            id: "hc-shell-1".to_string(),
+            title: "hc · shell".to_string(),
+            space_id: "local:/tmp".to_string(),
+            cwd: "/tmp".to_string(),
+            started_at: now,
+            last_output_at: now,
+            last_byte_sig: 0,
+            lines: vec![
+                "Welcome to Coda".to_string(),
+                "Build 中文 OK".to_string(),
+            ],
+            styled_lines: vec![
+                StyledTerminalLine {
+                    text: "Welcome to Coda".to_string(),
+                    spans: Vec::new(),
+                },
+                StyledTerminalLine {
+                    text: "Build 中文 OK".to_string(),
+                    spans: Vec::new(),
+                },
+            ],
+            scroll_offset: 0,
+            alive: true,
+            attached_hc: true,
+            hc_addr: Some("shell-1".to_string()),
+            remote_host_id: None,
+            osc_status: None,
+        });
+        st.active_session_id = Some("hc-shell-1".to_string());
+        assert!(
+            st.should_show_quickstart_onboarding(),
+            "auto-seeded local shell must not hide 3-Step Quickstart card"
+        );
+
+        // Terminal Cmd+A range covers all lines and display columns (including CJK width=2)
+        let range = select_all_terminal_range_for_session(&st.sessions[0])
+            .expect("non-empty terminal session must produce Cmd+A range");
+        assert_eq!(range, ((0, 0), (1, 13)));
+
+        // Dismissing, launching an agent, or pairing a host hides Quickstart cleanly
+        st.has_user_launched_agent = true;
+        assert!(!st.should_show_quickstart_onboarding());
+        st.has_user_launched_agent = false;
+        st.quickstart_dismissed = true;
+        assert!(!st.should_show_quickstart_onboarding());
+
+        // Verify Cmd+C (`copyable_input_text_for_state`) covers all 4 previously missing inputs + Register inputs
+        st.webhook_settings.generic_webhook_url = "https://hooks.example.com/generic".to_string();
+        st.bootstrap_modal.parent_dir = "~/projects".to_string();
+        st.bootstrap_modal.folder_name = "coda-app".to_string();
+        st.bootstrap_modal.git_clone_url = "https://github.com/Annihilater/coda.git".to_string();
+        st.auth_register_invite_input = "CODA-INV777".to_string();
+        st.auth_register_email_input = "friend@coda.dev".to_string();
+        st.auth_register_handle_input = "friend".to_string();
+        st.auth_register_display_name_input = "Friend Dev".to_string();
+        st.auth_register_password_input = "TopSecret123!".to_string();
+
+        let expected_copyable = [
+            (
+                ActiveInputTarget::WebhookGenericUrl,
+                "https://hooks.example.com/generic",
+            ),
+            (ActiveInputTarget::BootstrapParentDir, "~/projects"),
+            (ActiveInputTarget::BootstrapFolderName, "coda-app"),
+            (
+                ActiveInputTarget::BootstrapGitCloneUrl,
+                "https://github.com/Annihilater/coda.git",
+            ),
+            (ActiveInputTarget::AuthRegisterInviteCode, "CODA-INV777"),
+            (ActiveInputTarget::AuthRegisterEmail, "friend@coda.dev"),
+            (ActiveInputTarget::AuthRegisterHandle, "friend"),
+            (ActiveInputTarget::AuthRegisterDisplayName, "Friend Dev"),
+        ];
+        for (target, expected_txt) in expected_copyable {
+            st.input_target = target;
+            assert_eq!(
+                copyable_input_text_for_state(&st).as_deref(),
+                Some(expected_txt),
+                "Cmd+C failed for {target:?}"
+            );
+        }
+
+        // Secret password/token inputs must never copy plaintext
+        st.input_target = ActiveInputTarget::AuthRegisterPassword;
+        assert_eq!(copyable_input_text_for_state(&st), None);
+    }
+
+    #[tokio::test]
+    async fn test_dirty_webhook_save_before_test_and_in_app_invite_registration() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let base_url = format!("http://127.0.0.1:{port}");
+        let order_log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let order_bg = Arc::clone(&order_log);
+
+        tokio::spawn(async move {
+            for _ in 0..3 {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = vec![0u8; 8192];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let body_json = if req.starts_with("PUT /api/v1/me/notifications ") {
+                    order_bg.lock().unwrap().push("PUT".to_string());
+                    assert!(req.contains("https://api.day.app/fresh-key"));
+                    r#"{"bark_url":"https://api.day.app/fresh-key","telegram_bot_token":"","telegram_chat_id":"","feishu_webhook_url":"","discord_webhook_url":"","generic_webhook_url":"","notify_on_needs_you":true,"notify_on_finished":true}"#.to_string()
+                } else if req.starts_with("POST /api/v1/me/notifications/test ") {
+                    order_bg.lock().unwrap().push("TEST".to_string());
+                    r#"{"ok":true,"delivered_channels":["bark"],"errors":[]}"#.to_string()
+                } else if req.starts_with("POST /api/v1/auth/register ") {
+                    order_bg.lock().unwrap().push("REGISTER".to_string());
+                    assert!(req.contains("\"email\":\"friend@example.com\""));
+                    assert!(req.contains("\"handle\":\"friend_example\""));
+                    assert!(req.contains("\"invite_code\":\"CODA-JOIN88\""));
+                    r#"{"user":{"id":"22222222-2222-2222-2222-222222222222","email":"friend@example.com","handle":"friend_example","display_name":"Friend"},"token":"tok_reg_1"}"#.to_string()
+                } else {
+                    r#"{"error":"unexpected"}"#.to_string()
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body_json.len(),
+                    body_json
+                );
+                let _ = stream.write_all(resp.as_bytes()).await;
+            }
+        });
+
+        // 1. Dirty webhook settings save via PUT strictly before POST /test
+        let mut dirty_wh = NotificationWebhookSettings::default();
+        dirty_wh.bark_url = "https://api.day.app/fresh-key".to_string();
+        let (saved_wh, delivered, errs) =
+            crate::remote_mesh::api_save_and_test_notification_webhooks(
+                &base_url,
+                "sess-tok",
+                &dirty_wh,
+            )
+            .await
+            .unwrap();
+        assert_eq!(saved_wh.bark_url, "https://api.day.app/fresh-key");
+        assert_eq!(delivered, 1);
+        assert!(errs.is_empty());
+
+        // 2. Pasting a full `https://.../register?invite=CODA-JOIN88` link extracts both origin & invite_code
+        let full_invite_link = format!("{base_url}/register?invite=CODA-JOIN88");
+        let (eff_srv, reg_email, reg_handle) = crate::remote_mesh::api_register_account(
+            "https://stale.example.invalid",
+            "Friend@Example.com",
+            "friend_example",
+            "Friend",
+            "StrongPass88!",
+            &full_invite_link,
+        )
+        .await
+        .unwrap();
+        assert_eq!(eff_srv, base_url);
+        assert_eq!(reg_email, "friend@example.com");
+        assert_eq!(reg_handle, "friend_example");
+        assert_eq!(
+            *order_log.lock().unwrap(),
+            vec!["PUT".to_string(), "TEST".to_string(), "REGISTER".to_string()]
+        );
     }
 }

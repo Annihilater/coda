@@ -466,6 +466,95 @@ pub fn extract_reset_token_and_origin(raw_input: &str) -> (String, Option<String
     (trimmed.to_string(), origin)
 }
 
+/// Extracts `(clean_invite_code, optional_server_origin)` from either a raw `CODA-XXXXXX` code
+/// or a full `https://.../register?invite=CODA-XXXXXX` registration link pasted from chat.
+pub fn extract_invite_code_and_origin(raw_input: &str) -> (String, Option<String>) {
+    let trimmed = raw_input.trim();
+    if trimmed.is_empty() {
+        return (String::new(), None);
+    }
+
+    let origin = if trimmed.starts_with("https://") || trimmed.starts_with("http://") {
+        let scheme_end = trimmed.find("://").map(|i| i + 3).unwrap_or(0);
+        let rest = &trimmed[scheme_end..];
+        let authority_end = rest
+            .find(['/', '?', '#'])
+            .map(|i| scheme_end + i)
+            .unwrap_or(trimmed.len());
+        let cand = &trimmed[..authority_end];
+        if authority_end > scheme_end && crate::config::is_safe_http_url(cand) {
+            Some(cand.to_string())
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    if let Some((_, query_and_frag)) = trimmed.split_once('?') {
+        let query = query_and_frag.split('#').next().unwrap_or(query_and_frag);
+        for pair in query.split('&') {
+            if let Some((k, v)) = pair.split_once('=') {
+                if matches!(k.trim(), "invite" | "invite_code" | "code") {
+                    let decoded = percent_decode_lossy(v.trim()).trim().to_string();
+                    if !decoded.is_empty() {
+                        return (decoded, origin);
+                    }
+                }
+            }
+        }
+    }
+
+    for key_prefix in ["invite=", "invite_code="] {
+        if let Some(idx) = trimmed.find(key_prefix) {
+            let after = &trimmed[idx + key_prefix.len()..];
+            let val = after
+                .split(['&', '#', ' ', '\t', '\r', '\n'])
+                .next()
+                .unwrap_or("");
+            let decoded = percent_decode_lossy(val.trim()).trim().to_string();
+            if !decoded.is_empty() {
+                return (decoded, origin);
+            }
+        }
+    }
+
+    if origin.is_some() {
+        return (String::new(), origin);
+    }
+
+    (trimmed.to_string(), None)
+}
+
+/// Derives a safe default account handle (`a-z0-9_-`, 2..=32 chars) from an email address.
+pub fn derive_default_handle_from_email(email: &str) -> String {
+    let local = email
+        .trim()
+        .split('@')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let mut cleaned = String::new();
+    for ch in local.chars() {
+        if ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_' || ch == '-' {
+            cleaned.push(ch);
+        } else if matches!(ch, '.' | '+') && !cleaned.ends_with('_') && !cleaned.is_empty() {
+            cleaned.push('_');
+        }
+        if cleaned.len() >= 32 {
+            break;
+        }
+    }
+    let trimmed = cleaned.trim_matches(['_', '-']).to_string();
+    if trimmed.len() >= 2 {
+        trimmed
+    } else if !trimmed.is_empty() {
+        format!("{trimmed}1")
+    } else {
+        String::new()
+    }
+}
+
 /// Derives a safe default folder name from a Git clone URL (e.g. `https://github.com/org/repo.git` -> `"repo"`).
 pub fn derive_folder_name_from_git_url(url: &str) -> Option<String> {
     let trimmed = url.trim().trim_end_matches('/');
@@ -982,5 +1071,20 @@ index 1111111..2222222 100644
         let (tok2, orig2) = extract_reset_token_and_origin("rst_rawTokenValue998877");
         assert_eq!(tok2, "rst_rawTokenValue998877");
         assert_eq!(orig2, None);
+
+        let (inv1, inv_orig1) = extract_invite_code_and_origin(
+            "  https://codahub.dev/register?invite=CODA-7F29AB#join  ",
+        );
+        assert_eq!(inv1, "CODA-7F29AB");
+        assert_eq!(inv_orig1.as_deref(), Some("https://codahub.dev"));
+
+        let (inv2, inv_orig2) = extract_invite_code_and_origin("CODA-RAW999");
+        assert_eq!(inv2, "CODA-RAW999");
+        assert_eq!(inv_orig2, None);
+
+        assert_eq!(
+            derive_default_handle_from_email("Alice.Dev+test@Example.com"),
+            "alice_dev_test"
+        );
     }
 }
